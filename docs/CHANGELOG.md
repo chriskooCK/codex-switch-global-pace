@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v20260824.1.0 — 2026-08-24
 
 - **Independent Global Pace distribution** — The project is now distributed as
   `codex-switch-global-pace` from
