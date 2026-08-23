@@ -1,0 +1,263 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "dev"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      prerelease: ${{ steps.parse.outputs.prerelease }}
+      is_dev: ${{ steps.parse.outputs.is_dev }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Parse tag
+        id: parse
+        run: |
+          RAW_TAG="${GITHUB_REF#refs/tags/}"
+          BASE=$(cat VERSION)
+          MANIFEST_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [[ ! "$BASE" =~ ^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "VERSION must contain a SemVer-compatible numeric base" >&2
+            exit 1
+          fi
+          if [[ "$MANIFEST_VERSION" != "$BASE" ]]; then
+            echo "Cargo.toml version must match VERSION" >&2
+            exit 1
+          fi
+          if [[ "$RAW_TAG" == "dev" ]]; then
+            echo "version=${BASE}-dev" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "is_dev=true" >> "$GITHUB_OUTPUT"
+          else
+            TAG="${RAW_TAG#v}"
+            PRERELEASE_IDENTIFIER='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+            BASE_PATTERN="${BASE//./\\.}"
+            TAG_PATTERN="^${BASE_PATTERN}(-${PRERELEASE_IDENTIFIER}(\.${PRERELEASE_IDENTIFIER})*)?$"
+            if [[ ! "$TAG" =~ $TAG_PATTERN ]]; then
+              echo "release tag must match VERSION with an optional SemVer prerelease suffix" >&2
+              exit 1
+            fi
+            echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "is_dev=false" >> "$GITHUB_OUTPUT"
+            if [[ "$TAG" == *-* ]]; then
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+  build:
+    needs: meta
+    env:
+      RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: codex-switch-global-pace-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: codex-switch-global-pace-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: codex-switch-global-pace-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: codex-switch-global-pace-darwin-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: codex-switch-global-pace-windows-amd64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            name: codex-switch-global-pace-windows-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch head 2026-07-16
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Install musl tools (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Install cross (Linux ARM64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a
+      - name: Inject release version
+        shell: bash
+        run: |
+          sed -i.bak "s/^version = \".*\"/version = \"${RELEASE_VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            cross build --release --target "${{ matrix.target }}"
+          else
+            cargo build --release --target "${{ matrix.target }}"
+          fi
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/codex-switch-global-pace"
+          chmod +x "$BIN"
+          tar czf "${{ matrix.name }}.tar.gz" -C "target/${{ matrix.target }}/release" codex-switch-global-pace
+          shasum -a 256 "${{ matrix.name }}.tar.gz" > "${{ matrix.name }}.tar.gz.sha256"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          7z a "${{ matrix.name }}.zip" "./target/${{ matrix.target }}/release/codex-switch-global-pace.exe"
+          sha256sum "${{ matrix.name }}.zip" > "${{ matrix.name }}.zip.sha256"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.tar.gz.sha256
+            ${{ matrix.name }}.zip
+            ${{ matrix.name }}.zip.sha256
+          if-no-files-found: ignore
+
+  release:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Verify release checksums
+        shell: bash
+        run: |
+          archives=(
+            codex-switch-global-pace-linux-amd64.tar.gz
+            codex-switch-global-pace-linux-arm64.tar.gz
+            codex-switch-global-pace-darwin-amd64.tar.gz
+            codex-switch-global-pace-darwin-arm64.tar.gz
+            codex-switch-global-pace-windows-amd64.zip
+            codex-switch-global-pace-windows-arm64.zip
+          )
+          for name in "${archives[@]}"; do
+            archive="artifacts/${name}"
+            checksum="${archive}.sha256"
+            if [[ ! -s "$archive" || ! -s "$checksum" ]]; then
+              echo "Missing or empty release archive/checksum: $archive / $checksum" >&2
+              exit 1
+            fi
+            (cd artifacts && sha256sum --check "$(basename "$checksum")")
+          done
+      - name: Attest release archives
+        id: attest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+      - name: Add provenance bundle to release assets
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" artifacts/codex-switch-global-pace-build-provenance.json
+      - name: Add installers and install notes
+        shell: bash
+        run: |
+          cp scripts/install.sh artifacts/install.sh
+          cp scripts/install.ps1 artifacts/install.ps1
+          cat > artifacts/INSTALL.md << 'EOF'
+          ## Quick install
+
+          macOS / Linux:
+
+          ```bash
+          curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash
+          ```
+
+          Windows PowerShell:
+
+          ```powershell
+          irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
+          ```
+
+          The program reuses profiles and configuration under `~/.codex-switch`.
+          EOF
+      - name: Delete existing dev release
+        if: needs.meta.outputs.is_dev == 'true'
+        run: gh release delete dev --yes || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate dev release body
+        if: needs.meta.outputs.is_dev == 'true'
+        shell: bash
+        run: |
+          cat > dev_body.md << EOF
+          Development build from \`${GITHUB_REF}\` at ${GITHUB_SHA}.
+
+          Use \`codex-switch-global-pace self-update --dev\` to install, or \`codex-switch-global-pace self-update --stable\` to return to stable.
+
+          macOS / Linux: \`curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh | bash -s -- --dev\`
+
+          Windows PowerShell: \`\$env:CS_DEV="1"; irm https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.ps1 | iex\`
+
+          Version: \`${RELEASE_VERSION}\`
+          EOF
+      - name: Create GitHub Release (dev)
+        if: needs.meta.outputs.is_dev == 'true'
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: dev
+          target_commitish: ${{ github.sha }}
+          name: "dev (${{ needs.meta.outputs.version }})"
+          prerelease: true
+          body_path: dev_body.md
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create GitHub Release (stable)
+        if: needs.meta.outputs.is_dev != 'true'
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: v${{ needs.meta.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: v${{ needs.meta.outputs.version }}
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          body: |
+            Profiles and configuration under `~/.codex-switch` are preserved.
+
+            `curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/v${{ needs.meta.outputs.version }}/install.sh | bash`
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

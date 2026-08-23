@@ -1,0 +1,73 @@
+name: Sync Wiki
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "docs/wiki/**"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    if: ${{ github.repository == 'chriskooCK/codex-switch-global-pace' && github.ref == 'refs/heads/dev' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out reviewed Wiki sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Publish docs/wiki to GitHub Wiki
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          wiki_dir="$(mktemp -d)"
+          trap 'rm -rf "$wiki_dir"' EXIT
+          wiki_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+
+          wiki_source_is_current() {
+            git fetch --no-tags --depth 1 origin refs/heads/dev:refs/remotes/origin/dev
+            git diff --quiet "$GITHUB_SHA" refs/remotes/origin/dev -- docs/wiki .github/workflows/wiki.yml
+          }
+
+          if ! wiki_source_is_current; then
+            echo "A newer dev commit changed the Wiki source; skipping this stale run."
+            exit 0
+          fi
+
+          git clone --depth 1 "$wiki_url" "$wiki_dir"
+          git -C "$wiki_dir" rm -r --ignore-unmatch -- .
+          for page in docs/wiki/*.md; do
+            if ! [[ -f "$page" && ! -L "$page" ]]; then
+              echo "Wiki sources must be regular Markdown files: $page" >&2
+              exit 1
+            fi
+            cp -- "$page" "$wiki_dir"/
+          done
+          git -C "$wiki_dir" add --all
+
+          if git -C "$wiki_dir" diff --cached --quiet; then
+            echo "Wiki is already up to date."
+            exit 0
+          fi
+
+          git -C "$wiki_dir" config user.name "github-actions[bot]"
+          git -C "$wiki_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$wiki_dir" commit -m "docs: sync wiki from ${GITHUB_SHA::12}"
+
+          if ! wiki_source_is_current; then
+            echo "A newer dev commit changed the Wiki source before publication; skipping this stale run."
+            exit 0
+          fi
+
+          git -C "$wiki_dir" push origin HEAD:master
