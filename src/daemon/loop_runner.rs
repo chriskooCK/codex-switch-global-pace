@@ -52,6 +52,23 @@ fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn switch_defer_reason(
+    activity: super::codex_process::CodexActivity,
+    defer_interactive_session: bool,
+) -> Option<&'static str> {
+    match activity {
+        super::codex_process::CodexActivity::AuthMutation => {
+            Some("Codex is changing authentication")
+        }
+        super::codex_process::CodexActivity::Unknown => Some("Codex process inspection failed"),
+        super::codex_process::CodexActivity::Session if defer_interactive_session => {
+            Some("a Codex session is running")
+        }
+        super::codex_process::CodexActivity::Idle
+        | super::codex_process::CodexActivity::Session => None,
+    }
+}
+
 /// Main daemon event loop: periodically checks usage and switches account when needed.
 pub async fn run_daemon_loop() -> Result<()> {
     // Registered before anything else can block: from here on every signal is
@@ -193,10 +210,10 @@ async fn check_and_switch() -> Result<PollOutcome> {
         return Ok(PollOutcome::NoAction);
     }
 
-    let current = profile::read_current();
-    if current.is_empty() {
+    let Some(current) = profile::sync_current_from_live() else {
+        tracing::debug!("No saved profile matches the live Codex authentication");
         return Ok(PollOutcome::NoAction);
-    }
+    };
 
     let cfg = config::get();
     let safety_7d = cfg.use_cfg.safety_margin_7d;
@@ -205,7 +222,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
     // 1. Force-fetch current account's usage (bypass cache)
     let current_path = profile::profile_auth_path(&current)?;
-    let current_usage = usage::fetch_usage_retried_unattended(&current, &current_path, &current)
+    let current_usage = usage::fetch_usage_retried_unattended(&current, &current_path)
         .await
         .map_err(|e| anyhow::anyhow!("{}", e.detail))?;
 
@@ -245,14 +262,13 @@ async fn check_and_switch() -> Result<PollOutcome> {
             Err(_) => continue,
         };
         let alias = alias.clone();
-        let current = current.clone();
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
                 .expect("candidate usage limiter must stay open");
-            let u = usage::fetch_usage_retried(&alias, &path, &current).await;
+            let u = usage::fetch_usage_retried(&alias, &path).await;
             (alias, path, u)
         });
     }
@@ -291,16 +307,19 @@ async fn check_and_switch() -> Result<PollOutcome> {
         usage::pick_switch_target(&current_scored, &scored, safety_7d)
     {
         let (best_alias, best_score) = (best_alias.to_string(), best_score);
-        // A switch replaces the live auth.json; doing that under an active
-        // Codex session would swap accounts mid-conversation. Hold the
-        // switch and let the next poll retry once the session ends.
-        if cfg.daemon.defer_switch_while_codex_running
-            && super::codex_process::codex_process_running()
-        {
+        // `codex login` and `codex logout` mutate the same live auth file and
+        // are always protected. Interactive sessions remain configurable, but
+        // an inspection failure is never interpreted as permission to replace
+        // credentials.
+        let activity = super::codex_process::codex_activity();
+        let defer_reason =
+            switch_defer_reason(activity, cfg.daemon.defer_switch_while_codex_running);
+        if let Some(reason) = defer_reason {
             tracing::info!(
-                "Deferring switch '{}' -> '{}': a Codex session is running",
+                "Deferring switch '{}' -> '{}': {}",
                 current,
                 best_alias,
+                reason,
             );
             return Ok(PollOutcome::Deferred { to: best_alias });
         }
@@ -312,7 +331,14 @@ async fn check_and_switch() -> Result<PollOutcome> {
             best_alias,
             best_score,
         );
-        profile::switch_profile(&best_alias)?;
+        if !profile::switch_profile_if_current(&current, &best_alias)? {
+            tracing::info!(
+                "Skipping stale daemon switch '{}' -> '{}': the active profile changed during the poll",
+                current,
+                best_alias,
+            );
+            return Ok(PollOutcome::NoAction);
+        }
         cache::set_last_used(&best_alias)?;
 
         if cfg.daemon.notify {
@@ -334,7 +360,8 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_usage_percent_for_switch, poll_backoff_secs};
+    use super::{current_usage_percent_for_switch, poll_backoff_secs, switch_defer_reason};
+    use crate::daemon::codex_process::CodexActivity;
     use crate::usage::{UsageInfo, WindowUsage};
     use std::sync::{
         Arc,
@@ -361,6 +388,17 @@ mod tests {
         };
 
         assert!(current_usage_percent_for_switch(&usage) >= 80.0);
+    }
+
+    #[test]
+    fn auth_mutation_and_failed_inspection_always_defer_switching() {
+        for defer_sessions in [false, true] {
+            assert!(switch_defer_reason(CodexActivity::AuthMutation, defer_sessions).is_some());
+            assert!(switch_defer_reason(CodexActivity::Unknown, defer_sessions).is_some());
+        }
+        assert!(switch_defer_reason(CodexActivity::Session, true).is_some());
+        assert!(switch_defer_reason(CodexActivity::Session, false).is_none());
+        assert!(switch_defer_reason(CodexActivity::Idle, true).is_none());
     }
 
     #[test]
@@ -425,7 +463,6 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
         return Ok(CacheRefreshSummary::default());
     }
 
-    let current = profile::read_current();
     let now = auth::now_unix_secs();
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config::get().network.max_concurrent,
@@ -433,7 +470,6 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
     let mut tasks = tokio::task::JoinSet::new();
 
     for alias in profiles {
-        let current = current.clone();
         let sem = semaphore.clone();
         tasks.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
@@ -449,7 +485,7 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
                 Err(e) => return (alias, false, false, Some(e.to_string())),
             };
 
-            let usage = match usage::fetch_usage_retried_unattended(&alias, &path, &current).await {
+            let usage = match usage::fetch_usage_retried_unattended(&alias, &path).await {
                 Ok(usage) => usage,
                 Err(e) => return (alias, false, false, Some(e.summary)),
             };
@@ -462,7 +498,7 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
                 return (alias, true, false, Some(format!("warmup failed: {e}")));
             }
 
-            if let Err(e) = usage::fetch_usage_retried_unattended(&alias, &path, &current).await {
+            if let Err(e) = usage::fetch_usage_retried_unattended(&alias, &path).await {
                 tracing::warn!("[{alias}] post-warmup cache refresh failed: {}", e.summary);
             }
             (alias, true, true, None)

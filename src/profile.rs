@@ -42,15 +42,32 @@ pub fn validate_alias(alias: &str) -> Result<()> {
 
 pub fn list_profiles() -> Result<Vec<String>> {
     let dir = profiles_dir()?;
-    if !dir.exists() {
-        return Ok(vec![]);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading profiles directory {}", dir.display()));
+        }
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .with_context(|| format!("reading file type of {}", path.display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if validate_alias(&name).is_ok() {
+            names.push(name);
+        }
     }
-    let mut names: Vec<String> = std::fs::read_dir(&dir)
-        .with_context(|| format!("reading profiles directory {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
     names.sort();
     Ok(names)
 }
@@ -60,6 +77,39 @@ pub fn read_current() -> String {
         .and_then(|p| std::fs::read_to_string(p).map_err(Into::into))
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
+}
+
+fn read_current_checked() -> Result<Option<String>> {
+    let path = current_file()?;
+    match std::fs::read_to_string(&path) {
+        Ok(value) => Ok(Some(value.trim().to_string())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading current profile marker {}", path.display()))
+        }
+    }
+}
+
+fn path_exists_checked(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading metadata for {}", path.display()))
+        }
+    }
+}
+
+#[allow(dead_code)] // Binary-only commands use this checked existence boundary.
+pub(crate) fn profile_exists(alias: &str) -> Result<bool> {
+    path_exists_checked(&profile_auth_path(alias)?)
+}
+
+fn read_existing_auth(path: &Path) -> Result<Option<serde_json::Value>> {
+    if path_exists_checked(path)? {
+        return read_auth(path).map(Some);
+    }
+    Ok(None)
 }
 
 fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -132,6 +182,174 @@ fn lock_auth_transaction() -> Result<AuthTransaction> {
         _legacy_launch: legacy_launch,
         _auth: auth,
     })
+}
+
+/// An OS-backed per-profile lease. Keep this value alive for the complete
+/// credential operation; dropping it releases the lease.
+pub(crate) struct ProfileLease {
+    alias: String,
+    _file: File,
+}
+
+impl ProfileLease {
+    pub(crate) fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
+fn profile_lease_path(alias: &str) -> Result<PathBuf> {
+    validate_alias(alias)?;
+    Ok(app_home()?.join("locks").join(format!("{alias}.lock")))
+}
+
+const PROFILE_LEASE_WAITING: u8 = 0;
+const PROFILE_LEASE_ACQUIRED: u8 = 1;
+const PROFILE_LEASE_CANCELLED: u8 = 2;
+
+/// Coordinates cancellation only while an async profile lease is still
+/// waiting. Once acquisition wins the state transition, cancellation is a
+/// no-op and the credential operation must be allowed to finish.
+#[derive(Clone, Debug)]
+pub(crate) struct ProfileLeaseAcquireControl {
+    state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ProfileLeaseAcquireControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(PROFILE_LEASE_WAITING)),
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Cancel a task that has not acquired its profile lease yet. The compare
+    /// and exchange is the boundary that prevents shutdown from cancelling a
+    /// task after it may have started a credential-mutating request.
+    pub(crate) fn cancel_waiting(&self) -> bool {
+        let cancelled = self
+            .state
+            .compare_exchange(
+                PROFILE_LEASE_WAITING,
+                PROFILE_LEASE_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.wake.notify_one();
+        }
+        cancelled
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == PROFILE_LEASE_CANCELLED
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.wake.notified().await;
+        }
+    }
+
+    fn mark_acquired(&self) -> bool {
+        self.state
+            .compare_exchange(
+                PROFILE_LEASE_WAITING,
+                PROFILE_LEASE_ACQUIRED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+pub(crate) fn acquire_profile_lease(alias: &str) -> Result<ProfileLease> {
+    let path = profile_lease_path(alias)?;
+    // Synchronous UI mutations must never freeze forever behind another
+    // process's interactive OAuth session. They fail closed before doing any
+    // credential or network work when the established lock timeout expires.
+    let file = acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, &format!("profile '{alias}'"))?;
+    Ok(ProfileLease {
+        alias: alias.to_string(),
+        _file: file,
+    })
+}
+
+/// Async profile-lease acquisition with an explicit pre-acquisition
+/// cancellation boundary. It never creates an unabortable blocking worker:
+/// contention is polled with `try_lock`, a Tokio timer, and the control's wake
+/// signal.
+pub(crate) async fn acquire_profile_lease_async_cancellable(
+    alias: impl Into<String>,
+    control: &ProfileLeaseAcquireControl,
+) -> Result<Option<ProfileLease>> {
+    let alias = alias.into();
+    let path = profile_lease_path(&alias)?;
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let file = open_lock_file(&path)?;
+    let label = format!("profile '{alias}'");
+
+    loop {
+        if control.is_cancelled() {
+            return Ok(None);
+        }
+        match FileExt::try_lock(&file) {
+            Ok(()) => {
+                if !control.mark_acquired() {
+                    // Shutdown won the only state transition while this poll
+                    // was acquiring the OS lock. Dropping the handle releases
+                    // it before any credential or network work can begin.
+                    return Ok(None);
+                }
+                write_lock_holder(&file);
+                return Ok(Some(ProfileLease { alias, _file: file }));
+            }
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                notify_test_lock_attempt(&label);
+                tokio::select! {
+                    _ = control.cancelled() => return Ok(None),
+                    _ = tokio::time::sleep(LOCK_POLL_INTERVAL) => {}
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("acquiring {label} lock {}", path.display()));
+            }
+        }
+    }
+}
+
+/// CLI and background callers deliberately wait until the profile is free.
+/// The async polling implementation remains cancellable by dropping its future
+/// and leaves no detached `spawn_blocking` waiter behind at runtime shutdown.
+pub(crate) async fn acquire_profile_lease_async(alias: impl Into<String>) -> Result<ProfileLease> {
+    let control = ProfileLeaseAcquireControl::new();
+    acquire_profile_lease_async_cancellable(alias, &control)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("profile lease acquisition was cancelled unexpectedly"))
+}
+
+pub(crate) fn acquire_profile_leases(aliases: &[&str]) -> Result<Vec<ProfileLease>> {
+    let mut aliases = aliases
+        .iter()
+        .map(|alias| {
+            validate_alias(alias)?;
+            Ok((*alias).to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    aliases.sort();
+    aliases.dedup();
+    aliases
+        .iter()
+        .map(|alias| acquire_profile_lease(alias))
+        .collect()
 }
 
 fn acquire_file_lock(path: &Path, timeout: Duration, label: &str) -> Result<File> {
@@ -246,34 +464,304 @@ fn write_current(alias: &str) -> Result<()> {
     Ok(())
 }
 
-fn switch_live_auth(alias: &str) -> Result<()> {
-    validate_alias(alias)?;
-    let src = profile_auth_path(alias)?;
-    if !src.exists() {
-        return Err(CsError::NotFound(alias.to_string()).into());
-    }
+#[cfg(test)]
+thread_local! {
+    static TEST_FAIL_NEXT_ACTIVATION_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-    let _transaction = lock_auth_transaction()?;
-    let val = read_auth(&src)?;
-    crate::auth::validate_managed_auth_value(&val)?;
-    let dst = codex_auth_path()?;
-    backup_auth(&dst)?;
-    write_auth(&dst, &val)?;
-    write_current(alias)?;
+#[cfg(test)]
+fn fail_next_activation_marker_write() {
+    TEST_FAIL_NEXT_ACTIVATION_MARKER.with(|flag| flag.set(true));
+}
+
+fn write_activation_marker(alias: &str) -> Result<()> {
+    #[cfg(test)]
+    if TEST_FAIL_NEXT_ACTIVATION_MARKER.with(|flag| flag.replace(false)) {
+        anyhow::bail!("injected activation marker failure");
+    }
+    write_current(alias)
+}
+
+fn clear_current() -> Result<()> {
+    let path = current_file()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("removing current profile marker {}", path.display())),
+    }
+}
+
+fn snapshot_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn restore_file_snapshot(path: &Path, snapshot: Option<&[u8]>) -> Result<()> {
+    match snapshot {
+        Some(contents) => atomic_write_private(path, contents)
+            .with_context(|| format!("restoring {}", path.display())),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("removing newly-created {}", path.display()))
+            }
+        },
+    }
+}
+
+fn restore_activation_snapshots(
+    live_path: &Path,
+    live_snapshot: Option<&[u8]>,
+    current_path: &Path,
+    current_snapshot: Option<&[u8]>,
+) -> Result<()> {
+    let live_result = restore_file_snapshot(live_path, live_snapshot);
+    let current_result = restore_file_snapshot(current_path, current_snapshot);
+    match (live_result, current_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(live), Ok(())) => Err(live),
+        (Ok(()), Err(current)) => Err(current),
+        (Err(live), Err(current)) => anyhow::bail!(
+            "restoring live auth failed ({live:#}); restoring current marker also failed ({current:#})"
+        ),
+    }
+}
+
+/// Commit the two files that define activation. The caller must hold the auth
+/// transaction (and the target profile lease). Any reported write failure
+/// restores both files to the exact bytes observed before the attempt.
+fn commit_activation(alias: &str, value: &serde_json::Value) -> Result<()> {
+    validate_alias(alias)?;
+    crate::auth::validate_managed_auth_value(value)?;
+    let live_path = codex_auth_path()?;
+    let current_path = current_file()?;
+    let live_snapshot = snapshot_optional_file(&live_path)?;
+    let current_snapshot = snapshot_optional_file(&current_path)?;
+
+    backup_auth(&live_path)?;
+    let write_result = write_auth(&live_path, value).and_then(|()| write_activation_marker(alias));
+    if let Err(error) = write_result {
+        return match restore_activation_snapshots(
+            &live_path,
+            live_snapshot.as_deref(),
+            &current_path,
+            current_snapshot.as_deref(),
+        ) {
+            Ok(()) => Err(error.context("activating profile failed; previous activation restored")),
+            Err(rollback) => Err(anyhow::anyhow!(
+                "activating profile failed ({error:#}) and rollback failed ({rollback:#})"
+            )),
+        };
+    }
     Ok(())
 }
 
-/// Compare-and-swap a refresh rotation while holding the auth transaction.
-/// A concurrent re-login supersedes the presented token and must win.
-pub fn update_profile_tokens_if_refresh_matches(
-    alias: &str,
+/// Activate newly minted credentials after they are durable in the profile.
+/// Unlike a normal switch, this must never restore the previous live refresh
+/// token: the auth server has already invalidated it. A failure therefore
+/// leaves the new credential in the profile (and, when that write succeeded,
+/// live) and reports precisely which activation step remains incomplete.
+fn commit_fresh_credentials_activation(alias: &str, value: &serde_json::Value) -> Result<()> {
+    validate_alias(alias)?;
+    crate::auth::validate_managed_auth_value(value)?;
+    let live_path = codex_auth_path()?;
+    backup_auth(&live_path)?;
+    write_auth(&live_path, value).with_context(|| {
+        format!(
+            "new credentials are preserved in profile '{alias}', but writing live auth {} failed; the previous live refresh token may already be invalid",
+            live_path.display()
+        )
+    })?;
+    write_activation_marker(alias).with_context(|| {
+        format!(
+            "new credentials for profile '{alias}' are saved and active live, but updating the current marker failed"
+        )
+    })
+}
+
+fn live_belongs_to_profile_locked(alias: &str) -> Result<bool> {
+    let profile_path = profile_auth_path(alias)?;
+    let Some(profile) = read_existing_auth(&profile_path)? else {
+        return Ok(false);
+    };
+    live_belongs_to_auth_value_locked(alias, &profile)
+}
+
+fn live_belongs_to_auth_value_locked(alias: &str, profile: &serde_json::Value) -> Result<bool> {
+    let live_path = codex_auth_path()?;
+    let Some(live) = read_existing_auth(&live_path)? else {
+        return Ok(false);
+    };
+    if profile == &live {
+        return Ok(true);
+    }
+    let profile_identity = extract_identity(profile);
+    let live_identity = extract_identity(&live);
+    if let (Some(profile_email), Some(live_email)) = (
+        profile_identity.email.as_deref(),
+        live_identity.email.as_deref(),
+    ) && profile_email != live_email
+    {
+        return Ok(false);
+    }
+    if let (Some(profile_id), Some(live_id)) = (
+        profile_identity.account_id.as_deref(),
+        live_identity.account_id.as_deref(),
+    ) && profile_id != live_id
+    {
+        return Ok(false);
+    }
+    match (
+        profile_identity.account_id.as_deref(),
+        profile_identity.email.as_deref(),
+        live_identity.account_id.as_deref(),
+        live_identity.email.as_deref(),
+    ) {
+        (Some(profile_id), Some(profile_email), Some(live_id), Some(live_email)) => {
+            Ok(profile_id == live_id && profile_email == live_email)
+        }
+        _ => anyhow::bail!(
+            "cannot safely determine whether live auth belongs to profile '{alias}': account_id and email are required when credential files differ"
+        ),
+    }
+}
+
+fn repair_stale_current_marker_locked(stale_alias: &str) -> Result<()> {
+    if read_current_checked()?.as_deref() != Some(stale_alias) {
+        return Ok(());
+    }
+    let live_path = codex_auth_path()?;
+    if let Some(actual) = find_matching_profile_checked(&live_path)? {
+        write_current(&actual)
+    } else {
+        clear_current()
+    }
+}
+
+fn switch_live_auth_with_lease(lease: &ProfileLease) -> Result<()> {
+    let alias = lease.alias();
+    let src = profile_auth_path(alias)?;
+    let _transaction = lock_auth_transaction()?;
+    let val = match read_existing_auth(&src)? {
+        Some(value) => value,
+        None => return Err(CsError::NotFound(alias.to_string()).into()),
+    };
+    crate::auth::validate_managed_auth_value(&val)?;
+    commit_activation(alias, &val)
+}
+
+fn switch_live_auth(alias: &str) -> Result<()> {
+    validate_alias(alias)?;
+    let lease = acquire_profile_lease(alias)?;
+    switch_live_auth_with_lease(&lease)
+}
+
+/// Activate `target_alias` only while the caller's view of the active profile
+/// still matches both the marker and live credentials.
+pub(crate) fn switch_profile_if_current(expected_alias: &str, target_alias: &str) -> Result<bool> {
+    validate_alias(expected_alias)?;
+    validate_alias(target_alias)?;
+    let target_lease = acquire_profile_lease(target_alias)?;
+    let _transaction = lock_auth_transaction()?;
+    if read_current_checked()?.as_deref() != Some(expected_alias)
+        || !live_belongs_to_profile_locked(expected_alias)?
+    {
+        return Ok(false);
+    }
+    if expected_alias == target_alias {
+        return Ok(true);
+    }
+    let target_path = profile_auth_path(target_alias)?;
+    let target = match read_existing_auth(&target_path)? {
+        Some(value) => value,
+        None => return Err(CsError::NotFound(target_alias.to_string()).into()),
+    };
+    crate::auth::validate_managed_auth_value(&target)?;
+    commit_activation(target_lease.alias(), &target)?;
+    Ok(true)
+}
+
+/// Compare-and-swap a refresh rotation while holding the caller's profile
+/// lease and the auth transaction. A concurrent re-login supersedes the
+/// presented token and must win.
+#[derive(Debug)]
+pub(crate) enum RefreshTokenUpdate {
+    /// The refreshed credential is durable in the profile and, when that
+    /// profile was active, in live Codex auth as well.
+    Saved,
+    /// Another credential replaced the token presented to the auth server.
+    /// Refusing to overwrite it preserves the newer writer.
+    Superseded,
+    /// The refreshed credential is durable in the profile, but live-auth
+    /// ownership or activation could not be completed safely.
+    SavedWithActivationIncomplete { cause: anyhow::Error },
+}
+
+fn update_profile_tokens_if_refresh_matches_after_lock(
+    lease: &ProfileLease,
     presented_refresh_token: &str,
     id_token: &str,
     access_token: &str,
     new_refresh_token: &str,
-) -> Result<bool> {
+    after_lock: impl FnOnce(),
+) -> Result<RefreshTokenUpdate> {
+    let alias = lease.alias();
+    validate_alias(alias)?;
+    let profile_path = profile_auth_path(alias)?;
+    let profile = read_auth(&profile_path)?;
+    if refresh_token(&profile) != Some(presented_refresh_token) {
+        return Ok(RefreshTokenUpdate::Superseded);
+    }
+    let mut updated = profile.clone();
+    crate::auth::apply_tokens(&mut updated, id_token, access_token, new_refresh_token)?;
+    crate::auth::validate_managed_auth_value(&updated)?;
+    write_auth(&profile_path, &updated)?;
+    let _transaction = match lock_auth_transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return Ok(RefreshTokenUpdate::SavedWithActivationIncomplete {
+                cause: error.context(format!(
+                    "new credentials are preserved in profile '{alias}', but the live-auth transaction could not be acquired"
+                )),
+            });
+        }
+    };
+    after_lock();
+    // Compare live auth with the credential snapshot that was current before
+    // the rotation. The profile file now contains the new token, so comparing
+    // against it would lose the exact-equality proof for older credentials
+    // whose identity fields are incomplete.
+    let active = live_belongs_to_auth_value_locked(alias, &profile);
+    let active = match active {
+        Ok(active) => active,
+        Err(error) => {
+            return Ok(RefreshTokenUpdate::SavedWithActivationIncomplete {
+                cause: error.context(format!(
+                    "new credentials are preserved in profile '{alias}', but determining whether live auth also needed rotation failed"
+                )),
+            });
+        }
+    };
+    if active && let Err(error) = commit_fresh_credentials_activation(alias, &updated) {
+        return Ok(RefreshTokenUpdate::SavedWithActivationIncomplete { cause: error });
+    }
+    Ok(RefreshTokenUpdate::Saved)
+}
+
+pub(crate) fn update_profile_tokens_if_refresh_matches_leased(
+    lease: &ProfileLease,
+    presented_refresh_token: &str,
+    id_token: &str,
+    access_token: &str,
+    new_refresh_token: &str,
+) -> Result<RefreshTokenUpdate> {
     update_profile_tokens_if_refresh_matches_after_lock(
-        alias,
+        lease,
         presented_refresh_token,
         id_token,
         access_token,
@@ -282,66 +770,72 @@ pub fn update_profile_tokens_if_refresh_matches(
     )
 }
 
-fn update_profile_tokens_if_refresh_matches_after_lock(
-    alias: &str,
-    presented_refresh_token: &str,
-    id_token: &str,
-    access_token: &str,
-    new_refresh_token: &str,
-    after_lock: impl FnOnce(),
-) -> Result<bool> {
-    validate_alias(alias)?;
-    let profile_path = profile_auth_path(alias)?;
-    let _transaction = lock_auth_transaction()?;
-    after_lock();
-    let profile = read_auth(&profile_path)?;
-    if refresh_token(&profile) != Some(presented_refresh_token) {
-        return Ok(false);
-    }
-    let mut updated = profile;
-    crate::auth::apply_tokens(&mut updated, id_token, access_token, new_refresh_token)?;
-    crate::auth::validate_managed_auth_value(&updated)?;
-    crate::auth::update_tokens(&profile_path, id_token, access_token, new_refresh_token)?;
-    if read_current() == alias {
-        let live = codex_auth_path()?;
-        let live_auth = read_auth(&live)?;
-        if refresh_token(&live_auth) == Some(presented_refresh_token) {
-            crate::auth::update_tokens(&live, id_token, access_token, new_refresh_token)?;
-        }
-    }
-    Ok(true)
-}
-
 /// Replace a saved profile and its live copy, when current, as one serialized
 /// transaction. Used by CLI/TUI re-login paths.
-pub fn replace_profile_auth_and_live_if_current(
-    alias: &str,
+pub(crate) fn replace_profile_auth_and_live_if_current_leased(
+    lease: &ProfileLease,
     val: &serde_json::Value,
 ) -> Result<()> {
-    validate_alias(alias)?;
+    let alias = lease.alias();
     let profile_path = profile_auth_path(alias)?;
-    let _transaction = lock_auth_transaction()?;
     crate::auth::validate_managed_auth_value(val)?;
-    ensure_same_account_identity(alias, &read_auth(&profile_path)?, val)?;
+    let existing = match read_existing_auth(&profile_path)? {
+        Some(existing) => existing,
+        None => return Err(CsError::NotFound(alias.to_string()).into()),
+    };
+    ensure_same_account_identity(alias, &existing, val)?;
     write_auth(&profile_path, val)?;
-    if read_current() == alias {
-        let live = codex_auth_path()?;
-        backup_auth(&live)?;
-        write_auth(&live, val)?;
+    let _transaction = lock_auth_transaction().with_context(|| {
+        format!(
+            "new credentials are preserved in profile '{alias}', but the live-auth transaction could not be acquired"
+        )
+    })?;
+    let active = live_belongs_to_auth_value_locked(alias, &existing);
+    if active.with_context(|| {
+        format!(
+            "new credentials are preserved in profile '{alias}', but determining whether live auth also needed replacement failed"
+        )
+    })? {
+        commit_fresh_credentials_activation(alias, val)?;
+    } else if read_current_checked()
+        .with_context(|| {
+            format!(
+                "new credentials are preserved in profile '{alias}', but reading the current marker failed"
+            )
+        })?
+        .as_deref()
+        == Some(alias)
+    {
+        repair_stale_current_marker_locked(alias).with_context(|| {
+            format!(
+                "new credentials are preserved in profile '{alias}', but repairing its stale current marker failed"
+            )
+        })?;
     }
     Ok(())
 }
 
+fn find_matching_profile_checked(auth_path: &Path) -> Result<Option<String>> {
+    let target = match std::fs::read(auth_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", auth_path.display()));
+        }
+    };
+    for alias in list_profiles()? {
+        let path = profile_auth_path(&alias)?;
+        let contents = std::fs::read(&path)
+            .with_context(|| format!("reading existing profile '{alias}' at {}", path.display()))?;
+        if contents == target {
+            return Ok(Some(alias));
+        }
+    }
+    Ok(None)
+}
+
 pub fn find_matching_profile(auth_path: &Path) -> Option<String> {
-    let hash = crate::auth::sha256_file(auth_path)?;
-    let profiles = list_profiles().ok()?;
-    profiles.into_iter().find(|alias| {
-        profile_auth_path(alias)
-            .ok()
-            .and_then(|p| crate::auth::sha256_file(&p))
-            .map(|h| h == hash)
-            .unwrap_or(false)
-    })
+    find_matching_profile_checked(auth_path).ok().flatten()
 }
 
 pub fn active_profile_from_live() -> Option<String> {
@@ -360,14 +854,39 @@ pub fn active_profile_from_live() -> Option<String> {
 }
 
 pub fn sync_current_from_live() -> Option<String> {
-    let _transaction = lock_auth_transaction().ok()?;
-    let alias = active_profile_from_live()?;
-    if read_current() != alias
-        && let Err(e) = write_current(&alias)
-    {
-        tracing::debug!("sync_current_from_live: could not sync current pointer: {e}");
+    for _ in 0..4 {
+        let alias = active_profile_from_live()?;
+        let lease = acquire_profile_lease(&alias).ok()?;
+        let _transaction = lock_auth_transaction().ok()?;
+        if active_profile_from_live().as_deref() != Some(alias.as_str()) {
+            drop(_transaction);
+            drop(lease);
+            continue;
+        }
+        if read_current_checked().ok().flatten().as_deref() != Some(alias.as_str())
+            && let Err(error) = write_current(&alias)
+        {
+            tracing::debug!("sync_current_from_live: could not sync current pointer: {error}");
+            return None;
+        }
+        return Some(alias);
     }
-    Some(alias)
+    None
+}
+
+fn repair_current_for_exact_live_match(alias: &str) -> Result<()> {
+    let _lease = acquire_profile_lease(alias)?;
+    let _transaction = lock_auth_transaction()?;
+    let live_path = codex_auth_path()?;
+    let profile_path = profile_auth_path(alias)?;
+    let live = std::fs::read(&live_path)
+        .with_context(|| format!("reading live auth {}", live_path.display()))?;
+    let profile = std::fs::read(&profile_path)
+        .with_context(|| format!("reading profile auth {}", profile_path.display()))?;
+    if live == profile && read_current_checked()?.as_deref() != Some(alias) {
+        write_current(alias)?;
+    }
+    Ok(())
 }
 
 // ── Deduplication ─────────────────────────────────────────
@@ -393,15 +912,18 @@ fn ensure_same_account_identity(
 ) -> Result<()> {
     let existing = extract_identity(existing);
     let incoming = extract_identity(incoming);
+    let (Some(existing_account_id), Some(incoming_account_id)) =
+        (&existing.account_id, &incoming.account_id)
+    else {
+        anyhow::bail!(
+            "refusing to overwrite profile '{alias}': both existing and incoming credentials must contain account_id; email alone is not a safe account identity"
+        );
+    };
     let email_matches = matches!(
         (&existing.email, &incoming.email),
         (Some(existing), Some(incoming)) if existing == incoming
     );
-    let account_matches = match (&existing.account_id, &incoming.account_id) {
-        (Some(existing), Some(incoming)) => existing == incoming,
-        _ => true,
-    };
-    if email_matches && account_matches {
+    if email_matches && existing_account_id == incoming_account_id {
         return Ok(());
     }
     anyhow::bail!("authenticated account does not match profile '{alias}'")
@@ -440,25 +962,19 @@ pub fn find_profile_by_identity_exact(identity: &AccountIdentity) -> Option<Stri
 struct IdentityMatches {
     /// account_id AND email both equal — unambiguous by construction.
     exact: Option<String>,
-    /// email equal while one side carries no account_id — possibly several.
-    email_only: Vec<String>,
+    /// Same email while at least one side lacks account_id. These are diagnostic
+    /// conflicts only and are never eligible credential-write targets.
+    incomplete_identity_matches: Vec<String>,
 }
 
-fn scan_profiles_by_identity(identity: &AccountIdentity) -> IdentityMatches {
+fn scan_profiles_by_identity(identity: &AccountIdentity) -> Result<IdentityMatches> {
     let mut matches = IdentityMatches::default();
-    let Ok(profiles) = list_profiles() else {
-        return matches;
-    };
+    let profiles = list_profiles()?;
 
     for alias in profiles {
-        let path = match profile_auth_path(&alias) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let val = match read_auth(&path) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let path = profile_auth_path(&alias)?;
+        let val = read_auth(&path)
+            .with_context(|| format!("reading existing profile '{alias}' during identity match"))?;
         let existing = extract_identity(&val);
 
         // Match: account_id AND email both equal (same person, same workspace)
@@ -468,25 +984,19 @@ fn scan_profiles_by_identity(identity: &AccountIdentity) -> IdentityMatches {
             && e1 == e2
         {
             matches.exact = Some(alias);
-            return matches;
+            return Ok(matches);
         }
 
-        // Fallback: email-only match (when account_id is missing on either side)
+        // Record an unsafe email-only resemblance for an explicit refusal.
         if let (Some(a), Some(b)) = (&identity.email, &existing.email)
             && a == b
             && (identity.account_id.is_none() || existing.account_id.is_none())
         {
-            matches.email_only.push(alias);
+            matches.incomplete_identity_matches.push(alias);
         }
     }
 
-    matches
-}
-
-/// Find an existing profile matching the given identity (account_id+email > email-only).
-pub fn find_profile_by_identity(identity: &AccountIdentity) -> Option<String> {
-    let IdentityMatches { exact, email_only } = scan_profiles_by_identity(identity);
-    exact.or_else(|| email_only.into_iter().next())
+    Ok(matches)
 }
 
 pub fn alias_from_email(email: &str) -> String {
@@ -542,6 +1052,40 @@ pub(crate) enum RecoveredImportAction {
     Quarantined { path: PathBuf, reason: String },
 }
 
+/// Durable copy of an imported credential after the auth server has consumed
+/// its previous single-use refresh token.
+///
+/// The file lives under the app-owned recovery directory. A successful import
+/// moves this exact file into the chosen profile, while a failed or interrupted
+/// import deliberately leaves it in recovery.
+#[derive(Debug)]
+pub(crate) struct ImportRotationStage {
+    path: PathBuf,
+}
+
+impl ImportRotationStage {
+    #[allow(dead_code)] // Called by the binary-only import command.
+    pub(crate) fn persist(&mut self, val: &serde_json::Value) -> Result<()> {
+        let contents =
+            serde_json::to_vec_pretty(val).context("serializing rotated import credentials")?;
+        atomic_write_private(&self.path, &contents).with_context(|| {
+            format!(
+                "saving rotated import credentials to {}",
+                self.path.display()
+            )
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[allow(dead_code)] // Called by the binary-only import command.
+    pub(crate) fn contains(&self, val: &serde_json::Value) -> Result<bool> {
+        Ok(read_auth(&self.path)? == *val)
+    }
+}
+
 #[derive(Debug)]
 pub struct ImportSuccess {
     pub source: PathBuf,
@@ -579,7 +1123,7 @@ pub enum AuthChange {
 /// Compare live auth.json against all saved profiles.
 /// - Exact SHA256 match → NoChange
 /// - Identity match (email + account_id) but different content → TokensUpdated
-/// - Email matches several profiles and no account_id to disambiguate → NoChange (warned)
+/// - Email resembles any profile while account_id is incomplete → NoChange (warned)
 /// - No identity match → NewAccount
 pub fn detect_auth_change() -> AuthChange {
     let auth_path = match codex_auth_path() {
@@ -595,7 +1139,10 @@ pub fn detect_auth_change() -> AuthChange {
     };
 
     // Exact file match — nothing changed
-    if find_matching_profile(&auth_path).is_some() {
+    if let Some(alias) = find_matching_profile(&auth_path) {
+        if let Err(error) = repair_current_for_exact_live_match(&alias) {
+            tracing::warn!("Could not repair current profile marker for '{alias}': {error:#}");
+        }
         return AuthChange::NoChange;
     }
 
@@ -606,23 +1153,29 @@ pub fn detect_auth_change() -> AuthChange {
 
     // The read-back path writes live credentials into a profile, so an
     // email-only guess across workspaces would clobber the wrong account.
-    let IdentityMatches { exact, email_only } = scan_profiles_by_identity(&identity);
+    let IdentityMatches {
+        exact,
+        incomplete_identity_matches,
+    } = match scan_profiles_by_identity(&identity) {
+        Ok(matches) => matches,
+        Err(error) => {
+            tracing::warn!("Could not compare live auth with saved profiles: {error:#}");
+            return AuthChange::NoChange;
+        }
+    };
     if let Some(alias) = exact {
         return AuthChange::TokensUpdated { alias };
     }
-    match email_only.as_slice() {
+    match incomplete_identity_matches.as_slice() {
         [] => AuthChange::NewAccount,
-        [only] => AuthChange::TokensUpdated {
-            alias: only.clone(),
-        },
-        ambiguous => {
+        incomplete => {
             user_println(&format!(
-                "auth.json carries no account id and its email matches {} profiles ({}) — \
-                 refusing to guess which one to update. \
+                "auth.json or a saved profile carries no account id and its email matches {} profile(s) ({}) — \
+                 refusing to update credentials from email alone. \
                  Run `codex-switch-global-pace use <alias>` to restore a known profile, \
                  or `codex-switch-global-pace login <alias>` to re-authenticate the intended profile.",
-                ambiguous.len(),
-                ambiguous.join(", ")
+                incomplete.len(),
+                incomplete.join(", ")
             ));
             AuthChange::NoChange
         }
@@ -738,7 +1291,7 @@ fn write_profile_credentials(alias: &str, incoming: &serde_json::Value) -> Resul
     validate_alias(alias)?;
     crate::auth::validate_managed_auth_value(incoming)?;
     let dst = profile_auth_path(alias)?;
-    if let Ok(existing) = read_auth(&dst) {
+    if let Some(existing) = read_existing_auth(&dst)? {
         ensure_same_account_identity(alias, &existing, incoming)?;
         ensure_live_not_older(alias, &existing, incoming)?;
     }
@@ -749,66 +1302,97 @@ fn write_profile_credentials(alias: &str, incoming: &serde_json::Value) -> Resul
 
 /// The profile these credentials provably belong to, if there is exactly one.
 ///
-/// `Err` when several profiles share the email and nothing tells them apart:
-/// same-email-different-workspace is the shape that has already destroyed the
-/// wrong account's `refresh_token` in the wild, so the caller has to either
-/// surface the choice to the user or fall back to creating a new profile —
-/// never to picking a candidate.
+/// `Err` whenever an email resembles an existing profile but account_id is
+/// missing on either side. Email alone never authorizes credential replacement.
 fn resolve_identity_target(identity: &AccountIdentity) -> Result<Option<String>> {
     let IdentityMatches {
         exact,
-        mut email_only,
-    } = scan_profiles_by_identity(identity);
+        mut incomplete_identity_matches,
+    } = scan_profiles_by_identity(identity)?;
     if let Some(alias) = exact {
         return Ok(Some(alias));
     }
-    match email_only.len() {
-        0 => Ok(None),
-        1 => Ok(email_only.pop()),
-        _ => {
-            email_only.sort();
-            anyhow::bail!(
-                "Ambiguous account: {} profiles share email '{}' with different workspaces ({}) -- refusing to guess which one to update.\nRe-run `codex-switch-global-pace login <alias>` with the intended saved profile to choose it explicitly.",
-                email_only.len(),
-                identity.email.as_deref().unwrap_or("unknown"),
-                email_only.join(", ")
-            )
-        }
+    if incomplete_identity_matches.is_empty() {
+        return Ok(None);
     }
+    incomplete_identity_matches.sort();
+    anyhow::bail!(
+        "Cannot safely match credentials to {} existing profile(s) with email '{}' ({}) because account_id is missing on at least one side. Refusing to overwrite credentials from email alone; run `codex-switch-global-pace login <alias>` so both credentials contain account_id.",
+        incomplete_identity_matches.len(),
+        identity.email.as_deref().unwrap_or("unknown"),
+        incomplete_identity_matches.join(", ")
+    )
 }
 
 /// Where credentials should land when the user named an alias explicitly.
 ///
-/// An alias the user typed outranks every identity heuristic: naming an
-/// existing profile *is* the disambiguation that the ambiguity refusal asks
-/// for, so it is obeyed verbatim. Only when the alias does not exist yet does
-/// deduplication get a say, and then ambiguity is harmless — falling back to
-/// creating the named profile overwrites nothing.
+/// An existing explicitly named alias is still subject to strict identity
+/// validation before any write. For a new alias, only a complete exact identity
+/// match may redirect the write to an existing profile.
 fn resolve_named_target(alias: &str, identity: &AccountIdentity) -> Result<Option<String>> {
     validate_alias(alias)?;
-    if profile_auth_path(alias)?.exists() {
+    if path_exists_checked(&profile_auth_path(alias)?)? {
         return Ok(Some(alias.to_string()));
     }
-    Ok(resolve_identity_target(identity).ok().flatten())
+    resolve_identity_target(identity)
 }
 
-/// Copy the live auth.json into an existing profile's directory and mark it current.
-/// The profile is written in canonical format. The live file is also normalized
-/// (best-effort) to ensure SHA256 consistency; failure to normalize live is non-fatal.
+#[derive(Debug)]
+struct ProfileWritePlan {
+    alias: String,
+    updated: bool,
+    requested_alias_taken: bool,
+}
+
+fn plan_profile_write(
+    identity: &AccountIdentity,
+    hint_alias: Option<&str>,
+) -> Result<ProfileWritePlan> {
+    let existing = match hint_alias {
+        Some(alias) => resolve_named_target(alias, identity)?,
+        None => resolve_identity_target(identity)?,
+    };
+    if let Some(alias) = existing {
+        return Ok(ProfileWritePlan {
+            alias,
+            updated: true,
+            requested_alias_taken: false,
+        });
+    }
+
+    let requested = hint_alias
+        .map(str::to_string)
+        .or_else(|| identity.email.as_deref().map(alias_from_email))
+        .unwrap_or_else(|| "account".to_string());
+    validate_alias(&requested)?;
+    let alias = if path_exists_checked(&profile_auth_path(&requested)?)? {
+        make_unique_alias(&requested)?
+    } else {
+        requested.clone()
+    };
+    validate_alias(&alias)?;
+    Ok(ProfileWritePlan {
+        requested_alias_taken: alias != requested,
+        alias,
+        updated: false,
+    })
+}
+
+/// Copy live auth.json into an existing profile and atomically activate it.
 pub fn update_profile_from_live(alias: &str) -> Result<()> {
     validate_alias(alias)?;
+    let _lease = acquire_profile_lease(alias)?;
     let _transaction = lock_auth_transaction()?;
     let src = codex_auth_path()?;
     let val = read_auth(&src)?;
     // This is a read-back into a profile the caller already knows, not a save:
     // a missing profile is its own failure, distinct from the guards below.
-    read_auth(&profile_auth_path(alias)?)?;
-    write_profile_credentials(alias, &val)?;
-    // Best-effort: normalize live file to match profile (same key ordering)
-    if let Err(e) = write_auth(&src, &val) {
-        tracing::debug!("Could not normalize live auth.json: {e}");
+    let profile_path = profile_auth_path(alias)?;
+    if read_existing_auth(&profile_path)?.is_none() {
+        return Err(CsError::NotFound(alias.to_string()).into());
     }
-    write_current(alias)?;
+    write_profile_credentials(alias, &val)?;
+    commit_activation(alias, &val)?;
     Ok(())
 }
 
@@ -835,12 +1419,6 @@ pub fn auto_track_current() -> bool {
         let _ = sync_current_from_live();
         return false;
     }
-    // Email-only matches are ambiguous (same email, different workspace) —
-    // fall through to cmd_save which will prompt the user if interactive.
-    if find_profile_by_identity(&identity).is_some() {
-        return false;
-    }
-
     if let Ok(SaveAction::Created(a)) = cmd_save(None) {
         user_println(&format!("Auto-saved current account as profile: {a}"));
         return true;
@@ -852,63 +1430,47 @@ pub fn auto_track_current() -> bool {
 
 pub fn cmd_save(alias: Option<&str>) -> Result<SaveAction> {
     let src = codex_auth_path()?;
-    if !src.exists() {
-        return Err(CsError::NoAuthFile(src.display().to_string()).into());
-    }
+    let preview = read_auth(&src)?;
+    let mut plan = plan_profile_write(&extract_identity(&preview), alias)?;
 
-    let _transaction = lock_auth_transaction()?;
-    let val = read_auth(&src)?;
-    // Best-effort: normalize live file to canonical formatting for SHA256 consistency
-    if let Err(e) = write_auth(&src, &val) {
-        tracing::debug!("Could not normalize live auth.json: {e}");
-    }
-    let identity = extract_identity(&val);
-
-    let update_target = match alias {
-        Some(a) => resolve_named_target(a, &identity)?,
-        // A bare `save` has no user-supplied disambiguation, so an ambiguous
-        // email is fatal here rather than a fallback to creating a profile.
-        None => resolve_identity_target(&identity)?,
-    };
-
-    if let Some(target) = update_target {
-        write_profile_credentials(&target, &val)?;
-        write_current(&target)?;
-        match alias {
-            Some(named) if named != target => user_println(&format!(
-                "Duplicate account detected -- updated existing profile: {target} (not creating {named})"
-            )),
-            _ => user_println(&format!("Updated profile: {target}")),
+    for _ in 0..8 {
+        let lease = acquire_profile_lease(&plan.alias)?;
+        let _transaction = lock_auth_transaction()?;
+        let val = read_auth(&src)?;
+        let confirmed = plan_profile_write(&extract_identity(&val), alias)?;
+        if confirmed.alias != lease.alias() {
+            plan = confirmed;
+            continue;
         }
-        return Ok(SaveAction::Updated(target));
-    }
 
-    // New profile
-    let resolved_alias = match alias {
-        Some(a) => a.to_string(),
-        None => identity
-            .email
-            .as_deref()
-            .map(alias_from_email)
-            .unwrap_or_else(|| "account".to_string()),
-    };
-    validate_alias(&resolved_alias)?;
-    let dst = profile_auth_path(&resolved_alias)?;
-    if dst.exists() {
-        let unique = make_unique_alias(&resolved_alias)?;
-        validate_alias(&unique)?;
-        write_profile_credentials(&unique, &val)?;
-        write_current(&unique)?;
-        user_println(&format!(
-            "Saved profile: {unique} (alias '{resolved_alias}' already taken)"
-        ));
-        return Ok(SaveAction::Created(unique));
+        write_profile_credentials(&confirmed.alias, &val)?;
+        commit_fresh_credentials_activation(&confirmed.alias, &val)?;
+        let action = if confirmed.updated {
+            SaveAction::Updated(confirmed.alias.clone())
+        } else {
+            SaveAction::Created(confirmed.alias.clone())
+        };
+        match (&action, alias) {
+            (SaveAction::Updated(target), Some(named)) if named != target => {
+                user_println(&format!(
+                    "Duplicate account detected -- updated existing profile: {target} (not creating {named})"
+                ));
+            }
+            (SaveAction::Updated(target), _) => {
+                user_println(&format!("Updated profile: {target}"));
+            }
+            (SaveAction::Created(target), Some(named)) if confirmed.requested_alias_taken => {
+                user_println(&format!(
+                    "Saved profile: {target} (alias '{named}' already taken)"
+                ));
+            }
+            (SaveAction::Created(target), _) => {
+                user_println(&format!("Saved profile: {target}"));
+            }
+        }
+        return Ok(action);
     }
-
-    write_profile_credentials(&resolved_alias, &val)?;
-    write_current(&resolved_alias)?;
-    user_println(&format!("Saved profile: {resolved_alias}"));
-    Ok(SaveAction::Created(resolved_alias))
+    anyhow::bail!("profile destination kept changing while saving; retry the command")
 }
 
 fn make_unique_alias(base: &str) -> Result<String> {
@@ -919,7 +1481,7 @@ fn make_unique_alias(base: &str) -> Result<String> {
         let prefix_len = MAX_ALIAS_LEN.saturating_sub(suffix.len());
         let prefix = base.chars().take(prefix_len).collect::<String>();
         let candidate = format!("{prefix}{suffix}");
-        if !profile_auth_path(&candidate)?.exists() {
+        if !path_exists_checked(&profile_auth_path(&candidate)?)? {
             return Ok(candidate);
         }
         n += 1;
@@ -934,13 +1496,13 @@ fn make_unique_alias(base: &str) -> Result<String> {
 pub fn cmd_use(alias: &str, allow_prompt: bool) -> Result<()> {
     validate_alias(alias)?;
     let src = profile_auth_path(alias)?;
-    if !src.exists() {
+    if read_existing_auth(&src)?.is_none() {
         return Err(CsError::NotFound(alias.to_string()).into());
     }
 
     let dst = codex_auth_path()?;
 
-    if dst.exists() && find_matching_profile(&dst).is_none() {
+    if path_exists_checked(&dst)? && find_matching_profile(&dst).is_none() {
         if !allow_prompt {
             anyhow::bail!(
                 "current auth.json is not tracked; interactive confirmation is required before overwriting it"
@@ -969,14 +1531,22 @@ pub fn switch_profile(alias: &str) -> Result<()> {
 
 pub fn cmd_delete(alias: &str) -> Result<()> {
     validate_alias(alias)?;
+    let _lease = acquire_profile_lease(alias)?;
     let _transaction = lock_auth_transaction()?;
     let dir = profiles_dir()?.join(alias);
-    if !dir.exists() {
+    if !path_exists_checked(&dir)? {
         return Err(CsError::NotFound(alias.to_string()).into());
     }
-    if read_current() == alias {
+    // Reading the credential is intentional even when live auth is missing:
+    // a corrupt or unreadable existing profile must never be archived as if it
+    // had safely passed the active-account check.
+    read_auth(&profile_auth_path(alias)?)?;
+    if live_belongs_to_profile_locked(alias)? {
         return Err(CsError::ActiveProfileDelete(alias.to_string()).into());
     }
+    let current_path = current_file()?;
+    let current_snapshot = snapshot_optional_file(&current_path)?;
+    let stale_marker = read_current_checked()?.as_deref() == Some(alias);
     let deleted_dir = deleted_profiles_dir()?;
     ensure_private_dir(&deleted_dir)?;
     let timestamp = SystemTime::now()
@@ -987,13 +1557,25 @@ pub fn cmd_delete(alias: &str) -> Result<()> {
     // Cache state is reconstructable; clear it before moving the recoverable
     // profile so a cache write failure cannot leave the command half-deleted.
     crate::cache::purge_profile(alias)?;
-    std::fs::rename(&dir, &archived).with_context(|| {
+    if stale_marker {
+        repair_stale_current_marker_locked(alias)?;
+    }
+    if let Err(error) = std::fs::rename(&dir, &archived).with_context(|| {
         format!(
             "archiving profile directory {} to {}",
             dir.display(),
             archived.display()
         )
-    })?;
+    }) {
+        if stale_marker
+            && let Err(rollback) = restore_file_snapshot(&current_path, current_snapshot.as_deref())
+        {
+            anyhow::bail!(
+                "deleting profile failed ({error:#}) and restoring its current marker failed ({rollback:#})"
+            );
+        }
+        return Err(error);
+    }
     user_println(&format!(
         "Deleted profile: {alias} (recoverable from {})",
         archived.display()
@@ -1041,11 +1623,29 @@ fn collect_import_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> Resul
     Ok(())
 }
 
+#[allow(dead_code)] // Public library API; the binary uses the staged variant.
 pub fn save_imported_auth_value(
     val: &serde_json::Value,
     hint_alias: Option<&str>,
     validated_account_id: &str,
     suggested_alias: Option<&str>,
+) -> Result<SaveAction> {
+    save_imported_auth_value_with_stage(
+        val,
+        hint_alias,
+        validated_account_id,
+        suggested_alias,
+        None,
+    )
+}
+
+#[allow(dead_code)] // Called by the binary-only import command.
+pub(crate) fn save_imported_auth_value_with_stage(
+    val: &serde_json::Value,
+    hint_alias: Option<&str>,
+    validated_account_id: &str,
+    suggested_alias: Option<&str>,
+    stage: Option<ImportRotationStage>,
 ) -> Result<SaveAction> {
     let _transaction = lock_auth_transaction()?;
     let identity = extract_identity(val);
@@ -1065,20 +1665,79 @@ pub fn save_imported_auth_value(
     // Usage API proves the bearer can access this workspace, but a Team
     // workspace id is shared by multiple users and the JWT is not
     // signature-verified here. It therefore cannot prove ownership of an
-    // existing profile. Imports are create-only; collisions get a unique alias.
-    create_import_profile(val, hint_alias, suggested_alias)
+    // existing profile. Imports are create-only, but an exact account identity
+    // already owned by another alias is not a distinct account and must not be
+    // duplicated. Alias/path collisions for different identities still get a
+    // unique destination.
+    refuse_duplicate_import_identity(&identity)?;
+    create_import_profile(val, hint_alias, suggested_alias, stage.as_ref())
+}
+
+fn refuse_duplicate_import_identity(identity: &AccountIdentity) -> Result<()> {
+    if let Some(existing) = scan_profiles_by_identity(identity)?.exact {
+        anyhow::bail!(
+            "refusing duplicate import: profile '{existing}' already has the same account_id and email"
+        );
+    }
+    Ok(())
 }
 
 /// Preserve credentials rotated by the auth server after validation later
 /// failed. Without a successful Usage API response they may never overwrite an
 /// existing profile; a unique recovery profile is the only safe destination.
-#[allow(dead_code)] // Called by the binary-only import command, not the library target.
-pub(crate) fn save_recovered_import_auth_value(
+#[allow(dead_code)] // Called by the binary-only import command.
+pub(crate) fn save_recovered_import_auth_value_with_stage(
     val: serde_json::Value,
     hint_alias: Option<&str>,
     suggested_alias: Option<&str>,
+    stage: Option<ImportRotationStage>,
 ) -> Result<RecoveredImportAction> {
-    let _transaction = lock_auth_transaction()?;
+    let (current_stage, stale_stage) = match stage {
+        Some(stage) => match read_auth(stage.path()) {
+            Ok(staged) if staged == val => (Some(stage), None),
+            Ok(_) => (
+                None,
+                Some((
+                    stage.path,
+                    "the earlier recovery stage contains a superseded refresh token".to_string(),
+                )),
+            ),
+            Err(error) => (
+                None,
+                Some((
+                    stage.path,
+                    format!("the earlier recovery stage could not be verified: {error:#}"),
+                )),
+            ),
+        },
+        None => (None, None),
+    };
+    // A refresh token has already been consumed server-side. Make the latest
+    // value durable before waiting for any global profile-registry lock; that
+    // lock may legitimately be held by another interactive operation.
+    let current_stage = match current_stage {
+        Some(stage) => stage,
+        None => stage_import_rotation(&val).with_context(|| {
+            let stale_detail = stale_stage
+                .as_ref()
+                .map(|(_, detail)| format!("; {detail}"))
+                .unwrap_or_default();
+            format!("saving the latest rotated credentials before profile recovery{stale_detail}")
+        })?,
+    };
+    remove_stale_import_stage(stale_stage.as_ref());
+
+    let _transaction = match lock_auth_transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            return Ok(RecoveredImportAction::Quarantined {
+                path: current_stage.path,
+                reason: format!(
+                    "the latest rotated credentials are safe, but profile recovery could not acquire the profile-registry transaction: {error:#}"
+                ),
+            });
+        }
+    };
     let account_id = extract_identity(&val)
         .account_id
         .filter(|account_id| !account_id.is_empty());
@@ -1087,52 +1746,70 @@ pub(crate) fn save_recovered_import_auth_value(
         .ok_or_else(|| anyhow::anyhow!("rotated credentials have no authenticated account_id"))
         .and_then(|_| crate::auth::validate_managed_auth_value(&val));
     let profile_result = validation.and_then(|_| {
-        create_import_profile(&val, hint_alias, suggested_alias).map(RecoveredImportAction::Profile)
+        let identity = extract_identity(&val);
+        refuse_duplicate_import_identity(&identity)?;
+        create_import_profile(&val, hint_alias, suggested_alias, Some(&current_stage))
+            .map(RecoveredImportAction::Profile)
     });
     match profile_result {
         Ok(action) => Ok(action),
-        Err(error) => {
-            let path = quarantine_recovered_import(&val).with_context(|| {
-                format!(
-                    "profile recovery failed ({error:#}) and quarantining rotated credentials \
-                     also failed"
-                )
-            })?;
-            Ok(RecoveredImportAction::Quarantined {
-                path,
-                reason: error.to_string(),
-            })
-        }
+        Err(error) => Ok(RecoveredImportAction::Quarantined {
+            path: current_stage.path,
+            reason: error.to_string(),
+        }),
     }
 }
 
-fn quarantine_recovered_import(val: &serde_json::Value) -> Result<PathBuf> {
-    let recovery_dir = crate::auth::app_home()?.join("recovery");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_nanos();
-    let contents = serde_json::to_vec_pretty(val).context("serializing recovered credentials")?;
-    for suffix in 0..1000u16 {
-        let filename = if suffix == 0 {
-            format!("rotated-import-{timestamp}.json")
-        } else {
-            format!("rotated-import-{timestamp}-{suffix}.json")
-        };
-        let path = recovery_dir.join(filename);
-        if path.exists() {
-            continue;
-        }
-        crate::auth::atomic_write_private(&path, &contents)?;
-        return Ok(path);
+fn remove_stale_import_stage(stale_stage: Option<&(PathBuf, String)>) {
+    let Some((path, _)) = stale_stage else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            "Current rotated import credentials were recovered, but stale recovery file {} could not be removed: {error}",
+            path.display()
+        );
     }
-    anyhow::bail!("could not allocate a unique rotated-import recovery path")
+}
+
+#[allow(dead_code)] // Called by the binary-only import command.
+pub(crate) fn stage_import_rotation(val: &serde_json::Value) -> Result<ImportRotationStage> {
+    let path = allocate_import_recovery_path()?;
+    let mut stage = ImportRotationStage { path };
+    if let Err(error) = stage.persist(val) {
+        let _ = std::fs::remove_file(stage.path());
+        return Err(error);
+    }
+    Ok(stage)
+}
+
+fn allocate_import_recovery_path() -> Result<PathBuf> {
+    let recovery_dir = crate::auth::app_home()?.join("recovery");
+    ensure_private_dir(&recovery_dir)?;
+    let reserved = tempfile::Builder::new()
+        .prefix("rotated-import-")
+        .suffix(".json")
+        .tempfile_in(&recovery_dir)
+        .with_context(|| {
+            format!(
+                "reserving a unique rotated-import recovery file in {}",
+                recovery_dir.display()
+            )
+        })?;
+    let (_file, path) = reserved
+        .keep()
+        .map_err(|error| error.error)
+        .context("preserving the reserved rotated-import recovery file")?;
+    Ok(path)
 }
 
 fn create_import_profile(
     val: &serde_json::Value,
     hint_alias: Option<&str>,
     suggested_alias: Option<&str>,
+    stage: Option<&ImportRotationStage>,
 ) -> Result<SaveAction> {
     let identity = extract_identity(val);
     let alias = hint_alias
@@ -1141,29 +1818,77 @@ fn create_import_profile(
         .or_else(|| suggested_alias.map(str::to_string))
         .unwrap_or_else(|| "account".to_string());
     validate_alias(&alias)?;
-    let alias = if profile_auth_path(&alias)?.exists() {
+    let alias = if path_exists_checked(&profile_auth_path(&alias)?)? {
         make_unique_alias(&alias)?
     } else {
         alias
     };
     validate_alias(&alias)?;
 
-    write_profile_credentials(&alias, val)?;
+    match stage {
+        Some(stage) => promote_import_stage(&alias, val, stage)?,
+        None => write_profile_credentials(&alias, val)?,
+    }
     Ok(SaveAction::Created(alias))
+}
+
+fn promote_import_stage(
+    alias: &str,
+    val: &serde_json::Value,
+    stage: &ImportRotationStage,
+) -> Result<()> {
+    validate_alias(alias)?;
+    crate::auth::validate_managed_auth_value(val)?;
+    let staged = read_auth(stage.path()).with_context(|| {
+        format!(
+            "reading staged rotated credentials {}",
+            stage.path().display()
+        )
+    })?;
+    if staged != *val {
+        anyhow::bail!(
+            "staged rotated credentials {} do not match the validated import",
+            stage.path().display()
+        );
+    }
+
+    let destination = profile_auth_path(alias)?;
+    if path_exists_checked(&destination)? {
+        anyhow::bail!("profile '{alias}' appeared before staged import commit");
+    }
+    ensure_profile_parent(&destination)?;
+    std::fs::rename(stage.path(), &destination).with_context(|| {
+        format!(
+            "promoting staged credentials {} to profile '{}'",
+            stage.path().display(),
+            alias
+        )
+    })?;
+    Ok(())
 }
 
 pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<()> {
     validate_alias(old_alias)?;
     validate_alias(new_alias)?;
+    if old_alias == new_alias {
+        anyhow::bail!("old and new profile aliases are identical");
+    }
+    let _leases = acquire_profile_leases(&[old_alias, new_alias])?;
+    let _transaction = lock_auth_transaction()?;
     let old_dir = profiles_dir()?.join(old_alias);
-    if !old_dir.exists() {
+    if !path_exists_checked(&old_dir)? {
         return Err(CsError::NotFound(old_alias.to_string()).into());
     }
     let new_dir = profiles_dir()?.join(new_alias);
-    if new_dir.exists() {
+    if path_exists_checked(&new_dir)? {
         anyhow::bail!("profile '{new_alias}' already exists");
     }
-    let _transaction = lock_auth_transaction()?;
+    read_auth(&profile_auth_path(old_alias)?)?;
+    let live_was_old = live_belongs_to_profile_locked(old_alias)?;
+    let current_path = current_file()?;
+    let current_snapshot = snapshot_optional_file(&current_path)?;
+    let marker_was_old = read_current_checked()?.as_deref() == Some(old_alias);
+
     std::fs::rename(&old_dir, &new_dir).with_context(|| {
         format!(
             "renaming profile {} -> {}",
@@ -1171,68 +1896,78 @@ pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<()> {
             new_dir.display()
         )
     })?;
-    if let Err(err) = crate::cache::rename(old_alias, new_alias) {
-        tracing::warn!("Failed to rename cache entry {old_alias} -> {new_alias}: {err}");
+    if let Err(error) = crate::cache::rename(old_alias, new_alias) {
+        if let Err(rollback) = std::fs::rename(&new_dir, &old_dir) {
+            anyhow::bail!(
+                "renaming profile cache failed ({error:#}) and restoring the profile directory failed ({rollback})"
+            );
+        }
+        return Err(error).context("renaming profile cache state");
     }
-    if read_current() == old_alias {
-        write_current(new_alias)?;
+
+    let marker_result = if live_was_old {
+        write_current(new_alias)
+    } else if marker_was_old {
+        repair_stale_current_marker_locked(old_alias)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = marker_result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback) = crate::cache::rename(new_alias, old_alias) {
+            rollback_errors.push(format!("cache: {rollback:#}"));
+        }
+        if let Err(rollback) = std::fs::rename(&new_dir, &old_dir) {
+            rollback_errors.push(format!("profile directory: {rollback}"));
+        }
+        if let Err(rollback) = restore_file_snapshot(&current_path, current_snapshot.as_deref()) {
+            rollback_errors.push(format!("current marker: {rollback:#}"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error)
+                .context("updating current marker after profile rename; rename rolled back");
+        }
+        anyhow::bail!(
+            "updating current marker after profile rename failed ({error:#}); rollback also failed: {}",
+            rollback_errors.join("; ")
+        );
     }
     user_println(&format!("Renamed profile: {old_alias} -> {new_alias}"));
     Ok(())
 }
 
 pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Result<SaveAction> {
-    let _transaction = lock_auth_transaction()?;
     crate::auth::validate_managed_auth_value(&val)?;
     let identity = extract_identity(&val);
-
-    let existing = match hint_alias {
-        Some(alias) => resolve_named_target(alias, &identity)?,
-        None => resolve_identity_target(&identity)?,
-    };
-
-    let (alias, updated) = if let Some(existing) = existing {
-        let dst = profile_auth_path(&existing)?;
-        // These credentials were just minted, so the freshness gate does not
-        // apply: a legacy profile carries no stamp to order against, and
-        // re-login is precisely how such a profile is recovered. Identity is
-        // still checked — without it, `login <alias>` naming a profile that
-        // holds a different workspace would overwrite that account's token.
-        if dst.exists() {
-            ensure_same_account_identity(&existing, &read_auth(&dst)?, &val)?;
+    let mut plan = plan_profile_write(&identity, hint_alias)?;
+    for _ in 0..8 {
+        let lease = acquire_profile_lease(&plan.alias)?;
+        let _transaction = lock_auth_transaction()?;
+        let confirmed = plan_profile_write(&identity, hint_alias)?;
+        if confirmed.alias != lease.alias() {
+            plan = confirmed;
+            continue;
         }
-        (existing, true)
-    } else {
-        let alias = hint_alias
-            .map(|s| s.to_string())
-            .or_else(|| identity.email.as_deref().map(alias_from_email))
-            .unwrap_or_else(|| "account".to_string());
-        validate_alias(&alias)?;
 
-        let alias = if profile_auth_path(&alias)?.exists() {
-            make_unique_alias(&alias)?
+        let profile_dst = profile_auth_path(&confirmed.alias)?;
+        if confirmed.updated {
+            let existing = read_existing_auth(&profile_dst)?.ok_or_else(|| {
+                anyhow::anyhow!("profile '{}' disappeared during login", confirmed.alias)
+            })?;
+            // Re-login intentionally replaces a potentially unstamped token,
+            // but never relaxes account identity.
+            ensure_same_account_identity(&confirmed.alias, &existing, &val)?;
+        }
+        ensure_profile_parent(&profile_dst)?;
+        write_auth(&profile_dst, &val)?;
+        commit_fresh_credentials_activation(&confirmed.alias, &val)?;
+        return Ok(if confirmed.updated {
+            SaveAction::Updated(confirmed.alias)
         } else {
-            alias
-        };
-        validate_alias(&alias)?;
-        (alias, false)
-    };
-
-    let profile_dst = profile_auth_path(&alias)?;
-    let auth_dst = codex_auth_path()?;
-    // Login activates the resulting profile, even when live auth was not
-    // previously associated with a saved profile. Preserve that only copy
-    // before replacing it, just as an explicit profile switch does.
-    backup_auth(&auth_dst)?;
-    ensure_profile_parent(&profile_dst)?;
-    write_auth(&profile_dst, &val)?;
-    write_auth(&auth_dst, &val)?;
-    write_current(&alias)?;
-    Ok(if updated {
-        SaveAction::Updated(alias)
-    } else {
-        SaveAction::Created(alias)
-    })
+            SaveAction::Created(confirmed.alias)
+        });
+    }
+    anyhow::bail!("profile destination kept changing during login; retry the command")
 }
 
 #[cfg(test)]
@@ -1487,6 +2222,134 @@ mod tests {
     }
 
     #[test]
+    fn normal_switch_restores_live_and_marker_when_activation_marker_fails() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        let bob = realistic_auth_json("bob@example.com", "acct_b", "b-old", "b-ref");
+        seed_profile("alice", &alice);
+        seed_profile("bob", &bob);
+        super::switch_profile("alice").unwrap();
+
+        super::fail_next_activation_marker_write();
+        let error =
+            super::switch_profile("bob").expect_err("a marker failure must fail the normal switch");
+        assert!(format!("{error:#}").contains("previous activation restored"));
+        assert_eq!(super::read_current(), "alice");
+        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
+        assert_eq!(
+            live.pointer("/tokens/access_token")
+                .and_then(|value| value.as_str()),
+            Some("a-old")
+        );
+    }
+
+    #[test]
+    fn rotated_credentials_are_not_rolled_back_when_marker_write_fails() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        super::switch_profile("alice").unwrap();
+
+        super::fail_next_activation_marker_write();
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            "a-ref",
+            &make_jwt("alice@example.com", "acct_a"),
+            "a-new",
+            "a-ref-new",
+        )
+        .expect("the profile write itself succeeds");
+        let super::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } = update else {
+            panic!("the injected marker failure must be reported as a partial activation")
+        };
+        assert!(format!("{cause:#}").contains("saved and active live"));
+
+        for path in [
+            super::profile_auth_path("alice").unwrap(),
+            crate::auth::codex_auth_path().unwrap(),
+        ] {
+            let value = crate::auth::read_auth(&path).unwrap();
+            assert_eq!(
+                value
+                    .pointer("/tokens/refresh_token")
+                    .and_then(|value| value.as_str()),
+                Some("a-ref-new"),
+                "new refresh token must remain durable at {}",
+                path.display()
+            );
+        }
+        assert_eq!(super::read_current(), "alice");
+    }
+
+    #[test]
+    fn rotated_credentials_are_saved_before_live_auth_lock_acquisition() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        super::switch_profile("alice").unwrap();
+
+        let auth_lock = super::auth_lock_path().unwrap();
+        std::fs::remove_file(&auth_lock).unwrap();
+        std::fs::create_dir(&auth_lock).unwrap();
+
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            "a-ref",
+            &make_jwt("alice@example.com", "acct_a"),
+            "a-new",
+            "a-ref-new",
+        )
+        .expect("profile persistence must not depend on the live-auth lock");
+        let super::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } = update else {
+            panic!("an unavailable live-auth lock must be a partial activation")
+        };
+        assert!(
+            format!("{cause:#}").contains("live-auth transaction could not be acquired"),
+            "{cause:#}"
+        );
+
+        let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("a-ref-new")
+        );
+        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
+        assert_eq!(
+            live.pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("a-ref"),
+            "live auth remains unchanged until its transaction can be acquired"
+        );
+    }
+
+    #[test]
+    fn conditional_switch_does_not_override_a_newer_manual_switch() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref"),
+        );
+        seed_profile(
+            "bob",
+            &realistic_auth_json("bob@example.com", "acct_b", "b-old", "b-ref"),
+        );
+        seed_profile(
+            "carol",
+            &realistic_auth_json("carol@example.com", "acct_c", "c-old", "c-ref"),
+        );
+        super::switch_profile("alice").unwrap();
+        super::switch_profile("bob").unwrap();
+
+        assert!(!super::switch_profile_if_current("alice", "carol").unwrap());
+        assert_eq!(super::read_current(), "bob");
+        assert_eq!(super::active_profile_from_live().as_deref(), Some("bob"));
+    }
+
+    #[test]
     fn auth_lock_timeout_preserves_live_lock_inode() {
         let _env = TestEnv::new();
         let lock_path = super::auth_lock_path().unwrap();
@@ -1510,6 +2373,40 @@ mod tests {
             Err(fs4::TryLockError::WouldBlock)
         ));
         FileExt::unlock(&holder).unwrap();
+    }
+
+    #[test]
+    fn rename_waits_for_the_profiles_credential_lease() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "old",
+            &realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref"),
+        );
+        let held_lease = super::acquire_profile_lease("old").unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            super::notify_on_test_lock_attempt("profile 'old'", attempt_tx);
+            let _ = done_tx.send(super::rename_profile("old", "new"));
+        });
+        let mut cleanup = ThreadCleanup::new(held_lease);
+        cleanup.push(worker);
+
+        attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rename did not wait on the profile lease");
+        assert!(matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        cleanup.release_blocker();
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("rename did not finish after lease release")
+            .unwrap();
+        cleanup.join_all();
+        assert!(super::profile_auth_path("new").unwrap().exists());
+        assert!(!super::profile_auth_path("old").unwrap().exists());
     }
 
     #[test]
@@ -1566,8 +2463,9 @@ mod tests {
         let (continue_tx, continue_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let updater = std::thread::spawn(move || {
+            let lease = super::acquire_profile_lease("alice").unwrap();
             let result = super::update_profile_tokens_if_refresh_matches_after_lock(
-                "alice",
+                &lease,
                 "a-ref",
                 "a-id-new",
                 "a-new",
@@ -1598,12 +2496,11 @@ mod tests {
             Err(std::sync::mpsc::TryRecvError::Empty)
         ));
         cleanup.release_blocker();
-        done_rx
+        let update = done_rx
             .recv_timeout(Duration::from_secs(1))
             .unwrap()
-            .unwrap()
-            .then_some(())
-            .expect("refresh CAS should persist");
+            .unwrap();
+        assert!(matches!(update, super::RefreshTokenUpdate::Saved));
         switch_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("profile switch did not finish after refresh transaction")
@@ -1718,16 +2615,18 @@ mod tests {
     }
 
     #[test]
-    fn detect_exact_match_returns_no_change() {
+    fn detect_exact_match_returns_no_change_and_repairs_marker() {
         let _env = TestEnv::new();
         let val = realistic_auth_json("test@example.com", "acct_1", "acc_a", "ref_a");
         let live = crate::auth::codex_auth_path().unwrap();
         crate::auth::write_auth(&live, &val).unwrap();
         super::cmd_save(Some("test-profile")).unwrap();
+        super::write_current("stale-profile").unwrap();
         assert!(matches!(
             super::detect_auth_change(),
             super::AuthChange::NoChange
         ));
+        assert_eq!(super::read_current(), "test-profile");
     }
 
     #[test]
@@ -1829,16 +2728,16 @@ mod tests {
     }
 
     #[test]
-    fn detect_tokens_updated_email_only_fallback_when_account_id_missing() {
+    fn detect_auth_change_refuses_single_email_match_without_account_id() {
         let _env = TestEnv::new();
         // Profile saved with account_id
-        let val = realistic_auth_json("fallback@example.com", "acct_fb", "acc_1", "ref_1");
+        let val = realistic_auth_json("legacy@example.com", "acct_fb", "acc_1", "ref_1");
         let live = crate::auth::codex_auth_path().unwrap();
         crate::auth::write_auth(&live, &val).unwrap();
         super::cmd_save(Some("fb-profile")).unwrap();
         // Live auth.json has no account_id in JWT claims (email-only match)
         let claims_no_id = serde_json::json!({
-            "email": "fallback@example.com",
+            "email": "legacy@example.com",
             "https://api.openai.com/auth": {
                 "chatgpt_plan_type": "plus",
                 "organizations": [],
@@ -1862,10 +2761,10 @@ mod tests {
             "last_refresh": "2026-04-08T00:00:00Z"
         });
         crate::auth::write_auth(&live, &updated).unwrap();
-        match super::detect_auth_change() {
-            super::AuthChange::TokensUpdated { alias } => assert_eq!(alias, "fb-profile"),
-            other => panic!("expected TokensUpdated via email fallback, got {other:?}"),
-        }
+        assert!(matches!(
+            super::detect_auth_change(),
+            super::AuthChange::NoChange
+        ));
     }
 
     // ── update_profile_from_live ─────────────────────────────
@@ -1937,14 +2836,15 @@ mod tests {
         super::cmd_save(Some("alice")).unwrap();
 
         let bob = realistic_auth_json("bob@example.com", "acct_b", "acc_b1", "ref_b1");
-        let result = super::replace_profile_auth_and_live_if_current("alice", &bob);
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let result = super::replace_profile_auth_and_live_if_current_leased(&lease, &bob);
         assert!(result.is_err());
         let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
         assert_eq!(saved["tokens"]["access_token"], "acc_a1");
     }
 
     #[test]
-    fn relogin_allows_matching_legacy_email_without_account_id() {
+    fn relogin_refuses_matching_email_without_account_id() {
         let _env = TestEnv::new();
         let live = crate::auth::codex_auth_path().unwrap();
         let old = realistic_auth_json("alice@example.com", "", "acc_a1", "ref_a1");
@@ -1952,9 +2852,12 @@ mod tests {
         super::cmd_save(Some("alice")).unwrap();
 
         let refreshed = realistic_auth_json("Alice@example.com", "", "acc_a2", "ref_a2");
-        super::replace_profile_auth_and_live_if_current("alice", &refreshed).unwrap();
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let error = super::replace_profile_auth_and_live_if_current_leased(&lease, &refreshed)
+            .expect_err("email alone must not authorize credential replacement");
+        assert!(error.to_string().contains("account_id"), "{error:#}");
         let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
-        assert_eq!(saved["tokens"]["access_token"], "acc_a2");
+        assert_eq!(saved["tokens"]["access_token"], "acc_a1");
     }
 
     // ── Failure paths ────────────────────────────────────────
@@ -2379,29 +3282,46 @@ mod tests {
     }
 
     #[test]
-    fn cmd_save_single_email_only_candidate_updates_it() {
+    fn cmd_save_does_not_replace_a_malformed_existing_profile() {
+        let _env = TestEnv::new();
+        let path = super::profile_auth_path("corrupt").unwrap();
+        super::ensure_profile_parent(&path).unwrap();
+        std::fs::write(&path, b"{not-json").unwrap();
+        write_live(&realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "acc_new",
+            "ref_new",
+        ));
+
+        let error =
+            cmd_save(Some("corrupt")).expect_err("an unreadable existing profile must fail closed");
+        assert!(format!("{error:#}").contains("parsing"), "{error:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{not-json");
+    }
+
+    #[test]
+    fn cmd_save_refuses_single_email_match_without_account_id() {
         let _env = TestEnv::new();
         seed_profile(
-            "fallback",
-            &auth_json_without_account_id("fallback@example.com", "acc_old", "ref_old"),
+            "legacy",
+            &auth_json_without_account_id("legacy@example.com", "acc_old", "ref_old"),
         );
-        let mut live = auth_json_without_account_id("fallback@example.com", "acc_new", "ref_new");
+        let mut live = auth_json_without_account_id("legacy@example.com", "acc_new", "ref_new");
         live["last_refresh"] = serde_json::json!("2026-07-25T00:00:00Z");
         write_live(&live);
 
-        match cmd_save(None) {
-            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "fallback"),
-            other => panic!("expected single email-only candidate to update, got {other:?}"),
-        }
-        assert_eq!(profile_refresh_token("fallback"), "ref_new");
+        let error = cmd_save(None).expect_err(
+            "a single email match still must not replace credentials without account_id",
+        );
+        assert!(error.to_string().contains("account_id"), "{error:#}");
+        assert_eq!(profile_refresh_token("legacy"), "ref_old");
     }
 
-    // ── An explicit alias is the user's own disambiguation ──
+    // ── An explicit alias fixes destination, not identity proof ──
 
-    /// Two profiles for one email is exactly the state an explicitly named
-    /// profile disambiguates, so that alias has to be obeyed verbatim —
-    /// redirecting it to the other twin would overwrite the single-use refresh
-    /// token the user was trying to protect.
+    /// A named profile must never redirect to its same-email twin, and naming it
+    /// must never bypass complete account_id + email validation.
     fn seed_email_twins() {
         seed_profile(
             "oai001",
@@ -2414,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_save_with_explicit_alias_writes_to_that_profile_not_its_email_twin() {
+    fn cmd_save_with_explicit_alias_still_requires_complete_account_identity() {
         let _env = TestEnv::new();
         seed_email_twins();
         // No account_id on the live copy: the email alone matches both twins,
@@ -2425,17 +3345,15 @@ mod tests {
             "ref_live",
         ));
 
-        match cmd_save(Some("oai001_20x")) {
-            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "oai001_20x"),
-            other => panic!("expected the named profile to be updated, got {other:?}"),
-        }
-        assert_eq!(profile_refresh_token("oai001_20x"), "ref_live");
+        let error = cmd_save(Some("oai001_20x"))
+            .expect_err("an explicit alias cannot replace account_id validation");
+        assert!(error.to_string().contains("account_id"), "{error:#}");
+        assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
         assert_eq!(
             profile_refresh_token("oai001"),
             "ref_t",
             "the twin the user did not name must keep its credentials"
         );
-        assert_eq!(super::read_current(), "oai001_20x");
     }
 
     #[test]
@@ -2479,7 +3397,76 @@ mod tests {
     }
 
     #[test]
-    fn imported_credentials_never_overwrite_an_existing_profile_without_user_proof() {
+    fn validated_import_promotes_the_exact_rotation_stage_without_a_duplicate() {
+        let _env = TestEnv::new();
+        let imported = realistic_auth_json(
+            "alice@example.com",
+            "acct_alice",
+            "access_latest",
+            "refresh_latest",
+        );
+        let stage = super::stage_import_rotation(&imported).unwrap();
+        let stage_path = stage.path().to_path_buf();
+
+        let action = super::save_imported_auth_value_with_stage(
+            &imported,
+            Some("alice"),
+            "acct_alice",
+            None,
+            Some(stage),
+        )
+        .unwrap();
+
+        assert!(matches!(action, super::SaveAction::Created(ref alias) if alias == "alice"));
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap(),
+            imported
+        );
+        assert!(
+            !stage_path.exists(),
+            "the recovery stage is moved, not copied, into the profile"
+        );
+        let recovery_entries = std::fs::read_dir(crate::auth::app_home().unwrap().join("recovery"))
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert!(recovery_entries.is_empty());
+    }
+
+    #[test]
+    fn recovered_import_normalizes_the_latest_rotation_before_registry_lock_failure() {
+        let _env = TestEnv::new();
+        let earlier =
+            realistic_auth_json("alice@example.com", "acct_alice", "access_1", "refresh_1");
+        let latest =
+            realistic_auth_json("alice@example.com", "acct_alice", "access_2", "refresh_2");
+        let stale_stage = super::stage_import_rotation(&earlier).unwrap();
+        let stale_path = stale_stage.path().to_path_buf();
+
+        // Make the production auth-lock open fail immediately. Recovery must
+        // already have written RT2 to a new private stage before it reaches
+        // this profile-registry transaction boundary.
+        std::fs::create_dir_all(super::auth_lock_path().unwrap()).unwrap();
+        let action = super::save_recovered_import_auth_value_with_stage(
+            latest.clone(),
+            Some("recovered"),
+            None,
+            Some(stale_stage),
+        )
+        .expect("a busy registry leaves the latest credentials quarantined");
+
+        let super::RecoveredImportAction::Quarantined { path, reason } = action else {
+            panic!("registry-lock failure must retain a recovery stage")
+        };
+        assert_ne!(path, stale_path, "the RT1 stage must not masquerade as RT2");
+        assert_eq!(crate::auth::read_auth(&path).unwrap(), latest);
+        assert!(!stale_path.exists(), "the superseded RT1 stage is removed");
+        assert!(reason.contains("profile-registry transaction"), "{reason}");
+        assert!(super::list_profiles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_credentials_refuse_an_existing_exact_identity_without_overwriting() {
         let _env = TestEnv::new();
         seed_profile(
             "alice",
@@ -2497,20 +3484,21 @@ mod tests {
             "refresh_imported",
         );
 
-        let action = super::save_imported_auth_value(
+        let error = super::save_imported_auth_value(
             &imported,
             None,
             "acct_shared_workspace",
             Some("alice"),
         )
-        .expect("a validated import should be preserved in a new profile");
+        .expect_err("the same strict identity must not create a second alias");
 
-        match action {
-            super::SaveAction::Created(alias) => assert_eq!(alias, "alice_2"),
-            other => panic!("import must create instead of overwriting, got {other:?}"),
-        }
+        assert!(error.to_string().contains("profile 'alice'"), "{error:#}");
+        assert!(
+            error.to_string().contains("same account_id and email"),
+            "{error:#}"
+        );
         assert_eq!(profile_refresh_token("alice"), "refresh_existing");
-        assert_eq!(profile_refresh_token("alice_2"), "refresh_imported");
+        assert!(!super::profile_auth_path("alice_2").unwrap().exists());
     }
 
     #[test]
@@ -2520,8 +3508,9 @@ mod tests {
             "alice",
             &realistic_auth_json("alice@example.com", "acct_a", "old_access", "refresh_new"),
         );
-        let written = super::update_profile_tokens_if_refresh_matches(
-            "alice",
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
             "refresh_old",
             "stale_id",
             "stale_access",
@@ -2529,20 +3518,20 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !written,
+            matches!(update, super::RefreshTokenUpdate::Superseded),
             "a re-login that replaced the presented token wins"
         );
         assert_eq!(profile_refresh_token("alice"), "refresh_new");
 
-        let written = super::update_profile_tokens_if_refresh_matches(
-            "alice",
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
             "refresh_new",
             "fresh_id",
             "fresh_access",
             "fresh_refresh",
         )
         .unwrap();
-        assert!(written);
+        assert!(matches!(update, super::RefreshTokenUpdate::Saved));
         assert_eq!(profile_refresh_token("alice"), "fresh_refresh");
     }
 
@@ -2642,7 +3631,7 @@ mod tests {
     }
 
     #[test]
-    fn save_imported_auth_value_preserves_a_stale_dump_without_overwriting() {
+    fn save_imported_auth_value_refuses_a_stale_duplicate_without_overwriting() {
         let _env = TestEnv::new();
         seed_profile_ahead_of_live();
         // A stale auth.json dump on disk is the same hazard as a stale live file.
@@ -2654,14 +3643,11 @@ mod tests {
             Some("2026-07-20T00:00:00Z"),
         );
 
-        let action = super::save_imported_auth_value(&imported, None, "acct_a", None)
-            .expect("import should preserve the dump in a unique profile");
-        match action {
-            super::SaveAction::Created(alias) => assert_eq!(alias, "alice_2"),
-            other => panic!("import must not update the newer profile, got {other:?}"),
-        }
+        let error = super::save_imported_auth_value(&imported, None, "acct_a", None)
+            .expect_err("a stale dump of the same strict identity must be refused");
+        assert!(error.to_string().contains("profile 'alice'"), "{error:#}");
         assert_eq!(profile_refresh_token("alice"), "ref_new");
-        assert_eq!(profile_refresh_token("alice_2"), "ref_dead");
+        assert!(!super::profile_auth_path("alice_2").unwrap().exists());
     }
 
     #[test]
@@ -2946,6 +3932,46 @@ mod tests {
         assert!(crate::cache::get(alias).is_none());
         assert_eq!(crate::cache::get_last_used(alias), 0);
         assert!(crate::cache::get_auth_failure(alias, "old_refresh").is_none());
+    }
+
+    #[test]
+    fn delete_protection_uses_live_profile_not_a_stale_marker() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref"),
+        );
+        seed_profile(
+            "bob",
+            &realistic_auth_json("bob@example.com", "acct_b", "b-old", "b-ref"),
+        );
+        super::switch_profile("alice").unwrap();
+        super::write_current("bob").unwrap();
+
+        let error = super::cmd_delete("alice")
+            .expect_err("live alice credentials must protect alice from deletion");
+        assert!(error.to_string().contains("active profile"));
+        assert!(super::profile_auth_path("alice").unwrap().exists());
+    }
+
+    #[test]
+    fn stale_marker_does_not_block_deleting_a_different_live_profile() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref"),
+        );
+        seed_profile(
+            "bob",
+            &realistic_auth_json("bob@example.com", "acct_b", "b-old", "b-ref"),
+        );
+        super::switch_profile("bob").unwrap();
+        super::write_current("alice").unwrap();
+
+        super::cmd_delete("alice").unwrap();
+        assert!(!super::profile_auth_path("alice").unwrap().exists());
+        assert_eq!(super::active_profile_from_live().as_deref(), Some("bob"));
+        assert_eq!(super::read_current(), "bob");
     }
 
     #[test]

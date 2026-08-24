@@ -110,20 +110,53 @@ pub(crate) async fn self_update_cmd(
     }
 
     let show_progress = !json && update::should_show_download_progress();
-    let mut daemon_restart = daemon::SelfUpdateDaemonRestart::capture();
+    // Serialize the complete daemon snapshot/stop/replace/restart transaction.
+    // Acquiring this after stopping the daemon would let a second updater wait
+    // on the lock while the service remains unnecessarily offline.
+    let update_lease = update::acquire_self_update_lease()
+        .context("acquiring exclusive self-update transaction")?;
+    let mut daemon_restart = daemon::SelfUpdateDaemonRestart::capture()
+        .context("capturing daemon state before self-update")?;
     if daemon_restart.is_needed() {
         daemon_restart.stop_before_update()?;
     }
     let update_result = if use_dev {
-        update::self_update_dev(show_progress).await
+        update::self_update_dev(show_progress, update_lease.clone()).await
     } else {
-        update::self_update(version, show_progress).await
+        update::self_update(version, show_progress, update_lease.clone()).await
     };
     let result = match update_result {
-        Ok(result) => {
-            daemon_restart
-                .restart_after_update()
-                .context("self-update completed, but daemon restart failed")?;
+        Ok(mut result) => {
+            if let Err(restart_err) = daemon_restart.restart_after_update() {
+                #[cfg(target_os = "windows")]
+                if result.updated {
+                    if let Err(stop_err) = daemon_restart.stop_failed_restart_before_rollback() {
+                        let recovery = result
+                            .preserve_replacement_for_recovery()
+                            .context("preserving the previous executable for manual recovery")?;
+                        return Err(restart_err.context(format!(
+                            "self-update installed the new binary, but its daemon did not restart; the new daemon could not be proven stopped, so automatic rollback was refused: {stop_err}. Manual recovery paths: current executable {}, previous executable backup {}",
+                            recovery.executable.display(),
+                            recovery.previous_executable.display()
+                        )));
+                    }
+                    if let Err(rollback_err) = result.rollback_replacement() {
+                        return Err(restart_err.context(format!(
+                            "self-update installed the new binary, but its daemon did not restart and restoring the previous binary failed: {rollback_err}"
+                        )));
+                    }
+                    if let Err(old_restart_err) = daemon_restart.restart_after_update() {
+                        return Err(restart_err.context(format!(
+                            "self-update daemon restart failed; the previous binary was restored, but its daemon also could not be restarted: {old_restart_err}"
+                        )));
+                    }
+                    return Err(restart_err.context(
+                        "self-update daemon restart failed; the previous binary and daemon state were restored",
+                    ));
+                }
+                return Err(restart_err.context("self-update completed, but daemon restart failed"));
+            }
+            result.commit_replacement();
             result
         }
         Err(err) => {

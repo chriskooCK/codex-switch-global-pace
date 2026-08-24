@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
 
 use crate::error::CsError;
 
@@ -520,12 +519,6 @@ pub(crate) fn redact_sensitive_log_body(body: &serde_json::Value) -> String {
     serde_json::to_string(&value).unwrap_or_default()
 }
 
-pub fn sha256_file(path: &Path) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
-    let digest = Sha256::digest(&data);
-    Some(hex::encode(digest))
-}
-
 pub fn backup_auth(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -568,19 +561,6 @@ fn allocate_backup_path(path: &Path) -> Result<PathBuf> {
         "could not allocate a unique backup path for {}",
         path.display()
     )
-}
-
-pub fn update_tokens(
-    path: &Path,
-    id_token: &str,
-    access_token: &str,
-    refresh_token: &str,
-) -> Result<()> {
-    let mut val = read_auth(path)?;
-    apply_tokens(&mut val, id_token, access_token, refresh_token)
-        .with_context(|| format!("updating tokens in {}", path.display()))?;
-    validate_managed_auth_value(&val)?;
-    write_auth(path, &val)
 }
 
 pub fn apply_tokens(
@@ -871,26 +851,6 @@ mod tests {
         apply_tokens(&mut val, "new-id", "new-access", "new-refresh").unwrap();
 
         assert_eq!(val["tokens"]["access_token"], "new-access");
-        assert_recent_rfc3339(&val["last_refresh"]);
-    }
-
-    #[test]
-    fn test_update_tokens_updates_last_refresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        write_auth(
-            &path,
-            &json!({
-                "tokens": { "id_token": "a", "access_token": "b", "refresh_token": "c" },
-                "last_refresh": "2020-01-01T00:00:00Z"
-            }),
-        )
-        .unwrap();
-
-        update_tokens(&path, "new-id", "new-access", "new-refresh").unwrap();
-
-        let val = read_auth(&path).unwrap();
-        assert_eq!(val["tokens"]["refresh_token"], "new-refresh");
         assert_recent_rfc3339(&val["last_refresh"]);
     }
 

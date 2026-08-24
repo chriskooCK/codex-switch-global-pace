@@ -8,7 +8,7 @@ mod mock;
 
 use codex_switch::auth;
 use codex_switch::jwt::AccountInfo;
-use codex_switch::usage::{self, ScoredCandidate};
+use codex_switch::usage::{self, ResetCredit, ScoredCandidate};
 use mock::scenarios;
 use serde_json::json;
 use std::path::PathBuf;
@@ -201,22 +201,28 @@ async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
     let _token_url = EnvVarGuard::set("CS_TOKEN_URL", server.token_url());
     let _reset_url = EnvVarGuard::remove("CS_RESET_CREDITS_URL");
 
-    let outcome = usage::fetch_usage_with_refresh(
-        "refresh_case",
-        "old_access",
-        Some("old_id"),
-        Some("refresh_old"),
-        None,
-        false,
-    )
-    .await;
-    let usage = outcome.result.unwrap();
+    let mut persisted = None;
+    let usage = {
+        let mut persist_rotation = |presented: &str, tokens| {
+            assert_eq!(presented, "refresh_old");
+            persisted = Some(tokens);
+            anyhow::Ok(())
+        };
+        usage::fetch_usage_with_refresh(
+            "refresh_case",
+            "old_access",
+            Some("old_id"),
+            Some("refresh_old"),
+            None,
+            false,
+            &mut persist_rotation,
+        )
+        .await
+        .unwrap()
+    };
 
     assert_eq!(usage.primary.unwrap().used_percent, Some(12.0));
-    assert_eq!(
-        outcome.refreshed.unwrap().access_token,
-        refreshed_access_token
-    );
+    assert_eq!(persisted.unwrap().access_token, refreshed_access_token);
     assert_eq!(server.request_count("old_access"), 1);
     assert_eq!(server.request_count(refreshed_access_token), 1);
     server.shutdown();
@@ -235,11 +241,18 @@ async fn usage_5xx_returns_contextual_error() {
     .await;
     let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
 
-    let error =
-        usage::fetch_usage_with_refresh("server_error", "server_error", None, None, None, false)
-            .await
-            .result
-            .expect_err("HTTP 500 must fail");
+    let mut reject_rotation = |_: &str, _| anyhow::bail!("unexpected token rotation");
+    let error = usage::fetch_usage_with_refresh(
+        "server_error",
+        "server_error",
+        None,
+        None,
+        None,
+        false,
+        &mut reject_rotation,
+    )
+    .await
+    .expect_err("HTTP 500 must fail");
 
     assert!(error.to_string().contains("HTTP 500"), "{error:#}");
     server.shutdown();
@@ -258,10 +271,18 @@ async fn usage_malformed_json_returns_parse_context() {
     .await;
     let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
 
-    let error = usage::fetch_usage_with_refresh("malformed", "malformed", None, None, None, false)
-        .await
-        .result
-        .expect_err("malformed JSON must fail");
+    let mut reject_rotation = |_: &str, _| anyhow::bail!("unexpected token rotation");
+    let error = usage::fetch_usage_with_refresh(
+        "malformed",
+        "malformed",
+        None,
+        None,
+        None,
+        false,
+        &mut reject_rotation,
+    )
+    .await
+    .expect_err("malformed JSON must fail");
 
     assert!(
         error
@@ -295,7 +316,7 @@ async fn usage_retry_exhaustion_returns_last_error_after_three_attempts() {
     )
     .unwrap();
 
-    let error = usage::fetch_usage_retried_force("retry_exhausted", &auth_path, "")
+    let error = usage::fetch_usage_retried_force("retry_exhausted", &auth_path)
         .await
         .unwrap_err();
 
@@ -518,10 +539,10 @@ async fn http_mock_returns_correct_structure() {
 }
 
 #[tokio::test]
-async fn http_reset_card_consume_uses_earliest_expiry() {
+async fn http_reset_card_consume_uses_the_exact_confirmed_credit() {
     let _lock = HTTP_ENV_LOCK.lock().await;
     let entries = scenarios::healthy_pool();
-    let (_dir, profiles) = setup_profiles(&entries);
+    let (dir, profiles) = setup_profiles(&entries);
     let server = mock::MockServer::start(entries).await;
     let (_alias, auth_path, _token, _is_team) = profiles
         .iter()
@@ -530,12 +551,19 @@ async fn http_reset_card_consume_uses_earliest_expiry() {
 
     let _reset_url_guard = EnvVarGuard::set("CS_RESET_CREDITS_URL", server.reset_credits_url());
     let _consume_url_guard = EnvVarGuard::remove("CS_RESET_CREDITS_CONSUME_URL");
+    let _home_guard = EnvVarGuard::set("CODEX_SWITCH_HOME", dir.path().display().to_string());
 
-    let result = usage::consume_earliest_reset_credit("healthy_a", auth_path)
+    let confirmed = ResetCredit {
+        id: "reset_credit_1".to_string(),
+        granted_at: Some("2026-01-01T00:00:00Z".to_string()),
+        expires_at: Some("2026-01-02T00:00:00Z".to_string()),
+    };
+    let result = usage::consume_reset_credit_by_id("healthy_a", auth_path, confirmed.clone())
         .await
         .unwrap();
 
-    assert_eq!(result.credit.id, "reset_credit_1");
+    assert_eq!(result.credit.id, confirmed.id);
+    assert_eq!(result.credit.expires_at, confirmed.expires_at);
     assert_eq!(result.windows_reset, Some(2));
     assert_eq!(result.code.as_deref(), Some("reset"));
 

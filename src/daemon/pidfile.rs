@@ -29,6 +29,70 @@ pub fn pidfile_path() -> Result<PathBuf> {
     Ok(crate::auth::app_home()?.join("daemon.pid"))
 }
 
+fn pidfile_lock_path_for(path: &Path) -> PathBuf {
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    PathBuf::from(lock_name)
+}
+
+fn open_pidfile_lock_at(path: &Path) -> Result<File> {
+    let lock_path = pidfile_lock_path_for(path);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| anyhow::anyhow!("opening daemon PID lock {}: {err}", lock_path.display()))
+}
+
+fn acquire_pidfile_lock_at(path: &Path) -> Result<File> {
+    let lock_file = open_pidfile_lock_at(path)?;
+    match FileExt::try_lock(&lock_file) {
+        Ok(()) => Ok(lock_file),
+        Err(TryLockError::WouldBlock) => anyhow::bail!(
+            "daemon PID lock is already held at {}; another daemon is running",
+            pidfile_lock_path_for(path).display()
+        ),
+        Err(TryLockError::Error(err)) => anyhow::bail!(
+            "locking daemon PID authority {}: {err}",
+            pidfile_lock_path_for(path).display()
+        ),
+    }
+}
+
+/// One-version migration probe for daemons that still lock `daemon.pid`
+/// itself. New daemons never take this lock; they own `daemon.pid.lock`.
+fn legacy_pidfile_lock_is_held_checked(path: &Path) -> Result<bool> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "opening legacy daemon PID lock {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    match FileExt::try_lock(&file) {
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(err)) => Err(anyhow::anyhow!(
+            "checking legacy daemon PID lock {}: {err}",
+            path.display()
+        )),
+        Ok(()) => {
+            FileExt::unlock(&file).map_err(|err| {
+                anyhow::anyhow!("unlocking legacy daemon PID file {}: {err}", path.display())
+            })?;
+            Ok(false)
+        }
+    }
+}
+
 fn shutdown_request_path() -> Result<PathBuf> {
     Ok(crate::auth::app_home()?.join("daemon.shutdown"))
 }
@@ -40,6 +104,14 @@ pub fn write_pidfile_exclusive() -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let lock_file = acquire_pidfile_lock_at(&path)?;
+    let identity = PidIdentity {
+        version: 2,
+        pid: std::process::id(),
+        executable: std::env::current_exe()?,
+        generation: daemon_generation(),
+    };
+    let encoded = serde_json::to_vec(&identity)?;
     // create_new(true) → O_CREAT | O_EXCL: atomic, fails if file exists.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -55,20 +127,19 @@ pub fn write_pidfile_exclusive() -> Result<()> {
                 anyhow::anyhow!("Failed to create PID file {}: {e}", path.display())
             }
         })?;
-    FileExt::lock(&file)
-        .map_err(|e| anyhow::anyhow!("Failed to lock PID file {}: {e}", path.display()))?;
-    let identity = PidIdentity {
-        version: 2,
-        pid: std::process::id(),
-        executable: std::env::current_exe()?,
-        generation: daemon_generation(),
-    };
     use std::io::Write;
-    let encoded = serde_json::to_vec(&identity)?;
-    file.write_all(&encoded)
-        .map_err(|e| anyhow::anyhow!("Failed to write PID to {}: {e}", path.display()))?;
-    file.sync_data()
-        .map_err(|e| anyhow::anyhow!("Failed to sync PID file {}: {e}", path.display()))?;
+    if let Err(error) = file
+        .write_all(&encoded)
+        .map_err(|e| anyhow::anyhow!("Failed to write PID to {}: {e}", path.display()))
+        .and_then(|()| {
+            file.sync_data()
+                .map_err(|e| anyhow::anyhow!("Failed to sync PID file {}: {e}", path.display()))
+        })
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error);
+    }
     // A fresh PID file has exclusive ownership, so any request left by a prior
     // daemon cannot target this generation.
     let _ = std::fs::remove_file(shutdown_request_path()?);
@@ -77,7 +148,7 @@ pub fn write_pidfile_exclusive() -> Result<()> {
     let mut guard = handle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = Some(file);
+    *guard = Some(lock_file);
     Ok(())
 }
 
@@ -85,6 +156,68 @@ pub fn read_pidfile() -> Option<u32> {
     let path = pidfile_path().ok()?;
     let raw = std::fs::read_to_string(&path).ok()?;
     read_pid_from_raw(&raw)
+}
+
+/// Return the running daemon PID using the PID file's held lock as the
+/// authoritative liveness signal. Unlike the status-oriented reader, this
+/// never folds malformed content, permissions, or lock errors into "stopped".
+pub(crate) fn running_pid_checked() -> Result<Option<u32>> {
+    let path = pidfile_path()?;
+    running_pid_checked_at(&path)
+}
+
+fn running_pid_checked_at(path: &Path) -> Result<Option<u32>> {
+    let initial_raw = match std::fs::read_to_string(path) {
+        Ok(raw) => Some(raw),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "reading daemon PID file {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    let lock_file = open_pidfile_lock_at(path)?;
+    match FileExt::try_lock(&lock_file) {
+        Err(TryLockError::WouldBlock) => {
+            // Re-read after observing the held authority lock so a stale
+            // identity sampled before a new generation started is never used.
+            let raw = std::fs::read_to_string(path).map_err(|err| {
+                anyhow::anyhow!(
+                    "daemon PID lock is held but its identity {} cannot be read: {err}",
+                    path.display()
+                )
+            })?;
+            let identity = parse_pid_identity(&raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "daemon PID lock is held but its identity is malformed: {}",
+                    path.display()
+                )
+            })?;
+            Ok(Some(identity.pid))
+        }
+        Err(TryLockError::Error(err)) => Err(anyhow::anyhow!(
+            "checking daemon PID lock {}: {err}",
+            pidfile_lock_path_for(path).display()
+        )),
+        Ok(()) => {
+            let legacy_running_pid = if let Some(raw) = initial_raw {
+                let identity = parse_pid_identity(&raw).ok_or_else(|| {
+                    anyhow::anyhow!("daemon PID file is malformed: {}", path.display())
+                })?;
+                legacy_pidfile_lock_is_held_checked(path)?.then_some(identity.pid)
+            } else {
+                None
+            };
+            FileExt::unlock(&lock_file).map_err(|err| {
+                anyhow::anyhow!(
+                    "unlocking daemon PID lock {}: {err}",
+                    pidfile_lock_path_for(path).display()
+                )
+            })?;
+            Ok(legacy_running_pid)
+        }
+    }
 }
 
 fn read_pid_from_raw(raw: &str) -> Option<u32> {
@@ -178,22 +311,8 @@ pub fn cleanup_pidfile() -> Result<()> {
 }
 
 fn cleanup_pidfile_at(path: &Path) -> Result<()> {
-    if pidfile_lock_is_held(path) {
-        anyhow::bail!(
-            "Refusing to remove PID file {}: locked by a running daemon",
-            path.display()
-        );
-    }
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    match FileExt::try_lock(&file) {
+    let lock_file = open_pidfile_lock_at(path)?;
+    match FileExt::try_lock(&lock_file) {
         Err(TryLockError::WouldBlock) => anyhow::bail!(
             "Refusing to remove PID file {}: locked by a running daemon",
             path.display()
@@ -201,11 +320,24 @@ fn cleanup_pidfile_at(path: &Path) -> Result<()> {
         Err(TryLockError::Error(e)) => return Err(e.into()),
         Ok(()) => {}
     }
-    match std::fs::remove_file(path) {
+    if legacy_pidfile_lock_is_held_checked(path)? {
+        anyhow::bail!(
+            "Refusing to remove PID file {}: locked by a running legacy daemon",
+            path.display()
+        );
+    }
+    let remove_result = match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
-    }
+    };
+    FileExt::unlock(&lock_file).map_err(|err| {
+        anyhow::anyhow!(
+            "unlocking daemon PID lock {}: {err}",
+            pidfile_lock_path_for(path).display()
+        )
+    })?;
+    remove_result
 }
 
 /// RAII guard that cleans up the PID file on drop (including panics).
@@ -217,87 +349,10 @@ impl Drop for PidGuard {
     }
 }
 
-fn process_exists(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: kill(pid, 0) only checks if the process exists; no signal is sent.
-        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        ret == 0
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let Ok(output) = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-            .output()
-        else {
-            return false;
-        };
-        if !output.status.success() {
-            return false;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        tasklist_contains_pid(&stdout, pid)
-    }
-    #[cfg(not(any(unix, target_os = "windows")))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-#[cfg(any(target_os = "windows", test))]
-fn tasklist_contains_pid(stdout: &str, pid: u32) -> bool {
-    stdout.lines().any(|line| {
-        let Some(csv) = line
-            .trim()
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-        else {
-            return false;
-        };
-        csv.split("\",\"")
-            .nth(1)
-            .and_then(|value| value.parse::<u32>().ok())
-            == Some(pid)
-    })
-}
-
-fn pidfile_lock_is_held(path: &Path) -> bool {
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    else {
-        return false;
-    };
-    match FileExt::try_lock(&file) {
-        Err(TryLockError::WouldBlock) => true,
-        Ok(()) => {
-            let _ = FileExt::unlock(&file);
-            false
-        }
-        Err(TryLockError::Error(_)) => false,
-    }
-}
-
-/// A daemon is trusted only while the process still exists and owns the
-/// exclusive lock created for this exact daemon startup.
-pub fn process_alive(pid: u32) -> bool {
-    let Ok(path) = pidfile_path() else {
-        return false;
-    };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return false;
-    };
-    let Some(identity) = parse_pid_identity(&raw) else {
-        return false;
-    };
-    identity.pid == pid && process_exists(pid) && pidfile_lock_is_held(&path)
-}
-
 /// Send SIGTERM to a process.
+#[cfg(not(target_os = "windows"))]
 pub fn send_sigterm(pid: u32) -> Result<()> {
-    if !process_alive(pid) {
+    if running_pid_checked()? != Some(pid) {
         anyhow::bail!("Refusing to stop PID {pid}: daemon process identity is stale");
     }
     #[cfg(unix)]
@@ -310,45 +365,22 @@ pub fn send_sigterm(pid: u32) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(target_os = "windows")]
-    {
-        request_shutdown(pid)
-    }
-    #[cfg(not(any(unix, target_os = "windows")))]
+    #[cfg(not(unix))]
     {
         let _ = pid;
         anyhow::bail!("Stopping daemon is not supported on this platform");
     }
 }
 
-pub fn is_daemon_running() -> bool {
-    read_pidfile().is_some_and(process_alive)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        PidIdentity, ShutdownRequest, cleanup_pidfile_at, parse_pid_identity, pidfile_lock_is_held,
-        read_pid_from_raw, shutdown_request_matches, tasklist_contains_pid,
+        PidIdentity, ShutdownRequest, acquire_pidfile_lock_at, cleanup_pidfile_at,
+        parse_pid_identity, pidfile_lock_path_for, read_pid_from_raw, running_pid_checked_at,
+        shutdown_request_matches,
     };
     use fs4::FileExt;
     use std::path::PathBuf;
-
-    #[test]
-    fn tasklist_reads_pid_from_second_csv_column() {
-        let output = r#""codex-switch.exe","4242","Console","1","12,345 K""#;
-        assert!(tasklist_contains_pid(output, 4242));
-        assert!(!tasklist_contains_pid(output, 1234));
-    }
-
-    #[test]
-    fn tasklist_rejects_info_and_empty_output() {
-        assert!(!tasklist_contains_pid(
-            "INFO: No tasks are running which match the specified criteria.",
-            4242,
-        ));
-        assert!(!tasklist_contains_pid("", 4242));
-    }
 
     #[test]
     fn legacy_pidfile_is_not_trusted() {
@@ -388,48 +420,170 @@ mod tests {
     }
 
     #[test]
-    fn pidfile_lock_identifies_only_active_daemon_startup() {
+    fn checked_running_pid_uses_the_lock_without_a_process_list_probe() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
+        let identity = PidIdentity {
+            version: 2,
+            // This PID need not exist: the held generation lock, not tasklist,
+            // is the transaction authority under test.
+            pid: u32::MAX,
+            executable: PathBuf::from("codex-switch"),
+            generation: "locked-generation".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        let lock_path = pidfile_lock_path_for(&path);
         let file = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
-            .open(&path)
+            .open(&lock_path)
             .unwrap();
         FileExt::lock(&file).unwrap();
-        assert!(pidfile_lock_is_held(&path));
+
+        assert_eq!(running_pid_checked_at(&path).unwrap(), Some(u32::MAX));
 
         FileExt::unlock(&file).unwrap();
-        assert!(!pidfile_lock_is_held(&path));
+        assert_eq!(running_pid_checked_at(&path).unwrap(), None);
     }
 
     #[test]
-    fn concurrent_start_cannot_replace_a_locked_pidfile_owner() {
+    fn checked_running_pid_never_folds_a_malformed_locked_file_into_stopped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
+        std::fs::write(&path, b"{not-valid-json").unwrap();
+        let lock_path = pidfile_lock_path_for(&path);
         let file = std::fs::OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
-            .open(&path)
+            .open(&lock_path)
             .unwrap();
         FileExt::lock(&file).unwrap();
 
-        let err = cleanup_pidfile_at(&path).unwrap_err();
-        let contender = std::fs::OpenOptions::new()
-            .create_new(true)
+        let error =
+            running_pid_checked_at(&path).expect_err("a malformed PID identity must fail closed");
+        assert!(error.to_string().contains("malformed"), "{error:#}");
+
+        FileExt::unlock(&file).unwrap();
+    }
+
+    #[test]
+    fn held_lock_without_identity_is_transient_error_then_becomes_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let owner = acquire_pidfile_lock_at(&path).unwrap();
+
+        let missing = running_pid_checked_at(&path)
+            .expect_err("a held authority lock without its identity must fail closed");
+        assert!(
+            missing.to_string().contains("cannot be read"),
+            "{missing:#}"
+        );
+
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch"),
+            generation: "ready-generation".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert_eq!(running_pid_checked_at(&path).unwrap(), Some(4242));
+
+        FileExt::unlock(&owner).unwrap();
+        assert_eq!(running_pid_checked_at(&path).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prior_release_same_file_lock_remains_a_live_migration_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let identity = PidIdentity {
+            version: 1,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch"),
+            generation: String::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        let legacy_owner = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&path);
+            .open(&path)
+            .unwrap();
+        FileExt::lock(&legacy_owner).unwrap();
+
+        assert_eq!(running_pid_checked_at(&path).unwrap(), Some(4242));
+        assert!(cleanup_pidfile_at(&path).is_err());
+
+        FileExt::unlock(&legacy_owner).unwrap();
+        assert_eq!(running_pid_checked_at(&path).unwrap(), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prior_release_windows_same_file_lock_fails_closed_without_tasklist_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let identity = PidIdentity {
+            version: 1,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch.exe"),
+            generation: String::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        let legacy_owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        FileExt::lock(&legacy_owner).unwrap();
+
+        let error = running_pid_checked_at(&path)
+            .expect_err("Windows cannot safely read a legacy same-file-locked identity");
+        assert!(
+            error.to_string().contains("reading daemon PID file"),
+            "{error:#}"
+        );
+
+        FileExt::unlock(&legacy_owner).unwrap();
+        assert_eq!(running_pid_checked_at(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn concurrent_start_is_rejected_without_waiting_to_become_a_second_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch"),
+            generation: "first-generation".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+        let owner = acquire_pidfile_lock_at(&path).unwrap();
+
+        let contender_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            tx.send(acquire_pidfile_lock_at(&contender_path).map(|_| ()))
+                .unwrap();
+        });
+        let contender_result = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("a concurrent startup must fail immediately instead of waiting");
+
+        let err = cleanup_pidfile_at(&path).unwrap_err();
 
         assert!(path.exists());
         assert!(err.to_string().contains("locked by a running daemon"));
-        assert_eq!(
-            contender.unwrap_err().kind(),
-            std::io::ErrorKind::AlreadyExists
+        assert!(
+            contender_result
+                .unwrap_err()
+                .to_string()
+                .contains("another daemon is running")
         );
-        assert!(pidfile_lock_is_held(&path));
-        FileExt::unlock(&file).unwrap();
+        FileExt::unlock(&owner).unwrap();
+        contender.join().unwrap();
     }
 }

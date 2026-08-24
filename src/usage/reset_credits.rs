@@ -166,23 +166,6 @@ pub fn earliest_reset_credit(credits: &[ResetCredit]) -> Option<&ResetCredit> {
         .min_by_key(|credit| reset_credit_expiry_sort_key(credit))
 }
 
-pub async fn consume_earliest_reset_credit(
-    alias: &str,
-    profile_path: &Path,
-) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
-    let (client, access_token, account_id) = load_consume_context(alias, profile_path)?;
-
-    let (_, credits) = fetch_reset_credits(&client, &access_token, account_id.as_deref())
-        .await
-        .map_err(ConsumeResetCreditError::not_consumed)?;
-    let credit = earliest_reset_credit(&credits)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))
-        .map_err(ConsumeResetCreditError::not_consumed)?;
-
-    send_reset_credit_consume(&client, &access_token, account_id.as_deref(), credit).await
-}
-
 fn load_consume_context(
     alias: &str,
     profile_path: &Path,
@@ -200,10 +183,10 @@ fn load_consume_context(
 
 /// Consume the exact reset credit to which the caller obtained user consent.
 ///
-/// Unlike [`consume_earliest_reset_credit`], this deliberately does not fetch
-/// the server's current list and select a new earliest card. A confirmation UI
-/// can therefore never turn consent for one card into consumption of another
-/// card when its cached list changes between confirmation and submission.
+/// This deliberately does not fetch the server's current list and select a new
+/// earliest card. A confirmation UI can therefore never turn consent for one
+/// card into consumption of another card when its cached list changes between
+/// confirmation and submission.
 pub async fn consume_reset_credit_by_id(
     alias: &str,
     profile_path: &Path,
@@ -215,6 +198,32 @@ pub async fn consume_reset_credit_by_id(
         )));
     }
 
+    // Own the profile lease for the complete credential/network lifetime. This
+    // serializes the submission with token rotation and makes rename/delete
+    // wait until the exact confirmed redemption has a known outcome.
+    let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+        .await
+        .map_err(ConsumeResetCreditError::not_consumed)?;
+    consume_reset_credit_by_id_leased(alias, profile_path, credit, &lease).await
+}
+
+pub(crate) async fn consume_reset_credit_by_id_leased(
+    alias: &str,
+    profile_path: &Path,
+    credit: ResetCredit,
+    lease: &crate::profile::ProfileLease,
+) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
+    if credit.id.trim().is_empty() {
+        return Err(ConsumeResetCreditError::not_consumed(anyhow::anyhow!(
+            "{alias}: reset card is missing its id"
+        )));
+    }
+    if lease.alias() != alias {
+        return Err(ConsumeResetCreditError::not_consumed(anyhow::anyhow!(
+            "reset-card use for '{alias}' received profile lease for '{}'",
+            lease.alias()
+        )));
+    }
     let (client, access_token, account_id) = load_consume_context(alias, profile_path)?;
 
     send_reset_credit_consume(&client, &access_token, account_id.as_deref(), credit).await

@@ -528,10 +528,12 @@ fn delete_with_yes_archives_inactive_profile_for_recovery() {
 #[test]
 fn delete_rejects_active_profile() {
     let home = temp_home("delete-active");
+    let active_auth = auth_json("gina@example.com", "acct_gina");
     write_json(
         home.join(".codex-switch/profiles/gina/auth.json"),
-        &auth_json("gina@example.com", "acct_gina"),
+        &active_auth,
     );
+    write_json(home.join(".codex/auth.json"), &active_auth);
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     fs::write(home.join(".codex-switch/current"), "gina").unwrap();
 
@@ -1133,6 +1135,42 @@ fn import_persists_rotated_credentials_when_usage_validation_fails() {
     assert!(
         error.contains("donor"),
         "the failure must name where the rotated credentials were saved: {error}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn successful_rotated_import_promotes_stage_without_recovery_duplicate() {
+    let home = temp_home("import-rotated-promote");
+    let sample = auth_json_needing_refresh("promote@example.com", "acct_promote");
+    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+
+    let server = start_rotating_mock(rotated_id_token, true);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "promoted"],
+        &server,
+    );
+
+    assert!(
+        output.status.success(),
+        "validated rotated import should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stored_refresh_token(&home.join(".codex-switch/profiles/promoted/auth.json")),
+        "refresh_1"
+    );
+    let recovery_dir = home.join(".codex-switch/recovery");
+    let recovery_files = fs::read_dir(&recovery_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        recovery_files, 0,
+        "successful promotion must move the stage instead of leaving a credential duplicate"
     );
 
     let _ = fs::remove_dir_all(home);

@@ -10,6 +10,10 @@ set -euo pipefail
 #   curl -fsSL .../install.sh | CS_VERSION=20260712.1.0 bash  # install specific version
 
 REPO="chriskooCK/codex-switch-global-pace"
+# Release workflow replaces this value in the installer asset. Keeping the
+# source value empty makes a raw checkout fail closed instead of guessing which
+# release version a downloaded archive ought to contain.
+PACKAGED_RELEASE_VERSION=""
 USER_INSTALL_DIR="${HOME}/.local/bin"
 SYSTEM_INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="codex-switch-global-pace"
@@ -43,6 +47,115 @@ classify_legacy_binary() {
     LEGACY_KIND="homebrew"
   else
     LEGACY_KIND="direct"
+  fi
+}
+
+legacy_service_references_binary() {
+  LEGACY_SERVICE_PATH=""
+  case "$OS" in
+    darwin)
+      local plist_path="${HOME}/Library/LaunchAgents/com.codex-switch-global-pace.daemon.plist"
+      if [ -f "$plist_path" ] && grep -Fq "<string>${LEGACY_BIN}</string>" "$plist_path"; then
+        LEGACY_SERVICE_PATH="$plist_path"
+        return 0
+      fi
+      ;;
+    linux)
+      local unit_path="${HOME}/.config/systemd/user/codex-switch-global-pace-daemon.service"
+      if [ -f "$unit_path" ] && grep -Fqx "ExecStart=\"${LEGACY_BIN}\" daemon start --foreground" "$unit_path"; then
+        LEGACY_SERVICE_PATH="$unit_path"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+legacy_service_is_running() {
+  case "$OS" in
+    darwin)
+      launchctl list com.codex-switch-global-pace.daemon >/dev/null 2>&1
+      ;;
+    linux)
+      systemctl --user is-active --quiet codex-switch-global-pace-daemon
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+verify_candidate_version() {
+  local candidate="$1" expected="$2" output first_line
+  if ! output="$("$candidate" --version 2>&1)"; then
+    CANDIDATE_ERROR="candidate version check failed: ${output}"
+    return 1
+  fi
+  first_line="${output%%$'\n'*}"
+  first_line="${first_line%$'\r'}"
+  if [ "$first_line" != "${BINARY_NAME} ${expected}" ]; then
+    CANDIDATE_ERROR="candidate reported '${first_line}', expected '${BINARY_NAME} ${expected}'"
+    return 1
+  fi
+  return 0
+}
+
+run_install_fs() {
+  if [ "${INSTALL_WITH_SUDO:-false}" = true ]; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
+cleanup_install_artifacts() {
+  if [ -n "${INSTALL_STAGE:-}" ]; then
+    run_install_fs rm -f "$INSTALL_STAGE" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${INSTALL_BACKUP:-}" ]; then
+    run_install_fs rm -f "$INSTALL_BACKUP" >/dev/null 2>&1 || true
+  fi
+}
+
+rollback_installed_binary() {
+  if [ "${INSTALL_DEST_EXISTED:-false}" = true ] && [ -n "${INSTALL_BACKUP:-}" ]; then
+    run_install_fs mv -f "$INSTALL_BACKUP" "$INSTALL_DEST" || return 1
+    INSTALL_BACKUP=""
+  else
+    run_install_fs rm -f "$INSTALL_DEST" || return 1
+  fi
+  return 0
+}
+
+stage_and_replace_binary() {
+  local candidate="$1"
+  INSTALL_DEST="${INSTALL_DIR}/${BINARY_NAME}"
+  INSTALL_STAGE=""
+  INSTALL_BACKUP=""
+  INSTALL_DEST_EXISTED=false
+
+  if [ -L "$INSTALL_DEST" ]; then
+    CANDIDATE_ERROR="refusing to replace symbolic-link install target ${INSTALL_DEST}"
+    return 1
+  fi
+  INSTALL_STAGE="$(run_install_fs mktemp "${INSTALL_DIR}/.${BINARY_NAME}.install.XXXXXX")" || return 1
+  run_install_fs install -m 0755 "$candidate" "$INSTALL_STAGE" || return 1
+
+  if [ -e "$INSTALL_DEST" ]; then
+    INSTALL_DEST_EXISTED=true
+    INSTALL_BACKUP="$(run_install_fs mktemp "${INSTALL_DIR}/.${BINARY_NAME}.backup.XXXXXX")" || return 1
+    run_install_fs cp -p "$INSTALL_DEST" "$INSTALL_BACKUP" || return 1
+  fi
+
+  run_install_fs mv -f "$INSTALL_STAGE" "$INSTALL_DEST" || return 1
+  INSTALL_STAGE=""
+  return 0
+}
+
+commit_installed_binary() {
+  if [ -n "${INSTALL_BACKUP:-}" ]; then
+    run_install_fs rm -f "$INSTALL_BACKUP"
+    INSTALL_BACKUP=""
   fi
 }
 
@@ -257,6 +370,20 @@ else
   fi
 fi
 
+if [ "$VERSION" = "latest" ] || [ "$VERSION" = "dev" ]; then
+  [ -n "$PACKAGED_RELEASE_VERSION" ] || error "This installer is not bound to a GitHub Release. Download install.sh from the stable or dev Release assets instead of running the repository copy directly."
+  EXPECTED_RELEASE_VERSION="$PACKAGED_RELEASE_VERSION"
+else
+  EXPECTED_RELEASE_VERSION="$VERSION"
+fi
+validate_version "$EXPECTED_RELEASE_VERSION"
+if [ "$USE_DEV" = true ]; then
+  case "$EXPECTED_RELEASE_VERSION" in
+    *-dev|*-dev.*) ;;
+    *) error "Development installer expected a -dev release, got '${EXPECTED_RELEASE_VERSION}'." ;;
+  esac
+fi
+
 # Detect OS and architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -274,22 +401,32 @@ case "$ARCH" in
 esac
 
 # A pre-user-install direct binary in /usr/local/bin would otherwise shadow the
-# new user-owned binary. Validate sudo before downloading, then remove it only
-# after the new binary is installed successfully.
+# new user-owned binary. Classify its ownership before downloading, then remove
+# it only after the new binary and any running daemon service are committed.
 MIGRATE_LEGACY=false
+MIGRATE_LEGACY_SERVICE=false
 LEGACY_NEEDS_SUDO=false
-if [ "$SYSTEM_INSTALL" = false ] && [ -e "$LEGACY_BIN" ]; then
+if [ -e "$LEGACY_BIN" ] || [ -L "$LEGACY_BIN" ]; then
   classify_legacy_binary
   if [ "$LEGACY_KIND" = "homebrew" ]; then
     error "Homebrew-managed install detected at ${LEGACY_RESOLVED}. Run 'brew uninstall codex-switch-global-pace' before using the direct installer; no Homebrew files were changed."
   fi
-  if [ ! -w "$SYSTEM_INSTALL_DIR" ]; then
-    info "Legacy system install detected at ${LEGACY_RESOLVED}; migration requires sudo once."
-    LEGACY_NEEDS_SUDO=true
-  else
-    info "Legacy system install detected at ${LEGACY_RESOLVED}; it will be migrated."
+  if [ "$SYSTEM_INSTALL" = false ]; then
+    if legacy_service_references_binary; then
+      if ! legacy_service_is_running; then
+        error "The installed daemon service at ${LEGACY_SERVICE_PATH} still references ${LEGACY_BIN}, but it is not running. To preserve that state safely, run '${LEGACY_BIN} daemon uninstall', rerun this installer, then reinstall the daemon only when you want it running. No binary or service was changed."
+      fi
+      MIGRATE_LEGACY_SERVICE=true
+      info "Running legacy daemon service detected; it will be moved to the user-owned binary transactionally."
+    fi
+    if [ ! -w "$SYSTEM_INSTALL_DIR" ]; then
+      info "Legacy system install detected at ${LEGACY_RESOLVED}; migration requires sudo once."
+      LEGACY_NEEDS_SUDO=true
+    else
+      info "Legacy system install detected at ${LEGACY_RESOLVED}; it will be migrated."
+    fi
+    MIGRATE_LEGACY=true
   fi
-  MIGRATE_LEGACY=true
 fi
 
 ASSET_NAME="codex-switch-global-pace-${PLATFORM}-${ARCH_NAME}.tar.gz"
@@ -310,7 +447,10 @@ info "Downloading: ${DOWNLOAD_URL}"
 
 # Download, verify, and extract
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+INSTALL_STAGE=""
+INSTALL_BACKUP=""
+INSTALL_WITH_SUDO=false
+trap 'cleanup_install_artifacts; rm -rf "$TMP_DIR"' EXIT
 
 curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" || error "Download failed. Check the URL or your network."
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
@@ -339,24 +479,61 @@ fi
 info "Checksum verified: ${ASSET_NAME}"
 tar xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR"
 
+CANDIDATE_ERROR=""
+if ! verify_candidate_version "${TMP_DIR}/${BINARY_NAME}" "$EXPECTED_RELEASE_VERSION"; then
+  error "Downloaded binary failed its pre-install check; the existing installation was not changed: ${CANDIDATE_ERROR}"
+fi
+
 if [ "$MIGRATE_LEGACY" = true ] && [ "$LEGACY_NEEDS_SUDO" = true ]; then
   sudo -v || error "Cannot migrate ${LEGACY_BIN} without sudo. Re-run with access to remove the legacy binary, or use --system."
 fi
 
 # Install
 if [ "$SYSTEM_INSTALL" = true ]; then
-  if [ -w "$INSTALL_DIR" ]; then
-    install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-    install -m 0644 /dev/null "$SYSTEM_INSTALL_MARKER"
-  else
+  if [ ! -w "$INSTALL_DIR" ]; then
     info "Installing system-wide to ${INSTALL_DIR} (requires sudo)"
-    sudo install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
-    sudo install -m 0644 /dev/null "$SYSTEM_INSTALL_MARKER"
+    sudo -v || error "Cannot install to ${INSTALL_DIR} without sudo."
+    INSTALL_WITH_SUDO=true
   fi
 else
   mkdir -p "$INSTALL_DIR"
-  install -m 0755 "${TMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 fi
+
+MARKER_WAS_PRESENT=false
+[ -e "$SYSTEM_INSTALL_MARKER" ] && MARKER_WAS_PRESENT=true
+CANDIDATE_ERROR=""
+if ! stage_and_replace_binary "${TMP_DIR}/${BINARY_NAME}"; then
+  cleanup_install_artifacts
+  error "Failed to stage an atomic binary replacement; the existing installation was not changed. ${CANDIDATE_ERROR}"
+fi
+
+if [ "$SYSTEM_INSTALL" = true ] && ! run_install_fs install -m 0644 /dev/null "$SYSTEM_INSTALL_MARKER"; then
+  rollback_installed_binary || error "System install marker creation failed and the prior executable could not be restored from ${INSTALL_BACKUP}."
+  [ "$MARKER_WAS_PRESENT" = true ] || run_install_fs rm -f "$SYSTEM_INSTALL_MARKER" || true
+  error "System install marker creation failed; the prior executable was restored."
+fi
+
+if ! verify_candidate_version "${INSTALL_DIR}/${BINARY_NAME}" "$EXPECTED_RELEASE_VERSION"; then
+  rollback_installed_binary || error "Installed binary verification failed and the prior executable could not be restored from ${INSTALL_BACKUP}: ${CANDIDATE_ERROR}"
+  if [ "$SYSTEM_INSTALL" = true ] && [ "$MARKER_WAS_PRESENT" = false ]; then
+    run_install_fs rm -f "$SYSTEM_INSTALL_MARKER" || true
+  fi
+  error "Installed binary verification failed; the prior executable was restored: ${CANDIDATE_ERROR}"
+fi
+
+if [ "$MIGRATE_LEGACY_SERVICE" = true ]; then
+  info "Reinstalling the running daemon service with ${INSTALL_DEST}..."
+  if ! "$INSTALL_DEST" daemon install; then
+    warn "The new service installation failed; restoring the legacy service definition."
+    if "$LEGACY_BIN" daemon install; then
+      rollback_installed_binary || error "Legacy daemon service was restored, but the prior user binary could not be restored from ${INSTALL_BACKUP}."
+      error "Daemon service migration failed; the legacy service and prior user binary were restored, and ${LEGACY_BIN} was kept."
+    fi
+    commit_installed_binary
+    error "Daemon service migration and legacy-service restoration both failed. Both verified binaries were kept at ${INSTALL_DEST} and ${LEGACY_BIN}; resolve the service error before removing either path."
+  fi
+fi
+commit_installed_binary
 
 if [ "$MIGRATE_LEGACY" = true ]; then
   if [ "$LEGACY_NEEDS_SUDO" = true ]; then

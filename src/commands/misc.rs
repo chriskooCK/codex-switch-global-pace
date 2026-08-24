@@ -9,11 +9,11 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
         anyhow::bail!("confirmation required; rerun with --yes to consume a reset card");
     }
     let path = profile::profile_auth_path(alias)?;
-    if !path.exists() {
+    if !profile::profile_exists(alias)? {
         anyhow::bail!("profile '{alias}' not found");
     }
 
-    let usage = usage::fetch_usage_retried_force(alias, &path, &profile::read_current())
+    let usage = usage::fetch_usage_retried_force(alias, &path)
         .await
         .map_err(|e| anyhow::anyhow!("{alias}: {}", e.detail))?;
     let credit = usage::earliest_reset_credit(&usage.reset_credits)
@@ -33,7 +33,7 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
         }
     }
 
-    let result = match usage::consume_earliest_reset_credit(alias, &path).await {
+    let result = match usage::consume_reset_credit_by_id(alias, &path, credit).await {
         Ok(result) => result,
         Err(error) if error.outcome_unknown_after_request() => {
             if let Err(err) = cache::invalidate(alias) {
@@ -91,16 +91,8 @@ pub(crate) fn open_cmd() -> Result<()> {
         .spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = std::process::Command::new("xdg-open").arg(&dir).spawn();
-    match result {
-        Ok(_) => println!("Opened: {}", dir.display()),
-        Err(e) => println!(
-            "{}",
-            color::error(&format!(
-                "Could not open file manager: {e}\nPath: {}",
-                dir.display()
-            ))
-        ),
-    }
+    result.with_context(|| format!("opening file manager for {}", dir.display()))?;
+    println!("Opened: {}", dir.display());
     Ok(())
 }
 
@@ -112,7 +104,7 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
         None => profile::list_profiles()?,
     };
     if let Some(a) = alias
-        && !profile::profile_auth_path(a)?.exists()
+        && !profile::profile_exists(a)?
     {
         anyhow::bail!("profile '{}' not found", a);
     }

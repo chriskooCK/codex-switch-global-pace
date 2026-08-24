@@ -526,20 +526,20 @@ async fn warmup_additional_models(
 /// user a profile that silently stops working at the next start, which makes
 /// this a reportable failure rather than something to warn about and walk past.
 ///
-/// The wording is shared with the usage path's [`crate::usage::UsageError::token_persist_failed`]
-/// so the report stays distinguishable from a *rejected* refresh: here the
-/// tokens are valid and the local write needs fixing, there the profile needs a
-/// new sign-in.
+/// The result model is shared with the usage path so a profile write failure,
+/// a superseding writer, and an incomplete live-auth activation remain
+/// distinguishable instead of all being reported as lost credentials.
 ///
 /// Each caller owns a single account, so propagating this aborts that account
 /// only — batch drivers keep processing the rest.
 fn persist_refreshed_tokens(
-    alias: &str,
+    lease: &crate::profile::ProfileLease,
     presented_refresh_token: &str,
     refreshed: &crate::usage::RefreshedTokens,
 ) -> Result<()> {
-    let persisted = crate::profile::update_profile_tokens_if_refresh_matches(
-        alias,
+    let alias = lease.alias();
+    let update = crate::profile::update_profile_tokens_if_refresh_matches_leased(
+        lease,
         presented_refresh_token,
         &refreshed.id_token,
         &refreshed.access_token,
@@ -551,20 +551,17 @@ fn persist_refreshed_tokens(
             crate::usage::UsageError::token_persist_failed(alias, &err).detail
         )
     })?;
-    if !persisted {
-        // Deliberately weaker than the usage path, which answers the same race
-        // by re-reading the profile and retrying (`reload_rotated_credentials`).
-        // Losing the CAS means a peer already wrote a newer credential, so the
-        // profile is healthy and warmup has nothing left to do — warmup only
-        // opens a quota window, and the next one will use the stored token.
-        // Adding a recovery round here would buy nothing and duplicate the
-        // hardest logic in the codebase.
-        debug!(
-            "[{alias}] skipped stale refreshed tokens because another process replaced the \
-             presented refresh token"
-        );
+    match update {
+        crate::profile::RefreshTokenUpdate::Saved => Ok(()),
+        crate::profile::RefreshTokenUpdate::Superseded => bail!(
+            "{}",
+            crate::usage::UsageError::token_update_superseded(alias).detail
+        ),
+        crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } => bail!(
+            "{}",
+            crate::usage::UsageError::live_activation_incomplete(alias, &cause).detail
+        ),
     }
-    Ok(())
 }
 
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
@@ -573,11 +570,28 @@ fn persist_refreshed_tokens(
 /// This sends the lightest valid request ("ping") and discards the response body,
 /// which is enough for the server to stamp the window start time.
 pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
+    let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+        .await
+        .with_context(|| format!("{alias}: failed to lock profile for warmup"))?;
+    warmup_account_leased(alias, profile_path, &lease).await
+}
+
+pub(crate) async fn warmup_account_leased(
+    alias: &str,
+    profile_path: &Path,
+    lease: &crate::profile::ProfileLease,
+) -> Result<()> {
+    if lease.alias() != alias {
+        anyhow::bail!(
+            "warmup for '{alias}' received profile lease for '{}'",
+            lease.alias()
+        );
+    }
     let usage = match crate::cache::get(alias) {
         Some(usage) => Some(usage),
         None => {
-            let current = crate::profile::read_current();
-            match crate::usage::fetch_usage_retried_unattended(alias, profile_path, &current).await
+            match crate::usage::fetch_usage_retried_unattended_leased(alias, profile_path, lease)
+                .await
             {
                 Ok(usage) => Some(usage),
                 Err(error) => {
@@ -630,7 +644,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
         .await
         {
             Ok(refreshed) => {
-                persist_refreshed_tokens(alias, rt, &refreshed)?;
+                persist_refreshed_tokens(lease, rt, &refreshed)?;
                 access_token = refreshed.access_token;
                 id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
@@ -771,7 +785,7 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
                 .await
                 {
                     Ok(refreshed) => {
-                        persist_refreshed_tokens(alias, rt, &refreshed)?;
+                        persist_refreshed_tokens(lease, rt, &refreshed)?;
                         let mut retry_resp = make_request(
                             &client,
                             &refreshed.access_token,
@@ -817,10 +831,17 @@ pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
 /// Fetch the full model list for a profile (for display, e.g. the TUI detail
 /// panel). Unlike `warmup_account`, this never sends a warmup ping — it only
 /// refreshes an expiring access token before calling the `/models` endpoint.
-pub(crate) async fn fetch_models_for_profile(
+pub(crate) async fn fetch_models_for_profile_leased(
     alias: &str,
     profile_path: &Path,
+    lease: &crate::profile::ProfileLease,
 ) -> Result<Vec<ModelEntry>> {
+    if lease.alias() != alias {
+        anyhow::bail!(
+            "model discovery for '{alias}' received profile lease for '{}'",
+            lease.alias()
+        );
+    }
     let val = crate::auth::read_auth(profile_path)
         .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
 
@@ -852,7 +873,7 @@ pub(crate) async fn fetch_models_for_profile(
             Ok(refreshed) => {
                 // No degrade here: the refresh *worked*, so the old token this
                 // would fall back to has already been invalidated server-side.
-                persist_refreshed_tokens(alias, rt, &refreshed)?;
+                persist_refreshed_tokens(lease, rt, &refreshed)?;
                 access_token = refreshed.access_token;
             }
             // Deliberate degrade: fall through and try /models with the
@@ -1709,7 +1730,10 @@ mod tests {
 
             let result = {
                 let _tracing_guard = tracing::subscriber::set_default(subscriber);
-                fetch_models_for_profile(alias, &profile_path).await
+                let lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .expect("model test acquires its profile lease");
+                fetch_models_for_profile_leased(alias, &profile_path, &lease).await
             };
 
             // Existing degrade-gracefully behavior must be preserved: a failed
@@ -1941,7 +1965,10 @@ mod tests {
 
             let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
 
-            let result = fetch_models_for_profile(alias, &profile_path).await;
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .expect("model test acquires its profile lease");
+            let result = fetch_models_for_profile_leased(alias, &profile_path, &lease).await;
 
             let error = result.map(|models| format!("{models:?}")).expect_err(
                 "degrading to the old token is only correct when the refresh was refused; a \
@@ -1960,6 +1987,10 @@ mod tests {
             let home = tempfile::tempdir().unwrap();
             let _codex_switch_home =
                 EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_home = EnvVarGuard::set(
+                "CODEX_HOME",
+                &home.path().join("codex").display().to_string(),
+            );
 
             let broken = "batch-persist-broken";
             let healthy = "batch-persist-healthy";
