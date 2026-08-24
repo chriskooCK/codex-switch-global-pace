@@ -202,10 +202,19 @@ fn running_pid_checked_at(path: &Path) -> Result<Option<u32>> {
         )),
         Ok(()) => {
             let legacy_running_pid = if let Some(raw) = initial_raw {
-                let identity = parse_pid_identity(&raw).ok_or_else(|| {
-                    anyhow::anyhow!("daemon PID file is malformed: {}", path.display())
-                })?;
-                legacy_pidfile_lock_is_held_checked(path)?.then_some(identity.pid)
+                let identity = parse_pid_identity(&raw);
+                if identity.is_none() && read_pid_from_raw(&raw).is_none() {
+                    anyhow::bail!("daemon PID file is malformed: {}", path.display());
+                }
+                let legacy_lock_held = legacy_pidfile_lock_is_held_checked(path)?;
+                match (identity, legacy_lock_held) {
+                    (Some(identity), true) => Some(identity.pid),
+                    (None, true) => anyhow::bail!(
+                        "daemon PID file {} is locked but has no trusted process identity",
+                        path.display()
+                    ),
+                    (_, false) => None,
+                }
             } else {
                 None
             };
@@ -466,6 +475,38 @@ mod tests {
         assert!(error.to_string().contains("malformed"), "{error:#}");
 
         FileExt::unlock(&file).unwrap();
+    }
+
+    #[test]
+    fn checked_running_pid_recognizes_an_unlocked_legacy_numeric_file_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        std::fs::write(&path, b"4242").unwrap();
+
+        assert_eq!(running_pid_checked_at(&path).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_running_pid_never_trusts_a_locked_legacy_numeric_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        std::fs::write(&path, b"4242").unwrap();
+        let legacy_owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        FileExt::lock(&legacy_owner).unwrap();
+
+        let error = running_pid_checked_at(&path)
+            .expect_err("a numeric PID alone must never authorize process control");
+        assert!(
+            error.to_string().contains("no trusted process identity"),
+            "{error:#}"
+        );
+
+        FileExt::unlock(&legacy_owner).unwrap();
     }
 
     #[test]
