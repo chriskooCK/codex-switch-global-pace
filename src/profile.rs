@@ -93,7 +93,7 @@ fn auth_lock_path() -> Result<PathBuf> {
     Ok(app_home()?.join("auth.lock"))
 }
 
-fn launch_lock_path() -> Result<PathBuf> {
+fn legacy_launch_lock_path() -> Result<PathBuf> {
     Ok(app_home()?.join("launch.lock"))
 }
 
@@ -110,30 +110,25 @@ pub fn lock_live_auth() -> Result<File> {
     acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, "auth")
 }
 
-/// Serialize the short launch staging window without holding the auth write
-/// lock while Codex starts and reads the staged credentials.
-pub fn lock_launch_session() -> Result<File> {
-    let path = launch_lock_path()?;
-    acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, "launch session")
+/// Coordinate with older `codex-switch` binaries that may still stage and
+/// restore live authentication while sharing `CODEX_SWITCH_HOME`.
+fn lock_legacy_launch_compatibility() -> Result<File> {
+    let path = legacy_launch_lock_path()?;
+    acquire_file_lock(&path, LOCK_WAIT_TIMEOUT, "legacy launch compatibility")
 }
 
 struct AuthTransaction {
-    _launch: File,
+    _legacy_launch: File,
     _auth: File,
 }
 
 fn lock_auth_transaction() -> Result<AuthTransaction> {
-    lock_auth_transaction_after_launch(|| {})
-}
-
-fn lock_auth_transaction_after_launch(after_launch: impl FnOnce()) -> Result<AuthTransaction> {
-    // Every writer uses this order. Launch holds the first lock across its
-    // stage/start/restore window and only takes the auth lock for each write.
-    let launch = lock_launch_session()?;
-    after_launch();
+    // Preserve the historical lock order so this binary cannot deadlock with
+    // an older shared-state process: launch.lock, then auth.lock.
+    let legacy_launch = lock_legacy_launch_compatibility()?;
     let auth = lock_live_auth()?;
     Ok(AuthTransaction {
-        _launch: launch,
+        _legacy_launch: legacy_launch,
         _auth: auth,
     })
 }
@@ -276,7 +271,7 @@ pub fn update_profile_tokens_if_refresh_matches(
     access_token: &str,
     new_refresh_token: &str,
 ) -> Result<bool> {
-    update_profile_tokens_if_refresh_matches_after_launch(
+    update_profile_tokens_if_refresh_matches_after_lock(
         alias,
         presented_refresh_token,
         id_token,
@@ -286,17 +281,18 @@ pub fn update_profile_tokens_if_refresh_matches(
     )
 }
 
-fn update_profile_tokens_if_refresh_matches_after_launch(
+fn update_profile_tokens_if_refresh_matches_after_lock(
     alias: &str,
     presented_refresh_token: &str,
     id_token: &str,
     access_token: &str,
     new_refresh_token: &str,
-    after_launch: impl FnOnce(),
+    after_lock: impl FnOnce(),
 ) -> Result<bool> {
     validate_alias(alias)?;
     let profile_path = profile_auth_path(alias)?;
-    let _transaction = lock_auth_transaction_after_launch(after_launch)?;
+    let _transaction = lock_auth_transaction()?;
+    after_lock();
     let profile = read_auth(&profile_path)?;
     if refresh_token(&profile) != Some(presented_refresh_token) {
         return Ok(false);
@@ -970,22 +966,6 @@ pub fn switch_profile(alias: &str) -> Result<()> {
     switch_live_auth(alias)
 }
 
-/// Write a profile's auth.json to the live codex auth path WITHOUT updating
-/// the current-profile marker.  Used by `launch` for temporary switching.
-/// Caller MUST hold the lock from `lock_live_auth()`.
-pub fn stage_profile_auth(alias: &str) -> Result<()> {
-    validate_alias(alias)?;
-    let src = profile_auth_path(alias)?;
-    if !src.exists() {
-        return Err(CsError::NotFound(alias.to_string()).into());
-    }
-    let val = read_auth(&src)?;
-    crate::auth::validate_managed_auth_value(&val)?;
-    let dst = codex_auth_path()?;
-    write_auth(&dst, &val)?;
-    Ok(())
-}
-
 pub fn cmd_delete(alias: &str) -> Result<()> {
     validate_alias(alias)?;
     let _transaction = lock_auth_transaction()?;
@@ -1524,18 +1504,18 @@ mod tests {
     }
 
     #[test]
-    fn switch_profile_waits_for_launch_session_lease() {
+    fn switch_profile_waits_for_legacy_launch_compatibility_lock() {
         let _env = TestEnv::new();
         let next = realistic_auth_json("next@example.com", "acct_next", "acc_new", "ref_new");
         let profile_path = super::profile_auth_path("next-profile").unwrap();
         super::ensure_profile_parent(&profile_path).unwrap();
         crate::auth::write_auth(&profile_path, &next).unwrap();
 
-        let lease = super::lock_launch_session().unwrap();
+        let lease = super::lock_legacy_launch_compatibility().unwrap();
         let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            super::notify_on_test_lock_attempt("launch session", attempt_tx);
+            super::notify_on_test_lock_attempt("legacy launch compatibility", attempt_tx);
             let _ = done_tx.send(super::switch_profile("next-profile"));
         });
         let mut cleanup = ThreadCleanup::new(lease);
@@ -1543,19 +1523,19 @@ mod tests {
 
         attempt_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("switch did not reach launch session lock attempt");
+            .expect("switch did not reach the legacy compatibility lock");
         assert!(
             matches!(
                 done_rx.try_recv(),
                 Err(std::sync::mpsc::TryRecvError::Empty)
             ),
-            "switch must wait while the launch session lease is held"
+            "switch must wait while an older launcher can still restore auth.json"
         );
 
         cleanup.release_blocker();
         done_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("switch did not finish after launch session lease release")
+            .expect("switch did not finish after the compatibility lock was released")
             .unwrap();
         cleanup.join_all();
     }
@@ -1573,11 +1553,11 @@ mod tests {
         crate::auth::write_auth(&bob_path, &bob).unwrap();
         super::switch_profile("alice").unwrap();
 
-        let auth_gate = super::lock_live_auth().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let updater = std::thread::spawn(move || {
-            let result = super::update_profile_tokens_if_refresh_matches_after_launch(
+            let result = super::update_profile_tokens_if_refresh_matches_after_lock(
                 "alice",
                 "a-ref",
                 "a-id-new",
@@ -1585,19 +1565,29 @@ mod tests {
                 "a-ref-new",
                 || {
                     let _ = started_tx.send(());
+                    let _ = continue_rx.recv();
                 },
             );
             let _ = done_tx.send(result);
         });
-        let mut cleanup = ThreadCleanup::new(auth_gate);
+        let mut cleanup = ThreadCleanup::new(continue_tx);
         cleanup.push(updater);
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
         let (switch_tx, switch_rx) = std::sync::mpsc::channel();
         let switcher = std::thread::spawn(move || {
+            super::notify_on_test_lock_attempt("legacy launch compatibility", attempt_tx);
             let _ = switch_tx.send(super::switch_profile("bob"));
         });
         cleanup.push(switcher);
+        attempt_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("profile switch did not wait for the refresh transaction");
+        assert!(matches!(
+            switch_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
         cleanup.release_blocker();
         done_rx
             .recv_timeout(Duration::from_secs(1))

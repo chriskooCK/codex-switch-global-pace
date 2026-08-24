@@ -14,7 +14,6 @@ launched directly.
 | `import <path> [alias]` | Validate and import one `auth.json`, or recursively scan a directory for JSON files. The alias applies to single-file imports only; directories auto-assign aliases. |
 | `list [-f]` | Show profiles, usage, and availability; `-f` / `--force` bypasses the cache. |
 | `use [alias] [--consume-card]` | Switch explicitly, or omit the alias to auto-select with the unified scoring algorithm. When the pool is exhausted, `--consume-card` consumes the earliest-expiring reset card to revive an account (auto-select only; ignored when an alias is given). |
-| `launch [alias] [--consume-card] -- [args]` | Start Codex with the best (or specified) profile's auth. Everything after `--` is passed through to Codex. |
 | `reset-card <alias> [-y]` | Consume the earliest-expiring reset card for a profile after confirmation; `-y` / `--yes` skips the prompt. |
 | `warmup [alias]` | Send a minimal request to activate the quota-window countdown for one or all profiles. |
 | `rename <old> <new>` | Rename a saved profile. |
@@ -43,7 +42,6 @@ launched directly.
 
 - Structured data is written to stdout; progress and diagnostics are written to stderr.
 - JSON and other non-interactive execution never consumes a reset card or deletes a profile without an explicit opt-in flag.
-- `launch` treats everything after `--` as Codex CLI arguments.
 - A manual `use` affects the next Codex process. Restart an already-running Codex process to load the new `auth.json`.
 - Update checks are manual except for the one check performed when the TUI starts.
 
@@ -52,7 +50,6 @@ Examples:
 ```bash
 codex-switch-global-pace --json list
 codex-switch-global-pace --json use work
-codex-switch-global-pace launch work -- --model gpt-5.4
 codex-switch-global-pace self-update --check
 ```
 

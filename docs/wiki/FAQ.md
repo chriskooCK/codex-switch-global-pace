@@ -6,7 +6,7 @@ No, and this is permanent by design. OS keyrings provide no locking or atomic-re
 
 ## Does switching affect an already-running Codex session?
 
-No. Codex reads authentication at startup. Restart Codex, or use `codex-switch-global-pace launch` for a new process.
+No. Codex reads authentication at startup. Restart Codex after switching accounts.
 
 ## Where is account data stored?
 
@@ -18,7 +18,7 @@ No. Inactive profiles are archived under `deleted-profiles/`. The active profile
 
 ## Is the daemon required?
 
-No. It is an optional Beta feature. `codex-switch-global-pace use`, `list`, `launch`, and the TUI work without it.
+No. It is an optional Beta feature. `codex-switch-global-pace use`, `list`, and the TUI work without it.
 
 ## What do the version numbers mean?
 

@@ -34,10 +34,7 @@ Configuration is loaded once from `config.toml`. An existing unreadable or inval
 
 [`src/auth.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/auth.rs) resolves `CODEX_HOME`, validates the Codex credential-store contract, reads and atomically writes authentication JSON, rotates live-auth backups, and builds network clients. It does not own profile selection.
 
-[`src/profile.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/profile.rs) owns aliases, identity deduplication, imports, recoverable deletion, current-profile tracking, and switching. Two file locks protect distinct operations:
-
-- `auth.lock` serializes replacement or synchronization of the live `auth.json`.
-- `launch.lock` serializes temporary authentication staging performed by `launch`.
+[`src/profile.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/profile.rs) owns aliases, identity deduplication, imports, recoverable deletion, current-profile tracking, and switching. `auth.lock` serializes replacement or synchronization of the live `auth.json`. A compatibility-only `launch.lock` is acquired first so an older `codex-switch` process sharing the same state directory cannot restore staged credentials over a newer switch; this binary does not implement the `launch` command.
 
 Profile identity prefers `account_id` and falls back to email when required for locally authenticated operations. Imports are intentionally create-only: Usage API access proves workspace membership, but a Team workspace ID can belong to several users and cannot authorize overwriting an existing profile. Tokens refreshed while a profile is active are written to both the saved profile and the live auth file under the same switching discipline. A rotated import that loses verifiable identity is written under `recovery/`, outside the selectable profile tree.
 

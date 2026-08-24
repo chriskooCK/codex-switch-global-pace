@@ -1,7 +1,7 @@
 # codex-switch-global-pace
 
 **[OpenAI Codex CLI](https://github.com/openai/codex) 多账号管理与全局周配额仪表盘。**
-它把所有可用账号的 Weekly quota 视为一个 pool，同时保留登录、切换、启动、预热、
+它把所有可用账号的 Weekly quota 视为一个 pool，同时保留登录、切换、预热、
 重置卡、JSON 与 daemon 等既有功能。
 
 [English README](README.md) · [文档](docs/wiki/Home.md) ·
@@ -36,12 +36,12 @@ irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/downl
 codex-switch-global-pace login
 codex-switch-global-pace list
 codex-switch-global-pace use
-codex-switch-global-pace launch
 codex-switch-global-pace tui
 ```
 
 不带参数运行会直接打开 TUI；Windows 双击
 `codex-switch-global-pace.exe` 也是相同效果。
+`use` 会切换下一个 Codex 进程使用的实际账号；切换后请重新启动已运行的 Codex 应用或 CLI。
 
 ## Global Weekly Pace
 

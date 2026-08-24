@@ -192,6 +192,14 @@ mod error_reporting_tests {
         ];
         assert_eq!(with_default_tui(args.clone()), args);
     }
+
+    #[test]
+    fn removed_launch_command_is_rejected() {
+        let error = Cli::try_parse_from(["codex-switch-global-pace", "launch"])
+            .err()
+            .expect("launch must no longer be accepted as a subcommand");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
 }
 
 #[cfg(test)]
@@ -270,7 +278,6 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
                 | Commands::Import { .. }
                 | Commands::SelfUpdate { .. }
                 | Commands::Open
-                | Commands::Launch { .. }
         );
         if should_check {
             check_auth_change()
@@ -304,11 +311,6 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
             stable,
         } => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
         Commands::Warmup { alias } => commands::warmup_cmd(alias.as_deref(), json).await?,
-        Commands::Launch {
-            alias,
-            consume_card,
-            args,
-        } => commands::launch_cmd(alias.as_deref(), args, json, consume_card).await?,
         Commands::Tui => tui::run_tui().await?,
         Commands::Open => commands::open_cmd()?,
         Commands::Daemon(sub) => daemon::dispatch(sub, json).await?,
