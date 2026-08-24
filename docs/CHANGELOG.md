@@ -1,5 +1,34 @@
 # Changelog
 
+## v20260824.7.0 — 2026-08-24
+
+- **One active-account invariant** — A successful login now updates the saved
+  profile, the live Codex authentication, and the current marker together while
+  preserving the previous live credentials as a private backup. Profile paths
+  validate aliases at one boundary, and deletion refuses unreadable cache state
+  before purging usage, auth-failure, and selection history for a reusable alias.
+- **Deterministic TUI actions** — Reset-card confirmation pins the exact card and
+  blocks duplicate submissions per account. Model requests reject stale
+  generations without retrying permanent errors every frame, and warmup remains
+  tracked through a one-time slow notice until the work actually completes.
+  Missing quota renders as neutral `N/A`, while Unicode search and rename
+  cursors render at their real character positions.
+- **Eligibility-first daemon switching** — An unusable current account yields to
+  the best usable alternative even when its raw score is lower, while a usable
+  current account never yields to an exhausted one. Weekly exhaustion and
+  missing quota bypass the optional usage threshold so the recovery policy is
+  always reached.
+- **Fail-closed installation and service state** — Exact installer versions are
+  strict SemVer, Homebrew Cellar symlinks are never migrated or removed by the
+  direct installer, and Windows verifies a downloaded executable before stopping
+  a running daemon. Installed services capture absolute `CODEX_HOME` and
+  `CODEX_SWITCH_HOME` values; Windows rejects paths that Task Scheduler would
+  expand or cannot represent within its documented command limit.
+- **Exact-source release gate** — Release builds reuse the locked CI workflow,
+  update both manifest and lockfile versions on LF or CRLF checkouts, and verify
+  the rolling `dev` tag still names the built commit before replacing its
+  release. Per-tag concurrency prevents overlapping rolling releases.
+
 ## v20260824.6.0 — 2026-08-24
 
 - **Two-state pace presentation** — Removed the `!` suffix from 5h and 7d

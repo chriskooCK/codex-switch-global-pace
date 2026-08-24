@@ -17,9 +17,9 @@ use crate::profile::{
     switch_profile, sync_current_from_live, validate_alias,
 };
 use crate::usage::{
-    ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary, Refresh, UsageError,
-    UsageInfo, calculate_global_weekly_summary, fetch_usage_retried, fetch_usage_retried_force,
-    fetch_usage_retried_unattended, reset_credit_expiry_sort_key,
+    ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary, Refresh, ResetCredit,
+    UsageError, UsageInfo, calculate_global_weekly_summary, fetch_usage_retried,
+    fetch_usage_retried_force, fetch_usage_retried_unattended, reset_credit_expiry_sort_key,
 };
 use crate::warmup::ModelEntry;
 
@@ -151,7 +151,11 @@ impl SortMode {
 pub enum ConfirmAction {
     Delete(String),
     BatchDelete(Vec<String>),
-    ConsumeResetCard { alias: String, expires_at: String },
+    ConsumeResetCard {
+        alias: String,
+        credit: ResetCredit,
+        expires_at: String,
+    },
 }
 
 pub struct RenameState {
@@ -165,6 +169,16 @@ pub struct SearchState {
     pub query: String,
     pub cursor: usize,
 }
+
+#[derive(Debug)]
+pub struct WarmupTask {
+    alias: String,
+    started: Instant,
+    slow_reported: bool,
+    handle: tokio::task::JoinHandle<std::result::Result<(), String>>,
+}
+
+const WARMUP_SLOW_NOTICE: Duration = Duration::from_secs(60);
 
 pub struct App {
     pub accounts: Vec<AccountEntry>,
@@ -184,16 +198,15 @@ pub struct App {
     pub result_sender: tokio::sync::mpsc::Sender<(String, u64, Result<UsageInfo, UsageError>)>,
     pub pending_workspace: tokio::sync::mpsc::Receiver<String>,
     pub workspace_sender: tokio::sync::mpsc::Sender<String>,
-    pub pending_warmup: tokio::sync::mpsc::Receiver<(u64, String, Result<(), String>)>,
-    pub warmup_sender: tokio::sync::mpsc::Sender<(u64, String, Result<(), String>)>,
     pub pending_reset_cards:
         tokio::sync::mpsc::Receiver<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
     pub reset_card_sender:
         tokio::sync::mpsc::Sender<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
-    /// Tracks in-flight warmup tasks: task_id → (alias, start_time).
-    /// Each spawn gets a unique `warmup_next_id`; results are matched by ID
-    /// so a late-arriving result from a timed-out task cannot clear a newer task.
-    pub warmup_tasks: HashMap<u64, (String, Instant)>,
+    pub reset_cards_in_flight: BTreeSet<String>,
+    /// Tracks each warmup until its task has observably completed. The slow-task
+    /// notice never cancels work because a refresh-token rotation or submitted
+    /// quota request must be allowed to reach its persistence boundary.
+    pub warmup_tasks: HashMap<u64, WarmupTask>,
     pub warmup_next_id: u64,
     pub confirm: Option<ConfirmAction>,
     pub rename: Option<RenameState>,
@@ -210,15 +223,16 @@ pub struct App {
     /// Session-level per-alias model list cache (no TTL). Populated lazily
     /// for the selected account or when its account details are opened.
     pub model_cache: HashMap<String, ModelStatus>,
-    pub pending_models: tokio::sync::mpsc::Receiver<(String, Result<Vec<ModelEntry>, String>)>,
-    pub model_sender: tokio::sync::mpsc::Sender<(String, Result<Vec<ModelEntry>, String>)>,
+    pub pending_models: tokio::sync::mpsc::Receiver<(String, u64, Result<Vec<ModelEntry>, String>)>,
+    pub model_sender: tokio::sync::mpsc::Sender<(String, u64, Result<Vec<ModelEntry>, String>)>,
+    pub model_requests: HashMap<String, u64>,
+    pub model_next_id: u64,
 }
 
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let (workspace_tx, workspace_rx) = tokio::sync::mpsc::channel(128);
-        let (warmup_tx, warmup_rx) = tokio::sync::mpsc::channel(64);
         let (reset_card_tx, reset_card_rx) = tokio::sync::mpsc::channel(16);
         let (model_tx, model_rx) = tokio::sync::mpsc::channel(32);
         let cfg = crate::config::get();
@@ -240,10 +254,9 @@ impl App {
             result_sender: tx,
             pending_workspace: workspace_rx,
             workspace_sender: workspace_tx,
-            pending_warmup: warmup_rx,
-            warmup_sender: warmup_tx,
             pending_reset_cards: reset_card_rx,
             reset_card_sender: reset_card_tx,
+            reset_cards_in_flight: BTreeSet::new(),
             warmup_tasks: HashMap::new(),
             warmup_next_id: 0,
             confirm: None,
@@ -261,6 +274,8 @@ impl App {
             model_cache: HashMap::new(),
             pending_models: model_rx,
             model_sender: model_tx,
+            model_requests: HashMap::new(),
+            model_next_id: 0,
         }
     }
 
@@ -268,10 +283,10 @@ impl App {
     /// and it isn't already loaded or in flight. Idempotent — safe to call
     /// every frame.
     pub fn ensure_models_loaded(&mut self, alias: &str) {
-        if matches!(
-            self.model_cache.get(alias),
-            Some(ModelStatus::Loaded(_)) | Some(ModelStatus::Loading)
-        ) {
+        // Errors are stable session state too. Retrying every render tick can
+        // hammer a permanently failing endpoint; `refresh_one` is the explicit
+        // transition that invalidates any terminal state and starts a new request.
+        if self.model_cache.contains_key(alias) {
             return;
         }
         let path = match profile_auth_path(alias) {
@@ -280,6 +295,9 @@ impl App {
         };
         self.model_cache
             .insert(alias.to_string(), ModelStatus::Loading);
+        let request_id = self.model_next_id;
+        self.model_next_id = self.model_next_id.wrapping_add(1);
+        self.model_requests.insert(alias.to_string(), request_id);
         let alias_owned = alias.to_string();
         let tx = self.model_sender.clone();
         let limiter = self.usage_limiter.clone();
@@ -288,7 +306,7 @@ impl App {
             let result = crate::warmup::fetch_models_for_profile(&alias_owned, &path)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = tx.send((alias_owned, result)).await;
+            let _ = tx.send((alias_owned, request_id, result)).await;
         });
     }
 
@@ -309,7 +327,15 @@ impl App {
 
     pub fn poll_model_results(&mut self) {
         let mut refresh_open_account = false;
-        while let Ok((alias, result)) = self.pending_models.try_recv() {
+        while let Ok((alias, request_id, result)) = self.pending_models.try_recv() {
+            let is_current_request = self
+                .model_requests
+                .get(&alias)
+                .is_some_and(|active_id| *active_id == request_id);
+            if !is_current_request {
+                continue;
+            }
+            self.model_requests.remove(&alias);
             refresh_open_account |= matches!(
                 self.menu.as_ref(),
                 Some(super::menu::MenuState::Account { info, .. }) if info.alias == alias
@@ -385,7 +411,8 @@ impl App {
             .unwrap_or_default();
         let can_consume_reset_card = loaded_usage
             .and_then(|u| crate::usage::earliest_reset_credit(&u.reset_credits))
-            .is_some();
+            .is_some()
+            && !self.reset_cards_in_flight.contains(&entry.alias);
         let usage_meta: Vec<String> = loaded_usage
             .map(|usage| {
                 let mut items = Vec::new();
@@ -584,6 +611,10 @@ impl App {
     }
 
     pub fn request_consume_reset_card(&mut self, alias: &str) {
+        if self.reset_cards_in_flight.contains(alias) {
+            self.set_status(format!("{alias}: reset card use is already in progress"), 4);
+            return;
+        }
         let Some(entry) = self.accounts.iter().find(|a| a.alias == alias) else {
             return;
         };
@@ -597,6 +628,7 @@ impl App {
         };
         self.confirm = Some(ConfirmAction::ConsumeResetCard {
             alias: alias.to_string(),
+            credit: credit.clone(),
             expires_at: credit
                 .expires_at
                 .as_deref()
@@ -623,7 +655,7 @@ impl App {
             return;
         };
         let old = entry.alias.clone();
-        let len = old.len();
+        let len = old.chars().count();
         self.rename = Some(RenameState {
             old_alias: old.clone(),
             input: old,
@@ -841,7 +873,7 @@ impl App {
     }
 
     fn is_warmup_in_flight(&self, alias: &str) -> bool {
-        self.warmup_tasks.values().any(|(a, _)| a == alias)
+        self.warmup_tasks.values().any(|task| task.alias == alias)
     }
 
     fn warmup_indices(&mut self, target_indices: Vec<usize>) -> (usize, usize, usize) {
@@ -881,6 +913,7 @@ impl App {
             return;
         };
         self.model_cache.remove(alias);
+        self.model_requests.remove(alias);
         self.fetch_usage_for(idx, Refresh::Forced);
         self.ensure_models_loaded(alias);
         self.set_status(format!("Refreshing {alias}"), 3);
@@ -892,29 +925,37 @@ impl App {
             return;
         }
         let task_id = self.warmup_next_id;
-        self.warmup_next_id += 1;
-        self.warmup_tasks
-            .insert(task_id, (alias.clone(), Instant::now()));
+        self.warmup_next_id = self.warmup_next_id.wrapping_add(1);
         let path = match profile_auth_path(&alias) {
             Ok(p) => p,
             Err(e) => {
-                self.warmup_tasks.remove(&task_id);
                 self.set_status_error(format!("Path error for {alias}: {e}"), 5);
                 return;
             }
         };
-        let tx = self.warmup_sender.clone();
         let limiter = self.usage_limiter.clone();
-        tokio::spawn(async move {
-            let _permit = limiter.acquire().await;
-            let result = crate::warmup::warmup_account(&alias, &path)
+        let tracked_alias = alias.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = limiter
+                .acquire()
+                .await
+                .map_err(|error| format!("failed to acquire warmup permit: {error}"))?;
+            crate::warmup::warmup_account(&alias, &path)
                 .await
                 .map_err(|e| {
                     tracing::error!(alias = %alias, error = %format!("{e:#}"), "warmup failed");
                     format!("{e:#}")
-                });
-            let _ = tx.send((task_id, alias, result)).await;
+                })
         });
+        self.warmup_tasks.insert(
+            task_id,
+            WarmupTask {
+                alias: tracked_alias,
+                started: Instant::now(),
+                slow_reported: false,
+                handle,
+            },
+        );
     }
 
     pub fn poll_update(&mut self) {
@@ -955,21 +996,51 @@ impl App {
         });
     }
 
-    pub fn poll_warmup_results(&mut self) {
+    pub async fn poll_warmup_results(&mut self) {
         let mut to_refresh = std::collections::BTreeSet::<String>::new();
-        while let Ok((task_id, alias, result)) = self.pending_warmup.try_recv() {
-            // Only accept results whose task_id is still tracked.
-            // A timed-out task's late result is silently ignored.
-            if self.warmup_tasks.remove(&task_id).is_none() {
-                continue;
+        let now = Instant::now();
+        let mut slow_aliases = Vec::new();
+        for task in self.warmup_tasks.values_mut() {
+            if !task.handle.is_finished()
+                && !task.slow_reported
+                && now.duration_since(task.started) >= WARMUP_SLOW_NOTICE
+            {
+                task.slow_reported = true;
+                slow_aliases.push(task.alias.clone());
             }
-            match result {
-                Ok(()) => {
+        }
+        if !slow_aliases.is_empty() {
+            slow_aliases.sort();
+            self.set_status(
+                format!(
+                    "Warmup still running after 60s: {}",
+                    slow_aliases.join(", ")
+                ),
+                6,
+            );
+        }
+
+        let finished_task_ids: Vec<u64> = self
+            .warmup_tasks
+            .iter()
+            .filter_map(|(task_id, task)| task.handle.is_finished().then_some(*task_id))
+            .collect();
+
+        for task_id in finished_task_ids {
+            let Some(task) = self.warmup_tasks.remove(&task_id) else {
+                continue;
+            };
+            let alias = task.alias;
+            match task.handle.await {
+                Ok(Ok(())) => {
                     self.set_status(format!("Warmed up {alias} — refreshing usage..."), 4);
                     to_refresh.insert(alias);
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     self.set_status_error(format!("Warmup failed ({alias}): {e}"), 6);
+                }
+                Err(error) => {
+                    self.set_status_error(format!("Warmup task stopped ({alias}): {error}"), 6);
                 }
             }
         }
@@ -985,6 +1056,7 @@ impl App {
     pub fn poll_reset_card_results(&mut self) {
         let mut to_refresh = std::collections::BTreeSet::<String>::new();
         while let Ok((alias, result)) = self.pending_reset_cards.try_recv() {
+            self.reset_cards_in_flight.remove(&alias);
             match result {
                 Ok(consumed) => {
                     if let Err(err) = cache::invalidate(&alias) {
@@ -1267,16 +1339,21 @@ impl App {
                     self.set_status_error(msg, 6);
                 }
             }
-            ConfirmAction::ConsumeResetCard { alias, .. } => {
-                self.consume_reset_card(&alias);
+            ConfirmAction::ConsumeResetCard { alias, credit, .. } => {
+                self.consume_reset_card(&alias, credit);
             }
         }
     }
 
-    fn consume_reset_card(&mut self, alias: &str) {
+    fn consume_reset_card(&mut self, alias: &str, credit: ResetCredit) {
+        if !self.reset_cards_in_flight.insert(alias.to_string()) {
+            self.set_status(format!("{alias}: reset card use is already in progress"), 4);
+            return;
+        }
         let path = match profile_auth_path(alias) {
             Ok(p) => p,
             Err(e) => {
+                self.reset_cards_in_flight.remove(alias);
                 self.set_status_error(format!("Path error for {alias}: {e}"), 5);
                 return;
             }
@@ -1285,7 +1362,7 @@ impl App {
         let tx = self.reset_card_sender.clone();
         self.set_status(format!("Using reset card for {alias}..."), 6);
         tokio::spawn(async move {
-            let result = crate::usage::consume_earliest_reset_credit(&alias_owned, &path)
+            let result = crate::usage::consume_reset_credit_by_id(&alias_owned, &path, credit)
                 .await
                 .map_err(|error| {
                     let unknown = error.outcome_unknown_after_request();
@@ -1626,13 +1703,6 @@ impl App {
             self.status_msg = None;
             self.status_expiry = None;
         }
-
-        // Evict warmup tasks that have been in-flight too long (panic / channel drop).
-        // Late-arriving results for evicted IDs are ignored in poll_warmup_results.
-        const WARMUP_TASK_TIMEOUT: Duration = Duration::from_secs(60);
-        let now = Instant::now();
-        self.warmup_tasks
-            .retain(|_, (_, started)| now.duration_since(*started) < WARMUP_TASK_TIMEOUT);
     }
 }
 
@@ -1664,7 +1734,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
 
     loop {
         app.poll_results();
-        app.poll_warmup_results();
+        app.poll_warmup_results().await;
         app.poll_reset_card_results();
         app.poll_model_results();
         app.poll_update();
@@ -2144,15 +2214,17 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountEntry, App, ModelStatus, UsageStatus, batch_relogin_not_attempted,
-        finish_login_or_cancel, finish_refresh_then_commit, refresh_fetches_loaded_usage,
-        refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
+        AccountEntry, App, ConfirmAction, ModelStatus, UsageStatus, WarmupTask,
+        batch_relogin_not_attempted, finish_login_or_cancel, finish_refresh_then_commit,
+        refresh_fetches_loaded_usage, refresh_forces_negative_caches,
+        reset_card_failure_from_outcome, retained_usage_by_alias,
     };
     use crate::{
         jwt::{AccountInfo, OrgInfo},
         usage::{Refresh, ResetCredit, UsageInfo, WindowUsage},
         warmup::ModelEntry,
     };
+    use std::time::Instant;
 
     #[test]
     fn cancelled_batch_counts_the_current_account_as_attempted() {
@@ -2235,6 +2307,94 @@ mod tests {
         assert!(!committed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
+    #[tokio::test]
+    async fn slow_warmup_stays_tracked_until_it_really_finishes() {
+        let mut app = App::new();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            finish_rx
+                .await
+                .map_err(|error| format!("finish signal dropped: {error}"))?;
+            Ok(())
+        });
+        app.warmup_tasks.insert(
+            1,
+            WarmupTask {
+                alias: "account".into(),
+                started: Instant::now() - std::time::Duration::from_secs(61),
+                slow_reported: false,
+                handle,
+            },
+        );
+
+        app.poll_warmup_results().await;
+        assert!(app.is_warmup_in_flight("account"));
+        assert!(app.warmup_tasks[&1].slow_reported);
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Warmup still running after 60s: account")
+        );
+
+        app.status_msg = None;
+        app.poll_warmup_results().await;
+        assert!(
+            app.status_msg.is_none(),
+            "the slow notice is emitted only once"
+        );
+        assert!(app.is_warmup_in_flight("account"));
+
+        finish_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !app.warmup_tasks[&1].handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("warmup task should finish after its release signal");
+        app.poll_warmup_results().await;
+
+        assert!(app.warmup_tasks.is_empty());
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Warmed up account — refreshing usage...")
+        );
+    }
+
+    #[tokio::test]
+    async fn panicked_warmup_clears_tracking_after_join_error_is_observed() {
+        let mut app = App::new();
+        let handle = tokio::spawn(async move {
+            panic!("warmup panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        app.warmup_tasks.insert(
+            1,
+            WarmupTask {
+                alias: "account".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                handle,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !app.warmup_tasks[&1].handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicked warmup task should finish");
+
+        app.poll_warmup_results().await;
+
+        assert!(app.warmup_tasks.is_empty());
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Warmup task stopped (account):"))
+        );
+    }
+
     #[test]
     fn model_result_rebuilds_an_open_account_detail() {
         let mut app = App::new();
@@ -2247,11 +2407,13 @@ mod tests {
         app.view_indices.push(0);
         app.model_cache
             .insert("account".into(), ModelStatus::Loading);
+        app.model_requests.insert("account".into(), 7);
         app.open_account_menu();
 
         app.model_sender
             .try_send((
                 "account".into(),
+                7,
                 Ok(vec![ModelEntry {
                     slug: "official-slug".into(),
                     display_name: Some("Official Name".into()),
@@ -2278,6 +2440,56 @@ mod tests {
                 || line.contains("visibility=")
                 || line.contains("context=")
         }));
+    }
+
+    #[test]
+    fn model_error_is_stable_until_explicit_refresh() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.model_cache
+            .insert("account".into(), ModelStatus::Error("denied".into()));
+
+        app.tick();
+        app.ensure_models_loaded_for_selected();
+
+        assert!(matches!(
+            app.model_cache.get("account"),
+            Some(ModelStatus::Error(error)) if error == "denied"
+        ));
+        assert!(!app.model_requests.contains_key("account"));
+    }
+
+    #[test]
+    fn stale_model_result_cannot_overwrite_newer_generation() {
+        let mut app = App::new();
+        app.model_cache
+            .insert("account".into(), ModelStatus::Loading);
+        app.model_requests.insert("account".into(), 2);
+
+        let model = |slug: &str| ModelEntry {
+            slug: slug.into(),
+            ..ModelEntry::default()
+        };
+        app.model_sender
+            .try_send(("account".into(), 2, Ok(vec![model("new")])))
+            .unwrap();
+        app.model_sender
+            .try_send(("account".into(), 1, Ok(vec![model("old")])))
+            .unwrap();
+
+        app.poll_model_results();
+
+        let Some(ModelStatus::Loaded(models)) = app.model_cache.get("account") else {
+            panic!("newest model result should remain loaded");
+        };
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].slug, "new");
     }
 
     #[test]
@@ -2441,6 +2653,60 @@ mod tests {
         assert!(info.reset_card_expiries[0].contains("expires 2026-07-20"));
         assert!(!info.reset_card_expiries[0].contains("credit-secret-looking-id"));
         assert!(!info.organizations[0].contains("org-secret-looking-id"));
+    }
+
+    #[test]
+    fn reset_card_confirmation_pins_identity_and_pending_use_disables_a_second_consent() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits: vec![ResetCredit {
+                    id: "confirmed-credit".into(),
+                    granted_at: None,
+                    expires_at: Some("2026-08-30T00:00:00Z".into()),
+                }],
+                ..UsageInfo::default()
+            })),
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        app.request_consume_reset_card("account");
+        let Some(ConfirmAction::ConsumeResetCard { credit, .. }) = app.confirm.as_ref() else {
+            panic!("reset-card confirmation should open");
+        };
+        assert_eq!(credit.id, "confirmed-credit");
+
+        app.cancel_confirm();
+        app.reset_cards_in_flight.insert("account".into());
+        app.request_consume_reset_card("account");
+        assert!(app.confirm.is_none());
+
+        app.model_cache
+            .insert("account".into(), ModelStatus::Loaded(Vec::new()));
+        app.open_account_menu();
+        let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
+            panic!("account detail should open");
+        };
+        assert!(!info.can_consume_reset_card);
+    }
+
+    #[test]
+    fn reset_card_result_always_clears_in_flight_state() {
+        let mut app = App::new();
+        app.reset_cards_in_flight.insert("account".into());
+        app.reset_card_sender
+            .try_send((
+                "account".into(),
+                Err(super::map_reset_card_failure("failed".into(), false)),
+            ))
+            .unwrap();
+
+        app.poll_reset_card_results();
+
+        assert!(!app.reset_cards_in_flight.contains("account"));
     }
 
     #[test]

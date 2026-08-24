@@ -13,9 +13,7 @@ use crate::jwt::PlanKind;
 use crate::output::{
     format_local_time, format_reset_short, format_reset_time, reset_credits_count,
 };
-use crate::usage::{
-    GlobalWeeklySummary, QuotaPaceState, UsageInfo, is_available, quota_pace_state,
-};
+use crate::usage::{GlobalWeeklySummary, QuotaPaceState, UsageInfo, quota_pace_state};
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
@@ -217,6 +215,65 @@ fn fitted_segment_suffix(
 
 fn status_message_color(is_error: bool) -> Color {
     if is_error { C_RED } else { C_CYAN }
+}
+
+fn editable_input_line(
+    prefix: &'static str,
+    input: &str,
+    cursor: usize,
+    hint: &'static str,
+) -> Line<'static> {
+    let byte_cursor = input
+        .char_indices()
+        .nth(cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len());
+    let (before_cursor, after_cursor) = input.split_at(byte_cursor);
+
+    Line::from(vec![
+        Span::styled(prefix, base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            before_cursor.to_string(),
+            base().fg(C_WHITE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("#", base().fg(C_GRAY)),
+        Span::styled(
+            after_cursor.to_string(),
+            base().fg(C_WHITE).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(hint, base().fg(DIM)),
+    ])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountUsageState {
+    Available,
+    Limited,
+    Unavailable,
+}
+
+fn account_usage_state(usage: &UsageInfo) -> AccountUsageState {
+    if usage.account_limited {
+        return AccountUsageState::Limited;
+    }
+
+    let windows = [usage.primary.as_ref(), usage.secondary.as_ref()];
+    if windows.iter().all(|window| window.is_none())
+        || windows
+            .iter()
+            .flatten()
+            .any(|window| crate::usage::normalized_quota_usage(window.used_percent).is_none())
+    {
+        return AccountUsageState::Unavailable;
+    }
+
+    if windows.iter().flatten().any(|window| {
+        crate::usage::normalized_quota_usage(window.used_percent).is_some_and(|used| used >= 100.0)
+    }) {
+        AccountUsageState::Limited
+    } else {
+        AccountUsageState::Available
+    }
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -808,25 +865,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             cards,
                             cards_color,
                         )
-                    } else if is_available(u) {
-                        (
-                            "OK".into(),
-                            C_GREEN,
-                            p5,
-                            p5c,
-                            p7,
-                            p7c,
-                            r5,
-                            r5c,
-                            r7,
-                            r7c,
-                            cards,
-                            cards_color,
-                        )
                     } else {
+                        let (status, color) = match account_usage_state(u) {
+                            AccountUsageState::Available => ("OK", C_GREEN),
+                            AccountUsageState::Limited => ("Limited", C_RED),
+                            AccountUsageState::Unavailable => ("N/A", DIM),
+                        };
                         (
-                            "Limited".into(),
-                            C_RED,
+                            status.into(),
+                            color,
                             p5,
                             p5c,
                             p7,
@@ -1157,12 +1204,12 @@ fn reset_cards_color(u: &UsageInfo) -> Color {
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     // Rename input takes top priority
     if let Some(rs) = &app.rename {
-        let line = Line::from(vec![
-            Span::styled(" Rename: ", base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(&rs.input, base().fg(C_WHITE).add_modifier(Modifier::BOLD)),
-            Span::styled("#", base().fg(C_GRAY)),
-            Span::styled("  (Enter confirm / Esc cancel)", base().fg(DIM)),
-        ]);
+        let line = editable_input_line(
+            " Rename: ",
+            &rs.input,
+            rs.cursor,
+            "  (Enter confirm / Esc cancel)",
+        );
         f.render_widget(Paragraph::new(line).style(base()), area);
         return;
     }
@@ -1176,7 +1223,9 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             super::app::ConfirmAction::BatchDelete(aliases) => {
                 format!("Delete {} marked profile(s)? (y/n)", aliases.len())
             }
-            super::app::ConfirmAction::ConsumeResetCard { alias, expires_at } => {
+            super::app::ConfirmAction::ConsumeResetCard {
+                alias, expires_at, ..
+            } => {
                 format!(
                     "Confirm reset card for '{alias}' expiring {expires_at}: y to use, any other key cancels"
                 )
@@ -1193,12 +1242,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     if app.search_active
         && let Some(s) = &app.search
     {
-        let line = Line::from(vec![
-            Span::styled(" /", base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
-            Span::styled(&s.query, base().fg(C_WHITE).add_modifier(Modifier::BOLD)),
-            Span::styled("#", base().fg(C_GRAY)),
-            Span::styled("  (Enter accept / Esc clear)", base().fg(DIM)),
-        ]);
+        let line = editable_input_line(" /", &s.query, s.cursor, "  (Enter accept / Esc clear)");
         f.render_widget(Paragraph::new(line).style(base()), area);
         return;
     }
@@ -1514,12 +1558,13 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
+        AccountUsageState, C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
         GLOBAL_WEEKLY_COMPACT_HEIGHT, GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT,
-        PACE_LABEL, fitted_segment_suffix, global_weekly_panel_height, meter_fill_width,
-        percent_marker_offset, plan_color, quota_pace_color, quota_table_value, render,
-        render_detail_panel, render_global_weekly_pace, render_usage_gauge, render_usage_gauges,
-        status_message_color, table_text_widths, usage_gauges_height,
+        PACE_LABEL, account_usage_state, editable_input_line, fitted_segment_suffix,
+        global_weekly_panel_height, meter_fill_width, percent_marker_offset, plan_color,
+        quota_pace_color, quota_table_value, render, render_detail_panel,
+        render_global_weekly_pace, render_usage_gauge, render_usage_gauges, status_message_color,
+        table_text_widths, usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
     use crate::tui::app::{AccountEntry, App, UsageStatus};
@@ -1622,6 +1667,98 @@ mod tests {
     fn status_message_color_distinguishes_errors_from_information() {
         assert_eq!(status_message_color(false), C_CYAN);
         assert_eq!(status_message_color(true), C_RED);
+    }
+
+    #[test]
+    fn incomplete_quota_is_unavailable_while_explicit_limits_remain_limited() {
+        let missing_windows = UsageInfo::default();
+        let missing_percent = UsageInfo {
+            primary: Some(WindowUsage::default()),
+            ..UsageInfo::default()
+        };
+        let available = UsageInfo {
+            secondary: Some(WindowUsage {
+                used_percent: Some(20.0),
+                ..WindowUsage::default()
+            }),
+            ..UsageInfo::default()
+        };
+        let exhausted = UsageInfo {
+            secondary: Some(WindowUsage {
+                used_percent: Some(100.0),
+                ..WindowUsage::default()
+            }),
+            ..UsageInfo::default()
+        };
+        let explicitly_limited = UsageInfo {
+            account_limited: true,
+            ..UsageInfo::default()
+        };
+
+        assert_eq!(
+            account_usage_state(&missing_windows),
+            AccountUsageState::Unavailable
+        );
+        assert_eq!(
+            account_usage_state(&missing_percent),
+            AccountUsageState::Unavailable
+        );
+        assert_eq!(
+            account_usage_state(&available),
+            AccountUsageState::Available
+        );
+        assert_eq!(account_usage_state(&exhausted), AccountUsageState::Limited);
+        assert_eq!(
+            account_usage_state(&explicitly_limited),
+            AccountUsageState::Limited
+        );
+    }
+
+    #[test]
+    fn account_table_renders_loaded_missing_quota_as_neutral() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "missing".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                primary: Some(WindowUsage::default()),
+                ..UsageInfo::default()
+            })),
+            is_current: false,
+        });
+        app.update_view();
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let (x, y) = (0..12)
+            .find_map(|y| {
+                row_text(terminal.backend(), y)
+                    .find("N/A")
+                    .map(|x| (x as u16, y))
+            })
+            .expect("neutral missing-quota status");
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, y))
+                .expect("status cell")
+                .fg,
+            DIM
+        );
+    }
+
+    #[test]
+    fn editable_cursor_is_inserted_at_its_unicode_character_position() {
+        let line = editable_input_line(" /", "a중b", 2, " hint");
+
+        assert_eq!(line.to_string(), " /a중#b hint");
+        assert_eq!(
+            editable_input_line(" /", "a중b", 3, "").to_string(),
+            " /a중b#"
+        );
     }
 
     fn global_summary(now: i64) -> GlobalWeeklySummary {

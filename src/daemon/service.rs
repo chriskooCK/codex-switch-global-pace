@@ -54,10 +54,19 @@ pub fn is_installed() -> bool {
 }
 
 fn effective_codex_home() -> Result<PathBuf> {
-    crate::auth::codex_auth_path()?
+    let path = crate::auth::codex_auth_path()?
         .parent()
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("Codex auth path has no parent directory"))
+        .ok_or_else(|| anyhow::anyhow!("Codex auth path has no parent directory"))?;
+    absolute_service_path(path)
+}
+
+fn effective_app_home() -> Result<PathBuf> {
+    absolute_service_path(crate::auth::app_home()?)
+}
+
+fn absolute_service_path(path: PathBuf) -> Result<PathBuf> {
+    Ok(std::path::absolute(path)?)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -136,10 +145,11 @@ fn plist_path() -> Result<PathBuf> {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn launchd_plist(exe: &str, home: &str, codex_home: &str) -> String {
+fn launchd_plist(exe: &str, home: &str, codex_home: &str, app_home: &str) -> String {
     let exe = xml_escape(exe);
     let home = xml_escape(home);
     let codex_home = xml_escape(codex_home);
+    let app_home = xml_escape(app_home);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -165,12 +175,15 @@ fn launchd_plist(exe: &str, home: &str, codex_home: &str) -> String {
         <string>{home}</string>
         <key>CODEX_HOME</key>
         <string>{codex_home}</string>
+        <key>CODEX_SWITCH_HOME</key>
+        <string>{app_home}</string>
     </dict>
 </dict>
 </plist>"#,
         exe = exe,
         home = home,
         codex_home = codex_home,
+        app_home = app_home,
         label = LAUNCHD_LABEL,
     )
 }
@@ -183,7 +196,8 @@ fn install_launchd() -> Result<()> {
         .display()
         .to_string();
     let codex_home = effective_codex_home()?.display().to_string();
-    let plist = launchd_plist(&exe, &home, &codex_home);
+    let app_home = effective_app_home()?.display().to_string();
+    let plist = launchd_plist(&exe, &home, &codex_home, &app_home);
 
     let path = plist_path()?;
     if path.exists() {
@@ -283,10 +297,11 @@ fn unit_path() -> Result<PathBuf> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn systemd_unit(exe: &str, home: &str, codex_home: &str) -> String {
+fn systemd_unit(exe: &str, home: &str, codex_home: &str, app_home: &str) -> String {
     let exe = systemd_quote(exe);
     let home = systemd_quote(&format!("HOME={home}"));
     let codex_home = systemd_quote(&format!("CODEX_HOME={codex_home}"));
+    let app_home = systemd_quote(&format!("CODEX_SWITCH_HOME={app_home}"));
     format!(
         r#"[Unit]
 Description=codex-switch-global-pace auto-switching daemon
@@ -299,6 +314,7 @@ Restart=on-failure
 RestartSec=10
 Environment={home}
 Environment={codex_home}
+Environment={app_home}
 
 [Install]
 WantedBy=default.target
@@ -306,6 +322,7 @@ WantedBy=default.target
         exe = exe,
         home = home,
         codex_home = codex_home,
+        app_home = app_home,
     )
 }
 
@@ -317,8 +334,9 @@ fn install_systemd() -> Result<()> {
         .display()
         .to_string();
     let codex_home = effective_codex_home()?.display().to_string();
+    let app_home = effective_app_home()?.display().to_string();
 
-    let unit = systemd_unit(&exe, &home, &codex_home);
+    let unit = systemd_unit(&exe, &home, &codex_home, &app_home);
 
     let path = unit_path()?;
     if path.exists() {
@@ -403,12 +421,51 @@ fn uninstall_systemd() -> Result<()> {
 // -- Windows Task Scheduler --
 
 #[cfg(any(target_os = "windows", test))]
-fn task_scheduler_command(exe: &Path, codex_home: &Path) -> String {
-    format!(
-        "cmd.exe /D /S /C \"\"set \"CODEX_HOME={}\" && \"{}\" daemon start --foreground\"\"",
-        codex_home.display().to_string().replace('"', ""),
-        exe.display().to_string().replace('"', "")
-    )
+fn task_scheduler_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("{label} is not valid Unicode: {}", path.display()))?;
+    if value.contains('%') {
+        anyhow::bail!(
+            "{label} contains '%', which Windows Task Scheduler cannot preserve safely: {}",
+            path.display()
+        );
+    }
+    if value.contains('"') || value.contains('\r') || value.contains('\n') {
+        anyhow::bail!(
+            "{label} contains an unsupported character: {}",
+            path.display()
+        );
+    }
+    Ok(value)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn cmd_set_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '^' | '&' | '|' | '<' | '>' | '(' | ')') {
+            escaped.push('^');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn task_scheduler_command(exe: &Path, codex_home: &Path, app_home: &Path) -> Result<String> {
+    let exe = task_scheduler_path("executable path", exe)?;
+    let codex_home = cmd_set_value(task_scheduler_path("CODEX_HOME", codex_home)?);
+    let app_home = cmd_set_value(task_scheduler_path("CODEX_SWITCH_HOME", app_home)?);
+    let command = format!(
+        "cmd.exe /D /S /C set CODEX_HOME={codex_home}&& set CODEX_SWITCH_HOME={app_home}&& \"{exe}\" daemon start --foreground"
+    );
+    if command.encode_utf16().count() > 262 {
+        anyhow::bail!(
+            "Windows Task Scheduler command exceeds its 262-character limit; use shorter executable, CODEX_HOME, or CODEX_SWITCH_HOME paths"
+        );
+    }
+    Ok(command)
 }
 
 #[cfg(target_os = "windows")]
@@ -449,7 +506,8 @@ fn task_scheduler_failure_message(action: &str, detail: &str) -> String {
 fn install_task_scheduler() -> Result<()> {
     let exe = std::env::current_exe()?;
     let codex_home = effective_codex_home()?;
-    let task_run = task_scheduler_command(&exe, &codex_home);
+    let app_home = effective_app_home()?;
+    let task_run = task_scheduler_command(&exe, &codex_home, &app_home)?;
 
     schtasks(
         &[
@@ -496,11 +554,21 @@ fn uninstall_task_scheduler() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LAUNCHD_LABEL, SYSTEMD_UNIT_NAME, WINDOWS_TASK_NAME, exit_code_indicates_installed,
-        launchd_plist, systemd_unit, task_scheduler_command, task_scheduler_failure_message,
-        uninstall_may_continue,
+        LAUNCHD_LABEL, SYSTEMD_UNIT_NAME, WINDOWS_TASK_NAME, absolute_service_path,
+        exit_code_indicates_installed, launchd_plist, systemd_unit, task_scheduler_command,
+        task_scheduler_failure_message, uninstall_may_continue,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn service_state_home_is_resolved_to_an_absolute_path() {
+        let relative = PathBuf::from(".").join("private-state");
+        let expected = std::path::absolute(&relative).unwrap();
+        let resolved = absolute_service_path(relative).unwrap();
+
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, expected);
+    }
 
     #[test]
     fn service_identifiers_are_project_specific() {
@@ -515,6 +583,7 @@ mod tests {
             "/usr/local/bin/codex-switch-global-pace",
             "/Users/alice",
             "/Users/alice/.codex",
+            "/Volumes/private/codex-switch",
         );
         assert!(plist.contains("<string>/usr/local/bin/codex-switch-global-pace</string>"));
         assert!(plist.contains("<string>daemon</string>"));
@@ -523,6 +592,8 @@ mod tests {
         assert!(plist.contains("<key>KeepAlive</key>"));
         assert!(plist.contains("<key>CODEX_HOME</key>"));
         assert!(plist.contains("<string>/Users/alice/.codex</string>"));
+        assert!(plist.contains("<key>CODEX_SWITCH_HOME</key>"));
+        assert!(plist.contains("<string>/Volumes/private/codex-switch</string>"));
     }
 
     #[test]
@@ -531,10 +602,12 @@ mod tests {
             "/Applications/A & B/codex-switch-global-pace",
             "/Users/a<b",
             "/Users/a&b/.codex",
+            "/Users/a&b/private",
         );
         assert!(plist.contains("/Applications/A &amp; B/codex-switch-global-pace"));
         assert!(plist.contains("/Users/a&lt;b"));
         assert!(plist.contains("/Users/a&amp;b/.codex"));
+        assert!(plist.contains("/Users/a&amp;b/private"));
     }
 
     #[test]
@@ -543,6 +616,7 @@ mod tests {
             "/usr/local/bin/codex-switch-global-pace",
             "/home/alice",
             "/home/alice/.codex",
+            "/mnt/private/codex-switch",
         );
         assert!(unit.contains(
             "ExecStart=\"/usr/local/bin/codex-switch-global-pace\" daemon start --foreground"
@@ -550,6 +624,7 @@ mod tests {
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("Environment=\"HOME=/home/alice\""));
         assert!(unit.contains("Environment=\"CODEX_HOME=/home/alice/.codex\""));
+        assert!(unit.contains("Environment=\"CODEX_SWITCH_HOME=/mnt/private/codex-switch\""));
     }
 
     #[test]
@@ -558,24 +633,83 @@ mod tests {
             r#"/opt/Codex & Tools\\codex-switch-global-pace"#,
             "/home/a & b",
             r#"/home/a & b/.codex\\custom"#,
+            r#"/home/a & b/private\\custom"#,
         );
         assert!(unit.contains(
             r#"ExecStart="/opt/Codex & Tools\\\\codex-switch-global-pace" daemon start --foreground"#
         ));
         assert!(unit.contains(r#"Environment="HOME=/home/a & b""#));
         assert!(unit.contains(r#"Environment="CODEX_HOME=/home/a & b/.codex\\\\custom""#));
+        assert!(unit.contains(r#"Environment="CODEX_SWITCH_HOME=/home/a & b/private\\\\custom""#));
     }
 
     #[test]
-    fn windows_task_scheduler_command_quotes_exe_path() {
-        let cmd = task_scheduler_command(
+    fn windows_task_scheduler_command_quotes_supported_paths() {
+        let command = task_scheduler_command(
             Path::new(r"C:\Program Files\codex-switch-global-pace.exe"),
             Path::new(r"C:\Users\A & B\.codex"),
-        );
+            Path::new(r"D:\Private & Pace\state"),
+        )
+        .unwrap();
+
         assert_eq!(
-            cmd,
-            r#"cmd.exe /D /S /C ""set "CODEX_HOME=C:\Users\A & B\.codex" && "C:\Program Files\codex-switch-global-pace.exe" daemon start --foreground"""#
+            command,
+            r#"cmd.exe /D /S /C set CODEX_HOME=C:\Users\A ^& B\.codex&& set CODEX_SWITCH_HOME=D:\Private ^& Pace\state&& "C:\Program Files\codex-switch-global-pace.exe" daemon start --foreground"#
         );
+    }
+
+    #[test]
+    fn windows_task_scheduler_rejects_expanding_or_overlong_paths() {
+        let percent_error = task_scheduler_command(
+            Path::new(r"C:\bin\codex-switch-global-pace.exe"),
+            Path::new(r"C:\Users\A\%TEMP%\.codex"),
+            Path::new(r"C:\Users\A\.codex-switch"),
+        )
+        .unwrap_err();
+        assert!(percent_error.to_string().contains("contains '%'"));
+
+        let long_home = format!(r"C:\{}", "x".repeat(300));
+        let length_error = task_scheduler_command(
+            Path::new(r"C:\bin\codex-switch-global-pace.exe"),
+            Path::new(r"C:\Users\A\.codex"),
+            Path::new(&long_home),
+        )
+        .unwrap_err();
+        assert!(length_error.to_string().contains("262-character limit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_task_scheduler_command_runs_with_the_stored_argument_shape() {
+        use std::os::windows::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let probe = PathBuf::from("daemon probe.cmd");
+        let codex_home = PathBuf::from(r"A & B\.codex");
+        let app_home = PathBuf::from(r"Private & Pace\state");
+        std::fs::write(
+            dir.path().join(&probe),
+            "@echo off\r\nset CODEX_HOME\r\nset CODEX_SWITCH_HOME\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+
+        let task_run = task_scheduler_command(&probe, &codex_home, &app_home).unwrap();
+        let command_argument = task_run
+            .strip_prefix("cmd.exe /D /S /C ")
+            .expect("TaskRun must keep cmd arguments separate from its executable");
+        let mut command = std::process::Command::new("cmd.exe");
+        command.raw_arg(format!("/D /S /C {command_argument}"));
+        let output = command.current_dir(dir.path()).output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "TaskRun={task_run:?} argument={command_argument:?} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains(&format!("CODEX_HOME={}\r\n", codex_home.display())));
+        assert!(stdout.contains(&format!("CODEX_SWITCH_HOME={}\r\n", app_home.display())));
     }
 
     #[test]

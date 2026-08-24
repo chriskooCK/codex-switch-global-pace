@@ -170,14 +170,7 @@ pub async fn consume_earliest_reset_credit(
     alias: &str,
     profile_path: &Path,
 ) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
-    let val = auth::read_auth(profile_path).map_err(ConsumeResetCreditError::not_consumed)?;
-    let (access_token, _) = auth::extract_tokens(&val);
-    let access_token = access_token
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{alias}: auth.json missing access_token"))
-        .map_err(ConsumeResetCreditError::not_consumed)?;
-    let account_id = crate::jwt::parse_account_info(&val).account_id;
-    let client = auth::build_http_client().map_err(ConsumeResetCreditError::not_consumed)?;
+    let (client, access_token, account_id) = load_consume_context(alias, profile_path)?;
 
     let (_, credits) = fetch_reset_credits(&client, &access_token, account_id.as_deref())
         .await
@@ -187,10 +180,47 @@ pub async fn consume_earliest_reset_credit(
         .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))
         .map_err(ConsumeResetCreditError::not_consumed)?;
 
-    consume_reset_credit(&client, &access_token, account_id.as_deref(), credit).await
+    send_reset_credit_consume(&client, &access_token, account_id.as_deref(), credit).await
 }
 
-async fn consume_reset_credit(
+fn load_consume_context(
+    alias: &str,
+    profile_path: &Path,
+) -> std::result::Result<(reqwest::Client, String, Option<String>), ConsumeResetCreditError> {
+    let val = auth::read_auth(profile_path).map_err(ConsumeResetCreditError::not_consumed)?;
+    let (access_token, _) = auth::extract_tokens(&val);
+    let access_token = access_token
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{alias}: auth.json missing access_token"))
+        .map_err(ConsumeResetCreditError::not_consumed)?;
+    let account_id = crate::jwt::parse_account_info(&val).account_id;
+    let client = auth::build_http_client().map_err(ConsumeResetCreditError::not_consumed)?;
+    Ok((client, access_token, account_id))
+}
+
+/// Consume the exact reset credit to which the caller obtained user consent.
+///
+/// Unlike [`consume_earliest_reset_credit`], this deliberately does not fetch
+/// the server's current list and select a new earliest card. A confirmation UI
+/// can therefore never turn consent for one card into consumption of another
+/// card when its cached list changes between confirmation and submission.
+pub async fn consume_reset_credit_by_id(
+    alias: &str,
+    profile_path: &Path,
+    credit: ResetCredit,
+) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
+    if credit.id.trim().is_empty() {
+        return Err(ConsumeResetCreditError::not_consumed(anyhow::anyhow!(
+            "{alias}: reset card is missing its id"
+        )));
+    }
+
+    let (client, access_token, account_id) = load_consume_context(alias, profile_path)?;
+
+    send_reset_credit_consume(&client, &access_token, account_id.as_deref(), credit).await
+}
+
+async fn send_reset_credit_consume(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
@@ -461,6 +491,24 @@ mod tests {
         assert_eq!(earliest_reset_credit(&credits).unwrap().id, "valid-credit");
     }
 
+    #[tokio::test]
+    async fn exact_credit_consume_rejects_an_empty_confirmed_id_before_io() {
+        let error = consume_reset_credit_by_id(
+            "account",
+            Path::new("does-not-exist"),
+            ResetCredit {
+                id: "  ".into(),
+                granted_at: None,
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.definitely_not_consumed());
+        assert!(error.to_string().contains("missing its id"));
+    }
+
     #[test]
     fn test_consume_outcome_only_accepts_reset() {
         let credit = ResetCredit {
@@ -485,8 +533,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_consume_retry_reuses_redeem_request_id() {
-        let request_ids = Arc::new(Mutex::new(Vec::<String>::new()));
-        let captured = Arc::clone(&request_ids);
+        let requests = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let captured = Arc::clone(&requests);
         let app = axum::Router::new().route(
             "/consume",
             post(move |Json(body): Json<Value>| {
@@ -497,10 +545,15 @@ mod tests {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    let credit_id = body
+                        .get("credit_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     let attempt = {
-                        let mut ids = captured.lock().unwrap();
-                        ids.push(request_id);
-                        ids.len()
+                        let mut requests = captured.lock().unwrap();
+                        requests.push((request_id, credit_id));
+                        requests.len()
                     };
                     if attempt == 1 {
                         StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -530,10 +583,15 @@ mod tests {
         server.abort();
 
         assert_eq!(result.code.as_deref(), Some("reset"));
-        let ids = request_ids.lock().unwrap();
-        assert_eq!(ids.len(), 2);
-        assert!(!ids[0].is_empty());
-        assert_eq!(ids[0], ids[1]);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(!requests[0].0.is_empty());
+        assert_eq!(requests[0].0, requests[1].0);
+        assert!(
+            requests
+                .iter()
+                .all(|(_, credit_id)| credit_id == "credit-1")
+        );
     }
 
     #[tokio::test]

@@ -119,7 +119,9 @@ Every command writes diagnostic logs to `$CODEX_SWITCH_HOME/logs/`, one file per
 - Linux uses a systemd user service; headless login should use `login --device`.
 - Windows uses Task Scheduler and requires elevated PowerShell for daemon installation. Windows Terminal or PowerShell is recommended for the TUI.
 
-> **`CODEX_SWITCH_HOME` and installed daemon services:** `daemon install` writes a service definition that forwards only `HOME` and `CODEX_HOME` into the daemon's environment. If you relocate data with `CODEX_SWITCH_HOME`, an installed service still uses the default `~/.codex-switch` unless you add the variable to the generated LaunchAgent plist, systemd unit, or Task Scheduler command yourself.
+> **`CODEX_SWITCH_HOME` and installed daemon services:** `daemon install` resolves the current state directory to an absolute path and records it as `CODEX_SWITCH_HOME` in the LaunchAgent, systemd unit, or Task Scheduler command. If you later relocate the state directory, uninstall and reinstall the daemon service from a shell using the new value.
+
+On Windows, Task Scheduler limits its command to 262 characters and expands `%NAME%` text through `cmd.exe`. Service installation therefore fails clearly if the executable, `CODEX_HOME`, or `CODEX_SWITCH_HOME` contains `%`, or if their combined task command is too long; choose shorter literal paths and run `daemon install` again.
 
 ## Next steps
 

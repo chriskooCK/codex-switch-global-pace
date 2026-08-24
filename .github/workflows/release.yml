@@ -9,10 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+
   meta:
     runs-on: ubuntu-latest
     outputs:
@@ -60,7 +67,7 @@ jobs:
           fi
 
   build:
-    needs: meta
+    needs: [quality, meta]
     env:
       RELEASE_VERSION: ${{ needs.meta.outputs.version }}
     strategy:
@@ -109,13 +116,29 @@ jobs:
         run: |
           sed -i.bak "s/^version = \".*\"/version = \"${RELEASE_VERSION}\"/" Cargo.toml
           rm -f Cargo.toml.bak
+          awk -v version="${RELEASE_VERSION}" '
+            BEGIN { package = ""; replaced = 0 }
+            { sub(/\r$/, "") }
+            /^\[\[package\]\]$/ { package = "" }
+            /^name = "/ { package = $0 }
+            package == "name = \"codex-switch-global-pace\"" && /^version = "/ {
+              print "version = \"" version "\""
+              package = ""
+              replaced += 1
+              next
+            }
+            { print }
+            END { if (replaced != 1) exit 1 }
+          ' Cargo.lock > Cargo.lock.release
+          mv Cargo.lock.release Cargo.lock
+          cargo metadata --locked --no-deps --format-version 1 > /dev/null
       - name: Build release binary
         shell: bash
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            cross build --release --target "${{ matrix.target }}"
+            cross build --release --locked --target "${{ matrix.target }}"
           else
-            cargo build --release --target "${{ matrix.target }}"
+            cargo build --release --locked --target "${{ matrix.target }}"
           fi
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -213,11 +236,6 @@ jobs:
 
           The program reuses profiles and configuration under `~/.codex-switch`.
           EOF
-      - name: Delete existing dev release
-        if: needs.meta.outputs.is_dev == 'true'
-        run: gh release delete dev --yes || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Generate dev release body
         if: needs.meta.outputs.is_dev == 'true'
         shell: bash
@@ -233,6 +251,27 @@ jobs:
 
           Version: \`${RELEASE_VERSION}\`
           EOF
+      - name: Confirm rolling tag still targets this source
+        if: needs.meta.outputs.is_dev == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/dev")
+          TAG_KIND=$(jq -r '.object.type' <<<"$TAG_OBJECT")
+          TAG_SHA=$(jq -r '.object.sha' <<<"$TAG_OBJECT")
+          if [[ "$TAG_KIND" != "commit" || "${TAG_SHA,,}" != "${GITHUB_SHA,,}" ]]; then
+            echo "dev tag moved or is not a lightweight commit tag: expected ${GITHUB_SHA}, found ${TAG_KIND}:${TAG_SHA}" >&2
+            exit 1
+          fi
+      - name: Delete existing dev release
+        if: needs.meta.outputs.is_dev == 'true'
+        run: |
+          if gh release view dev > /dev/null 2>&1; then
+            gh release delete dev --yes
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Create GitHub Release (dev)
         if: needs.meta.outputs.is_dev == 'true'
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
