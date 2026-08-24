@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,6 +17,8 @@ const SYSTEM_INSTALL_DIR: &str = "/usr/local/bin";
 const SYSTEM_INSTALL_MARKER_NAME: &str = ".codex-switch-global-pace-system-install-v1";
 const UPDATE_CACHE_NAME: &str = "global-pace-update-check.json";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
+const UPDATE_LOCK_TARGET_ENV: &str = "CS_UPDATE_LOCK_TARGET";
+const UPDATE_LOCK_READY_MARKER: &str = "codex-switch-global-pace update lock ready";
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -116,8 +118,21 @@ fn legacy_system_install_migration_hint(
     ))
 }
 
-fn canonical_executable_path(executable: PathBuf) -> PathBuf {
-    fs::canonicalize(&executable).unwrap_or(executable)
+fn canonical_executable_path(executable: PathBuf) -> Result<PathBuf> {
+    fs::canonicalize(&executable)
+        .with_context(|| format!("resolving executable path {}", executable.display()))
+}
+
+fn checked_regular_marker(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => anyhow::bail!(
+            "system-install marker is not a regular file: {}",
+            path.display()
+        ),
+        Err(err) => Err(err).with_context(|| format!("checking marker {}", path.display())),
+    }
 }
 
 pub fn ensure_legacy_system_install_migrated(
@@ -125,12 +140,15 @@ pub fn ensure_legacy_system_install_migrated(
     requested_version: Option<&str>,
 ) -> Result<()> {
     let executable =
-        canonical_executable_path(std::env::current_exe().context("locating current executable")?);
+        canonical_executable_path(std::env::current_exe().context("locating current executable")?)?;
     let platform = current_update_platform();
-    let marker_present = executable
-        .parent()
-        .map(|parent| parent.join(SYSTEM_INSTALL_MARKER_NAME).is_file())
-        .unwrap_or(false);
+    let marker_present = if platform == UpdatePlatform::Unix
+        && executable.parent() == Some(Path::new(SYSTEM_INSTALL_DIR))
+    {
+        checked_regular_marker(&Path::new(SYSTEM_INSTALL_DIR).join(SYSTEM_INSTALL_MARKER_NAME))?
+    } else {
+        false
+    };
 
     if let Some(hint) = legacy_system_install_migration_hint(
         &executable,
@@ -712,6 +730,88 @@ pub(crate) fn acquire_self_update_lease() -> Result<SelfUpdateLease> {
     Ok(SelfUpdateLease(acquire_update_lease(&executable)?))
 }
 
+fn normalize_update_lock_target(destination: &Path) -> Result<PathBuf> {
+    match fs::metadata(destination) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                anyhow::bail!(
+                    "update destination is not a regular file: {}",
+                    destination.display()
+                );
+            }
+            fs::canonicalize(destination)
+                .with_context(|| format!("resolving update destination {}", destination.display()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = destination.parent().with_context(|| {
+                format!(
+                    "update destination has no parent directory: {}",
+                    destination.display()
+                )
+            })?;
+            let file_name = destination.file_name().with_context(|| {
+                format!(
+                    "update destination has no file name: {}",
+                    destination.display()
+                )
+            })?;
+            let canonical_parent = fs::canonicalize(parent).with_context(|| {
+                format!("resolving update destination parent {}", parent.display())
+            })?;
+            let normalized = canonical_parent.join(file_name);
+
+            // Close the create-between-checks race without inventing a second
+            // lock location: if the destination appeared, resolve it exactly as
+            // the existing-file branch does.
+            match fs::metadata(&normalized) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file() {
+                        anyhow::bail!(
+                            "update destination is not a regular file: {}",
+                            normalized.display()
+                        );
+                    }
+                    fs::canonicalize(&normalized).with_context(|| {
+                        format!("resolving update destination {}", normalized.display())
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(normalized),
+                Err(error) => Err(error).with_context(|| {
+                    format!("inspecting update destination {}", normalized.display())
+                }),
+            }
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspecting update destination {}", destination.display())),
+    }
+}
+
+pub(crate) fn hold_update_lock_from_env() -> Result<()> {
+    let destination = std::env::var_os(UPDATE_LOCK_TARGET_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .with_context(|| format!("{UPDATE_LOCK_TARGET_ENV} is required"))?;
+    let destination = normalize_update_lock_target(&destination)?;
+    let _lease = acquire_update_lease(&destination)?;
+
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{UPDATE_LOCK_READY_MARKER}").context("writing update-lock ready marker")?;
+    stdout
+        .flush()
+        .context("flushing update-lock ready marker")?;
+
+    // The parent owns the lease lifetime through this pipe. EOF is the only
+    // release signal; there is no timeout or alternate lock path.
+    let mut stdin = io::stdin().lock();
+    let mut buffer = [0_u8; 1024];
+    while stdin
+        .read(&mut buffer)
+        .context("waiting for update-lock release")?
+        != 0
+    {}
+    Ok(())
+}
+
 fn acquire_update_lease(executable: &Path) -> Result<UpdateLease> {
     let lock_path = transaction_sibling_path(executable, ".self-update.lock")?;
     match fs::symlink_metadata(&lock_path) {
@@ -1264,10 +1364,17 @@ fn verify_build_provenance(
     )
 }
 
-/// Returns true if the given version string contains a pre-release component
-/// (e.g. `20260712.1.0-dev`; legacy timestamped versions also match).
+/// Returns true only for the rolling development prerelease identifier.
+///
+/// Other valid prereleases such as `-development` or `-rc.1` are independent
+/// tagged releases and must not silently opt the installation into the bare
+/// `dev` channel.
 pub fn is_dev_version(version: &str) -> bool {
-    normalize_version(version).contains("-dev")
+    let Ok(version) = Version::parse(&normalize_version(version)) else {
+        return false;
+    };
+    let prerelease = version.pre.as_str();
+    prerelease == "dev" || prerelease.starts_with("dev.")
 }
 
 pub fn detect_install_source() -> InstallSource {
@@ -1778,6 +1885,38 @@ mod tests {
             None
         );
         assert_eq!(candidate_version_line("\n20260824.7.0-dev\n"), None);
+    }
+
+    #[test]
+    fn update_lock_target_canonicalizes_existing_and_missing_destinations() {
+        let temp = tempfile::tempdir().expect("create update-lock target fixture");
+        let install_dir = temp.path().join("install");
+        fs::create_dir(&install_dir).expect("create install directory");
+
+        let existing = install_dir.join("existing-binary");
+        fs::write(&existing, b"fixture").expect("create existing binary");
+        assert_eq!(
+            normalize_update_lock_target(
+                &install_dir
+                    .join("..")
+                    .join("install")
+                    .join("existing-binary"),
+            )
+            .expect("normalize existing destination"),
+            fs::canonicalize(&existing).expect("canonicalize existing destination")
+        );
+
+        let missing = install_dir.join("new-binary");
+        assert_eq!(
+            normalize_update_lock_target(
+                &install_dir.join("..").join("install").join("new-binary"),
+            )
+            .expect("normalize missing destination"),
+            fs::canonicalize(&install_dir)
+                .expect("canonicalize install directory")
+                .join("new-binary")
+        );
+        assert!(!missing.exists());
     }
 
     #[cfg(windows)]
@@ -2303,11 +2442,16 @@ mod tests {
     }
 
     #[test]
-    fn is_dev_version_detects_prerelease() {
+    fn is_dev_version_detects_only_the_rolling_dev_identifier() {
         assert!(is_dev_version("1.2.3-dev"));
         assert!(is_dev_version("1.2.3-dev.20260408143000"));
         assert!(is_dev_version("1.2.3-dev+abc1234"));
+        assert!(is_dev_version("v1.2.3-dev"));
         assert!(!is_dev_version("1.2.3"));
+        assert!(!is_dev_version("1.2.3-development"));
+        assert!(!is_dev_version("1.2.3-rc.dev"));
+        assert!(!is_dev_version("1.2.3+dev"));
+        assert!(!is_dev_version("not-a-version-dev"));
     }
 
     #[test]
@@ -2547,7 +2691,7 @@ mod tests {
         let symlink_path = temp.path().join("codex-switch-global-pace");
         symlink(&cellar_binary, &symlink_path).expect("create Homebrew symlink");
 
-        let resolved = canonical_executable_path(symlink_path);
+        let resolved = canonical_executable_path(symlink_path).expect("resolve Homebrew symlink");
         assert!(
             resolved
                 .to_string_lossy()
@@ -2562,6 +2706,29 @@ mod tests {
                 None,
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn executable_resolution_and_system_marker_checks_fail_closed() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let missing_executable = temp.path().join("missing-executable");
+        let error = canonical_executable_path(missing_executable).unwrap_err();
+        assert!(
+            error.to_string().contains("resolving executable path"),
+            "{error:#}"
+        );
+
+        let marker = temp.path().join(SYSTEM_INSTALL_MARKER_NAME);
+        assert!(!checked_regular_marker(&marker).unwrap());
+        fs::write(&marker, b"").unwrap();
+        assert!(checked_regular_marker(&marker).unwrap());
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&marker).unwrap();
+        let error = checked_regular_marker(&marker).unwrap_err();
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{error:#}"
         );
     }
 

@@ -7,43 +7,123 @@ pub mod state;
 
 use crate::cli::DaemonCommand;
 use crate::output::{print_json, user_println};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 pub async fn dispatch(cmd: DaemonCommand, json: bool) -> Result<()> {
     match cmd {
-        DaemonCommand::Start { foreground } => start(foreground).await,
-        DaemonCommand::Stop => stop(),
-        DaemonCommand::Status => status(json),
-        DaemonCommand::Install => service::install(),
-        DaemonCommand::Uninstall => uninstall(),
+        DaemonCommand::Start {
+            foreground,
+            expected_executable,
+        } => start(foreground, expected_executable).await,
+        DaemonCommand::Stop {
+            expected_service_executable,
+        } => stop(expected_service_executable),
+        DaemonCommand::Status { installer_state } => {
+            if installer_state {
+                print_installer_state(json)
+            } else {
+                status(json)
+            }
+        }
+        DaemonCommand::Install {
+            expected_existing_executable,
+        } => service::install(expected_existing_executable),
+        DaemonCommand::Uninstall {
+            expected_executable,
+            check_owner,
+        } => uninstall(expected_executable, check_owner),
     }
 }
 
-fn uninstall() -> Result<()> {
+fn uninstall(expected_executable: Option<std::path::PathBuf>, check_owner: bool) -> Result<()> {
+    let expected_executable = validated_uninstall_owner(expected_executable)?;
+    if check_owner {
+        return Ok(());
+    }
+    let service_lease = service::acquire_service_operation_lease()?;
+    // The read-only preflight may have raced a different service command.
+    // Re-prove ownership while holding the service-operation lease before any
+    // daemon process state is changed.
+    service::validate_uninstall_owner(&expected_executable)?;
+    let previous_daemon_running = pidfile::running_pid_checked()?.is_some();
+
     #[cfg(target_os = "windows")]
     {
-        // Task Scheduler's `/End` is a forced stop. If its daemon is live,
-        // give the process the same generation-bound graceful request used by
-        // `daemon stop` before removing the task.
-        if pidfile::running_pid_checked()?.is_some() {
-            stop_detached()?;
-        } else {
-            pidfile::cleanup_pidfile()?;
-        }
-        // Re-check immediately before `service::uninstall()` reaches
-        // Task Scheduler's `/End`. Only checked PID-lock absence authorizes
-        // the service layer to reach that force-stop boundary.
-        if let Some(pid) = pidfile::running_pid_checked()? {
-            anyhow::bail!(
-                "Daemon PID {pid} still owns the PID lock after the graceful stop request; \
-                 refusing to force-terminate it during uninstall"
+        let uninstall_result = (|| {
+            // Task Scheduler's `/End` is a forced stop. If its daemon is live,
+            // give the process the same generation-bound graceful request used by
+            // `daemon stop` before removing the task.
+            if previous_daemon_running {
+                stop_detached()?;
+            } else {
+                pidfile::cleanup_pidfile()?;
+            }
+            // Re-check immediately before `service::uninstall_locked()` reaches
+            // Task Scheduler's `/End`. Only checked PID-lock absence authorizes
+            // the service layer to reach that force-stop boundary.
+            if let Some(pid) = pidfile::running_pid_checked()? {
+                anyhow::bail!(
+                    "Daemon PID {pid} still owns the PID lock after the graceful stop request; \
+                     refusing to force-terminate it during uninstall"
+                );
+            }
+            service::uninstall_locked(
+                &expected_executable,
+                previous_daemon_running,
+                &service_lease,
+            )
+        })();
+        if let Err(error) = uninstall_result {
+            let restoration = service::restore_uninstall_running_state_locked(
+                &expected_executable,
+                previous_daemon_running,
+                &service_lease,
             );
+            return match restoration {
+                Ok(()) => Err(error.context(
+                    "Windows scheduled-task uninstall failed; the prior daemon running state was restored",
+                )),
+                Err(restoration_error) => Err(error.context(format!(
+                    "Windows scheduled-task uninstall failed and prior daemon running-state restoration was incomplete: {restoration_error:#}"
+                ))),
+            };
         }
+        Ok(())
     }
-    service::uninstall()
+    #[cfg(not(target_os = "windows"))]
+    service::uninstall_locked(
+        &expected_executable,
+        previous_daemon_running,
+        &service_lease,
+    )
 }
 
-async fn start(foreground: bool) -> Result<()> {
+fn validated_uninstall_owner(
+    expected_executable: Option<std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    let expected_executable = match expected_executable {
+        Some(path) => path,
+        None => std::env::current_exe().context("locating the daemon executable for uninstall")?,
+    };
+    service::validate_expected_executable(&expected_executable)?;
+    service::validate_uninstall_owner(&expected_executable)?;
+    Ok(expected_executable)
+}
+
+pub(crate) fn check_uninstall_owner(expected_executable: Option<std::path::PathBuf>) -> Result<()> {
+    validated_uninstall_owner(expected_executable).map(|_| ())
+}
+
+async fn start(foreground: bool, expected_executable: Option<std::path::PathBuf>) -> Result<()> {
+    if let Some(expected_executable) = expected_executable.as_deref() {
+        if foreground {
+            anyhow::bail!("--expected-executable cannot be combined with --foreground");
+        }
+        #[cfg(not(target_os = "windows"))]
+        anyhow::bail!("--expected-executable is supported only on Windows");
+        #[cfg(target_os = "windows")]
+        return start_windows_installer_owned(expected_executable);
+    }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
         let _ = foreground;
@@ -79,6 +159,10 @@ async fn run_foreground() -> Result<()> {
 
 fn start_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
+    start_detached_executable(&exe)
+}
+
+fn start_detached_executable(exe: &std::path::Path) -> Result<()> {
     let mut child = std::process::Command::new(exe)
         .args(["daemon", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
@@ -89,6 +173,21 @@ fn start_detached() -> Result<()> {
     let pid = await_daemon_ready(&mut child, STARTUP_TIMEOUT)?;
     user_println(&format!("Daemon started (PID {pid})"));
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn start_windows_installer_owned(expected_executable: &std::path::Path) -> Result<()> {
+    service::validate_expected_executable(expected_executable)?;
+    let service_lease = service::acquire_service_operation_lease()?;
+    if pidfile::running_pid_checked()?.is_some() {
+        anyhow::bail!("Daemon is already running");
+    }
+    pidfile::cleanup_pidfile()?;
+    if service::is_installed_checked()? {
+        service::start_installed_locked(expected_executable, &service_lease)
+    } else {
+        start_detached_executable(expected_executable)
+    }
 }
 
 /// How long a freshly spawned daemon gets to publish its PID file.
@@ -154,7 +253,14 @@ fn await_daemon_ready(
     }
 }
 
-fn stop() -> Result<()> {
+fn stop(expected_service_executable: Option<std::path::PathBuf>) -> Result<()> {
+    if let Some(expected_executable) = expected_service_executable.as_deref() {
+        #[cfg(not(target_os = "windows"))]
+        anyhow::bail!("--expected-service-executable is supported only on Windows");
+        #[cfg(target_os = "windows")]
+        return stop_windows_installer_owned(expected_executable);
+    }
+
     #[cfg(target_os = "windows")]
     {
         // A scheduled task runs the same foreground daemon. Ask that process
@@ -178,20 +284,66 @@ fn stop() -> Result<()> {
     {
         if service::is_installed_checked()? {
             let pid = pidfile::running_pid_checked()?;
-            match service::stop_installed() {
-                Ok(()) => {
-                    wait_until_stopped_or_kill(pid)?;
-                    pidfile::cleanup_pidfile()?;
-                    return Ok(());
-                }
-                Err(err) => {
-                    tracing::warn!("Failed to stop installed daemon service: {err}");
-                }
-            }
+            service::stop_installed()?;
+            wait_until_stopped(pid)?;
+            pidfile::cleanup_pidfile()?;
+            return Ok(());
         }
 
         stop_detached()
     }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_windows_installer_owned(expected_executable: &std::path::Path) -> Result<()> {
+    service::validate_expected_executable(expected_executable)?;
+    let service_lease = service::acquire_service_operation_lease()?;
+    service::validate_uninstall_owner(expected_executable)?;
+    let service_installed = service::is_installed_checked()?;
+    let was_running = pidfile::running_pid_checked()?.is_some();
+
+    let stop_result = (|| {
+        if was_running {
+            stop_detached()?;
+        } else {
+            pidfile::cleanup_pidfile()?;
+        }
+        if service_installed {
+            service::stop_installed_locked(expected_executable, &service_lease)?;
+            pidfile::cleanup_pidfile()?;
+        }
+        if let Some(pid) = pidfile::running_pid_checked()? {
+            anyhow::bail!(
+                "Daemon PID {pid} still owns the PID lock after the installer stop boundary"
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = stop_result {
+        let restoration = (|| {
+            let running = pidfile::running_pid_checked()?.is_some();
+            if was_running && !running {
+                if service_installed {
+                    service::start_installed_locked(expected_executable, &service_lease)?;
+                } else {
+                    start_detached_executable(expected_executable)?;
+                }
+            } else if !was_running && running {
+                anyhow::bail!("daemon started while the installer stop boundary was failing");
+            }
+            if pidfile::running_pid_checked()?.is_some() != was_running {
+                anyhow::bail!("daemon running state did not match its pre-stop value");
+            }
+            Ok(())
+        })();
+        return match restoration {
+            Ok(()) => Err(error.context("installer stop failed; prior daemon state was restored")),
+            Err(restoration_error) => Err(error.context(format!(
+                "installer stop failed and prior daemon state restoration was incomplete: {restoration_error:#}"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 fn stop_detached() -> Result<()> {
@@ -208,31 +360,15 @@ fn stop_detached() -> Result<()> {
     pidfile::request_shutdown(pid)?;
     #[cfg(not(target_os = "windows"))]
     pidfile::send_sigterm(pid)?;
-    #[cfg(target_os = "windows")]
-    {
-        wait_until_stopped(Some(pid)).map_err(|err| {
-            anyhow::anyhow!(
-                "{err}. The daemon may still be finishing an in-flight credential rotation; \
-                 refusing to force-terminate it. Retry `codex-switch-global-pace daemon stop` shortly."
-            )
-        })?;
-        pidfile::cleanup_pidfile()?;
-    }
-    user_println(&format!("Sent stop signal to daemon (PID {pid})"));
+    wait_until_stopped(Some(pid)).map_err(|err| {
+        anyhow::anyhow!(
+            "{err}. The daemon may still be finishing an in-flight credential rotation; \
+             refusing to force-terminate it. Retry `codex-switch-global-pace daemon stop` shortly."
+        )
+    })?;
+    pidfile::cleanup_pidfile()?;
+    user_println(&format!("Stopped daemon (PID {pid})"));
     Ok(())
-}
-
-fn wait_until_stopped_or_kill(pid: Option<u32>) -> Result<()> {
-    match wait_until_stopped(pid) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            tracing::warn!(
-                "Daemon still running after service stop, falling back to PID stop: {err}"
-            );
-            stop_detached()?;
-            wait_until_stopped(pid)
-        }
-    }
 }
 
 fn wait_until_stopped(pid: Option<u32>) -> Result<()> {
@@ -286,11 +422,10 @@ impl SelfUpdateDaemonRestart {
         user_println("Stopping daemon before self-update...");
         if self.service_installed && !cfg!(target_os = "windows") {
             service::stop_installed()?;
-            wait_until_stopped_or_kill(self.pid)?;
-            let _ = pidfile::cleanup_pidfile();
+            wait_until_stopped(self.pid)?;
+            pidfile::cleanup_pidfile()?;
         } else {
             stop_detached()?;
-            wait_until_stopped(self.pid)?;
         }
         self.stopped = true;
         Ok(())
@@ -324,6 +459,25 @@ impl SelfUpdateDaemonRestart {
             pidfile::cleanup_pidfile()?;
         }
         Ok(())
+    }
+}
+
+pub(crate) fn print_installer_state(json: bool) -> Result<()> {
+    if json {
+        anyhow::bail!("--installer-state cannot be combined with a JSON output mode");
+    }
+    let running = pidfile::running_pid_checked()?.is_some();
+    let service_installed = service::is_installed_checked()?;
+    println!("{}", installer_state_line(running, service_installed));
+    Ok(())
+}
+
+fn installer_state_line(running: bool, service_installed: bool) -> &'static str {
+    match (running, service_installed) {
+        (true, true) => "running=true service_installed=true",
+        (true, false) => "running=true service_installed=false",
+        (false, true) => "running=false service_installed=true",
+        (false, false) => "running=false service_installed=false",
     }
 }
 
@@ -465,6 +619,49 @@ fn service_manager_name() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unsupported"
+    }
+}
+
+#[cfg(test)]
+mod installer_state_tests {
+    use super::installer_state_line;
+
+    #[test]
+    fn installer_state_has_only_four_exact_single_line_payloads() {
+        assert_eq!(
+            installer_state_line(true, true),
+            "running=true service_installed=true"
+        );
+        assert_eq!(
+            installer_state_line(true, false),
+            "running=true service_installed=false"
+        );
+        assert_eq!(
+            installer_state_line(false, true),
+            "running=false service_installed=true"
+        );
+        assert_eq!(
+            installer_state_line(false, false),
+            "running=false service_installed=false"
+        );
+        for output in [
+            installer_state_line(true, true),
+            installer_state_line(true, false),
+            installer_state_line(false, true),
+            installer_state_line(false, false),
+        ] {
+            assert!(!output.contains(['\r', '\n']));
+        }
+    }
+
+    #[test]
+    fn installer_state_rejects_json_before_any_state_probe() {
+        let error = super::print_installer_state(true)
+            .expect_err("installer state must not enter either JSON output mode");
+        assert_eq!(
+            error.to_string(),
+            "--installer-state cannot be combined with a JSON output mode"
+        );
     }
 }
 

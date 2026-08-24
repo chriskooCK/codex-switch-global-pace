@@ -210,11 +210,12 @@ fn enforce_log_size_limit(dir: &Path, today: NaiveDate, incoming: u64) -> io::Re
         }
     }
 
-    if total.saturating_add(incoming) > MAX_LOG_BYTES && current.exists() {
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&current)?
-            .set_len(0)?;
+    if total.saturating_add(incoming) > MAX_LOG_BYTES {
+        match fs::OpenOptions::new().write(true).open(&current) {
+            Ok(file) => file.set_len(0)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
     Ok(())
 }

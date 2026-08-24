@@ -1,6 +1,6 @@
 # Release process
 
-The quality gate is defined once by `.github/workflows/ci.yml`. Pushes to `dev` and pull requests targeting `dev` or `master` run tests, Clippy, and a locked build on Linux, macOS, and Windows. The Linux quality job also runs formatting, `cargo audit`, and installer syntax checks. `.github/workflows/release.yml` calls that same workflow for the exact tag commit before any release build can start, then builds only for `v*` and `dev` tag events.
+The quality gate is defined once by `.github/workflows/ci.yml`. Pushes to `dev` and pull requests targeting `dev` or `master` run tests, Clippy, and a locked build on Linux, macOS, and Windows. The Linux quality job also runs formatting, `cargo audit`, and installer syntax checks. `.github/workflows/release.yml` calls that same workflow for the exact tag commit before any release build can start, then builds only for `v*` and `dev` tag events. Stable tags are published by the workflow. A rolling `dev` run uploads one verified, attested release bundle, and `scripts/publish-dev.ps1` publishes that exact bundle from the maintainer's authenticated GitHub CLI.
 
 This document is for maintainers. Users should follow the installation and update instructions in the README and do not need to manage Git tags.
 
@@ -12,6 +12,7 @@ All of the following must be true before any release push:
 - `VERSION` contains the target base version, `Cargo.toml` matches it, and the top of `docs/CHANGELOG.md` contains the matching release section. Ordinary dev builds may keep it Unreleased; allocate the final dev candidate's stable base from the real local date before publishing it so promotion requires no edit.
 - Independent code review has no CRITICAL or HIGH findings. Authentication, update, or user-data changes also require security review.
 - The local quality gate and a real CLI smoke test pass.
+- `gh auth status` shows the intended maintainer account. Development publication needs repository push access and workflow authorization because the `dev` commit can contain workflow changes relative to the default branch.
 - `git push` has explicit authorization and the commit to publish is recorded.
 
 A development release has two gates: push the branch and wait for all three CI hosts to pass, then move the `dev` tag to trigger the Release workflow. Never move the tag while branch CI is failing.
@@ -36,7 +37,7 @@ Base versions use the SemVer-compatible `YYYYMMDD.N.0` format:
 
 | Pushed tag | Version produced by CI | GitHub Release name | Self-update channel |
 |---|---|---|---|
-| `dev` (rolling, overwritten) | `YYYYMMDD.N.0-dev` | `dev` | `--dev` |
+| `dev` (rolling, overwritten) | `YYYYMMDD.N.0-dev` | `dev (YYYYMMDD.N.0-dev)` | `--dev` |
 | `vYYYYMMDD.N.0-<suffix>` (permanent prerelease) | `YYYYMMDD.N.0-<suffix>` | Same as tag | Unavailable to the hardcoded `dev` channel |
 | `vYYYYMMDD.N.0` (stable) | `YYYYMMDD.N.0` | Same as tag | Default channel |
 
@@ -80,22 +81,49 @@ git push origin :refs/tags/dev
 # 5) Recreate the local dev tag at HEAD.
 git tag -d dev && git tag dev
 
-# 6) Push the tag to rerun the exact-source quality gate, build six locked
-#    targets, and replace the dev GitHub Release.
+# 6) Push the tag to rerun the exact-source quality gate and build the six
+#    locked targets into one verified Actions artifact.
 git push origin refs/tags/dev:refs/tags/dev
+
+# 7) Wait for that Release run to succeed, then publish its exact artifact.
+#    The script resolves the successful run by the current remote dev-tag SHA.
+pwsh -NoProfile -File ./scripts/publish-dev.ps1
 ```
 
 > Step 6 **must not use `git push origin dev`** because the branch and tag names are ambiguous. Use `refs/tags/dev:refs/tags/dev`.
 >
 > Step 2 likewise requires `refs/heads/dev:refs/heads/dev`.
 
-GitHub Actions Release builds are the only distribution source of truth; do not publish from local `target/release`. The Release job verifies every archive against its `.sha256`, then uses GitHub artifact attestations to generate a Sigstore bundle before creating a GitHub Release. Artifacts are:
+If the same commit intentionally has more than one successful Release run,
+choose the intended run explicitly with `-RunId <run-id>`; the publisher never
+guesses between them.
+
+GitHub Actions Release builds are the only distribution source of truth; `publish-dev.ps1` downloads the Actions artifact and never publishes from local `target/release`. The Release job verifies every archive against its `.sha256` and generates the Sigstore provenance bundle before uploading the development bundle. The publisher independently checks the remote tag, workflow run, exact file set, checksums, provenance, packaged version, and uploaded bytes before it exposes the new release.
 
 Release runs are serialized per tag. The workflow resolves lightweight or
-annotated stable/dev tags to their commit before creating a draft, verifies the
-tag again after uploading every asset, and only then publishes the draft. It
-checks once more across that final publication transition and deletes that exact
-Release ID if the tag moved, so a mismatched Release is never left exposed.
+annotated tags to their commit before producing any distribution bundle. Stable
+publication keeps the isolated-draft flow inside Actions. Its candidate name is
+deterministic for the stable tag, so a rerun can remove a draft left by a lost
+runner only after matching its source SHA, tag, release metadata, body marker,
+and every uploaded candidate asset; any mismatched release or ref is preserved
+and blocks publication. If the publish request commits but its response is lost,
+cleanup verifies and preserves the published release. The serialized rerun then
+recognizes that exact final release instead of deleting it as an incomplete draft.
+Development
+publication is deliberately local because GitHub's built-in Actions token cannot
+modify a Release whose target changes workflow files relative to the default
+branch. The publisher uses the maintainer's existing `gh` authentication; no
+personal token is copied into repository secrets and no permission fallback is
+attempted. A local mutex prevents overlap on one machine. Before its first
+Release mutation, the publisher also atomically creates the single remote
+`refs/tags/codex-switch-publish-dev-lock` lock as a uniquely identified annotated
+tag. Only the process that receives and verifies the successful create response
+owns that lock. An existing lock or an ambiguous create response is never stolen
+or removed automatically. While the lock is held, candidate/park release tags
+form the crash-recovery journal; rerunning the publisher verifies that journal
+byte-for-byte before it restores an interrupted cutover or continues with a new
+one. Normal exit removes only the exact lock object it created and confirms the
+ref is absent.
 
 - Linux / macOS: `.tar.gz` archives named `codex-switch-global-pace-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
 - Windows: `.zip` archives named `codex-switch-global-pace-windows-{amd64,arm64}.zip` plus `.sha256`
@@ -105,7 +133,7 @@ Release ID if the tag moved, so a mismatched Release is never left exposed.
 
 Post-release verification must confirm at least:
 
-- The GitHub Actions Release run succeeds, including all six builds and the release job.
+- The GitHub Actions Release run succeeds, including all six builds and the release job; for `dev`, `publish-dev.ps1` also completes successfully.
 - A platform archive downloaded from GitHub Releases matches its `.sha256`.
 - A current GitHub CLI verifies that archive against `codex-switch-global-pace-build-provenance.json` with the repository, `.github/workflows/release.yml`, exact tag ref, the full commit digest reached by that tag, and self-hosted runners denied.
 - The unpacked release binary reports the CI-injected version with `codex-switch-global-pace --version`.
@@ -148,6 +176,18 @@ Use `refs/heads/dev:refs/heads/dev` for the branch or `refs/tags/dev:refs/tags/d
 
 **The dev tag was pushed but CI did not run**
 Check whether the Release workflow was triggered and whether `on.push.tags` still includes `"dev"`.
+
+**The Release workflow succeeded but the dev GitHub Release did not change**
+The workflow intentionally stops after creating the verified development bundle. Run `pwsh -NoProfile -File ./scripts/publish-dev.ps1` from the repository root; it selects only a successful Release run whose source SHA still equals the remote `dev` tag.
+
+**The remote development-publication lock already exists**
+Do not rerun with a different token or delete the lock speculatively. First make
+sure no publisher process is active and inspect both the lock and any
+`dev-candidate-*` / `dev-park-*` journal releases. The lock is intentionally not
+auto-recovered after a lost create response. Once its exact annotated-tag object
+and the journal state have been reviewed, remove that one ref explicitly with
+`gh api --method DELETE repos/chriskooCK/codex-switch-global-pace/git/refs/tags/codex-switch-publish-dev-lock`,
+then rerun the publisher so journal recovery happens under a newly acquired lock.
 
 **`self-update --dev` cannot find the new build**
 The GitHub Release tag must be the lowercase literal `dev`. A separate tag such as `v20260712.1.0-dev` creates an independent prerelease that the client channel cannot see.

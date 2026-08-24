@@ -28,7 +28,7 @@ pub(crate) async fn use_cmd(alias: Option<&str>, json: bool, consume_card: bool)
     match alias {
         Some(a) => {
             profile::cmd_use(a, !json && std::io::stdin().is_terminal())?;
-            cache::set_last_used(a)?;
+            cache::set_last_used(a);
             if json {
                 print_json(&output::JsonOk {
                     ok: true,
@@ -696,7 +696,7 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
     } = outcome;
 
     profile::switch_profile(&best_alias)?;
-    cache::set_last_used(&best_alias)?;
+    cache::set_last_used(&best_alias);
 
     let path = profile::profile_auth_path(&best_alias)?;
     let info = auth::read_account_info(&path);

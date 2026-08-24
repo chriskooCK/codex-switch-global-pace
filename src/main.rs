@@ -35,6 +35,16 @@ impl std::fmt::Display for OutputAlreadyReported {
 
 impl std::error::Error for OutputAlreadyReported {}
 
+fn installer_owner_check_request(command: &Option<Commands>) -> Option<Option<std::path::PathBuf>> {
+    match command {
+        Some(Commands::Daemon(cli::DaemonCommand::Uninstall {
+            expected_executable,
+            check_owner: true,
+        })) => Some(expected_executable.clone()),
+        _ => None,
+    }
+}
+
 fn should_report_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<OutputAlreadyReported>().is_none()
 }
@@ -75,6 +85,45 @@ fn read_last_refresh(path: Result<std::path::PathBuf>) -> Option<String> {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // The installer uses this internal command solely as an OS-lock holder. It
+    // must not initialize application configuration, inspect authentication, or
+    // create logs while an installation transaction is waiting for its turn.
+    if matches!(&cli.command, Some(Commands::HoldUpdateLock)) {
+        if let Err(error) = update::hold_update_lock_from_env() {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // The release-verified installer uses this as a read-only ownership
+    // precondition. Keep it ahead of config/auth/log initialization so success
+    // has no observable side effect and failure is stderr-only.
+    if let Some(expected_executable) = installer_owner_check_request(&cli.command) {
+        if let Err(error) = daemon::check_uninstall_owner(expected_executable) {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // The direct installers require one strict state tuple without config
+    // warnings, logging initialization, or other command output. Ownership and
+    // manager-state errors remain fatal and are written only to stderr.
+    if matches!(
+        &cli.command,
+        Some(Commands::Daemon(cli::DaemonCommand::Status {
+            installer_state: true
+        }))
+    ) {
+        if let Err(error) = daemon::print_installer_state(cli.json || cli.json_pretty) {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let use_json = cli.json || cli.json_pretty;
     let message_mode = if cli.command.is_none() {
         MessageMode::Silent
@@ -154,7 +203,7 @@ async fn main() {
 
 #[cfg(test)]
 mod error_reporting_tests {
-    use super::{Cli, OutputAlreadyReported, should_report_error};
+    use super::{Cli, OutputAlreadyReported, installer_owner_check_request, should_report_error};
     use clap::Parser;
 
     #[test]
@@ -184,6 +233,41 @@ mod error_reporting_tests {
             .err()
             .expect("launch must no longer be accepted as a subcommand");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn installer_owner_check_is_selected_before_normal_dispatch() {
+        let expected = if cfg!(windows) {
+            r"C:\Program Files\codex-switch-global-pace.exe"
+        } else {
+            "/opt/codex-switch-global-pace"
+        };
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "uninstall",
+            "--expected-executable",
+            expected,
+            "--check-owner",
+        ])
+        .unwrap();
+        assert_eq!(
+            installer_owner_check_request(&cli.command),
+            Some(Some(std::path::PathBuf::from(expected)))
+        );
+
+        let actual_uninstall = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "uninstall",
+            "--expected-executable",
+            expected,
+        ])
+        .unwrap();
+        assert_eq!(
+            installer_owner_check_request(&actual_uninstall.command),
+            None
+        );
     }
 }
 
@@ -263,6 +347,7 @@ async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
                 | Some(Commands::Import { .. })
                 | Some(Commands::SelfUpdate { .. })
                 | Some(Commands::Open)
+                | Some(Commands::Daemon(_))
         );
         if should_check {
             check_auth_change()
@@ -275,6 +360,9 @@ async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
     let auth_handled = !matches!(auth_check, AuthCheckResult::NoChange);
 
     match cmd {
+        Some(Commands::HoldUpdateLock) => {
+            anyhow::bail!("internal update-lock command reached normal command dispatch")
+        }
         Some(Commands::Use {
             alias,
             consume_card,

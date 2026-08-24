@@ -1599,7 +1599,7 @@ impl App {
             let alias = entry.alias.clone();
             match switch_profile(&alias) {
                 Ok(()) => {
-                    let _ = cache::set_last_used(&alias);
+                    cache::set_last_used(&alias);
                     for a in &mut self.accounts {
                         a.is_current = a.alias == alias;
                     }

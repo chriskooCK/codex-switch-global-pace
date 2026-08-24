@@ -58,20 +58,24 @@ jobs:
       - name: Check shell installer syntax
         if: runner.os != 'Windows'
         run: bash -n scripts/install.sh
-      - name: Check PowerShell installer syntax
+      - name: Check PowerShell script syntax
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path 'scripts/install.ps1'),
-            [ref]$tokens,
-            [ref]$errors
-          ) | Out-Null
-          if ($errors.Count -gt 0) {
-            $errors | ForEach-Object { Write-Error $_ }
-            exit 1
+          foreach ($script in @('scripts/install.ps1', 'scripts/publish-dev.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object {
+                Write-Error ("{0}: {1}" -f $script, $_)
+              }
+              exit 1
+            }
           }
       - name: Run tests
         run: cargo test --all --locked

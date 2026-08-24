@@ -19,6 +19,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use fs4::FileExt;
 use serde_json::{Value, json};
 
 /// Env vars are process-global; serialize every test that touches them.
@@ -1187,6 +1188,36 @@ async fn budget_exhaustion_stops_starting_new_refreshes() {
         "refresh_second_new",
         "the rotations that were started must still be saved"
     );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn lease_contention_cannot_start_a_rotation_after_the_budget() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start_keyed_by_refresh_token(vec![rotation_for("blocked")]).await;
+    let fx = expiring_profiles_fixture(&server, &["blocked"]);
+    let lock_dir = fx._home.path().join("locks");
+    std::fs::create_dir_all(&lock_dir).unwrap();
+    let lock_path = lock_dir.join("blocked.lock");
+    let held = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+        .unwrap();
+    FileExt::lock(&held).unwrap();
+
+    let failures =
+        codex_switch::usage::refresh_expiring_tokens_within(Duration::from_millis(200)).await;
+    drop(held);
+
+    assert!(failures.is_empty());
+    assert!(
+        server.token_calls().is_empty(),
+        "a profile that became available only after the budget must not contact the auth server"
+    );
+    assert_eq!(stored_refresh_token(&fx.profiles[0]), "refresh_blocked");
     server.shutdown();
 }
 
