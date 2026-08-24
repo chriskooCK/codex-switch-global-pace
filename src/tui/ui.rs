@@ -994,7 +994,7 @@ fn detail_panel_height(app: &App) -> u16 {
             _ => None,
         })
         .unwrap_or(4);
-    gauges.saturating_add(4)
+    gauges.saturating_add(2)
 }
 
 fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -1024,7 +1024,7 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1)])
-        .margin(1)
+        .horizontal_margin(1)
         .split(inner);
 
     // Usage area
@@ -1539,7 +1539,7 @@ mod tests {
         C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, GLOBAL_WEEKLY_COMPACT_HEIGHT,
         GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT, PACE_LABEL, fitted_segment_suffix,
         global_pace_color, global_weekly_panel_height, meter_fill_width, percent_marker_offset,
-        plan_color, render_detail_panel, render_global_weekly_pace, render_usage_gauge,
+        plan_color, render, render_detail_panel, render_global_weekly_pace, render_usage_gauge,
         render_usage_gauges, status_message_color, table_text_widths, usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
@@ -1705,7 +1705,7 @@ mod tests {
             })
             .unwrap();
 
-        let account_meter_y = GLOBAL_WEEKLY_FULL_HEIGHT + 2;
+        let account_meter_y = GLOBAL_WEEKLY_FULL_HEIGHT + 1;
         DashboardGeometry {
             global_meter: meter_bounds(terminal.backend(), 1),
             account_meter: meter_bounds(terminal.backend(), account_meter_y),
@@ -2086,6 +2086,74 @@ mod tests {
         };
 
         assert_eq!(usage_gauges_height(&usage), 11);
+    }
+
+    #[test]
+    fn eighty_by_twenty_four_keeps_every_additional_quota_meter_visible() {
+        let now = crate::auth::now_unix_secs();
+        let main_weekly = WindowUsage {
+            used_percent: Some(25.0),
+            resets_at: Some(now + 6 * 24 * 60 * 60),
+            window_minutes: Some(7 * 24 * 60),
+        };
+        let spark_five_hour = WindowUsage {
+            used_percent: Some(25.0),
+            resets_at: Some(now + 2 * 60 * 60),
+            window_minutes: Some(5 * 60),
+        };
+        let spark_weekly = WindowUsage {
+            used_percent: Some(25.0),
+            resets_at: Some(now + 5 * 24 * 60 * 60),
+            window_minutes: Some(7 * 24 * 60),
+        };
+        let usage = UsageInfo {
+            secondary: Some(main_weekly),
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                metered_feature: Some("codex_bengalfox".to_string()),
+                primary: Some(spark_five_hour),
+                secondary: Some(spark_weekly),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(usage_gauges_height(&usage), 9);
+
+        let mut app = App::new();
+        app.accounts = (1..=3)
+            .map(|number| AccountEntry {
+                alias: format!("work{number}"),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::new(usage.clone())),
+                is_current: number == 1,
+            })
+            .collect();
+        app.update_view();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let rows = (0..24)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<Vec<_>>();
+        let spark_title_y = rows
+            .iter()
+            .position(|row| row.contains("GPT-5.3-Codex-Spark"))
+            .expect("Spark quota title");
+
+        assert!(rows[spark_title_y + 1].contains("5h"));
+        assert!(rows[spark_title_y + 1].contains('|'));
+        assert!(rows[spark_title_y + 2].contains(PACE_LABEL));
+        assert!(rows[spark_title_y + 3].contains("7d"));
+        assert!(rows[spark_title_y + 3].contains('|'));
+        assert!(rows[spark_title_y + 4].contains(PACE_LABEL));
+        assert_eq!(
+            meter_bounds(terminal.backend(), MIN_ACCOUNT_TABLE_HEIGHT + 1),
+            meter_bounds(
+                terminal.backend(),
+                u16::try_from(spark_title_y + 3).unwrap()
+            )
+        );
     }
 
     #[test]
