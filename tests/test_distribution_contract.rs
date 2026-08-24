@@ -653,8 +653,8 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "ReleaseRemotePublicationLock $RemoteLock",
         "The exact remote publication lock could not be released",
         "function DiscoverJournal",
-        "dev-candidate-([1-9][0-9]*)-([0-9a-f]{64})-([0-9a-f]{32})",
-        "dev-park-([1-9][0-9]*)-([1-9][0-9]*)-([0-9a-f]{64})-([0-9a-f]{32})",
+        "dev-candidate-([1-9][0-9]*)-(draft|public)-([0-9a-f]{64})-([0-9a-f]{32})",
+        "dev-park-([1-9][0-9]*)-([1-9][0-9]*)-(draft|public)-([0-9a-f]{64})-([0-9a-f]{32})",
         "Multiple development publication journals exist",
         "Park journal '$tag' does not identify its own release ID.",
         "function RecoverJournal",
@@ -668,11 +668,13 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "Prior dev release is not a mutable SHA-bound prerelease.",
         "Prior dev release drifted before candidate creation.",
         "function AssertCurrentPublicExact",
+        "function ReleaseAnyTag",
         "is already exact at $sha",
-        "dev-candidate-$oldId-$oldFingerprint-$tx",
-        "dev-park-$oldId-$($Context.CandidateId)-$oldFingerprint-$tx",
+        "dev-candidate-$oldId-$oldVisibility-$oldFingerprint-$tx",
+        "dev-park-$oldId-$($Context.CandidateId)-$oldVisibility-$oldFingerprint-$tx",
+        "OldDraft",
         "OldFingerprint",
-        "codex-switch-old-release-v1;",
+        "codex-switch-old-release-v2;",
         "AppendFingerprintField",
         "function Rollback",
         "Rollback was not safe",
@@ -730,6 +732,9 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         .and_then(|section| section.split("function AssertState").next())
         .expect("canonical old-release fingerprint function");
     for required in [
+        "[Parameter(Mandatory = $true)][bool]$OriginalDraft",
+        "codex-switch-old-release-v2;",
+        "if ($OriginalDraft) { 'draft' } else { 'public' }",
         "target_commitish",
         "name",
         "body",
@@ -744,6 +749,24 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         );
     }
     assert!(!fingerprint.contains("ConvertTo-Json"));
+    assert!(!publisher.contains("codex-switch-old-release-v1;"));
+    let candidate_state = publisher
+        .split("function AssertCandidate([hashtable]$C")
+        .nth(1)
+        .and_then(|section| section.split("function DownloadExact").next())
+        .expect("candidate staged/final state function");
+    for required in [
+        "$stagedState",
+        "$finalState",
+        "$finalState = ((Prop $R 'tag_name') -eq 'dev' -and -not [bool](Prop $R 'draft'))",
+        "Staged = $stagedState",
+        "Final = $finalState",
+    ] {
+        assert!(
+            candidate_state.contains(required),
+            "candidate state contract must contain `{required}`"
+        );
+    }
     let journal_discovery = publisher
         .split("function DiscoverJournal")
         .nth(1)
@@ -751,6 +774,7 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         .expect("dev journal discovery function");
     for required in [
         "$candidate.OldId -ne $park.OldId",
+        "$candidate.OldDraft -ne $park.OldDraft",
         "$candidate.CandidateId -ne $park.CandidateId",
         "HasCandidateJournal",
         "HasParkJournal",
@@ -768,7 +792,9 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
     for required in [
         "$oldOriginal",
         "$oldParked",
-        "if ($owned.Published)",
+        "OldDraft = [bool]$Journal.OldDraft",
+        "Fingerprint $old ([bool]$Journal.OldDraft)",
+        "if ($owned.Final)",
         "elseif (-not $Journal.HasParkJournal)",
         "AssertCandidate $context $candidateAgain.Value",
         "Rollback $context",
@@ -790,12 +816,31 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "DownloadProjection",
     );
     assert_before(rollback, "DownloadProjection", "RemoveRelease $owned.Id");
+    for required in [
+        "Fingerprint $old ([bool]$C.OldDraft)",
+        "$owned.Final",
+        "$owned.Staged",
+        "draft = [bool]$C.OldDraft",
+        "AssertState $restored.Value $C.OldId 'dev' $C.OldTarget ([bool]$C.OldDraft)",
+    ] {
+        assert!(
+            rollback.contains(required),
+            "visibility-preserving rollback must contain `{required}`"
+        );
+    }
     let idempotent = publisher
         .split("function AssertCurrentPublicExact")
         .nth(1)
         .and_then(|section| section.split("function Rollback").next())
         .expect("exact-current verification function");
-    assert_before(idempotent, "DownloadExact 'dev'", "ReleaseTag 'dev'");
+    assert_before(idempotent, "DownloadExact 'dev'", "ReleaseAnyTag 'dev'");
+    let exact_current_guard = publisher
+        .split("$current = ReleaseAnyTag 'dev'")
+        .nth(1)
+        .and_then(|section| section.split("$oldByTag = ReleaseAnyTag 'dev'").next())
+        .expect("public exact-current guard");
+    assert!(exact_current_guard.contains("AssertCurrentPublicExact $current.Value"));
+    assert!(exact_current_guard.contains("-not [bool](Prop $current.Value 'draft')"));
     assert_before(&publisher, "ExactFiles $bundle", "Create candidate draft");
     assert_before(
         &publisher,
@@ -820,26 +865,42 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
     assert_before(
         &publisher,
         "$journal = DiscoverJournal",
-        "$oldByTag = ReleaseTag 'dev'",
+        "$oldByTag = ReleaseAnyTag 'dev'",
     );
     assert_before(
         &publisher,
         "$Context.CandidateId = [long](Prop $candidate 'id')",
-        "$parkTag = \"dev-park-$oldId-$($Context.CandidateId)-$oldFingerprint-$tx\"",
+        "$parkTag = \"dev-park-$oldId-$($Context.CandidateId)-$oldVisibility-$oldFingerprint-$tx\"",
     );
     assert_before(
         &publisher,
         "DownloadExact $candidateTag $remote $local",
         "Park old dev release",
     );
-    assert_before(&publisher, "Park old dev release", "Publish candidate");
-    assert_before(&publisher, "Publish candidate", "RemoveRelease $oldId");
-    assert_before(&publisher, "RemoveRelease $oldId", "$Published = $true");
+    assert_before(&publisher, "Park old dev release", "Finalize candidate");
+    assert_before(&publisher, "Finalize candidate", "RemoveRelease $oldId");
     assert_before(
         &publisher,
-        "Final dev release ID is not the published candidate.",
-        "$Published = $true",
+        "RemoveRelease $oldId",
+        "$CutoverComplete = $true",
     );
+    assert_before(
+        &publisher,
+        "Final dev release ID is not the replacement candidate.",
+        "$CutoverComplete = $true",
+    );
+    for required in [
+        "$oldVisibility = if ($oldDraft) { 'draft' } else { 'public' }",
+        "$oldFingerprint = Fingerprint $old $oldDraft",
+        "draft = $false",
+        "AssertState $finalized $Context.CandidateId 'dev' $sha $false",
+    ] {
+        assert!(
+            publisher.contains(required),
+            "replacement transaction visibility contract must contain `{required}`"
+        );
+    }
+    assert!(!publisher.contains("Existing dev release is unexpectedly a draft."));
     let cleanup = publisher
         .rsplit("finally {")
         .next()
@@ -856,6 +917,9 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "$PublisherMutex.ReleaseMutex()",
     );
     assert!(release_docs.contains("pwsh -NoProfile -File ./scripts/publish-dev.ps1"));
+    assert!(release_docs.contains("prior `dev` release was a draft or public"));
+    assert!(release_docs.contains("successful replacement always"));
+    assert!(release_docs.contains("exact draft/public state"));
 }
 
 #[test]

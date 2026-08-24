@@ -263,7 +263,12 @@ function Pages([string]$Base, [string]$ArrayProperty) {
 }
 function AllReleases { return @(Pages "repos/$script:Repo/releases?x=1" '') }
 function ReleaseId([long]$Id) { return Maybe "repos/$script:Repo/releases/$Id" "Read release $Id" }
-function ReleaseTag([string]$Tag) { return Maybe "repos/$script:Repo/releases/tags/$Tag" "Read published release $Tag" }
+function ReleaseAnyTag([string]$Tag) {
+    $matches = @(AllReleases | Where-Object { Same (Prop $_ 'tag_name') $Tag })
+    if ($matches.Count -gt 1) { throw "Release tag '$Tag' is ambiguous." }
+    if ($matches.Count -eq 1) { return [pscustomobject]@{ Found = $true; Value = $matches[0] } }
+    return [pscustomobject]@{ Found = $false; Value = $null }
+}
 function ReleaseAssets([long]$Id) { return @(Pages "repos/$script:Repo/releases/$Id/assets?x=1" '') }
 
 function RepoBytes([string]$Path, [string]$Sha) {
@@ -305,12 +310,16 @@ function AppendFingerprintField([Text.StringBuilder]$Builder, [object]$Value) {
     [void]$Builder.Append(';')
 }
 
-function Fingerprint([object]$Release) {
+function Fingerprint(
+    [Parameter(Mandatory = $true)][object]$Release,
+    [Parameter(Mandatory = $true)][bool]$OriginalDraft
+) {
     $id = [long](Prop $Release 'id')
     $remote = @(ReleaseAssets $id | Sort-Object { [long](Prop $_ 'id') })
     $builder = New-Object Text.StringBuilder
-    [void]$builder.Append('codex-switch-old-release-v1;')
+    [void]$builder.Append('codex-switch-old-release-v2;')
     AppendFingerprintField $builder ($id.ToString([Globalization.CultureInfo]::InvariantCulture))
+    AppendFingerprintField $builder $(if ($OriginalDraft) { 'draft' } else { 'public' })
     AppendFingerprintField $builder ([string](Prop $Release 'target_commitish')).ToLowerInvariant()
     AppendFingerprintField $builder (Prop $Release 'name')
     AppendFingerprintField $builder (Prop $Release 'body')
@@ -369,15 +378,15 @@ function AssertCandidateAssets([long]$Id, [object]$Map, [switch]$Exact, [string]
 
 function AssertCandidate([hashtable]$C, [object]$R, [switch]$ExactAssets) {
     $id = [long](Prop $R 'id'); if ($C.CandidateId -and $id -ne $C.CandidateId) { throw 'Candidate release ID changed.' }
-    $draftState = ((Prop $R 'tag_name') -eq $C.CandidateTag -and [bool](Prop $R 'draft'))
-    $publicState = ((Prop $R 'tag_name') -eq 'dev' -and -not [bool](Prop $R 'draft'))
-    if (-not ($draftState -or $publicState) -or -not (SameSha (Prop $R 'target_commitish') $C.Sha) -or
+    $stagedState = ((Prop $R 'tag_name') -eq $C.CandidateTag -and [bool](Prop $R 'draft'))
+    $finalState = ((Prop $R 'tag_name') -eq 'dev' -and -not [bool](Prop $R 'draft'))
+    if (-not ($stagedState -or $finalState) -or -not (SameSha (Prop $R 'target_commitish') $C.Sha) -or
         -not (Same $R.name $C.Name) -or -not (Same $R.body $C.Body) -or -not [bool]$R.prerelease -or [bool]$R.immutable) {
         throw 'Candidate release metadata changed.'
     }
     $projection = AssertCandidateAssets $id $C.Local -Exact:([bool]$ExactAssets) `
         -ExpectedProjection $C.CandidateProjection
-    return [pscustomobject]@{ Release = $R; Id = $id; Draft = $draftState; Published = $publicState; Assets = $projection }
+    return [pscustomobject]@{ Release = $R; Id = $id; Staged = $stagedState; Final = $finalState; Assets = $projection }
 }
 
 function DownloadExact([string]$Tag, [string]$Dir, [object]$Map) {
@@ -423,20 +432,21 @@ function DiscoverJournal {
     foreach ($release in @(AllReleases)) {
         $tag = [string](Prop $release 'tag_name')
         if ($tag.StartsWith('dev-candidate', [StringComparison]::Ordinal)) {
-            if ($tag -notmatch '\Adev-candidate-([1-9][0-9]*)-([0-9a-f]{64})-([0-9a-f]{32})\z') {
+            if ($tag -notmatch '\Adev-candidate-([1-9][0-9]*)-(draft|public)-([0-9a-f]{64})-([0-9a-f]{32})\z') {
                 throw "Malformed development publication journal tag '$tag'."
             }
             $candidates += [pscustomobject]@{
                 Release = $release
                 Tag = $tag
                 OldId = [long]$Matches[1]
-                OldFingerprint = $Matches[2]
-                Tx = $Matches[3]
+                OldDraft = ($Matches[2] -eq 'draft')
+                OldFingerprint = $Matches[3]
+                Tx = $Matches[4]
                 CandidateId = [long](Prop $release 'id')
             }
         }
         elseif ($tag.StartsWith('dev-park', [StringComparison]::Ordinal)) {
-            if ($tag -notmatch '\Adev-park-([1-9][0-9]*)-([1-9][0-9]*)-([0-9a-f]{64})-([0-9a-f]{32})\z') {
+            if ($tag -notmatch '\Adev-park-([1-9][0-9]*)-([1-9][0-9]*)-(draft|public)-([0-9a-f]{64})-([0-9a-f]{32})\z') {
                 throw "Malformed development publication journal tag '$tag'."
             }
             $oldId = [long]$Matches[1]
@@ -445,8 +455,9 @@ function DiscoverJournal {
                 Tag = $tag
                 OldId = $oldId
                 CandidateId = [long]$Matches[2]
-                OldFingerprint = $Matches[3]
-                Tx = $Matches[4]
+                OldDraft = ($Matches[3] -eq 'draft')
+                OldFingerprint = $Matches[4]
+                Tx = $Matches[5]
             }
             if ([long](Prop $release 'id') -ne $oldId) {
                 throw "Park journal '$tag' does not identify its own release ID."
@@ -464,6 +475,7 @@ function DiscoverJournal {
     $source = if ($null -ne $candidate) { $candidate } else { $park }
     if ($null -ne $candidate -and $null -ne $park) {
         if ($candidate.OldId -ne $park.OldId -or
+            $candidate.OldDraft -ne $park.OldDraft -or
             -not (Same $candidate.OldFingerprint $park.OldFingerprint) -or
             -not (Same $candidate.Tx $park.Tx) -or
             $candidate.CandidateId -ne $park.CandidateId) {
@@ -472,8 +484,9 @@ function DiscoverJournal {
     }
 
     $candidateId = if ($null -ne $candidate) { $candidate.CandidateId } else { $park.CandidateId }
-    $candidateTag = "dev-candidate-$($source.OldId)-$($source.OldFingerprint)-$($source.Tx)"
-    $parkTag = "dev-park-$($source.OldId)-$candidateId-$($source.OldFingerprint)-$($source.Tx)"
+    $oldVisibility = if ($source.OldDraft) { 'draft' } else { 'public' }
+    $candidateTag = "dev-candidate-$($source.OldId)-$oldVisibility-$($source.OldFingerprint)-$($source.Tx)"
+    $parkTag = "dev-park-$($source.OldId)-$candidateId-$oldVisibility-$($source.OldFingerprint)-$($source.Tx)"
     if ($null -ne $candidate -and -not (Same $candidate.Tag $candidateTag)) {
         throw 'Development candidate journal did not round-trip exactly.'
     }
@@ -483,6 +496,7 @@ function DiscoverJournal {
     return [pscustomobject]@{
         OldId = [long]$source.OldId
         CandidateId = [long]$candidateId
+        OldDraft = [bool]$source.OldDraft
         OldFingerprint = [string]$source.OldFingerprint
         Tx = [string]$source.Tx
         CandidateTag = $candidateTag
@@ -500,17 +514,18 @@ function RecoverJournal([object]$Journal, [string]$Sha, [string]$Name, [string]$
     $oldOpt = ReleaseId $Journal.OldId
     if (-not $oldOpt.Found) { throw 'Journal old release is missing; no remote state was changed.' }
     $old = $oldOpt.Value
-    if ((Fingerprint $old) -ne $Journal.OldFingerprint) {
+    if ((Fingerprint $old ([bool]$Journal.OldDraft)) -ne $Journal.OldFingerprint) {
         throw 'Journal old release fingerprint differs; no remote state was changed.'
     }
     $oldTarget = PriorTarget $old
-    $oldOriginal = ((Prop $old 'tag_name') -eq 'dev' -and -not [bool](Prop $old 'draft'))
+    $oldOriginal = ((Prop $old 'tag_name') -eq 'dev' -and
+        [bool](Prop $old 'draft') -eq [bool]$Journal.OldDraft)
     $oldParked = ((Prop $old 'tag_name') -eq $Journal.ParkTag -and [bool](Prop $old 'draft'))
     if ($Journal.HasParkJournal -and -not $oldParked) {
         throw 'Park journal release is not the exact parked draft; no remote state was changed.'
     }
     if (-not $Journal.HasParkJournal -and -not $oldOriginal) {
-        throw 'Candidate-only journal does not have the exact prior public release; no remote state was changed.'
+        throw 'Candidate-only journal does not have the exact prior release visibility; no remote state was changed.'
     }
 
     $context = @{
@@ -528,18 +543,19 @@ function RecoverJournal([object]$Journal, [string]$Sha, [string]$Name, [string]$
         OldName = (Prop $old 'name')
         OldBody = (Prop $old 'body')
         OldPrerelease = [bool](Prop $old 'prerelease')
+        OldDraft = [bool]$Journal.OldDraft
         OldFingerprint = $Journal.OldFingerprint
     }
 
     $candidateOpt = ReleaseId $context.CandidateId
     if ($candidateOpt.Found) {
         $owned = AssertCandidate $context $candidateOpt.Value
-        if ($owned.Published) {
+        if ($owned.Final) {
             $owned = AssertCandidate $context $candidateOpt.Value -ExactAssets
             $context.CandidateExact = $true
         }
         $context.CandidateProjection = $owned.Assets
-        $downloadTag = if ($owned.Published) { 'dev' } else { $context.CandidateTag }
+        $downloadTag = if ($owned.Final) { 'dev' } else { $context.CandidateTag }
         $downloadDir = Join-Path $script:Temp "journal-assets-$($context.CandidateId)"
         DownloadProjection $downloadTag $downloadDir $Local $context.CandidateProjection
         AssertDev $Sha
@@ -577,7 +593,7 @@ function AssertCurrentPublicExact([object]$Release, [string]$Sha, [string]$Name,
     $again = ReleaseId $id
     if (-not $again.Found) { throw 'Exact current dev release disappeared during verification.' }
     AssertCandidate $context $again.Value -ExactAssets | Out-Null
-    $byTag = ReleaseTag 'dev'
+    $byTag = ReleaseAnyTag 'dev'
     if (-not $byTag.Found -or [long](Prop $byTag.Value 'id') -ne $id) {
         throw 'Exact current dev release changed identity during verification.'
     }
@@ -588,8 +604,9 @@ function Rollback([hashtable]$C) {
     if ($C.ParkTag) { AssertNoRef $C.ParkTag }
     if ($C.CandidateTag) { AssertNoRef $C.CandidateTag }
     $oldOpt = ReleaseId $C.OldId; if (-not $oldOpt.Found) { throw 'Old release is missing; preserving candidate.' }
-    $old = $oldOpt.Value; if ((Fingerprint $old) -ne $C.OldFingerprint) { throw 'Old release drifted; preserving both releases.' }
-    $oldOriginal = ((Prop $old 'tag_name') -eq 'dev' -and -not [bool](Prop $old 'draft'))
+    $old = $oldOpt.Value; if ((Fingerprint $old ([bool]$C.OldDraft)) -ne $C.OldFingerprint) { throw 'Old release drifted; preserving both releases.' }
+    $oldOriginal = ((Prop $old 'tag_name') -eq 'dev' -and
+        [bool](Prop $old 'draft') -eq [bool]$C.OldDraft)
     $oldParked = ((Prop $old 'tag_name') -eq $C.ParkTag -and [bool](Prop $old 'draft'))
     if (-not ($oldOriginal -or $oldParked)) { throw 'Old release state is unowned; preserving both releases.' }
     $candidate = FindCandidate $C
@@ -597,7 +614,7 @@ function Rollback([hashtable]$C) {
         $owned = AssertCandidate $C $candidate -ExactAssets:([bool]$C.CandidateExact)
         if (-not $C.CandidateProjection) {
             $C.CandidateProjection = $owned.Assets
-            $downloadTag = if ($owned.Published) { 'dev' } else { $C.CandidateTag }
+            $downloadTag = if ($owned.Final) { 'dev' } else { $C.CandidateTag }
             $downloadDir = Join-Path $script:Temp "rollback-assets-$($owned.Id)"
             DownloadProjection $downloadTag $downloadDir $C.Local $C.CandidateProjection
             AssertDev $C.Sha
@@ -605,36 +622,36 @@ function Rollback([hashtable]$C) {
             if (-not $candidateAgain.Found) { throw 'Candidate disappeared during rollback ownership verification.' }
             $owned = AssertCandidate $C $candidateAgain.Value -ExactAssets:([bool]$C.CandidateExact)
         }
-        $devRelease = ReleaseTag 'dev'
-        if ($owned.Published -and (-not $devRelease.Found -or [long](Prop $devRelease.Value 'id') -ne $owned.Id)) { throw 'Published dev release ownership is ambiguous.' }
-        if ($owned.Draft -and $oldParked -and $devRelease.Found) { throw 'An unrelated dev release exists.' }
-        if ($oldOriginal -and (-not $owned.Draft -or -not $devRelease.Found -or [long](Prop $devRelease.Value 'id') -ne $C.OldId)) { throw 'Old release/candidate ownership is ambiguous.' }
+        $devRelease = ReleaseAnyTag 'dev'
+        if ($owned.Final -and (-not $devRelease.Found -or [long](Prop $devRelease.Value 'id') -ne $owned.Id)) { throw 'Final dev release ownership is ambiguous.' }
+        if ($owned.Staged -and $oldParked -and $devRelease.Found) { throw 'An unrelated dev release exists.' }
+        if ($oldOriginal -and (-not $owned.Staged -or -not $devRelease.Found -or [long](Prop $devRelease.Value 'id') -ne $C.OldId)) { throw 'Old release/candidate ownership is ambiguous.' }
         AssertDev $C.Sha; RemoveRelease $owned.Id
     }
     if ($oldParked) {
-        AssertDev $C.Sha; if ((ReleaseTag 'dev').Found) { throw 'dev release is occupied; old draft was preserved.' }
+        AssertDev $C.Sha; if ((ReleaseAnyTag 'dev').Found) { throw 'dev release is occupied; parked old release was preserved.' }
         $body = [ordered]@{ tag_name = 'dev'; target_commitish = $C.OldTarget; name = $C.OldName;
-            body = $C.OldBody; draft = $false; prerelease = $C.OldPrerelease }
+            body = $C.OldBody; draft = [bool]$C.OldDraft; prerelease = $C.OldPrerelease }
         AssertRemotePublicationMutationLock
         $result = Mutate "repos/$script:Repo/releases/$($C.OldId)" 'PATCH' (Payload 'restore.json' $body) 'Restore old dev release'
         $restored = ReleaseId $C.OldId
         if (-not $restored.Found) { throw "Old release disappeared during restore: $($result.Error)" }
-        AssertState $restored.Value $C.OldId 'dev' $C.OldTarget $false
-        if ((Fingerprint $restored.Value) -ne $C.OldFingerprint) { throw 'Restored old release fingerprint differs.' }
-        $byTag = ReleaseTag 'dev'; if (-not $byTag.Found -or [long](Prop $byTag.Value 'id') -ne $C.OldId) { throw 'Old release was not restored under dev.' }
+        AssertState $restored.Value $C.OldId 'dev' $C.OldTarget ([bool]$C.OldDraft)
+        if ((Fingerprint $restored.Value ([bool]$C.OldDraft)) -ne $C.OldFingerprint) { throw 'Restored old release fingerprint differs.' }
+        $byTag = ReleaseAnyTag 'dev'; if (-not $byTag.Found -or [long](Prop $byTag.Value 'id') -ne $C.OldId) { throw 'Old release was not restored under dev.' }
         AssertDev $C.Sha
     }
     elseif ($oldOriginal) {
-        $byTag = ReleaseTag 'dev'
+        $byTag = ReleaseAnyTag 'dev'
         if (-not $byTag.Found -or [long](Prop $byTag.Value 'id') -ne $C.OldId -or
-            (Fingerprint $byTag.Value) -ne $C.OldFingerprint) {
-            throw 'Prior public dev release changed during candidate rollback.'
+            (Fingerprint $byTag.Value ([bool]$C.OldDraft)) -ne $C.OldFingerprint) {
+            throw 'Prior dev release changed during candidate rollback.'
         }
     }
 }
 
 $Context = $null
-$Published = $false
+$CutoverComplete = $false
 $RemoteLock = $null
 $RemoteLockOwned = $false
 $PendingFailure = $null
@@ -750,7 +767,7 @@ try {
         RecoverJournal $journal $sha $name $expectedBody $local
     }
 
-    $current = ReleaseTag 'dev'
+    $current = ReleaseAnyTag 'dev'
     if ($current.Found -and
         (SameSha (Prop $current.Value 'target_commitish') $sha) -and
         -not [bool](Prop $current.Value 'draft') -and
@@ -763,18 +780,19 @@ try {
         return
     }
 
-    $oldByTag = ReleaseTag 'dev'; if (-not $oldByTag.Found) { throw 'A published dev release is required for replacement.' }
+    $oldByTag = ReleaseAnyTag 'dev'; if (-not $oldByTag.Found) { throw 'A dev release is required for replacement.' }
     $old = $oldByTag.Value; $oldId = [long](Prop $old 'id')
-    if ([bool](Prop $old 'draft')) { throw 'Existing dev release is unexpectedly a draft.' }
+    $oldDraft = [bool](Prop $old 'draft')
     $oldTarget = PriorTarget $old
-    $oldFingerprint = Fingerprint $old
+    $oldFingerprint = Fingerprint $old $oldDraft
     $tx = [string]$RemoteLock.Transaction
-    $candidateTag = "dev-candidate-$oldId-$oldFingerprint-$tx"
+    $oldVisibility = if ($oldDraft) { 'draft' } else { 'public' }
+    $candidateTag = "dev-candidate-$oldId-$oldVisibility-$oldFingerprint-$tx"
     $Context = @{ Sha = $sha; CandidateTag = $candidateTag; CandidateId = 0L;
         CandidateProjection = ''; CandidateExact = $false; ParkTag = ''; Local = $local; Name = $name;
         Body = $expectedBody; OldId = $oldId; OldTarget = $oldTarget; OldName = (Prop $old 'name');
         OldBody = (Prop $old 'body'); OldPrerelease = [bool](Prop $old 'prerelease');
-        OldFingerprint = $oldFingerprint }
+        OldDraft = $oldDraft; OldFingerprint = $oldFingerprint }
     $collisions = @(AllReleases | Where-Object { (Prop $_ 'tag_name') -eq $candidateTag })
     if ($collisions.Count -ne 0) { throw 'Candidate journal tag collision.' }
     AssertNoRef $candidateTag
@@ -782,8 +800,8 @@ try {
     AssertDev $sha
     $oldBeforeCreate = ReleaseId $oldId
     if (-not $oldBeforeCreate.Found) { throw 'Prior dev release disappeared before candidate creation.' }
-    AssertState $oldBeforeCreate.Value $oldId 'dev' $oldTarget $false
-    if ((Fingerprint $oldBeforeCreate.Value) -ne $oldFingerprint) {
+    AssertState $oldBeforeCreate.Value $oldId 'dev' $oldTarget $oldDraft
+    if ((Fingerprint $oldBeforeCreate.Value $oldDraft) -ne $oldFingerprint) {
         throw 'Prior dev release drifted before candidate creation.'
     }
     $createBody = [ordered]@{ tag_name = $candidateTag; target_commitish = $sha; name = $name; body = $expectedBody; draft = $true; prerelease = $true }
@@ -793,7 +811,7 @@ try {
     $Context.CandidateId = [long](Prop $candidate 'id')
     AssertCandidate $Context $candidate | Out-Null
     AssertNoRef $candidateTag
-    $parkTag = "dev-park-$oldId-$($Context.CandidateId)-$oldFingerprint-$tx"
+    $parkTag = "dev-park-$oldId-$($Context.CandidateId)-$oldVisibility-$oldFingerprint-$tx"
     $parkCollisions = @(AllReleases | Where-Object { (Prop $_ 'tag_name') -eq $parkTag })
     if ($parkCollisions.Count -ne 0) { throw 'Park journal tag collision.' }
     AssertNoRef $parkTag
@@ -808,52 +826,59 @@ try {
     $remote = Join-Path $Temp 'remote'; DownloadExact $candidateTag $remote $local
     AssertCandidate $Context $candidate -ExactAssets | Out-Null
 
-    AssertDev $sha; AssertState (ReleaseId $oldId).Value $oldId 'dev' $oldTarget $false
-    if ((Fingerprint (ReleaseId $oldId).Value) -ne $Context.OldFingerprint) { throw 'Old release drifted before parking.' }
+    AssertDev $sha
+    $oldBeforePark = ReleaseId $oldId
+    if (-not $oldBeforePark.Found) { throw 'Prior dev release disappeared before parking.' }
+    AssertState $oldBeforePark.Value $oldId 'dev' $oldTarget $oldDraft
+    if ((Fingerprint $oldBeforePark.Value $oldDraft) -ne $Context.OldFingerprint) { throw 'Old release drifted before parking.' }
     AssertCandidate $Context (ReleaseId $Context.CandidateId).Value -ExactAssets | Out-Null
     AssertDev $sha
     AssertRemotePublicationMutationLock
     $park = Mutate "repos/$Repo/releases/$oldId" 'PATCH' (Payload 'park.json' ([ordered]@{ tag_name = $parkTag; draft = $true })) 'Park old dev release'
     $parked = (ReleaseId $oldId).Value; AssertState $parked $oldId $parkTag $oldTarget $true
-    if ((Fingerprint $parked) -ne $Context.OldFingerprint) { throw "Parking changed old release: $($park.Error)" }
-    AssertNoRef $parkTag; if ((ReleaseTag 'dev').Found) { throw 'dev release remained occupied after parking.' }
+    if ((Fingerprint $parked $oldDraft) -ne $Context.OldFingerprint) { throw "Parking changed old release: $($park.Error)" }
+    AssertNoRef $parkTag; if ((ReleaseAnyTag 'dev').Found) { throw 'dev release remained occupied after parking.' }
 
     AssertDev $sha; AssertCandidate $Context (ReleaseId $Context.CandidateId).Value -ExactAssets | Out-Null
-    if ((Fingerprint (ReleaseId $oldId).Value) -ne $Context.OldFingerprint) { throw 'Parked old release drifted.' }
+    if ((Fingerprint (ReleaseId $oldId).Value $oldDraft) -ne $Context.OldFingerprint) { throw 'Parked old release drifted.' }
     AssertDev $sha
-    $publishBody = [ordered]@{ tag_name = 'dev'; target_commitish = $sha; name = $name; body = $expectedBody; draft = $false; prerelease = $true }
+    $finalizeBody = [ordered]@{ tag_name = 'dev'; target_commitish = $sha; name = $name;
+        body = $expectedBody; draft = $false; prerelease = $true }
     AssertRemotePublicationMutationLock
-    $pub = Mutate "repos/$Repo/releases/$($Context.CandidateId)" 'PATCH' (Payload 'publish.json' $publishBody) 'Publish candidate'
-    $published = (ReleaseId $Context.CandidateId).Value; AssertState $published $Context.CandidateId 'dev' $sha $false
-    if (-not (Same $published.name $name) -or -not (Same $published.body $expectedBody) -or -not [bool]$published.prerelease) { throw "Published metadata differs: $($pub.Error)" }
-    AssertCandidate $Context $published -ExactAssets | Out-Null; AssertDev $sha; AssertNoRef $candidateTag
-    $tagRelease = ReleaseTag 'dev'; if (-not $tagRelease.Found -or [long](Prop $tagRelease.Value 'id') -ne $Context.CandidateId) { throw 'Published dev release ID is not the candidate.' }
+    $cutover = Mutate "repos/$Repo/releases/$($Context.CandidateId)" 'PATCH' `
+        (Payload 'finalize.json' $finalizeBody) 'Finalize candidate'
+    $finalized = (ReleaseId $Context.CandidateId).Value
+    AssertState $finalized $Context.CandidateId 'dev' $sha $false
+    if (-not (Same $finalized.name $name) -or -not (Same $finalized.body $expectedBody) -or
+        -not [bool]$finalized.prerelease) { throw "Finalized metadata differs: $($cutover.Error)" }
+    AssertCandidate $Context $finalized -ExactAssets | Out-Null; AssertDev $sha; AssertNoRef $candidateTag
+    $tagRelease = ReleaseAnyTag 'dev'; if (-not $tagRelease.Found -or [long](Prop $tagRelease.Value 'id') -ne $Context.CandidateId) { throw 'Final dev release ID is not the candidate.' }
 
     AssertDev $sha; AssertCandidate $Context (ReleaseId $Context.CandidateId).Value -ExactAssets | Out-Null
     $parked = (ReleaseId $oldId).Value; AssertState $parked $oldId $parkTag $oldTarget $true
-    if ((Fingerprint $parked) -ne $Context.OldFingerprint) { throw 'Parked old release drifted before cleanup.' }
+    if ((Fingerprint $parked $oldDraft) -ne $Context.OldFingerprint) { throw 'Parked old release drifted before cleanup.' }
     AssertNoRef $parkTag; AssertDev $sha; RemoveRelease $oldId; AssertDev $sha
-    $final = ReleaseTag 'dev'
+    $final = ReleaseAnyTag 'dev'
     if (-not $final.Found -or [long](Prop $final.Value 'id') -ne $Context.CandidateId) {
-        throw 'Final dev release ID is not the published candidate.'
+        throw 'Final dev release ID is not the replacement candidate.'
     }
     AssertCandidate $Context $final.Value -ExactAssets | Out-Null
     AssertDev $sha
-    $Published = $true
-    Write-Host "Published dev $version from run $($run.id) at $sha."
+    $CutoverComplete = $true
+    Write-Host "Replaced dev $version from run $($run.id) at $sha as a public prerelease; prior $oldVisibility visibility was journaled for rollback."
 }
 catch {
     $primary = $_.Exception.Message
-    if ($Published) {
-        $PendingFailure = "The new dev release is verified and was preserved; cleanup failed: $primary"
+    if ($CutoverComplete) {
+        $PendingFailure = "The replacement dev release is verified and was preserved; cleanup failed: $primary"
     }
     elseif ($Context) {
         try {
             Rollback $Context
-            $PendingFailure = "Publication failed and the exact prior release was restored: $primary"
+            $PendingFailure = "Replacement failed and the exact prior release was restored: $primary"
         }
         catch {
-            $PendingFailure = "Publication failed: $primary`nRollback was not safe; candidate '$($Context.CandidateTag)' and old release $($Context.OldId) were preserved where present: $($_.Exception.Message)"
+            $PendingFailure = "Replacement failed: $primary`nRollback was not safe; candidate '$($Context.CandidateTag)' and old release $($Context.OldId) were preserved where present: $($_.Exception.Message)"
         }
     }
     else {

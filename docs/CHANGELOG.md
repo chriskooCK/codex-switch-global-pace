@@ -46,7 +46,10 @@
   their exact tag and release ID are verified for publish. Development
   builds are preserved as one attested Actions bundle and published through a
   crash-recoverable remote journal using the maintainer's existing GitHub CLI
-  authentication without repository secrets.
+  authentication without repository secrets. That journal binds the prior
+  release's draft/public state into its fingerprint, so a verified replacement
+  is published without first exposing an old draft and any rollback restores
+  the exact prior visibility.
 
 ## v20260824.7.0 — 2026-08-24
 
