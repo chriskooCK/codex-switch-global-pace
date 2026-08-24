@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use super::popup::{PopupState, render_popup};
+use super::ui::quota_pace_color;
 
 const C_WHITE: Color = Color::Rgb(240, 240, 240);
 const DIM: Color = Color::Rgb(120, 120, 120);
@@ -101,37 +102,23 @@ pub enum MenuAction {
 
 fn quota_window_lines(
     window: &crate::usage::WindowUsage,
-    fallback_label: &str,
+    default_label: &str,
+    default_secs: i64,
 ) -> Vec<Line<'static>> {
     const BAR_WIDTH: usize = 22;
-    let label = match window.window_minutes {
-        Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
-        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
-        Some(minutes) => format!("{minutes}m"),
-        None => fallback_label.to_string(),
+    let (label, window_secs) = crate::usage::quota_window_spec(window, default_label, default_secs);
+    let used_percent = crate::usage::normalized_quota_usage(window.used_percent);
+    let (used_width, remaining) = match used_percent {
+        Some(used) => (
+            ((used / 100.0) * BAR_WIDTH as f64).round() as usize,
+            Some(100.0 - used),
+        ),
+        None => (0, None),
     };
-    let used = window.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let remaining = (100.0 - used).max(0.0);
-    let used_width = ((used / 100.0) * BAR_WIDTH as f64).round() as usize;
-    let used_color = if used >= 90.0 {
-        C_RED
-    } else if used >= 70.0 {
-        C_YELLOW
-    } else {
-        C_GREEN
-    };
-    let window_secs = window
-        .window_minutes
-        .map(|minutes| minutes.saturating_mul(60))
-        .unwrap_or_else(|| {
-            if fallback_label == "5h" {
-                crate::usage::WINDOW_5H_SECS
-            } else {
-                crate::usage::WINDOW_7D_SECS
-            }
-        });
     let pace = crate::usage::pace_percent(window, window_secs);
-    let pace_index = pace.map(|value| {
+    let marker_pace = crate::usage::visible_pace_marker(used_percent, pace);
+    let used_color = quota_pace_color(used_percent, pace);
+    let pace_index = marker_pace.map(|value| {
         ((value / 100.0) * BAR_WIDTH as f64)
             .round()
             .clamp(0.0, (BAR_WIDTH - 1) as f64) as usize
@@ -153,23 +140,13 @@ fn quota_window_lines(
         };
         spans.push(Span::styled(symbol, style));
     }
+    let remaining_text = remaining
+        .map(|value| format!("  {value:.0}% left"))
+        .unwrap_or_else(|| "  --% left".to_string());
     spans.push(Span::styled(
-        format!("  {remaining:.0}% left"),
-        Style::default().fg(if remaining <= 10.0 { C_RED } else { C_YELLOW }),
+        remaining_text,
+        Style::default().fg(used_color),
     ));
-    if let Some(pace) = pace {
-        let delta = used - pace;
-        if delta > 0.0 {
-            let seconds = ((delta * window_secs as f64 / 100.0) as i64).max(1);
-            spans.push(Span::styled(
-                format!(
-                    " · {delta:.0}% over pace · rest {}",
-                    format_duration(seconds)
-                ),
-                Style::default().fg(C_YELLOW),
-            ));
-        }
-    }
     let reset_relative = window
         .resets_at
         .map(crate::output::format_reset_time)
@@ -217,20 +194,6 @@ fn model_line_spans(model: &str, label_style: Style) -> Vec<Span<'static>> {
     spans
 }
 
-fn format_duration(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    let days = seconds / 86_400;
-    let hours = seconds % 86_400 / 3_600;
-    let minutes = seconds % 3_600 / 60;
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else {
-        format!("{}m", minutes.max(1))
-    }
-}
-
 fn quota_lines(usage: Option<&crate::usage::UsageInfo>) -> Vec<Line<'static>> {
     let Some(usage) = usage else {
         return vec![Line::from(Span::styled(
@@ -257,10 +220,18 @@ fn quota_lines(usage: Option<&crate::usage::UsageInfo>) -> Vec<Line<'static>> {
             ),
         ]));
         if let Some(window) = primary {
-            lines.extend(quota_window_lines(window, "5h"));
+            lines.extend(quota_window_lines(
+                window,
+                "5h",
+                crate::usage::WINDOW_5H_SECS,
+            ));
         }
         if let Some(window) = secondary {
-            lines.extend(quota_window_lines(window, "7d"));
+            lines.extend(quota_window_lines(
+                window,
+                "7d",
+                crate::usage::WINDOW_7D_SECS,
+            ));
         }
         if primary.is_none() && secondary.is_none() {
             lines.push(Line::from(Span::styled(
@@ -680,8 +651,8 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode, style::Color};
 
     use super::{
-        AccountMenuInfo, C_CYAN, C_GREEN, C_PURPLE, C_RED, C_YELLOW, MenuAction, MenuState,
-        model_line_spans, quota_lines,
+        AccountMenuInfo, C_CYAN, C_GREEN, C_PURPLE, C_RED, C_YELLOW, DIM, MenuAction, MenuState,
+        model_line_spans, quota_lines, quota_window_lines,
     };
     use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
@@ -772,9 +743,63 @@ mod tests {
         assert!(text.contains('┃'));
         assert!(text.contains("20% left"));
         assert!(text.contains("reset"));
-        assert!(text.contains("over pace"));
+        assert!(!text.contains('!'));
+        assert!(!text.contains("over pace"));
         assert!(!text.contains("Pace"));
         assert!(!text.contains("Rest"));
+    }
+
+    #[test]
+    fn quota_visuals_use_the_same_relative_pace_colors() {
+        let now = crate::auth::now_unix_secs();
+        let color_for = |used_percent, resets_at| {
+            let window = WindowUsage {
+                used_percent,
+                resets_at,
+                window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+            };
+            quota_window_lines(&window, "7d", crate::usage::WINDOW_7D_SECS)[0]
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == "█")
+                .and_then(|span| span.style.fg)
+        };
+
+        assert_eq!(
+            color_for(Some(20.0), Some(now + crate::usage::WINDOW_7D_SECS - 60)),
+            Some(C_YELLOW)
+        );
+        assert_eq!(
+            color_for(Some(20.0), Some(now + crate::usage::WINDOW_7D_SECS / 2)),
+            Some(C_GREEN)
+        );
+        assert_eq!(
+            color_for(Some(100.0), Some(now + crate::usage::WINDOW_7D_SECS / 2)),
+            Some(C_RED)
+        );
+        assert_eq!(color_for(Some(20.0), None), Some(DIM));
+
+        let full = WindowUsage {
+            used_percent: Some(100.0),
+            resets_at: Some(now + crate::usage::WINDOW_7D_SECS / 2),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+        assert!(
+            quota_window_lines(&full, "7d", crate::usage::WINDOW_7D_SECS)[0]
+                .spans
+                .iter()
+                .all(|span| span.content.as_ref() != "┃")
+        );
+
+        let missing = WindowUsage {
+            used_percent: None,
+            resets_at: Some(now + crate::usage::WINDOW_7D_SECS / 2),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+        let missing_text =
+            quota_window_lines(&missing, "7d", crate::usage::WINDOW_7D_SECS)[0].to_string();
+        assert!(missing_text.contains("--% left"));
+        assert!(!missing_text.contains("100% left"));
     }
 
     #[test]

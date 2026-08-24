@@ -1,5 +1,23 @@
 # Changelog
 
+## v20260824.6.0 — 2026-08-24
+
+- **Two-state pace presentation** — Removed the `!` suffix from 5h and 7d
+  quota values. Every CLI and TUI quota meter now uses the same exact relative
+  comparison: yellow when actual usage is ahead of elapsed-time pace, and green
+  when usage is at or behind pace. Fully exhausted quotas remain red and
+  unavailable comparisons remain neutral.
+- **One pace classification path** — Removed the separate 10%, 30%, 70%, and
+  90% presentation thresholds, suffix-string parsing, and duplicate popup
+  warning text. Color classification uses the raw pace value while marker-only
+  visibility stays isolated. Missing usage is represented as unavailable in
+  human and JSON output instead of being presented as `0% used / 100% left`.
+- **One window-duration path** — CLI, TUI, table, popup, and JSON rendering now
+  resolve reported window metadata through the same helper, using the explicit
+  5h or 7d slot duration only when metadata is absent. Invalid or stale windows
+  no longer receive a made-up pace; the public JSON `over_pace` field keeps its
+  existing optional-boolean shape.
+
 ## v20260824.5.0 — 2026-08-24
 
 - **Short-terminal quota detail** — Removed unused vertical padding inside the

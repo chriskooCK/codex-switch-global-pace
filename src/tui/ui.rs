@@ -13,7 +13,9 @@ use crate::jwt::PlanKind;
 use crate::output::{
     format_local_time, format_reset_short, format_reset_time, reset_credits_count,
 };
-use crate::usage::{GlobalWeeklySummary, UsageInfo, is_available};
+use crate::usage::{
+    GlobalWeeklySummary, QuotaPaceState, UsageInfo, is_available, quota_pace_state,
+};
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
@@ -23,16 +25,14 @@ const BG: Color = Color::Rgb(24, 24, 24); // near-black background
 const C_WHITE: Color = Color::Rgb(240, 240, 240); // primary text
 const C_GRAY: Color = Color::Rgb(180, 180, 180); // secondary text
 const DIM: Color = Color::Rgb(120, 120, 120); // dim labels / placeholders
-const C_RED: Color = Color::Rgb(255, 90, 90); // errors, warnings
+const C_RED: Color = Color::Rgb(255, 90, 90); // errors, exhausted quotas
 const C_GREEN: Color = Color::Rgb(80, 220, 120); // OK, active
-const C_YELLOW: Color = Color::Rgb(255, 220, 80); // keys, markers
+const C_YELLOW: Color = Color::Rgb(255, 220, 80); // keys, usage ahead of pace
 const C_CYAN: Color = Color::Rgb(100, 210, 255); // headers, prompts
 const C_MAGENTA: Color = Color::Rgb(220, 130, 255); // team plans
 const C_BLUE: Color = Color::Rgb(80, 140, 220); // borders (inactive)
 const C_HIGHLIGHT_BG: Color = Color::Rgb(55, 55, 65); // selected row bg
 
-const GLOBAL_PACE_HEALTHY_MIN: f64 = 100.0;
-const GLOBAL_PACE_WARNING_MIN: f64 = 90.0;
 const GLOBAL_WEEKLY_FULL_HEIGHT: u16 = 5;
 const GLOBAL_WEEKLY_COMPACT_HEIGHT: u16 = 1;
 const MIN_ACCOUNT_TABLE_HEIGHT: u16 = 6;
@@ -280,12 +280,12 @@ fn global_weekly_panel_height(total_height: u16, status_height: u16) -> u16 {
     }
 }
 
-fn global_pace_color(pace_percent: Option<f64>) -> Color {
-    match pace_percent {
-        Some(pace) if pace >= GLOBAL_PACE_HEALTHY_MIN => C_GREEN,
-        Some(pace) if pace >= GLOBAL_PACE_WARNING_MIN => C_YELLOW,
-        Some(_) => C_RED,
-        None => DIM,
+pub(super) fn quota_pace_color(used_percent: Option<f64>, pace_percent: Option<f64>) -> Color {
+    match quota_pace_state(used_percent, pace_percent) {
+        QuotaPaceState::Exhausted => C_RED,
+        QuotaPaceState::UsageAhead => C_YELLOW,
+        QuotaPaceState::PaceAheadOrEqual => C_GREEN,
+        QuotaPaceState::Unavailable => DIM,
     }
 }
 
@@ -321,7 +321,10 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
         width: inner.width.saturating_sub(2),
         ..inner
     };
-    let pace_color = global_pace_color(summary.pace_percent);
+    let pace_color = quota_pace_color(
+        summary.aggregate_used_percent,
+        summary.aggregate_elapsed_percent,
+    );
 
     f.render_widget(block, area);
 
@@ -337,7 +340,9 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
     ) {
         (Some(_), Some(used), Some(elapsed)) => {
             let areas = usage_bar_areas(gauge_area);
-            let marker_offset = percent_marker_offset(elapsed, areas.bar.width);
+            let marker_pace = crate::usage::visible_pace_marker(Some(used), Some(elapsed));
+            let marker_offset =
+                marker_pace.and_then(|value| percent_marker_offset(value, areas.bar.width));
             let remaining = (100.0 - used).max(0.0);
             render_usage_bar_row(
                 f,
@@ -348,7 +353,7 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
                     marker_offset,
                     areas.bar.width,
                     base().fg(pace_color),
-                    base().fg(remaining_color(remaining)),
+                    base().fg(DIM),
                     base().fg(C_WHITE).add_modifier(Modifier::BOLD),
                 ),
                 Line::from(Span::styled(
@@ -448,7 +453,10 @@ fn compact_global_weekly_line(
             Span::styled(format!("{unavailable}{suffix}"), base().fg(DIM)),
         ]);
     };
-    let pace_color = global_pace_color(Some(pace));
+    let pace_color = quota_pace_color(
+        summary.aggregate_used_percent,
+        summary.aggregate_elapsed_percent,
+    );
     let pace_text = format!("{pace:.1}%");
     let mut segments = vec![format_pace_delta_value(reserve)];
     if let Some(next) = next_reset_text(summary, now) {
@@ -706,7 +714,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 status_text,
                 status_color,
                 pct_5h,
+                pct_5h_color,
                 pct_7d,
+                pct_7d_color,
                 reset_5h,
                 reset_5h_color,
                 reset_7d,
@@ -717,7 +727,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 String,
                 Color,
                 String,
+                Color,
                 String,
+                Color,
                 String,
                 Color,
                 String,
@@ -729,7 +741,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     "--".into(),
                     DIM,
                     "--".into(),
+                    DIM,
                     "--".into(),
+                    DIM,
                     "--".into(),
                     DIM,
                     "--".into(),
@@ -741,7 +755,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     "...".into(),
                     C_YELLOW,
                     "...".into(),
+                    C_YELLOW,
                     "...".into(),
+                    C_YELLOW,
                     "loading".into(),
                     DIM,
                     "loading".into(),
@@ -753,7 +769,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                     "Error".into(),
                     C_RED,
                     "Err".into(),
+                    C_RED,
                     "Err".into(),
+                    C_RED,
                     "--".into(),
                     DIM,
                     "--".into(),
@@ -763,38 +781,10 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 UsageStatus::Loaded(u) => {
                     let refreshing = app.is_refreshing(&entry.alias);
-                    let over_5h = u.primary.as_ref().is_some_and(|w| {
-                        let used = w.used_percent.unwrap_or(0.0);
-                        // Suppress pace warning when usage is negligible — a fresh window
-                        // always shows used > pace near t=0, which is noise not a real warning.
-                        used >= 10.0
-                            && crate::usage::visible_pace_percent(w, crate::usage::WINDOW_5H_SECS)
-                                .is_some_and(|pace| used > pace)
-                    });
-                    let over_7d = u.secondary.as_ref().is_some_and(|w| {
-                        let used = w.used_percent.unwrap_or(0.0);
-                        used >= 10.0
-                            && crate::usage::visible_pace_percent(w, crate::usage::WINDOW_7D_SECS)
-                                .is_some_and(|pace| used > pace)
-                    });
-                    let p5 = u
-                        .primary
-                        .as_ref()
-                        .and_then(|w| w.used_percent)
-                        .map(|p| {
-                            let s = format!("{:.0}%", (100.0 - p).max(0.0));
-                            if over_5h { format!("{s}!") } else { s }
-                        })
-                        .unwrap_or_else(|| "--".into());
-                    let p7 = u
-                        .secondary
-                        .as_ref()
-                        .and_then(|w| w.used_percent)
-                        .map(|p| {
-                            let s = format!("{:.0}%", (100.0 - p).max(0.0));
-                            if over_7d { format!("{s}!") } else { s }
-                        })
-                        .unwrap_or_else(|| "--".into());
+                    let (p5, p5c) =
+                        quota_table_value(u.primary.as_ref(), "5h", crate::usage::WINDOW_5H_SECS);
+                    let (p7, p7c) =
+                        quota_table_value(u.secondary.as_ref(), "7d", crate::usage::WINDOW_7D_SECS);
                     let r5_ts = u.primary.as_ref().and_then(|w| w.resets_at);
                     let r5 = r5_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
                     let r5c = r5_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
@@ -808,7 +798,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             "Refresh".into(),
                             C_YELLOW,
                             p5,
+                            p5c,
                             p7,
+                            p7c,
                             r5,
                             r5c,
                             r7,
@@ -821,7 +813,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             "OK".into(),
                             C_GREEN,
                             p5,
+                            p5c,
                             p7,
+                            p7c,
                             r5,
                             r5c,
                             r7,
@@ -834,7 +828,9 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             "Limited".into(),
                             C_RED,
                             p5,
+                            p5c,
                             p7,
+                            p7c,
                             r5,
                             r5c,
                             r7,
@@ -858,8 +854,8 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                         Modifier::empty()
                     },
                 )),
-                Cell::from(pct_5h.clone()).style(usage_pct_style(&pct_5h, is_selected)),
-                Cell::from(pct_7d.clone()).style(usage_pct_style(&pct_7d, is_selected)),
+                Cell::from(pct_5h).style(usage_pct_style(pct_5h_color, is_selected)),
+                Cell::from(pct_7d).style(usage_pct_style(pct_7d_color, is_selected)),
                 Cell::from(reset_5h).style(base().fg(reset_5h_color)),
                 Cell::from(reset_7d).style(base().fg(reset_7d_color)),
                 Cell::from(reset_cards).style(base().fg(reset_cards_color)),
@@ -1080,7 +1076,7 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
             && y < area.bottom()
         {
             let (label, window_secs) =
-                quota_window_display(window, "5h", crate::usage::WINDOW_5H_SECS);
+                crate::usage::quota_window_spec(window, "5h", crate::usage::WINDOW_5H_SECS);
             render_usage_gauge(
                 f,
                 window,
@@ -1100,7 +1096,7 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
             && y < area.bottom()
         {
             let (label, window_secs) =
-                quota_window_display(window, "7d", crate::usage::WINDOW_7D_SECS);
+                crate::usage::quota_window_spec(window, "7d", crate::usage::WINDOW_7D_SECS);
             render_usage_gauge(
                 f,
                 window,
@@ -1139,23 +1135,6 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
             pool.secondary.as_ref(),
             pool.allowed == Some(false) || pool.limit_reached == Some(true),
         );
-    }
-}
-
-fn quota_window_display(
-    window: &crate::usage::WindowUsage,
-    fallback_label: &str,
-    fallback_secs: i64,
-) -> (String, i64) {
-    match window.window_minutes {
-        Some(minutes) if minutes % 1_440 == 0 => {
-            (format!("{}d", minutes / 1_440), minutes.saturating_mul(60))
-        }
-        Some(minutes) if minutes % 60 == 0 => {
-            (format!("{}h", minutes / 60), minutes.saturating_mul(60))
-        }
-        Some(minutes) => (format!("{minutes}m"), minutes.saturating_mul(60)),
-        None => (fallback_label.to_string(), fallback_secs),
     }
 }
 
@@ -1288,33 +1267,35 @@ fn render_usage_gauge(
     now: i64,
     area: Rect,
 ) {
-    let used = w.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
-    let remaining_pct = (100.0 - used).max(0.0);
-    let pace = crate::usage::visible_pace_percent(w, window_secs);
-    let over = used >= 10.0 && pace.is_some_and(|p| used > p);
-    let reset_str = w
-        .resets_at
-        .map(format_reset_time)
-        .unwrap_or_else(|| "--".into());
-    let remaining_secs = w.resets_at.map(|ts| ts - now).unwrap_or(0);
+    let used_percent = crate::usage::normalized_quota_usage(w.used_percent);
+    let (used, quota_text) = match used_percent {
+        Some(used) => (
+            used,
+            format!("  {used:>3.0}% used  {:>3.0}% left", 100.0 - used),
+        ),
+        None => (0.0, "   --% used   --% left".to_string()),
+    };
+    let pace = crate::usage::pace_percent(w, window_secs);
+    let marker_pace = crate::usage::visible_pace_marker(used_percent, pace);
+    let (reset_str, reset_style) = match w.resets_at {
+        Some(resets_at) => (
+            format_reset_time(resets_at),
+            base().fg(reset_color(resets_at - now)),
+        ),
+        None => ("--".to_string(), base().fg(DIM)),
+    };
 
     // Row 1: fixed label and metrics columns around the shared-width meter.
     let gauge_area = Rect { height: 1, ..area };
     let areas = usage_bar_areas(gauge_area);
     let bar_width = areas.bar.width;
 
-    let used_color = if used >= 90.0 {
-        C_RED
-    } else if over || used >= 70.0 {
-        C_YELLOW
-    } else {
-        C_GREEN
-    };
+    let used_color = quota_pace_color(used_percent, pace);
     let used_style = base().fg(used_color);
-    let remaining_style = base().fg(remaining_color(remaining_pct));
+    let remaining_style = base().fg(DIM);
     let pace_style = base().fg(C_WHITE).add_modifier(Modifier::BOLD);
 
-    let pace_pos = pace.and_then(|value| percent_marker_offset(value, bar_width));
+    let pace_pos = marker_pace.and_then(|value| percent_marker_offset(value, bar_width));
     let bar_line = usage_meter_line(
         used,
         pace_pos,
@@ -1324,16 +1305,12 @@ fn render_usage_gauge(
         pace_style,
     );
 
-    let suffix_color = if over { C_YELLOW } else { DIM };
     render_usage_bar_row(
         f,
         areas,
         Line::from(Span::styled(label.to_string(), base().fg(C_WHITE))),
         bar_line,
-        Line::from(Span::styled(
-            format!("  {used:>3.0}% used  {remaining_pct:>3.0}% left"),
-            base().fg(suffix_color),
-        )),
+        Line::from(Span::styled(quota_text, base().fg(used_color))),
     );
 
     // Row 2: "started HH:MM" left, "↑ pace" at pace position, "resets in ..." right
@@ -1343,11 +1320,13 @@ fn render_usage_gauge(
         ..area
     };
     let reset_text = format!("resets in {reset_str}");
-    let reset_style = base().fg(reset_color(remaining_secs));
-    let started_text = w
-        .resets_at
-        .map(|ts| format!("started {}", format_local_time(ts - window_secs)))
-        .unwrap_or_default();
+    let started_text = if window_secs > 0 {
+        w.resets_at
+            .map(|ts| format!("started {}", format_local_time(ts - window_secs)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let reset_text_width = u16::try_from(display_width(&reset_text)).unwrap_or(u16::MAX);
     let reset_width = if reset_text_width <= reset_area.width {
         reset_text_width
@@ -1389,15 +1368,24 @@ fn render_usage_gauge(
 
 // ── Style helpers ─────────────────────────────────────────
 
-/// Color for remaining percentage: green > 30%, yellow > 10%, red <= 10%
-fn remaining_color(remaining_pct: f64) -> Color {
-    if remaining_pct > 30.0 {
-        C_GREEN
-    } else if remaining_pct > 10.0 {
-        C_YELLOW
-    } else {
-        C_RED
-    }
+fn quota_table_value(
+    window: Option<&crate::usage::WindowUsage>,
+    default_label: &str,
+    default_secs: i64,
+) -> (String, Color) {
+    let Some(window) = window else {
+        return ("--".into(), DIM);
+    };
+    let Some(used) = crate::usage::normalized_quota_usage(window.used_percent) else {
+        return ("--".into(), DIM);
+    };
+    let remaining = 100.0 - used;
+    let (_, window_secs) = crate::usage::quota_window_spec(window, default_label, default_secs);
+    let pace = crate::usage::pace_percent(window, window_secs);
+    (
+        format!("{remaining:.0}%"),
+        quota_pace_color(Some(used), pace),
+    )
 }
 
 fn plan_color(plan: Option<&str>, is_selected: bool) -> Style {
@@ -1428,18 +1416,8 @@ fn reset_color(remaining_secs: i64) -> Color {
     }
 }
 
-fn usage_pct_style(remaining_pct_str: &str, is_selected: bool) -> Style {
-    let over_pace = remaining_pct_str.ends_with('!');
-    let clean = remaining_pct_str.trim_end_matches('!');
-    let fg = if over_pace {
-        C_RED
-    } else {
-        match clean.trim_end_matches('%').parse::<f64>() {
-            Ok(n) => remaining_color(n),
-            Err(_) => DIM,
-        }
-    };
-    let s = base().fg(fg);
+fn usage_pct_style(color: Color, is_selected: bool) -> Style {
+    let s = base().fg(color);
     if is_selected {
         s.add_modifier(Modifier::BOLD)
     } else {
@@ -1536,11 +1514,12 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, GLOBAL_WEEKLY_COMPACT_HEIGHT,
-        GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT, PACE_LABEL, fitted_segment_suffix,
-        global_pace_color, global_weekly_panel_height, meter_fill_width, percent_marker_offset,
-        plan_color, render, render_detail_panel, render_global_weekly_pace, render_usage_gauge,
-        render_usage_gauges, status_message_color, table_text_widths, usage_gauges_height,
+        C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
+        GLOBAL_WEEKLY_COMPACT_HEIGHT, GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT,
+        PACE_LABEL, fitted_segment_suffix, global_weekly_panel_height, meter_fill_width,
+        percent_marker_offset, plan_color, quota_pace_color, quota_table_value, render,
+        render_detail_panel, render_global_weekly_pace, render_usage_gauge, render_usage_gauges,
+        status_message_color, table_text_widths, usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
     use crate::tui::app::{AccountEntry, App, UsageStatus};
@@ -1722,11 +1701,41 @@ mod tests {
     }
 
     #[test]
-    fn global_pace_color_uses_normal_baseline_thresholds() {
-        assert_eq!(global_pace_color(Some(100.0)), C_GREEN);
-        assert_eq!(global_pace_color(Some(99.99)), C_YELLOW);
-        assert_eq!(global_pace_color(Some(90.0)), C_YELLOW);
-        assert_eq!(global_pace_color(Some(89.99)), C_RED);
+    fn quota_pace_colors_use_relative_position_only() {
+        assert_eq!(quota_pace_color(Some(1.0), Some(0.0)), C_YELLOW);
+        assert_eq!(quota_pace_color(Some(50.0), Some(50.0)), C_GREEN);
+        assert_eq!(quota_pace_color(Some(95.0), Some(99.0)), C_GREEN);
+        assert_eq!(quota_pace_color(Some(100.0), Some(50.0)), C_RED);
+        assert_eq!(quota_pace_color(Some(20.0), None), DIM);
+        assert_eq!(quota_pace_color(None, Some(20.0)), DIM);
+    }
+
+    #[test]
+    fn quota_table_values_do_not_encode_state_in_the_text() {
+        let now = crate::auth::now_unix_secs();
+        let ahead = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(now + crate::usage::WINDOW_7D_SECS - 60),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+        let behind = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(now + crate::usage::WINDOW_7D_SECS / 2),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+
+        assert_eq!(
+            quota_table_value(Some(&ahead), "7d", crate::usage::WINDOW_7D_SECS),
+            ("80%".to_string(), C_YELLOW)
+        );
+        assert_eq!(
+            quota_table_value(Some(&behind), "7d", crate::usage::WINDOW_7D_SECS),
+            ("80%".to_string(), C_GREEN)
+        );
+        assert_eq!(
+            quota_table_value(None, "7d", crate::usage::WINDOW_7D_SECS),
+            ("--".to_string(), DIM)
+        );
     }
 
     #[test]
@@ -1886,10 +1895,29 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_global_meter_hides_the_pace_marker() {
+        let now = 1_000_000;
+        let mut summary = global_summary(now);
+        summary.aggregate_used_percent = Some(100.0);
+        summary.aggregate_elapsed_percent = Some(50.0);
+        summary.pace_percent = Some(50.0);
+        summary.reserve_percent_points = Some(-50.0);
+
+        let backend = TestBackend::new(80, GLOBAL_WEEKLY_FULL_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .unwrap();
+
+        assert_eq!(symbol_x(terminal.backend(), 1, "|"), None);
+        assert_eq!(symbol_x(terminal.backend(), 2, "↑"), None);
+    }
+
+    #[test]
     fn global_pace_label_is_complete_at_every_meter_boundary() {
         let now = 1_000_000;
         for width in [40, 80, 110] {
-            for elapsed in [0.0, 50.0, 97.73, 100.0, 125.0] {
+            for elapsed in [0.0, 50.0, 97.73, 100.0] {
                 let mut summary = global_summary(now);
                 summary.aggregate_used_percent = Some(50.0);
                 summary.aggregate_elapsed_percent = Some(elapsed);

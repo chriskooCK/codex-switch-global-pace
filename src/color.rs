@@ -4,6 +4,7 @@ use owo_colors::OwoColorize;
 
 use crate::cli::ColorMode;
 use crate::jwt::PlanKind;
+use crate::usage::{QuotaPaceState, quota_pace_state};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -90,17 +91,20 @@ pub fn active(s: &str) -> String {
     }
 }
 
-/// Color a usage percentage: green < 70, yellow < 90, red >= 90
-pub fn usage_pct(s: &str, pct: f64) -> String {
+/// Color quota usage by its position relative to pace.
+pub fn usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f64>) -> String {
     if !enabled() {
         return s.to_string();
     }
-    if pct >= 90.0 {
-        format!("{}", s.red())
-    } else if pct >= 70.0 {
-        format!("{}", s.yellow())
-    } else {
-        format!("{}", s.green())
+    colored_usage_pace(s, used_percent, pace_percent)
+}
+
+fn colored_usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f64>) -> String {
+    match quota_pace_state(used_percent, pace_percent) {
+        QuotaPaceState::Exhausted => format!("{}", s.red()),
+        QuotaPaceState::UsageAhead => format!("{}", s.yellow()),
+        QuotaPaceState::PaceAheadOrEqual => format!("{}", s.green()),
+        QuotaPaceState::Unavailable => format!("{}", s.dimmed()),
     }
 }
 
@@ -154,7 +158,7 @@ fn colored_plan(label: &str, plan_type: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::colored_plan;
+    use super::{colored_plan, colored_usage_pace};
 
     #[test]
     fn plan_colors_distinguish_go_and_both_pro_tiers() {
@@ -163,5 +167,14 @@ mod tests {
         let pro = colored_plan("Pro 20×", Some("pro"));
         assert!(pro.contains("\u{1b}[93m"));
         assert!(pro.contains("\u{1b}[1m"));
+    }
+
+    #[test]
+    fn quota_colors_use_only_relative_pace_plus_real_limit_states() {
+        assert!(colored_usage_pace("x", Some(1.0), Some(0.0)).contains("\u{1b}[33m"));
+        assert!(colored_usage_pace("x", Some(50.0), Some(50.0)).contains("\u{1b}[32m"));
+        assert!(colored_usage_pace("x", Some(95.0), Some(99.0)).contains("\u{1b}[32m"));
+        assert!(colored_usage_pace("x", Some(100.0), Some(50.0)).contains("\u{1b}[31m"));
+        assert!(colored_usage_pace("x", Some(20.0), None).contains("\u{1b}[2m"));
     }
 }

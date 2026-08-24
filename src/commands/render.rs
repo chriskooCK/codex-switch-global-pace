@@ -83,19 +83,47 @@ pub(crate) fn format_reset_short_relative(w: &usage::WindowUsage) -> String {
     }
 }
 
+struct QuotaWindowParts {
+    used_percent: Option<f64>,
+    remaining_percent: Option<f64>,
+    pace_percent: Option<f64>,
+    bar: String,
+}
+
+fn quota_window_parts(
+    window: &usage::WindowUsage,
+    window_secs: i64,
+    bar_width: usize,
+) -> QuotaWindowParts {
+    let used_percent = usage::normalized_quota_usage(window.used_percent);
+    let pace_percent = usage::pace_percent(window, window_secs);
+    let marker_pace = usage::visible_pace_marker(used_percent, pace_percent);
+    let bar = match used_percent {
+        Some(used) => render_progress_bar(used, marker_pace, bar_width),
+        None => "-".repeat(bar_width),
+    };
+    QuotaWindowParts {
+        used_percent,
+        remaining_percent: used_percent.map(|used| 100.0 - used),
+        pace_percent,
+        bar,
+    }
+}
+
 /// Render one additional-limit pool's window as a compact segment, e.g.
-/// "5h [====------] 60% left". Reuses the same bar/color helpers as the
-/// primary account's usage line.
-fn pool_window_segment(label: &str, w: &usage::WindowUsage, window_secs: i64) -> String {
-    let pct = w.used_percent.unwrap_or(0.0);
-    let remaining_pct = (100.0 - pct).max(0.0);
-    let pace = usage::visible_pace_percent(w, window_secs);
-    let bar = render_progress_bar(pct, pace, 10);
+/// "5h [====------] 60% left".
+fn pool_window_segment(default_label: &str, w: &usage::WindowUsage, default_secs: i64) -> String {
+    let (label, window_secs) = usage::quota_window_spec(w, default_label, default_secs);
+    let parts = quota_window_parts(w, window_secs, 10);
+    let remaining = parts
+        .remaining_percent
+        .map(|value| format!("{value:.0}% left"))
+        .unwrap_or_else(|| "--% left".to_string());
     format!(
         "{} [{}] {}",
-        color::dim(label),
-        color::usage_pct(&bar, pct),
-        color::usage_pct(&format!("{remaining_pct:.0}% left"), pct),
+        color::dim(&label),
+        color::usage_pace(&parts.bar, parts.used_percent, parts.pace_percent),
+        color::usage_pace(&remaining, parts.used_percent, parts.pace_percent),
     )
 }
 
@@ -121,6 +149,27 @@ pub(crate) fn print_additional_pool_lines(limits: &[usage::AdditionalRateLimit])
     }
 }
 
+fn usage_window_line(
+    default_label: &str,
+    window: &usage::WindowUsage,
+    default_secs: i64,
+    bar_width: usize,
+) -> String {
+    let (label, window_secs) = usage::quota_window_spec(window, default_label, default_secs);
+    let parts = quota_window_parts(window, window_secs, bar_width);
+    let remaining = parts
+        .remaining_percent
+        .map(|value| format!("{value:>3.0}% left"))
+        .unwrap_or_else(|| " --% left".to_string());
+    let reset = format_reset_short_relative(window);
+    format!(
+        "  {label}  {}  {}   {}",
+        color::usage_pace(&parts.bar, parts.used_percent, parts.pace_percent),
+        color::usage_pace(&remaining, parts.used_percent, parts.pace_percent),
+        color::dim(&reset),
+    )
+}
+
 pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
     let width = term_width();
     // Each line: "  5h  bar  XXX% left  ~Xh" ≈ bar_width + 30
@@ -133,43 +182,15 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
     };
 
     if let Some(w) = &u.primary {
-        let pct = w.used_percent.unwrap_or(0.0);
-        let remaining_pct = (100.0 - pct).max(0.0);
-        let pace = usage::visible_pace_percent(w, usage::WINDOW_5H_SECS);
-        let over = pct >= 10.0 && pace.is_some_and(|p| pct > p);
-        let bar = render_progress_bar(pct, pace, bar_width);
-        let reset = format_reset_short_relative(w);
-        let warn = if over {
-            color::error("!")
-        } else {
-            String::new()
-        };
         println!(
-            "  5h  {}  {}{}   {}",
-            color::usage_pct(&bar, pct),
-            color::usage_pct(&format!("{remaining_pct:>3.0}% left"), pct),
-            warn,
-            color::dim(&reset),
+            "{}",
+            usage_window_line("5h", w, usage::WINDOW_5H_SECS, bar_width)
         );
     }
     if let Some(w) = &u.secondary {
-        let pct = w.used_percent.unwrap_or(0.0);
-        let remaining_pct = (100.0 - pct).max(0.0);
-        let pace = usage::visible_pace_percent(w, usage::WINDOW_7D_SECS);
-        let over = pct >= 10.0 && pace.is_some_and(|p| pct > p);
-        let bar = render_progress_bar(pct, pace, bar_width);
-        let reset = format_reset_short_relative(w);
-        let warn = if over {
-            color::error("!")
-        } else {
-            String::new()
-        };
         println!(
-            "  7d  {}  {}{}   {}",
-            color::usage_pct(&bar, pct),
-            color::usage_pct(&format!("{remaining_pct:>3.0}% left"), pct),
-            warn,
-            color::dim(&reset),
+            "{}",
+            usage_window_line("7d", w, usage::WINDOW_7D_SECS, bar_width)
         );
     }
     print_additional_pool_lines(&u.additional_limits);
@@ -189,7 +210,9 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_reset_short_relative, render_progress_bar};
+    use super::{
+        format_reset_short_relative, pool_window_segment, render_progress_bar, usage_window_line,
+    };
     use crate::usage::WindowUsage;
 
     #[test]
@@ -198,6 +221,47 @@ mod tests {
         assert_eq!(render_progress_bar(100.0, None, 10), "==========");
         assert_eq!(render_progress_bar(0.0, Some(150.0), 10), "---------|");
         assert_eq!(render_progress_bar(50.0, Some(50.0), 10), "=====|----");
+    }
+
+    #[test]
+    fn usage_lines_never_append_a_warning_suffix() {
+        let now = crate::auth::now_unix_secs();
+        let window = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(now + crate::usage::WINDOW_7D_SECS - 60),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+        let rendered = usage_window_line("7d", &window, crate::usage::WINDOW_7D_SECS, 10);
+
+        assert!(!rendered.contains('!'));
+        assert!(rendered.contains("80% left"));
+    }
+
+    #[test]
+    fn usage_lines_do_not_invent_missing_quota() {
+        let window = WindowUsage {
+            used_percent: None,
+            resets_at: Some(crate::auth::now_unix_secs() + 60),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+        let rendered = usage_window_line("7d", &window, crate::usage::WINDOW_7D_SECS, 10);
+
+        assert!(rendered.contains("--% left"));
+        assert!(!rendered.contains("100% left"));
+        assert!(!rendered.contains('|'));
+    }
+
+    #[test]
+    fn additional_pool_uses_its_reported_window_duration() {
+        let window = WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(crate::auth::now_unix_secs() + crate::usage::WINDOW_7D_SECS / 2),
+            window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+        };
+        let rendered = pool_window_segment("5h", &window, crate::usage::WINDOW_5H_SECS);
+
+        assert!(rendered.contains("7d ["));
+        assert!(!rendered.contains("5h ["));
     }
 
     fn reset_after(seconds: i64) -> WindowUsage {
