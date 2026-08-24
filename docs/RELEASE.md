@@ -130,6 +130,16 @@ exact draft/public state without temporarily publishing a prior draft. Here,
 exact recovery covers release metadata, asset identity and bytes, tag, and draft
 flag; it does not claim to restore GitHub's
 server-generated timestamps.
+The successful candidate-create response is the authoritative candidate identity:
+the publisher accepts its positive release ID only after exact metadata validation
+and an explicit empty asset set. It does not replace that response with an
+immediate release-list lookup, because GitHub's list can lag behind a successful
+create. A failed, lost, empty, invalid, or mismatched response is fail-closed: the
+publisher neither retries nor infers ownership, and any deterministic candidate
+journal created by the request is left for a serialized rerun after it becomes
+visible. A zero-asset candidate is a valid early interruption state; recovery
+verifies that exact empty projection before removing the owned candidate and
+restoring the prior release.
 Rerunning the publisher verifies that journal byte-for-byte before it restores an
 interrupted cutover or continues with a new one. Normal exit removes only the
 exact lock object it created and confirms the ref is absent.
