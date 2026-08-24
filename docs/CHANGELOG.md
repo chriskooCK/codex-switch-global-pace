@@ -1,5 +1,14 @@
 # Changelog
 
+## v20260824.3.0 — 2026-08-24
+
+- **Aligned dashboard meters** — Global Weekly Pace and every selected-account
+  quota meter now share one fixed label/value layout, so their bars start and
+  end in the same columns regardless of percentage digits, account activity,
+  or window label length. The separate 25-cell Global meter and its
+  width-dependent replacement text were removed; the shared-width Global bar
+  keeps its 100% normal divider and signed reserve display.
+
 ## v20260824.2.0 — 2026-08-24
 
 - **Leaner source tree** — Removed two unreferenced screenshots and the empty
