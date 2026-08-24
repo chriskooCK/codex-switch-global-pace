@@ -321,7 +321,7 @@ async fn daemon_start_switch_status_and_stop() {
         "stop stderr: {}",
         String::from_utf8_lossy(&stop.stderr)
     );
-    assert!(stdout(&stop).starts_with("Sent stop signal to daemon (PID "));
+    assert!(stdout(&stop).starts_with("Stopped daemon (PID "));
 
     wait_until(
         Duration::from_secs(15),
