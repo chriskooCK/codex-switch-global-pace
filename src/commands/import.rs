@@ -110,8 +110,9 @@ fn unsaveable_rotation_reason(save_error: &anyhow::Error) -> String {
 pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> Result<()> {
     let input = std::path::PathBuf::from(path);
     let files = profile::collect_import_files(&input)?;
+    let single_file_input = files.len() == 1 && files[0] == input;
 
-    if input.is_dir() {
+    if !single_file_input {
         if let Some(alias) = alias {
             anyhow::bail!(
                 "alias '{alias}' can only be used when importing a single file, not a directory"
@@ -122,7 +123,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
         }
     }
 
-    if files.len() == 1 && input.is_file() {
+    if single_file_input {
         let imported = match import_one_file(&files[0], alias).await {
             Ok(imported) => imported,
             Err(failure) => anyhow::bail!("{}: {}", failure.stage, failure.error),

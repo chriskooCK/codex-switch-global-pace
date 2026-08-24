@@ -236,6 +236,57 @@ fn json_use_keeps_stdout_machine_readable() {
 }
 
 #[test]
+fn use_reports_success_after_the_profile_commit_even_if_selection_cache_is_malformed() {
+    let home = temp_home("use-malformed-selection-cache");
+    write_json(
+        home.join(".codex-switch/profiles/alice/auth.json"),
+        &auth_json("alice@example.com", "acct_alice"),
+    );
+    write_json(
+        home.join(".codex-switch/profiles/bob/auth.json"),
+        &auth_json("bob@example.com", "acct_bob"),
+    );
+    write_json(
+        home.join(".codex/auth.json"),
+        &auth_json("bob@example.com", "acct_bob"),
+    );
+    fs::write(home.join(".codex-switch/current"), "bob").unwrap();
+    fs::write(home.join(".codex-switch/cache.json"), "not-json").unwrap();
+
+    let output = run(&home, &["--json", "use", "alice"]);
+
+    assert!(
+        output.status.success(),
+        "a committed profile switch must not be reported as failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({"ok": true, "alias": "alice", "action": "switched"})
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".codex-switch/current")).unwrap(),
+        "alice"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".codex-switch/cache.json")).unwrap(),
+        "not-json",
+        "selection metadata must not overwrite unreadable cache state"
+    );
+
+    let live: Value = serde_json::from_slice(
+        &fs::read(home.join(".codex/auth.json")).expect("live auth after profile switch"),
+    )
+    .unwrap();
+    assert_eq!(
+        live.pointer("/tokens/account_id").and_then(Value::as_str),
+        Some("acct_alice")
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn json_use_rejects_untracked_live_auth_without_prompting() {
     let home = temp_home("json-use-untracked");
     write_json(

@@ -619,7 +619,10 @@ where
                         crate::auth::redact_sensitive_log_body(&body)
                     );
                     let mut usage = parse_usage_checked(&body)?;
-                    enrich_reset_credits(alias, &client, &bearer, account_id, &mut usage).await;
+                    enrich_reset_credits(
+                        alias, &client, &bearer, account_id, is_fedramp, &mut usage,
+                    )
+                    .await;
                     return Ok(usage);
                 }
                 anyhow::bail!("Usage API failed (HTTP {status}) after proactive token refresh");
@@ -660,7 +663,15 @@ where
             crate::auth::redact_sensitive_log_body(&body)
         );
         let mut usage = parse_usage_checked(&body)?;
-        enrich_reset_credits(alias, &client, access_token, account_id, &mut usage).await;
+        enrich_reset_credits(
+            alias,
+            &client,
+            access_token,
+            account_id,
+            is_fedramp,
+            &mut usage,
+        )
+        .await;
         return Ok(usage);
     }
 
@@ -701,7 +712,10 @@ where
                         )
                     })?;
                     let mut usage = parse_usage_checked(&body)?;
-                    enrich_reset_credits(alias, &client, &bearer, account_id, &mut usage).await;
+                    enrich_reset_credits(
+                        alias, &client, &bearer, account_id, is_fedramp, &mut usage,
+                    )
+                    .await;
                     return Ok(usage);
                 }
                 anyhow::bail!("Usage API still failed (HTTP {status2}) after token refresh");
@@ -934,6 +948,34 @@ fn profile_still_holds_refresh_token(profile_path: &Path, presented: &str) -> bo
         == Some(presented)
 }
 
+fn opportunistic_start_budget_remaining(deadline: tokio::time::Instant) -> bool {
+    tokio::time::Instant::now() < deadline
+}
+
+#[cfg(test)]
+type BeforeOpportunisticRequestHook = Box<dyn FnOnce(tokio::time::Instant) + Send>;
+
+#[cfg(test)]
+fn before_opportunistic_request_hook()
+-> &'static std::sync::Mutex<Option<BeforeOpportunisticRequestHook>> {
+    static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<BeforeOpportunisticRequestHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_before_opportunistic_request_hook(hook: impl FnOnce(tokio::time::Instant) + Send + 'static) {
+    *before_opportunistic_request_hook().lock().unwrap() = Some(Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_before_opportunistic_request_hook(deadline: tokio::time::Instant) {
+    let hook = before_opportunistic_request_hook().lock().unwrap().take();
+    if let Some(hook) = hook {
+        hook(deadline);
+    }
+}
+
 /// Opportunistically refresh tokens that are about to expire.
 ///
 /// Refresh *failures* are logged, not propagated. A memorable terminal
@@ -947,8 +989,8 @@ pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
 
 /// As [`refresh_expiring_tokens`], with an explicit start budget.
 ///
-/// `budget` bounds how long this keeps **opening** new rotations; it is never a
-/// deadline for the ones already open. `refresh_token` is single-use: as soon as
+/// `budget` bounds how long this may wait for a profile lease and **open** new
+/// rotations; it is never a deadline for the ones already open. `refresh_token` is single-use: as soon as
 /// a request reaches the auth server the presented token is dead and its
 /// replacement exists only in that one response. Abandoning the request — which
 /// is what a `timeout` around the join loop does, since `JoinSet::drop` aborts
@@ -1047,25 +1089,49 @@ pub async fn refresh_expiring_tokens_within(
 
     // Start refreshes while the budget lasts, then wait for every started one:
     // an in-flight rotation is not cancellable without losing the credential.
-    let started_at = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + budget;
     let mut queued = candidates.into_iter();
     let mut tasks = tokio::task::JoinSet::new();
     let mut failures = Vec::new();
 
     loop {
-        while tasks.len() < OPPORTUNISTIC_REFRESH_CONCURRENCY && started_at.elapsed() < budget {
+        while tasks.len() < OPPORTUNISTIC_REFRESH_CONCURRENCY
+            && tokio::time::Instant::now() < deadline
+        {
             let Some((alias, path, rt, exp)) = queued.next() else {
                 break;
             };
             let client = client.clone();
             tasks.spawn(async move {
-                let lease = match crate::profile::acquire_profile_lease_async(alias.clone()).await {
-                    Ok(lease) => lease,
-                    Err(error) => {
+                let lease_control = crate::profile::ProfileLeaseAcquireControl::new();
+                let lease = match tokio::time::timeout_at(
+                    deadline,
+                    crate::profile::acquire_profile_lease_async_cancellable(
+                        alias.clone(),
+                        &lease_control,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(Some(lease))) => lease,
+                    Ok(Ok(None)) => return None,
+                    Ok(Err(error)) => {
                         debug!("[{alias}] opportunistic refresh could not lock profile: {error:#}");
                         return None;
                     }
+                    Err(_) => {
+                        lease_control.cancel_waiting();
+                        debug!("[{alias}] opportunistic refresh skipped: lease wait spent budget");
+                        return None;
+                    }
                 };
+                // Acquiring the lease can race the timer at the exact boundary.
+                // Recheck while holding it so an expired batch cannot start a
+                // fresh HTTP rotation.
+                if tokio::time::Instant::now() >= deadline {
+                    debug!("[{alias}] opportunistic refresh skipped: budget expired after lease");
+                    return None;
+                }
                 // Candidate discovery is intentionally lock-free. Re-read after
                 // acquiring the lease so no credential observed before the
                 // lease can be sent to the auth server after another operation
@@ -1090,6 +1156,17 @@ pub async fn refresh_expiring_tokens_within(
                 let remaining = exp - auth::now_unix_secs();
                 debug!("[{alias}] token expires in {remaining}s, refreshing");
 
+                // File parsing and task scheduling can spend the remainder of
+                // the budget after the lease-level check. This is the final
+                // boundary before an irreversible refresh-token rotation.
+                #[cfg(test)]
+                run_before_opportunistic_request_hook(deadline);
+                if !opportunistic_start_budget_remaining(deadline) {
+                    debug!(
+                        "[{alias}] opportunistic refresh skipped: budget expired before request"
+                    );
+                    return None;
+                }
                 match do_refresh_token(
                     &alias,
                     &client,
@@ -1153,8 +1230,36 @@ pub async fn refresh_expiring_tokens_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::routing::post;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: String) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn jwt_with_exp(exp: i64) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
@@ -1188,6 +1293,83 @@ mod tests {
         let id = jwt_with_exp(now - 60);
 
         assert!(token_needs_refresh(&access, Some(&id), 60));
+    }
+
+    #[test]
+    fn final_opportunistic_request_boundary_rejects_an_expired_deadline() {
+        let now = tokio::time::Instant::now();
+        assert!(!opportunistic_start_budget_remaining(now));
+        assert!(opportunistic_start_budget_remaining(
+            now + std::time::Duration::from_secs(60)
+        ));
+    }
+
+    // Process-global auth paths are serialized by TEST_ENV_LOCK. This test uses
+    // a current-thread runtime, and no awaited task tries to reacquire it.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn auth_read_finishing_after_the_budget_does_not_open_a_rotation() {
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let calls = Arc::clone(&server_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "id_token": "new-id",
+                        "access_token": "new-access",
+                        "refresh_token": "new-refresh"
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set(
+            "CODEX_HOME",
+            home.path().join("codex").display().to_string(),
+        );
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+        let profile_path = home.path().join("profiles/late/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        let expiring = jwt_with_exp(crate::auth::now_unix_secs() - 60);
+        crate::auth::write_auth(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": expiring.clone(),
+                    "access_token": expiring,
+                    "refresh_token": "old-refresh"
+                }
+            }),
+        )
+        .unwrap();
+        set_before_opportunistic_request_hook(|deadline| {
+            while tokio::time::Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        });
+
+        let failures = refresh_expiring_tokens_within(std::time::Duration::from_millis(20)).await;
+        server.abort();
+
+        assert!(failures.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stored = crate::auth::read_auth(&profile_path).unwrap();
+        assert_eq!(
+            stored
+                .pointer("/tokens/refresh_token")
+                .and_then(Value::as_str),
+            Some("old-refresh")
+        );
     }
 
     #[test]

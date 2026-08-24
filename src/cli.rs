@@ -17,15 +17,38 @@ pub enum DaemonCommand {
         /// Run in foreground (for service managers)
         #[arg(long)]
         foreground: bool,
+        /// Exact executable restored by a verified installer and selected for restart.
+        #[arg(long, hide = true, value_name = "ABSOLUTE_PATH")]
+        expected_executable: Option<std::path::PathBuf>,
     },
     /// Stop a running Beta daemon
-    Stop,
+    Stop {
+        /// Exact executable owned by the installed service being stopped by a verified installer.
+        #[arg(long, hide = true, value_name = "ABSOLUTE_PATH")]
+        expected_service_executable: Option<std::path::PathBuf>,
+    },
     /// Show Beta daemon status
-    Status,
+    Status {
+        /// Print the strict state tuple consumed by the direct installers.
+        #[arg(long, hide = true)]
+        installer_state: bool,
+    },
     /// Install the Beta daemon as a system service (LaunchAgent on macOS, systemd on Linux, Task Scheduler on Windows)
-    Install,
+    Install {
+        /// Exact executable currently owned by a service being migrated.
+        #[arg(long, hide = true, value_name = "ABSOLUTE_PATH")]
+        expected_existing_executable: Option<std::path::PathBuf>,
+    },
     /// Uninstall the Beta daemon system service
-    Uninstall,
+    Uninstall {
+        /// Exact executable path that the service definition must own.
+        /// Used by the verified direct uninstaller, whose helper executable is temporary.
+        #[arg(long, hide = true, value_name = "ABSOLUTE_PATH")]
+        expected_executable: Option<std::path::PathBuf>,
+        /// Verify service-definition ownership without changing service state.
+        #[arg(long, hide = true)]
+        check_owner: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -71,6 +94,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(name = "__hold-update-lock", hide = true)]
+    HoldUpdateLock,
     /// Switch to a profile; omit alias to auto-select using the unified scoring algorithm
     Use {
         /// Profile alias (omit to auto-select)
@@ -160,4 +185,159 @@ pub enum Commands {
     /// Background daemon (Beta) for automatic account switching
     #[command(subcommand)]
     Daemon(DaemonCommand),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, DaemonCommand};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn hidden_daemon_owner_check_keeps_the_exact_expected_path() {
+        let expected = if cfg!(windows) {
+            r"C:\Program Files\codex-switch-global-pace.exe"
+        } else {
+            "/opt/codex-switch-global-pace"
+        };
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "uninstall",
+            "--expected-executable",
+            expected,
+            "--check-owner",
+        ])
+        .unwrap();
+
+        let Some(Commands::Daemon(DaemonCommand::Uninstall {
+            expected_executable,
+            check_owner,
+        })) = cli.command
+        else {
+            panic!("expected daemon uninstall command");
+        };
+        assert_eq!(expected_executable, Some(PathBuf::from(expected)));
+        assert!(check_owner);
+    }
+
+    #[test]
+    fn hidden_installer_stop_keeps_the_exact_service_executable() {
+        let expected = if cfg!(windows) {
+            r"C:\Program Files\codex-switch-global-pace.exe"
+        } else {
+            "/opt/codex-switch-global-pace"
+        };
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "stop",
+            "--expected-service-executable",
+            expected,
+        ])
+        .unwrap();
+
+        let Some(Commands::Daemon(DaemonCommand::Stop {
+            expected_service_executable,
+        })) = cli.command
+        else {
+            panic!("expected daemon stop command");
+        };
+        assert_eq!(
+            expected_service_executable,
+            Some(std::path::PathBuf::from(expected))
+        );
+    }
+
+    #[test]
+    fn hidden_installer_start_keeps_the_exact_restored_executable() {
+        let expected = if cfg!(windows) {
+            r"C:\Program Files\codex-switch-global-pace.exe"
+        } else {
+            "/opt/codex-switch-global-pace"
+        };
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "start",
+            "--expected-executable",
+            expected,
+        ])
+        .unwrap();
+
+        let Some(Commands::Daemon(DaemonCommand::Start {
+            foreground,
+            expected_executable,
+        })) = cli.command
+        else {
+            panic!("expected daemon start command");
+        };
+        assert!(!foreground);
+        assert_eq!(
+            expected_executable,
+            Some(std::path::PathBuf::from(expected))
+        );
+    }
+
+    #[test]
+    fn hidden_service_migration_keeps_the_exact_existing_executable() {
+        let expected = if cfg!(windows) {
+            r"C:\Program Files\legacy-codex-switch.exe"
+        } else {
+            "/usr/local/bin/codex-switch-global-pace"
+        };
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "install",
+            "--expected-existing-executable",
+            expected,
+        ])
+        .unwrap();
+
+        let Some(Commands::Daemon(DaemonCommand::Install {
+            expected_existing_executable,
+        })) = cli.command
+        else {
+            panic!("expected daemon install command");
+        };
+        assert_eq!(expected_existing_executable, Some(PathBuf::from(expected)));
+    }
+
+    #[test]
+    fn hidden_installer_state_flag_parses_without_json_mode() {
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "daemon",
+            "status",
+            "--installer-state",
+        ])
+        .unwrap();
+
+        let Some(Commands::Daemon(DaemonCommand::Status { installer_state })) = cli.command else {
+            panic!("expected daemon status command");
+        };
+        assert!(installer_state);
+    }
+
+    #[test]
+    fn hidden_installer_state_preserves_global_json_modes_for_runtime_rejection() {
+        for json_flag in ["--json", "--json-pretty"] {
+            let cli = Cli::try_parse_from([
+                "codex-switch-global-pace",
+                json_flag,
+                "daemon",
+                "status",
+                "--installer-state",
+            ])
+            .unwrap();
+            assert!(cli.json || cli.json_pretty);
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Daemon(DaemonCommand::Status {
+                    installer_state: true
+                }))
+            ));
+        }
+    }
 }

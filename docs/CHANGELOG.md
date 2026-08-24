@@ -12,6 +12,13 @@
   are never rolled back to an already-consumed refresh token. Rename, delete,
   login, import, cache mutation, and reset-card confirmation fail closed on
   unreadable state and use the live Codex identity rather than a stale marker.
+  Legacy duplicate identities require an exact current binding, private writes
+  preserve their publication boundary, and auxiliary selection history can no
+  longer report an already-committed account switch as failed.
+- **Bounded refresh and routing** — Opportunistic token refresh stops waiting for
+  profile locks when its start budget expires and rechecks that budget at the
+  final HTTP boundary. Usage and reset-credit requests now share the same
+  workspace and FedRAMP routing headers.
 - **Race-safe daemon switching** — The daemon distinguishes conversations,
   authentication mutation, infrastructure, and failed process inspection. It
   always defers during login/logout or an unknown inspection result and uses a
@@ -22,12 +29,24 @@
   account work, exact reset-card consent is preserved, and search/rename editing
   now treats combining characters and emoji sequences as whole graphemes.
 - **Transactional distribution** — Installers verify the exact executable
-  version before replacement, migrate a running legacy service only after the
-  new service succeeds, and restore binaries and service state on failure.
+  version before replacement and use one destination lock across install,
+  self-update, and uninstall. Daemon service mutations use one OS-level lease
+  independent of configurable state homes, and Windows requires the scheduler,
+  trusted task file, and exported XML to agree on exact ownership. Installers
+  migrate a running legacy service only after the new service succeeds, preserve
+  system ownership when rollback is partial, and restore binaries and service
+  state on failure. Windows upgrades classify
+  atomic replacement bytes explicitly and reject reparse destinations or
+  current and legacy incomplete-transaction files without overwriting them.
   Self-update rechecks mutable tags after candidate execution, preserves exact
   recovery files across partial Windows replacement failures, and uses a
-  generation-bound PID lock for daemon transitions. Releases remain drafts
-  until their exact tag and release ID are verified for publish.
+  generation-bound PID lock for daemon transitions. Stable release candidates
+  use one deterministic tag per release and recover only an exact interrupted
+  draft; mismatched remote state is preserved. Releases remain drafts until
+  their exact tag and release ID are verified for publish. Development
+  builds are preserved as one attested Actions bundle and published through a
+  crash-recoverable remote journal using the maintainer's existing GitHub CLI
+  authentication without repository secrets.
 
 ## v20260824.7.0 — 2026-08-24
 

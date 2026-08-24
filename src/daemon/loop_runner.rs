@@ -339,7 +339,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
             );
             return Ok(PollOutcome::NoAction);
         }
-        cache::set_last_used(&best_alias)?;
+        cache::set_last_used(&best_alias);
 
         if cfg.daemon.notify {
             super::notify::send_notification(&format!(

@@ -610,15 +610,21 @@ pub fn get_last_used(alias: &str) -> i64 {
     }
 }
 
-/// Record that an alias was just selected by `use`.
-pub fn set_last_used(alias: &str) -> Result<()> {
-    with_cache_lock(|| {
+/// Record a successful profile selection for scoring.
+///
+/// This timestamp is auxiliary ranking data. The credential/current-profile
+/// transaction has already committed when callers reach this function, so a
+/// damaged cache must not turn that successful switch into a reported failure.
+pub fn set_last_used(alias: &str) {
+    if let Err(err) = with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
         cache
             .last_used
             .insert(alias.to_string(), crate::auth::now_unix_secs());
         save_cache(&cache).context("writing last_used cache")
-    })
+    }) {
+        tracing::warn!(alias, "Failed to record last-used profile: {err}");
+    }
 }
 
 pub fn rename(old: &str, new: &str) -> Result<()> {

@@ -169,7 +169,30 @@ pub(crate) fn running_pid_checked() -> Result<Option<u32>> {
 fn running_pid_checked_at(path: &Path) -> Result<Option<u32>> {
     let initial_raw = match std::fs::read_to_string(path) {
         Ok(raw) => Some(raw),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Ok(None);
+            };
+            match std::fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.file_type().is_dir() => None,
+                Ok(_) => {
+                    anyhow::bail!("daemon PID parent is not a directory: {}", parent.display())
+                }
+                Err(parent_err) if parent_err.kind() == std::io::ErrorKind::NotFound => {
+                    // With no state directory, neither the PID identity nor its
+                    // authority lock can exist. This is an authoritative
+                    // stopped snapshot and avoids creating state during a
+                    // read-only installer probe.
+                    return Ok(None);
+                }
+                Err(parent_err) => {
+                    return Err(anyhow::anyhow!(
+                        "inspecting daemon PID parent {}: {parent_err}",
+                        parent.display()
+                    ));
+                }
+            }
+        }
         Err(err) => {
             return Err(anyhow::anyhow!(
                 "reading daemon PID file {}: {err}",
@@ -454,6 +477,16 @@ mod tests {
 
         FileExt::unlock(&file).unwrap();
         assert_eq!(running_pid_checked_at(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn checked_running_pid_treats_a_missing_state_directory_as_stopped_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("missing-state");
+        let path = state_dir.join("daemon.pid");
+
+        assert_eq!(running_pid_checked_at(&path).unwrap(), None);
+        assert!(!state_dir.exists());
     }
 
     #[test]

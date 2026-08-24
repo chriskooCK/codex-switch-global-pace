@@ -7,7 +7,7 @@ use tracing::debug;
 
 use crate::auth::{self, format_reqwest_error};
 
-use super::api::extract_error_summary;
+use super::api::{apply_account_routing_headers, extract_error_summary};
 use super::parse::parse_optional_u64;
 use super::{ConsumedResetCredit, MAX_RETRIES, RETRY_DELAY, ResetCredit, UsageInfo};
 
@@ -95,9 +95,10 @@ pub(super) async fn enrich_reset_credits(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    is_fedramp: bool,
     usage: &mut UsageInfo,
 ) {
-    match fetch_reset_credits(client, access_token, account_id).await {
+    match fetch_reset_credits(client, access_token, account_id, is_fedramp).await {
         Ok((available_count, credits)) => {
             if available_count.is_some() {
                 usage.reset_credits_available_count = available_count;
@@ -119,17 +120,32 @@ async fn fetch_reset_credits(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    is_fedramp: bool,
 ) -> Result<(Option<u64>, Vec<ResetCredit>)> {
-    let mut req = client
-        .get(reset_credits_url())
+    fetch_reset_credits_at_url(
+        client,
+        access_token,
+        account_id,
+        is_fedramp,
+        &reset_credits_url(),
+    )
+    .await
+}
+
+async fn fetch_reset_credits_at_url(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    url: &str,
+) -> Result<(Option<u64>, Vec<ResetCredit>)> {
+    let req = client
+        .get(url)
         .bearer_auth(access_token)
         .header("Accept", "application/json")
         .header("OpenAI-Beta", "codex-1")
         .header("Originator", "Codex Desktop");
-
-    if let Some(account_id) = account_id.filter(|s| !s.trim().is_empty()) {
-        req = req.header("Chatgpt-Account-Id", account_id);
-    }
+    let req = apply_account_routing_headers(req, account_id, is_fedramp);
 
     let resp = req
         .send()
@@ -169,16 +185,21 @@ pub fn earliest_reset_credit(credits: &[ResetCredit]) -> Option<&ResetCredit> {
 fn load_consume_context(
     alias: &str,
     profile_path: &Path,
-) -> std::result::Result<(reqwest::Client, String, Option<String>), ConsumeResetCreditError> {
+) -> std::result::Result<(reqwest::Client, String, Option<String>, bool), ConsumeResetCreditError> {
     let val = auth::read_auth(profile_path).map_err(ConsumeResetCreditError::not_consumed)?;
     let (access_token, _) = auth::extract_tokens(&val);
     let access_token = access_token
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("{alias}: auth.json missing access_token"))
         .map_err(ConsumeResetCreditError::not_consumed)?;
-    let account_id = crate::jwt::parse_account_info(&val).account_id;
+    let account_info = crate::jwt::parse_account_info(&val);
     let client = auth::build_http_client().map_err(ConsumeResetCreditError::not_consumed)?;
-    Ok((client, access_token, account_id))
+    Ok((
+        client,
+        access_token,
+        account_info.account_id,
+        account_info.is_fedramp,
+    ))
 }
 
 /// Consume the exact reset credit to which the caller obtained user consent.
@@ -224,21 +245,30 @@ pub(crate) async fn consume_reset_credit_by_id_leased(
             lease.alias()
         )));
     }
-    let (client, access_token, account_id) = load_consume_context(alias, profile_path)?;
+    let (client, access_token, account_id, is_fedramp) = load_consume_context(alias, profile_path)?;
 
-    send_reset_credit_consume(&client, &access_token, account_id.as_deref(), credit).await
+    send_reset_credit_consume(
+        &client,
+        &access_token,
+        account_id.as_deref(),
+        is_fedramp,
+        credit,
+    )
+    .await
 }
 
 async fn send_reset_credit_consume(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    is_fedramp: bool,
     credit: ResetCredit,
 ) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
     consume_reset_credit_at_url(
         client,
         access_token,
         account_id,
+        is_fedramp,
         credit,
         &reset_credits_consume_url(),
     )
@@ -249,6 +279,7 @@ async fn consume_reset_credit_at_url(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
+    is_fedramp: bool,
     credit: ResetCredit,
     url: &str,
 ) -> std::result::Result<ConsumedResetCredit, ConsumeResetCreditError> {
@@ -257,7 +288,7 @@ async fn consume_reset_credit_at_url(
     let request_id = redeem_request_id();
     let mut outcome_may_have_changed = false;
     for attempt in 0..MAX_RETRIES {
-        let mut req = client
+        let req = client
             .post(url)
             .bearer_auth(access_token)
             .header("Accept", "application/json")
@@ -267,10 +298,7 @@ async fn consume_reset_credit_at_url(
                 "credit_id": &credit.id,
                 "redeem_request_id": &request_id,
             }));
-
-        if let Some(account_id) = account_id.filter(|s| !s.trim().is_empty()) {
-            req = req.header("Chatgpt-Account-Id", account_id);
-        }
+        let req = apply_account_routing_headers(req, account_id, is_fedramp);
 
         let resp = match req.send().await {
             Ok(resp) => resp,
@@ -452,12 +480,81 @@ pub(super) fn parse_reset_credits_summary(body: &Value) -> (Option<u64>, Vec<Res
 mod tests {
     use super::*;
     use axum::Json;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn fedramp_routing_headers_reach_reset_credit_fetch_and_consume() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let get_observed = Arc::clone(&observed);
+        let post_observed = Arc::clone(&observed);
+        let app = axum::Router::new()
+            .route(
+                "/credits",
+                get(move |headers: HeaderMap| {
+                    let observed = Arc::clone(&get_observed);
+                    async move {
+                        observed.lock().unwrap().push((
+                            headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok())
+                                == Some("workspace-123"),
+                            headers.get("x-openai-fedramp").and_then(|v| v.to_str().ok())
+                                == Some("true"),
+                        ));
+                        Json(json!({"available_count": 1, "credits": [{"id": "credit-1", "status": "available"}]}))
+                    }
+                }),
+            )
+            .route(
+                "/consume",
+                post(move |headers: HeaderMap| {
+                    let observed = Arc::clone(&post_observed);
+                    async move {
+                        observed.lock().unwrap().push((
+                            headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok())
+                                == Some("workspace-123"),
+                            headers.get("x-openai-fedramp").and_then(|v| v.to_str().ok())
+                                == Some("true"),
+                        ));
+                        Json(json!({"code": "reset", "windows_reset": 2}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        fetch_reset_credits_at_url(
+            &client,
+            "access-token",
+            Some("workspace-123"),
+            true,
+            &format!("http://{address}/credits"),
+        )
+        .await
+        .unwrap();
+        consume_reset_credit_at_url(
+            &client,
+            "access-token",
+            Some("workspace-123"),
+            true,
+            ResetCredit {
+                id: "credit-1".into(),
+                granted_at: None,
+                expires_at: None,
+            },
+            &format!("http://{address}/consume"),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(*observed.lock().unwrap(), vec![(true, true), (true, true)]);
+    }
 
     #[test]
     fn test_reset_credit_without_expiry_is_preserved_and_sorted_last() {
@@ -580,6 +677,7 @@ mod tests {
             &reqwest::Client::new(),
             "access-token",
             Some("workspace-123"),
+            false,
             ResetCredit {
                 id: "credit-1".to_string(),
                 granted_at: None,
@@ -615,6 +713,7 @@ mod tests {
             &reqwest::Client::new(),
             "access-token",
             None,
+            false,
             ResetCredit {
                 id: "credit-1".to_string(),
                 granted_at: None,
@@ -640,6 +739,7 @@ mod tests {
             &reqwest::Client::new(),
             "access-token",
             None,
+            false,
             ResetCredit {
                 id: "credit-1".to_string(),
                 granted_at: None,
@@ -668,6 +768,7 @@ mod tests {
             &reqwest::Client::new(),
             "access-token",
             None,
+            false,
             ResetCredit {
                 id: "credit-1".to_string(),
                 granted_at: None,
@@ -713,6 +814,7 @@ mod tests {
             &reqwest::Client::new(),
             "access-token",
             None,
+            false,
             ResetCredit {
                 id: "credit-1".to_string(),
                 granted_at: None,
@@ -752,6 +854,7 @@ mod tests {
             &reqwest::Client::new(),
             "access-token",
             None,
+            false,
             ResetCredit {
                 id: "credit-1".to_string(),
                 granted_at: None,

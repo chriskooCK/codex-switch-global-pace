@@ -2,6 +2,21 @@ use crate::output::{self, print_json};
 use crate::{color, daemon, update};
 use anyhow::{Context, Result};
 
+fn ensure_system_install_migrated(use_dev: bool, version: Option<&str>, json: bool) -> Result<()> {
+    if let Err(error) = update::ensure_legacy_system_install_migrated(use_dev, version) {
+        if !json
+            && error
+                .downcast_ref::<update::LegacySystemInstallMigrationRequired>()
+                .is_some()
+        {
+            output::user_println(&color::warn(&error.to_string()));
+            return Err(crate::OutputAlreadyReported.into());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 // ── self-update ──────────────────────────────────────────
 
 pub(crate) async fn self_update_cmd(
@@ -21,17 +36,8 @@ pub(crate) async fn self_update_cmd(
         update::is_dev_version(update::current_version())
     };
 
-    if let Err(error) = update::ensure_legacy_system_install_migrated(use_dev, version) {
-        if !json
-            && error
-                .downcast_ref::<update::LegacySystemInstallMigrationRequired>()
-                .is_some()
-        {
-            output::user_println(&color::warn(&error.to_string()));
-            return Err(crate::OutputAlreadyReported.into());
-        }
-        return Err(error);
-    }
+    // Preserve the migration-specific guidance before any network or lock error.
+    ensure_system_install_migrated(use_dev, version, json)?;
 
     if check {
         let current_version = update::current_version().to_string();
@@ -115,6 +121,9 @@ pub(crate) async fn self_update_cmd(
     // on the lock while the service remains unnecessarily offline.
     let update_lease = update::acquire_self_update_lease()
         .context("acquiring exclusive self-update transaction")?;
+    // The ownership marker can change between preflight and lock acquisition.
+    // Revalidate it under the same lease that protects the replacement.
+    ensure_system_install_migrated(use_dev, version, json)?;
     let mut daemon_restart = daemon::SelfUpdateDaemonRestart::capture()
         .context("capturing daemon state before self-update")?;
     if daemon_restart.is_needed() {

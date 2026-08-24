@@ -467,11 +467,27 @@ fn write_current(alias: &str) -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static TEST_FAIL_NEXT_ACTIVATION_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_AFTER_EXACT_LIVE_BINDING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn fail_next_activation_marker_write() {
     TEST_FAIL_NEXT_ACTIVATION_MARKER.with(|flag| flag.set(true));
+}
+
+#[cfg(test)]
+fn after_next_exact_live_binding(action: impl FnOnce() + 'static) {
+    TEST_AFTER_EXACT_LIVE_BINDING.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+}
+
+#[cfg(test)]
+fn run_exact_live_binding_test_hook() {
+    TEST_AFTER_EXACT_LIVE_BINDING.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action();
+        }
+    });
 }
 
 fn write_activation_marker(alias: &str) -> Result<()> {
@@ -597,8 +613,30 @@ fn live_belongs_to_auth_value_locked(alias: &str, profile: &serde_json::Value) -
     let Some(live) = read_existing_auth(&live_path)? else {
         return Ok(false);
     };
-    if profile == &live {
+
+    let current = read_current_checked()?;
+    // A refresh writes the profile before it decides whether the live copy must
+    // follow. The pre-write snapshot supplied by that caller is therefore the
+    // strongest proof that the marker still names these live credentials. This
+    // also disambiguates legacy duplicate profiles without consulting identity.
+    if current.as_deref() == Some(alias) && profile == &live {
         return Ok(true);
+    }
+
+    // Prefer an exact stored-credential binding over identity. In particular,
+    // two aliases may legitimately survive from older releases with the same
+    // account_id/email; refreshing the inactive one must not make it active.
+    let exact = find_matching_profiles_checked(&live_path)?;
+    if let Some(bound) = select_exact_profile_binding(&exact, current.as_deref())? {
+        return Ok(bound == alias);
+    }
+
+    // When Codex itself rotated live auth, no saved file has the new bytes yet.
+    // The current marker may still bind that change, but only to the alias it
+    // names and only with a complete strict identity match. Identity by itself
+    // never chooses an alias.
+    if current.as_deref() != Some(alias) {
+        return Ok(false);
     }
     let profile_identity = extract_identity(profile);
     let live_identity = extract_identity(&live);
@@ -815,23 +853,55 @@ pub(crate) fn replace_profile_auth_and_live_if_current_leased(
     Ok(())
 }
 
-fn find_matching_profile_checked(auth_path: &Path) -> Result<Option<String>> {
+fn find_matching_profiles_checked(auth_path: &Path) -> Result<Vec<String>> {
     let target = match std::fs::read(auth_path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error).with_context(|| format!("reading {}", auth_path.display()));
         }
     };
+    let mut matches = Vec::new();
     for alias in list_profiles()? {
         let path = profile_auth_path(&alias)?;
         let contents = std::fs::read(&path)
             .with_context(|| format!("reading existing profile '{alias}' at {}", path.display()))?;
         if contents == target {
-            return Ok(Some(alias));
+            matches.push(alias);
         }
     }
-    Ok(None)
+    Ok(matches)
+}
+
+fn select_exact_profile_binding(
+    matches: &[String],
+    current: Option<&str>,
+) -> Result<Option<String>> {
+    match matches {
+        [] => Ok(None),
+        [alias] => Ok(Some(alias.clone())),
+        aliases => {
+            if let Some(current) = current
+                && aliases.iter().any(|alias| alias == current)
+            {
+                return Ok(Some(current.to_string()));
+            }
+            anyhow::bail!(
+                "live auth exactly matches multiple legacy profiles ({}), and the current marker does not disambiguate them",
+                aliases.join(", ")
+            )
+        }
+    }
+}
+
+fn find_matching_profile_checked(auth_path: &Path) -> Result<Option<String>> {
+    let matches = find_matching_profiles_checked(auth_path)?;
+    let current = if matches.len() > 1 {
+        read_current_checked()?
+    } else {
+        None
+    };
+    select_exact_profile_binding(&matches, current.as_deref())
 }
 
 pub fn find_matching_profile(auth_path: &Path) -> Option<String> {
@@ -840,17 +910,33 @@ pub fn find_matching_profile(auth_path: &Path) -> Option<String> {
 
 pub fn active_profile_from_live() -> Option<String> {
     let src = codex_auth_path().ok()?;
-    if !src.exists() {
-        return None;
+
+    let exact = find_matching_profiles_checked(&src).ok()?;
+    if !exact.is_empty() {
+        let current = (exact.len() > 1)
+            .then(|| read_current_checked().ok().flatten())
+            .flatten();
+        return select_exact_profile_binding(&exact, current.as_deref())
+            .ok()
+            .flatten();
     }
 
-    if let Some(alias) = find_matching_profile(&src) {
+    // If Codex changed the live token bytes directly, only the current marker
+    // may bind those credentials back to an alias. A bare identity lookup is
+    // ambiguous in stores created by older releases that allowed duplicates.
+    let live = read_auth(&src).ok()?;
+    let live_identity = extract_identity(&live);
+    if let Some(alias) = read_current_checked().ok().flatten()
+        && validate_alias(&alias).is_ok()
+        && let Ok(path) = profile_auth_path(&alias)
+        && let Ok(profile) = read_auth(&path)
+        && exact_identity_matches(&extract_identity(&profile), &live_identity)
+    {
         return Some(alias);
     }
-
-    let val = read_auth(&src).ok()?;
-    let identity = extract_identity(&val);
-    find_profile_by_identity_exact(&identity)
+    // A stale/missing marker may be repaired only when strict identity resolves
+    // to exactly one profile. Legacy duplicates deliberately yield `None`.
+    find_profile_by_identity_exact(&live_identity)
 }
 
 pub fn sync_current_from_live() -> Option<String> {
@@ -932,36 +1018,30 @@ fn ensure_same_account_identity(
 /// Find a profile with a strict match: both account_id AND email must be present and equal.
 /// Used by `auto_track_current` to avoid silently syncing on ambiguous email-only matches.
 pub fn find_profile_by_identity_exact(identity: &AccountIdentity) -> Option<String> {
-    let (Some(target_id), Some(target_email)) = (&identity.account_id, &identity.email) else {
-        return None; // identity itself is incomplete — no exact match possible
-    };
-    let profiles = list_profiles().ok()?;
-    for alias in profiles {
-        let path = match profile_auth_path(&alias) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let val = match read_auth(&path) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let existing = extract_identity(&val);
-        if let (Some(eid), Some(eemail)) = (&existing.account_id, &existing.email)
-            && eid == target_id
-            && eemail == target_email
-        {
-            return Some(alias);
-        }
-    }
-    None
+    let matches = scan_profiles_by_identity(identity).ok()?.exact;
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
+fn exact_identity_matches(left: &AccountIdentity, right: &AccountIdentity) -> bool {
+    matches!(
+        (
+            left.account_id.as_deref(),
+            left.email.as_deref(),
+            right.account_id.as_deref(),
+            right.email.as_deref(),
+        ),
+        (Some(left_id), Some(left_email), Some(right_id), Some(right_email))
+            if left_id == right_id && left_email == right_email
+    )
 }
 
 /// Profiles matching an identity, split by match strength so callers can tell
 /// an unambiguous hit from "several workspaces share this email".
 #[derive(Default)]
 struct IdentityMatches {
-    /// account_id AND email both equal — unambiguous by construction.
-    exact: Option<String>,
+    /// account_id AND email both equal. Modern writes prevent duplicates, but
+    /// legacy stores can contain several aliases with this same identity.
+    exact: Vec<String>,
     /// Same email while at least one side lacks account_id. These are diagnostic
     /// conflicts only and are never eligible credential-write targets.
     incomplete_identity_matches: Vec<String>,
@@ -978,13 +1058,9 @@ fn scan_profiles_by_identity(identity: &AccountIdentity) -> Result<IdentityMatch
         let existing = extract_identity(&val);
 
         // Match: account_id AND email both equal (same person, same workspace)
-        if let (Some(a1), Some(a2)) = (&identity.account_id, &existing.account_id)
-            && a1 == a2
-            && let (Some(e1), Some(e2)) = (&identity.email, &existing.email)
-            && e1 == e2
-        {
-            matches.exact = Some(alias);
-            return Ok(matches);
+        if exact_identity_matches(identity, &existing) {
+            matches.exact.push(alias);
+            continue;
         }
 
         // Record an unsafe email-only resemblance for an explicit refusal.
@@ -1130,20 +1206,47 @@ pub fn detect_auth_change() -> AuthChange {
         Ok(p) => p,
         Err(_) => return AuthChange::NoChange,
     };
-    if !auth_path.exists() {
-        return AuthChange::NoChange;
-    }
     let val = match read_auth(&auth_path) {
         Ok(v) => v,
         Err(_) => return AuthChange::NoChange,
     };
 
-    // Exact file match — nothing changed
-    if let Some(alias) = find_matching_profile(&auth_path) {
-        if let Err(error) = repair_current_for_exact_live_match(&alias) {
-            tracing::warn!("Could not repair current profile marker for '{alias}': {error:#}");
+    // Exact file matches are authoritative. If legacy duplicates have the same
+    // bytes, only their current marker may disambiguate them; never fall through
+    // to identity selection after exact-byte ambiguity.
+    match find_matching_profiles_checked(&auth_path) {
+        Ok(matches) if !matches.is_empty() => {
+            let is_legacy_duplicate = matches.len() > 1;
+            let current = (matches.len() > 1)
+                .then(|| read_current_checked().ok().flatten())
+                .flatten();
+            match select_exact_profile_binding(&matches, current.as_deref()) {
+                Ok(Some(alias)) => {
+                    #[cfg(test)]
+                    run_exact_live_binding_test_hook();
+                    // With duplicate bytes, the marker was the only evidence
+                    // for `alias`. It may have legitimately changed while the
+                    // files were scanned, so it must never be "repaired" from
+                    // that stale observation. A unique exact match remains safe
+                    // to repair under the transaction's live-byte recheck.
+                    if !is_legacy_duplicate
+                        && let Err(error) = repair_current_for_exact_live_match(&alias)
+                    {
+                        tracing::warn!(
+                            "Could not repair current profile marker for '{alias}': {error:#}"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!("Could not bind live auth to a profile: {error:#}"),
+            }
+            return AuthChange::NoChange;
         }
-        return AuthChange::NoChange;
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!("Could not compare live auth bytes with saved profiles: {error:#}");
+            return AuthChange::NoChange;
+        }
     }
 
     let identity = extract_identity(&val);
@@ -1163,8 +1266,25 @@ pub fn detect_auth_change() -> AuthChange {
             return AuthChange::NoChange;
         }
     };
-    if let Some(alias) = exact {
-        return AuthChange::TokensUpdated { alias };
+    match exact.as_slice() {
+        [alias] => {
+            return AuthChange::TokensUpdated {
+                alias: alias.clone(),
+            };
+        }
+        [] => {}
+        aliases => {
+            if let Ok(Some(current)) = read_current_checked()
+                && aliases.iter().any(|alias| alias == &current)
+            {
+                return AuthChange::TokensUpdated { alias: current };
+            }
+            tracing::warn!(
+                "Live credentials have the same exact account identity as multiple legacy profiles ({}); refusing to choose an update target",
+                aliases.join(", ")
+            );
+            return AuthChange::NoChange;
+        }
     }
     match incomplete_identity_matches.as_slice() {
         [] => AuthChange::NewAccount,
@@ -1309,8 +1429,14 @@ fn resolve_identity_target(identity: &AccountIdentity) -> Result<Option<String>>
         exact,
         mut incomplete_identity_matches,
     } = scan_profiles_by_identity(identity)?;
-    if let Some(alias) = exact {
-        return Ok(Some(alias));
+    match exact.as_slice() {
+        [alias] => return Ok(Some(alias.clone())),
+        [] => {}
+        aliases => anyhow::bail!(
+            "Cannot safely choose between {} legacy profiles with the same account_id and email ({}). Refusing to overwrite either profile; name the existing alias explicitly.",
+            aliases.len(),
+            aliases.join(", ")
+        ),
     }
     if incomplete_identity_matches.is_empty() {
         return Ok(None);
@@ -1405,9 +1531,6 @@ pub fn auto_track_current() -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    if !src.exists() {
-        return false;
-    }
     let val = match read_auth(&src) {
         Ok(v) => v,
         Err(_) => return false,
@@ -1584,12 +1707,23 @@ pub fn cmd_delete(alias: &str) -> Result<()> {
 }
 
 pub fn collect_import_files(path: &Path) -> Result<Vec<PathBuf>> {
-    if !path.exists() {
-        return Err(CsError::NoAuthFile(path.display().to_string()).into());
-    }
-
-    if path.is_file() {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CsError::NoAuthFile(path.display().to_string()).into());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading metadata for {}", path.display()));
+        }
+    };
+    if metadata.is_file() {
         return Ok(vec![path.to_path_buf()]);
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "import path is not a regular file or directory: {}",
+            path.display()
+        );
     }
 
     let mut files = vec![];
@@ -1674,9 +1808,16 @@ pub(crate) fn save_imported_auth_value_with_stage(
 }
 
 fn refuse_duplicate_import_identity(identity: &AccountIdentity) -> Result<()> {
-    if let Some(existing) = scan_profiles_by_identity(identity)?.exact {
+    let existing = scan_profiles_by_identity(identity)?.exact;
+    if let [alias] = existing.as_slice() {
         anyhow::bail!(
-            "refusing duplicate import: profile '{existing}' already has the same account_id and email"
+            "refusing duplicate import: profile '{alias}' already has the same account_id and email"
+        );
+    }
+    if existing.len() > 1 {
+        anyhow::bail!(
+            "refusing duplicate import: profile(s) '{}' already have the same account_id and email",
+            existing.join(", ")
         );
     }
     Ok(())
@@ -2280,6 +2421,104 @@ mod tests {
             );
         }
         assert_eq!(super::read_current(), "alice");
+    }
+
+    #[test]
+    fn refreshing_an_inactive_legacy_identity_duplicate_does_not_replace_live_auth() {
+        let _env = TestEnv::new();
+        let active = realistic_auth_json("same@example.com", "acct_same", "active", "active-ref");
+        let inactive =
+            realistic_auth_json("same@example.com", "acct_same", "inactive", "inactive-ref");
+        seed_profile("active", &active);
+        seed_profile("inactive", &inactive);
+        super::switch_profile("active").unwrap();
+
+        let lease = super::acquire_profile_lease("inactive").unwrap();
+        let result = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            "inactive-ref",
+            &make_jwt("same@example.com", "acct_same"),
+            "inactive-new",
+            "inactive-ref-new",
+        )
+        .unwrap();
+
+        assert!(matches!(result, super::RefreshTokenUpdate::Saved));
+        assert_eq!(super::read_current(), "active");
+        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
+        assert_eq!(
+            live.pointer("/tokens/access_token")
+                .and_then(|v| v.as_str()),
+            Some("active")
+        );
+        assert_eq!(profile_refresh_token("inactive"), "inactive-ref-new");
+    }
+
+    #[test]
+    fn current_marker_keeps_active_binding_when_duplicate_has_the_old_bytes() {
+        let _env = TestEnv::new();
+        let old = realistic_auth_json("same@example.com", "acct_same", "old", "old-ref");
+        seed_profile("active", &old);
+        seed_profile("duplicate", &old);
+        super::switch_profile("active").unwrap();
+
+        let lease = super::acquire_profile_lease("active").unwrap();
+        let result = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            "old-ref",
+            &make_jwt("same@example.com", "acct_same"),
+            "new",
+            "new-ref",
+        )
+        .unwrap();
+
+        assert!(matches!(result, super::RefreshTokenUpdate::Saved));
+        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
+        assert_eq!(
+            live.pointer("/tokens/refresh_token")
+                .and_then(|v| v.as_str()),
+            Some("new-ref")
+        );
+        assert_eq!(super::read_current(), "active");
+        assert_eq!(profile_refresh_token("duplicate"), "old-ref");
+    }
+
+    #[test]
+    fn stale_marker_cannot_override_ambiguous_exact_live_duplicates() {
+        let _env = TestEnv::new();
+        let exact = realistic_auth_json("same@example.com", "acct_same", "exact", "exact-ref");
+        let stale = realistic_auth_json("same@example.com", "acct_same", "stale", "stale-ref");
+        seed_profile("first", &exact);
+        seed_profile("second", &exact);
+        seed_profile("stale", &stale);
+        write_live(&exact);
+        super::write_current("stale").unwrap();
+
+        assert_eq!(super::active_profile_from_live(), None);
+        assert!(matches!(
+            super::detect_auth_change(),
+            super::AuthChange::NoChange
+        ));
+        assert_eq!(super::read_current(), "stale");
+    }
+
+    #[test]
+    fn exact_duplicate_detection_does_not_undo_a_concurrent_marker_switch() {
+        let _env = TestEnv::new();
+        let exact = realistic_auth_json("same@example.com", "acct_same", "exact", "exact-ref");
+        seed_profile("first", &exact);
+        seed_profile("second", &exact);
+        super::switch_profile("first").unwrap();
+        super::after_next_exact_live_binding(|| {
+            super::switch_profile("second").unwrap();
+        });
+
+        assert!(matches!(
+            super::detect_auth_change(),
+            super::AuthChange::NoChange
+        ));
+        assert_eq!(super::read_current(), "second");
+        assert_eq!(super::active_profile_from_live().as_deref(), Some("second"));
     }
 
     #[test]
@@ -3210,6 +3449,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn detect_auth_change_uses_current_marker_to_disambiguate_legacy_exact_identities() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "first",
+            &realistic_auth_json("same@example.com", "acct_same", "first", "first-ref"),
+        );
+        seed_profile(
+            "second",
+            &realistic_auth_json("same@example.com", "acct_same", "second", "second-ref"),
+        );
+        super::write_current("second").unwrap();
+        write_live(&stamped_auth_json(
+            "same@example.com",
+            "acct_same",
+            "codex-rotated",
+            "codex-rotated-ref",
+            Some("2026-04-08T00:00:00Z"),
+        ));
+
+        match super::detect_auth_change() {
+            super::AuthChange::TokensUpdated { alias } => assert_eq!(alias, "second"),
+            other => panic!("current marker must disambiguate legacy identities, got {other:?}"),
+        }
+    }
+
     // ── cmd_save identity ambiguity (same email, several workspaces) ──
 
     #[test]
@@ -3252,6 +3517,47 @@ mod tests {
         // Neither existing profile was silently overwritten.
         assert_eq!(profile_refresh_token("oai001"), "ref_t");
         assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
+    }
+
+    #[test]
+    fn cmd_save_refuses_legacy_duplicate_exact_identities() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "first",
+            &stamped_auth_json(
+                "same@example.com",
+                "acct_same",
+                "first-old",
+                "first-ref",
+                Some("2026-04-07T00:00:00Z"),
+            ),
+        );
+        seed_profile(
+            "second",
+            &stamped_auth_json(
+                "same@example.com",
+                "acct_same",
+                "second-old",
+                "second-ref",
+                Some("2026-04-07T00:00:00Z"),
+            ),
+        );
+        write_live(&stamped_auth_json(
+            "same@example.com",
+            "acct_same",
+            "live-new",
+            "live-ref",
+            Some("2026-04-08T00:00:00Z"),
+        ));
+
+        let error = cmd_save(None).expect_err("duplicate exact identities need an explicit alias");
+        let message = error.to_string();
+        assert!(
+            message.contains("first") && message.contains("second"),
+            "{message}"
+        );
+        assert_eq!(profile_refresh_token("first"), "first-ref");
+        assert_eq!(profile_refresh_token("second"), "second-ref");
     }
 
     #[test]
@@ -3912,7 +4218,7 @@ mod tests {
             &realistic_auth_json("old@example.com", "acct_old", "old_access", "old_refresh"),
         );
         crate::cache::put(alias, &crate::usage::UsageInfo::default());
-        crate::cache::set_last_used(alias).unwrap();
+        crate::cache::set_last_used(alias);
         crate::cache::put_auth_failure(
             alias,
             "old_refresh",

@@ -96,11 +96,13 @@ fn validate_cli_auth_credentials_store(codex_home: &Path) -> Result<()> {
 
 fn load_codex_config(codex_home: &Path) -> Result<Option<(PathBuf, toml::Value)>> {
     let config_path = codex_home.join("config.toml");
-    if !config_path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", config_path.display()));
+        }
+    };
     let config =
         toml::from_str(&raw).with_context(|| format!("parsing {}", config_path.display()))?;
     Ok(Some((config_path, config)))
@@ -214,11 +216,13 @@ pub fn current_file() -> Result<PathBuf> {
 }
 
 pub fn read_auth(path: &Path) -> Result<serde_json::Value> {
-    if !path.exists() {
-        return Err(CsError::NoAuthFile(path.display().to_string()).into());
-    }
-    let raw =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CsError::NoAuthFile(path.display().to_string()).into());
+        }
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
     let val: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(val)
@@ -257,9 +261,36 @@ pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
     tmp.persist(path)
         .map_err(|err| err.error)
         .with_context(|| format!("atomically replacing {}", path.display()))?;
+
+    // `persist` is the publication boundary. Every error returned above means
+    // the destination was not replaced. Work after this point must not turn an
+    // already-visible credential into a misleading "not saved" result.
     #[cfg(windows)]
-    harden_windows_acl(path, false)?;
+    if let Err(error) = harden_windows_acl(path, false) {
+        // The temporary file was hardened before its same-directory rename, so
+        // this is a post-publish verification/repair failure, not a failed save.
+        tracing::error!(
+            "{} was atomically saved, but post-publish ACL verification failed: {error:#}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if let Err(error) = sync_parent_directory(parent) {
+        tracing::error!(
+            "{} was atomically saved, but syncing parent directory {} failed: {error:#}",
+            path.display(),
+            parent.display()
+        );
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .with_context(|| format!("opening parent directory {} for sync", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing parent directory {}", parent.display()))
 }
 
 #[cfg(any(windows, test))]
@@ -520,11 +551,13 @@ pub(crate) fn redact_sensitive_log_body(body: &serde_json::Value) -> String {
 }
 
 pub fn backup_auth(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let contents =
-        std::fs::read(path).with_context(|| format!("reading backup source {}", path.display()))?;
+    let contents = match std::fs::read(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading backup source {}", path.display()));
+        }
+    };
     let bak = allocate_backup_path(path)?;
     atomic_write_private(&bak, &contents)
         .with_context(|| format!("backing up {} -> {}", path.display(), bak.display()))?;
@@ -553,8 +586,13 @@ fn allocate_backup_path(path: &Path) -> Result<PathBuf> {
         } else {
             path.with_extension(format!("json.bak.{nanos}-{collision}"))
         };
-        if !candidate.exists() {
-            return Ok(candidate);
+        match std::fs::symlink_metadata(&candidate) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("checking backup candidate {}", candidate.display()));
+            }
         }
     }
     anyhow::bail!(
@@ -983,6 +1021,44 @@ mod tests {
 
         let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_errors_are_not_treated_as_missing_auth_or_managed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"x").unwrap();
+
+        let auth_path = blocked_parent.join("auth.json");
+        let auth_error = read_auth(&auth_path).unwrap_err();
+        assert!(auth_error.to_string().contains("reading"), "{auth_error:#}");
+
+        let config_error = load_codex_config(&blocked_parent).unwrap_err();
+        assert!(
+            config_error.to_string().contains("reading"),
+            "{config_error:#}"
+        );
+
+        let backup_error = backup_auth(&auth_path).unwrap_err();
+        assert!(
+            backup_error.to_string().contains("reading backup source"),
+            "{backup_error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_slot_metadata_errors_are_not_treated_as_empty_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"x").unwrap();
+
+        let error = allocate_backup_path(&blocked_parent.join("auth.json")).unwrap_err();
+        assert!(
+            error.to_string().contains("checking backup candidate"),
+            "{error:#}"
+        );
     }
 
     #[test]
