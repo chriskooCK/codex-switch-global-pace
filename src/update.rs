@@ -244,6 +244,7 @@ impl SelfUpdateResult {
     }
 
     /// Restore the pre-update executable before restarting the old daemon.
+    #[cfg(windows)]
     pub(crate) fn rollback_replacement(&mut self) -> Result<()> {
         if let Some(mut replacement) = self.replacement.take() {
             replacement.rollback()?;
@@ -359,6 +360,7 @@ impl PendingReplacement {
         self.lease.take();
     }
 
+    #[cfg(windows)]
     fn rollback(&mut self) -> Result<()> {
         if self.state != ReplacementState::Pending {
             return Ok(());
