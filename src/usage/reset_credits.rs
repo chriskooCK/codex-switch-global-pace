@@ -151,15 +151,19 @@ async fn fetch_reset_credits(
     Ok((available_count, credits))
 }
 
+pub(crate) fn reset_credit_expiry_sort_key(credit: &ResetCredit) -> i64 {
+    credit
+        .expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(i64::MAX)
+}
+
 pub fn earliest_reset_credit(credits: &[ResetCredit]) -> Option<&ResetCredit> {
-    credits.iter().min_by_key(|credit| {
-        credit
-            .expires_at
-            .as_deref()
-            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-            .map(|dt| dt.timestamp())
-            .unwrap_or(i64::MAX)
-    })
+    credits
+        .iter()
+        .min_by_key(|credit| reset_credit_expiry_sort_key(credit))
 }
 
 pub async fn consume_earliest_reset_credit(

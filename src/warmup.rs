@@ -314,6 +314,29 @@ fn is_model_quota_limit(limit: &crate::usage::AdditionalRateLimit) -> bool {
         && limit.limit_reached != Some(true)
 }
 
+fn matching_model_for_limit<'a>(
+    visible_models: &[&'a ModelEntry],
+    limit: &crate::usage::AdditionalRateLimit,
+) -> Option<&'a ModelEntry> {
+    let pool_name = normalized_pool_name(limit.limit_name.as_deref()?);
+    if pool_name.is_empty() {
+        return None;
+    }
+
+    visible_models.iter().copied().find(|model| {
+        let slug = normalized_pool_name(&model.slug);
+        let display = model
+            .display_name
+            .as_deref()
+            .map(normalized_pool_name)
+            .unwrap_or_default();
+        pool_name == slug
+            || pool_name == display
+            || slug.contains(&pool_name)
+            || display.contains(&pool_name)
+    })
+}
+
 fn select_warmup_models(
     models: &[ModelEntry],
     additional_limits: &[crate::usage::AdditionalRateLimit],
@@ -333,45 +356,14 @@ fn select_warmup_models(
         .collect();
     let additional_models: Vec<&ModelEntry> = model_limits
         .iter()
-        .filter_map(|limit| {
-            let pool_name = normalized_pool_name(limit.limit_name.as_deref()?);
-            visible.iter().copied().find(|model| {
-                let slug = normalized_pool_name(&model.slug);
-                let display = model
-                    .display_name
-                    .as_deref()
-                    .map(normalized_pool_name)
-                    .unwrap_or_default();
-                !pool_name.is_empty()
-                    && (pool_name == slug
-                        || pool_name == display
-                        || slug.contains(&pool_name)
-                        || display.contains(&pool_name))
-            })
-        })
+        .copied()
+        .filter_map(|limit| matching_model_for_limit(&visible, limit))
         .collect();
     if additional_models.len() != model_limits.len() {
         let unmatched = model_limits
             .iter()
-            .filter(|limit| {
-                let Some(name) = limit.limit_name.as_deref() else {
-                    return true;
-                };
-                let pool_name = normalized_pool_name(name);
-                !visible.iter().any(|model| {
-                    let slug = normalized_pool_name(&model.slug);
-                    let display = model
-                        .display_name
-                        .as_deref()
-                        .map(normalized_pool_name)
-                        .unwrap_or_default();
-                    !pool_name.is_empty()
-                        && (pool_name == slug
-                            || pool_name == display
-                            || slug.contains(&pool_name)
-                            || display.contains(&pool_name))
-                })
-            })
+            .copied()
+            .filter(|limit| matching_model_for_limit(&visible, limit).is_none())
             .map(|limit| limit.limit_name.as_deref().unwrap_or("unnamed"))
             .collect::<Vec<_>>()
             .join(", ");

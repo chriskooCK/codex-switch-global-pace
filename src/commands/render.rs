@@ -1,31 +1,25 @@
 use crate::{color, usage};
 
-/// Prompt the user for Y/n confirmation. Returns false on EOF or explicit "n"/"no".
-pub(crate) fn confirm(prompt: &str) -> bool {
+fn read_confirmation(prompt: &str) -> Option<String> {
     use std::io::{self, Write as _};
 
     eprint!("{}", color::dim(prompt));
     io::stderr().flush().ok();
     let mut input = String::new();
     match io::stdin().read_line(&mut input) {
-        Ok(0) => false, // EOF
-        Ok(_) => !matches!(input.trim().to_lowercase().as_str(), "n" | "no"),
-        Err(_) => false,
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(input.trim().to_lowercase()),
     }
+}
+
+/// Prompt the user for Y/n confirmation. Returns false on EOF or explicit "n"/"no".
+pub(crate) fn confirm(prompt: &str) -> bool {
+    read_confirmation(prompt).is_some_and(|answer| !matches!(answer.as_str(), "n" | "no"))
 }
 
 /// Prompt the user for y/N confirmation. Only an explicit "y" or "yes" accepts.
 pub(crate) fn confirm_default_no(prompt: &str) -> bool {
-    use std::io::{self, Write as _};
-
-    eprint!("{}", color::dim(prompt));
-    io::stderr().flush().ok();
-    let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
-        Ok(0) => false,
-        Ok(_) => matches!(input.trim().to_lowercase().as_str(), "y" | "yes"),
-        Err(_) => false,
-    }
+    read_confirmation(prompt).is_some_and(|answer| matches!(answer.as_str(), "y" | "yes"))
 }
 
 pub(crate) fn term_width() -> usize {

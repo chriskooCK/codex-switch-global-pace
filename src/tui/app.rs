@@ -19,7 +19,7 @@ use crate::profile::{
 use crate::usage::{
     ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary, Refresh, UsageError,
     UsageInfo, calculate_global_weekly_summary, fetch_usage_retried, fetch_usage_retried_force,
-    fetch_usage_retried_unattended,
+    fetch_usage_retried_unattended, reset_credit_expiry_sort_key,
 };
 use crate::warmup::ModelEntry;
 
@@ -364,14 +364,7 @@ impl App {
         let reset_card_expiries = loaded_usage
             .map(|u| {
                 let mut credits: Vec<_> = u.reset_credits.iter().collect();
-                credits.sort_by_key(|credit| {
-                    credit
-                        .expires_at
-                        .as_deref()
-                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or(i64::MAX)
-                });
+                credits.sort_by_key(|credit| reset_credit_expiry_sort_key(credit));
                 credits
                     .into_iter()
                     .map(|credit| {

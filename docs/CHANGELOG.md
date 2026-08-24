@@ -2,6 +2,10 @@
 
 ## v20260824.2.0 — 2026-08-24
 
+- **Leaner source tree** — Removed two unreferenced screenshots and the empty
+  Funding configuration, then centralized reset-card expiry ordering,
+  model-to-quota-pool matching, and default-No confirmation handling without
+  changing their behavior.
 - **One dashboard entry point** — The redundant `tui` subcommand has been
   removed. Running `codex-switch-global-pace` without a subcommand (including
   double-clicking the Windows executable) still opens the interactive
