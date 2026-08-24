@@ -1,3 +1,4 @@
+use super::render::confirm_default_no;
 use crate::output::{format_local_datetime, print_json, user_println};
 use crate::{auth, cache, color, config, profile, usage, warmup};
 use anyhow::{Context, Result};
@@ -25,7 +26,9 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
             .as_deref()
             .map(format_local_datetime)
             .unwrap_or_else(|| "no expiry".to_string());
-        if !confirm_reset_card(alias, &expires) {
+        if !confirm_default_no(&format!(
+            "Use earliest reset card for '{alias}' (expires {expires})? [y/N] "
+        )) {
             anyhow::bail!("aborted");
         }
     }
@@ -72,24 +75,6 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
         }
     }
     Ok(())
-}
-
-fn confirm_reset_card(alias: &str, expires: &str) -> bool {
-    use std::io::{self, Write as _};
-
-    eprint!(
-        "{}",
-        color::dim(&format!(
-            "Use earliest reset card for '{alias}' (expires {expires})? [y/N] "
-        ))
-    );
-    io::stderr().flush().ok();
-    let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
-        Ok(0) => false,
-        Ok(_) => matches!(input.trim().to_lowercase().as_str(), "y" | "yes"),
-        Err(_) => false,
-    }
 }
 
 // ── open ─────────────────────────────────────────────────

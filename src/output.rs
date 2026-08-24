@@ -375,14 +375,7 @@ pub fn reset_credits_count(u: &UsageInfo) -> Option<u64> {
 pub fn reset_credits_next_expiry(u: &UsageInfo) -> Option<&str> {
     u.reset_credits
         .iter()
-        .min_by_key(|credit| {
-            credit
-                .expires_at
-                .as_deref()
-                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
-                .map(|dt| dt.timestamp())
-                .unwrap_or(i64::MAX)
-        })
+        .min_by_key(|credit| crate::usage::reset_credit_expiry_sort_key(credit))
         .and_then(|credit| credit.expires_at.as_deref())
 }
 

@@ -27,6 +27,7 @@ pub use global_pace::{
 };
 #[allow(unused_imports)]
 pub use parse::parse_usage;
+pub(crate) use reset_credits::reset_credit_expiry_sort_key;
 pub use reset_credits::{consume_earliest_reset_credit, earliest_reset_credit};
 pub use scoring::{
     is_available, is_candidate_eligible, pace_percent, pick_switch_target, score_candidates,

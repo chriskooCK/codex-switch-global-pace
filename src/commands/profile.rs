@@ -422,17 +422,6 @@ struct RevivalCandidate<'a> {
     reset_credits: &'a [usage::ResetCredit],
 }
 
-/// Sort key for a credit's expiry: missing expiry sorts as "latest" (never
-/// ahead of a dated card), matching `usage::earliest_reset_credit`.
-fn expiry_sort_key(credit: &usage::ResetCredit) -> i64 {
-    credit
-        .expires_at
-        .as_deref()
-        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
-        .map(|dt| dt.timestamp())
-        .unwrap_or(i64::MAX)
-}
-
 /// Pick which ineligible, card-holding account should be revived by
 /// consuming its earliest-expiring reset card.
 ///
@@ -444,7 +433,7 @@ fn pick_revival_target(candidates: &[RevivalCandidate]) -> Option<String> {
         .filter(|c| !c.eligible && !c.reset_credits.is_empty())
         .filter_map(|c| {
             let earliest = usage::earliest_reset_credit(c.reset_credits)?;
-            Some((c, expiry_sort_key(earliest)))
+            Some((c, usage::reset_credit_expiry_sort_key(earliest)))
         })
         .min_by(|(a, a_key), (b, b_key)| {
             a_key
