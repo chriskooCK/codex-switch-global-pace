@@ -613,6 +613,8 @@ mod tests {
         let summary = GlobalWeeklySummary {
             pace_percent: Some(106.666_666_7),
             reserve_percent_points: Some(6.666_666_7),
+            aggregate_used_percent: Some(6.666_666_7),
+            aggregate_elapsed_percent: Some(13.333_333_3),
             effective_capacity: 320.0,
             normal_capacity: 300.0,
             included_accounts: 3,
