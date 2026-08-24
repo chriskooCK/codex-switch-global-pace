@@ -49,7 +49,10 @@
   authentication without repository secrets. That journal binds the prior
   release's draft/public state into its fingerprint, so a verified replacement
   is published without first exposing an old draft and any rollback restores
-  the exact prior visibility.
+  the exact prior visibility. Candidate ownership now comes from the exact
+  successful create response instead of an eventually consistent list, while
+  zero-asset interruption states remain explicit empty collections that can be
+  recovered safely.
 
 ## v20260824.7.0 — 2026-08-24
 

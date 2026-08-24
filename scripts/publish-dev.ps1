@@ -252,13 +252,14 @@ function AssertRemotePublicationMutationLock {
 }
 
 function Pages([string]$Base, [string]$ArrayProperty) {
-    $all = @(); $page = 1
+    [object[]]$all = @(); $page = 1
     do {
         $j = Json "$Base&per_page=100&page=$page" "Read page $page"
         $value = if ($ArrayProperty) { Prop $j $ArrayProperty } else { $j }
-        $batch = if ($null -eq $value) { @() } else { @($value) }
+        [object[]]$batch = @()
+        if ($null -ne $value) { $batch = [object[]]@($value) }
         $all += $batch; $page++
-    } while ($batch.Count -eq 100)
+    } while ($batch.Length -eq 100)
     return $all
 }
 function AllReleases { return @(Pages "repos/$script:Repo/releases?x=1" '') }
@@ -277,9 +278,12 @@ function RepoBytes([string]$Path, [string]$Sha) {
     return [Convert]::FromBase64String(([string](Prop $j 'content') -replace '\s', ''))
 }
 
-function ExactFiles([string]$Dir, [string[]]$Names) {
+function ExactFiles(
+    [string]$Dir,
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Names
+) {
     $items = @(Get-ChildItem -LiteralPath $Dir -Force)
-    if ($items.Count -ne $Names.Count) { throw "$Dir must contain exactly $($Names.Count) files." }
+    if ($items.Count -ne $Names.Length) { throw "$Dir must contain exactly $($Names.Length) files." }
     $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     foreach ($i in $items) {
         if ($i.PSIsContainer -or ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $i.Length -le 0) {
@@ -376,17 +380,54 @@ function AssertCandidateAssets([long]$Id, [object]$Map, [switch]$Exact, [string]
     return $projection
 }
 
-function AssertCandidate([hashtable]$C, [object]$R, [switch]$ExactAssets) {
+function AssertCandidateMetadata([hashtable]$C, [object]$R) {
     $id = [long](Prop $R 'id'); if ($C.CandidateId -and $id -ne $C.CandidateId) { throw 'Candidate release ID changed.' }
+    if ($id -le 0) { throw 'Candidate release ID is not positive.' }
     $stagedState = ((Prop $R 'tag_name') -eq $C.CandidateTag -and [bool](Prop $R 'draft'))
     $finalState = ((Prop $R 'tag_name') -eq 'dev' -and -not [bool](Prop $R 'draft'))
     if (-not ($stagedState -or $finalState) -or -not (SameSha (Prop $R 'target_commitish') $C.Sha) -or
-        -not (Same $R.name $C.Name) -or -not (Same $R.body $C.Body) -or -not [bool]$R.prerelease -or [bool]$R.immutable) {
+        -not (Same (Prop $R 'name') $C.Name) -or -not (Same (Prop $R 'body') $C.Body) -or
+        -not [bool](Prop $R 'prerelease') -or [bool](Prop $R 'immutable')) {
         throw 'Candidate release metadata changed.'
     }
-    $projection = AssertCandidateAssets $id $C.Local -Exact:([bool]$ExactAssets) `
+    return [pscustomobject]@{ Release = $R; Id = $id; Staged = $stagedState; Final = $finalState }
+}
+
+function AcceptCreatedCandidate([hashtable]$C, [object]$Result) {
+    if ($Result.Code -ne 0) {
+        throw "Candidate creation failed or its response was lost; the deterministic journal was preserved: $($Result.Error)"
+    }
+    if (-not $Result.Out) {
+        throw 'Candidate creation returned an empty response; the deterministic journal was preserved.'
+    }
+    try { $candidate = $Result.Out | ConvertFrom-Json }
+    catch { throw 'Candidate creation returned invalid JSON; the deterministic journal was preserved.' }
+
+    $state = AssertCandidateMetadata $C $candidate
+    if (-not $state.Staged -or $state.Final) {
+        throw 'Candidate creation did not return the exact staged state; the deterministic journal was preserved.'
+    }
+    $assetsProperty = $candidate.PSObject.Properties['assets']
+    if ($null -eq $assetsProperty -or $null -eq ($assetsProperty.Value)) {
+        throw 'Candidate creation response did not contain an explicit empty asset set; the deterministic journal was preserved.'
+    }
+    [object[]]$responseAssets = [object[]]@($assetsProperty.Value)
+    if ($responseAssets.Length -ne 0) {
+        throw 'Candidate creation response did not contain an explicit empty asset set; the deterministic journal was preserved.'
+    }
+
+    $C.CandidateId = $state.Id
+    $C.CandidateCreateAmbiguous = $false
+    $C.CandidateCreated = $true
+    return $state
+}
+
+function AssertCandidate([hashtable]$C, [object]$R, [switch]$ExactAssets) {
+    $state = AssertCandidateMetadata $C $R
+    $projection = AssertCandidateAssets $state.Id $C.Local -Exact:([bool]$ExactAssets) `
         -ExpectedProjection $C.CandidateProjection
-    return [pscustomobject]@{ Release = $R; Id = $id; Staged = $stagedState; Final = $finalState; Assets = $projection }
+    return [pscustomobject]@{ Release = $state.Release; Id = $state.Id; Staged = $state.Staged;
+        Final = $state.Final; Assets = $projection }
 }
 
 function DownloadExact([string]$Tag, [string]$Dir, [object]$Map) {
@@ -397,13 +438,17 @@ function DownloadExact([string]$Tag, [string]$Dir, [object]$Map) {
 }
 
 function DownloadProjection([string]$Tag, [string]$Dir, [object]$Map, [string]$Projection) {
-    $rows = if ($Projection) { @($Projection | ConvertFrom-Json) } else { @() }
-    $names = @($rows | ForEach-Object { [string](Prop $_ 'name') })
+    [object[]]$rows = @()
+    if ($Projection) {
+        $parsed = $Projection | ConvertFrom-Json
+        if ($null -ne $parsed) { $rows = [object[]]@($parsed) }
+    }
+    [string[]]$names = [string[]]@($rows | ForEach-Object { [string](Prop $_ 'name') })
     [void][IO.Directory]::CreateDirectory($Dir)
-    if ($names.Count -gt 0) {
+    if ($names.Length -gt 0) {
         RunGh @('release', 'download', $Tag, '--repo', $script:Repo, '--dir', $Dir) "Download release $Tag subset" | Out-Null
     }
-    ExactFiles $Dir $names
+    ExactFiles -Dir $Dir -Names $names
     foreach ($n in $names) {
         if (-not $Map.ContainsKey($n) -or (Hash (Join-Path $Dir $n)) -ne $Map[$n].Hash) {
             throw "Remote asset '$n' is not an exact local-bundle subset member."
@@ -609,7 +654,13 @@ function Rollback([hashtable]$C) {
         [bool](Prop $old 'draft') -eq [bool]$C.OldDraft)
     $oldParked = ((Prop $old 'tag_name') -eq $C.ParkTag -and [bool](Prop $old 'draft'))
     if (-not ($oldOriginal -or $oldParked)) { throw 'Old release state is unowned; preserving both releases.' }
+    if ($C.ContainsKey('CandidateCreateAmbiguous') -and [bool]$C.CandidateCreateAmbiguous) {
+        throw 'Candidate creation response was ambiguous; the deterministic journal was preserved for rerun recovery.'
+    }
     $candidate = FindCandidate $C
+    if (-not $candidate -and $C.ContainsKey('CandidateCreated') -and [bool]$C.CandidateCreated) {
+        throw 'The authoritatively created candidate is temporarily unavailable; its journal was preserved.'
+    }
     if ($candidate) {
         $owned = AssertCandidate $C $candidate -ExactAssets:([bool]$C.CandidateExact)
         if (-not $C.CandidateProjection) {
@@ -789,7 +840,8 @@ try {
     $oldVisibility = if ($oldDraft) { 'draft' } else { 'public' }
     $candidateTag = "dev-candidate-$oldId-$oldVisibility-$oldFingerprint-$tx"
     $Context = @{ Sha = $sha; CandidateTag = $candidateTag; CandidateId = 0L;
-        CandidateProjection = ''; CandidateExact = $false; ParkTag = ''; Local = $local; Name = $name;
+        CandidateProjection = ''; CandidateExact = $false; CandidateCreateAmbiguous = $false;
+        CandidateCreated = $false; ParkTag = ''; Local = $local; Name = $name;
         Body = $expectedBody; OldId = $oldId; OldTarget = $oldTarget; OldName = (Prop $old 'name');
         OldBody = (Prop $old 'body'); OldPrerelease = [bool](Prop $old 'prerelease');
         OldDraft = $oldDraft; OldFingerprint = $oldFingerprint }
@@ -806,10 +858,9 @@ try {
     }
     $createBody = [ordered]@{ tag_name = $candidateTag; target_commitish = $sha; name = $name; body = $expectedBody; draft = $true; prerelease = $true }
     AssertRemotePublicationMutationLock
+    $Context.CandidateCreateAmbiguous = $true
     $created = Mutate "repos/$Repo/releases" 'POST' (Payload 'create.json' $createBody) 'Create candidate draft'
-    $candidate = FindCandidate $Context; if (-not $candidate) { throw "Candidate creation failed: $($created.Error)" }
-    $Context.CandidateId = [long](Prop $candidate 'id')
-    AssertCandidate $Context $candidate | Out-Null
+    AcceptCreatedCandidate $Context $created | Out-Null
     AssertNoRef $candidateTag
     $parkTag = "dev-park-$oldId-$($Context.CandidateId)-$oldVisibility-$oldFingerprint-$tx"
     $parkCollisions = @(AllReleases | Where-Object { (Prop $_ 'tag_name') -eq $parkTag })

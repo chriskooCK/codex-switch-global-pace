@@ -660,10 +660,17 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "function RecoverJournal",
         "CandidateProjection",
         "CandidateExact",
+        "CandidateCreateAmbiguous",
+        "CandidateCreated",
+        "function AssertCandidateMetadata",
+        "function AcceptCreatedCandidate",
         "-Exact:([bool]$ExactAssets)",
         "DownloadProjection",
+        "[Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Names",
         "rollback-assets-",
         "exact local-bundle subset member",
+        "Candidate creation response was ambiguous",
+        "authoritatively created candidate is temporarily unavailable",
         "Recovered interrupted development publication",
         "Prior dev release is not a mutable SHA-bound prerelease.",
         "Prior dev release drifted before candidate creation.",
@@ -750,10 +757,26 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
     }
     assert!(!fingerprint.contains("ConvertTo-Json"));
     assert!(!publisher.contains("codex-switch-old-release-v1;"));
-    let candidate_state = publisher
-        .split("function AssertCandidate([hashtable]$C")
+    let pages = publisher
+        .split("function Pages")
         .nth(1)
-        .and_then(|section| section.split("function DownloadExact").next())
+        .and_then(|section| section.split("function RepoBytes").next())
+        .expect("release pagination function");
+    for required in [
+        "[object[]]$batch = @()",
+        "if ($null -ne $value) { $batch = [object[]]@($value) }",
+        "$batch.Length -eq 100",
+    ] {
+        assert!(
+            pages.contains(required),
+            "empty release pages must be represented explicitly with `{required}`"
+        );
+    }
+    assert!(!pages.contains("$batch = if"));
+    let candidate_state = publisher
+        .split("function AssertCandidateMetadata")
+        .nth(1)
+        .and_then(|section| section.split("function AcceptCreatedCandidate").next())
         .expect("candidate staged/final state function");
     for required in [
         "$stagedState",
@@ -765,6 +788,54 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         assert!(
             candidate_state.contains(required),
             "candidate state contract must contain `{required}`"
+        );
+    }
+    let created_candidate = publisher
+        .split("function AcceptCreatedCandidate")
+        .nth(1)
+        .and_then(|section| section.split("function AssertCandidate(").next())
+        .expect("authoritative candidate-create response function");
+    for required in [
+        "$Result.Out | ConvertFrom-Json",
+        "AssertCandidateMetadata $C $candidate",
+        "$candidate.PSObject.Properties['assets']",
+        "[object[]]$responseAssets = [object[]]@($assetsProperty.Value)",
+        "$responseAssets.Length -ne 0",
+        "$C.CandidateId = $state.Id",
+        "$C.CandidateCreateAmbiguous = $false",
+        "$C.CandidateCreated = $true",
+    ] {
+        assert!(
+            created_candidate.contains(required),
+            "candidate-create response contract must contain `{required}`"
+        );
+    }
+    assert!(!created_candidate.contains("AllReleases"));
+    assert!(!created_candidate.contains("FindCandidate"));
+    assert_before(
+        created_candidate,
+        "AssertCandidateMetadata $C $candidate",
+        "$C.CandidateId = $state.Id",
+    );
+    assert_before(
+        created_candidate,
+        "$responseAssets.Length -ne 0",
+        "$C.CandidateCreateAmbiguous = $false",
+    );
+    let projection_download = publisher
+        .split("function DownloadProjection")
+        .nth(1)
+        .and_then(|section| section.split("function RemoveRelease").next())
+        .expect("candidate projection download function");
+    for required in [
+        "[object[]]$rows = @()",
+        "[string[]]$names = [string[]]@(",
+        "if ($names.Length -gt 0)",
+        "ExactFiles -Dir $Dir -Names $names",
+    ] {
+        assert!(
+            projection_download.contains(required),
+            "empty candidate projection contract must contain `{required}`"
         );
     }
     let journal_discovery = publisher
@@ -867,10 +938,32 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "$journal = DiscoverJournal",
         "$oldByTag = ReleaseAnyTag 'dev'",
     );
+    let candidate_create_transaction = publisher
+        .split("$createBody =")
+        .nth(1)
+        .and_then(|section| section.split("$parkTag =").next())
+        .expect("candidate creation transaction");
+    for required in [
+        "$Context.CandidateCreateAmbiguous = $true",
+        "Create candidate draft",
+        "AcceptCreatedCandidate $Context $created",
+    ] {
+        assert!(
+            candidate_create_transaction.contains(required),
+            "candidate creation transaction must contain `{required}`"
+        );
+    }
+    assert!(!candidate_create_transaction.contains("FindCandidate"));
+    assert!(!candidate_create_transaction.contains("AllReleases"));
     assert_before(
-        &publisher,
-        "$Context.CandidateId = [long](Prop $candidate 'id')",
-        "$parkTag = \"dev-park-$oldId-$($Context.CandidateId)-$oldVisibility-$oldFingerprint-$tx\"",
+        candidate_create_transaction,
+        "$Context.CandidateCreateAmbiguous = $true",
+        "Create candidate draft",
+    );
+    assert_before(
+        candidate_create_transaction,
+        "Create candidate draft",
+        "AcceptCreatedCandidate $Context $created",
     );
     assert_before(
         &publisher,
