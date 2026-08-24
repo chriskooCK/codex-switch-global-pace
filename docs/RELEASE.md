@@ -120,10 +120,19 @@ Release mutation, the publisher also atomically creates the single remote
 tag. Only the process that receives and verifies the successful create response
 owns that lock. An existing lock or an ambiguous create response is never stolen
 or removed automatically. While the lock is held, candidate/park release tags
-form the crash-recovery journal; rerunning the publisher verifies that journal
-byte-for-byte before it restores an interrupted cutover or continues with a new
-one. Normal exit removes only the exact lock object it created and confirms the
-ref is absent.
+form the crash-recovery journal. Each journal tag explicitly records whether the
+prior `dev` release was a draft or public, so recovery never guesses visibility
+from a temporarily parked release. That value is also bound into the v2 prior-
+release fingerprint. After exact verification, a successful replacement always
+finalizes the new candidate as public (`draft=false`). If replacement fails or is
+interrupted, rollback instead restores the prior release to its original tag and
+exact draft/public state without temporarily publishing a prior draft. Here,
+exact recovery covers release metadata, asset identity and bytes, tag, and draft
+flag; it does not claim to restore GitHub's
+server-generated timestamps.
+Rerunning the publisher verifies that journal byte-for-byte before it restores an
+interrupted cutover or continues with a new one. Normal exit removes only the
+exact lock object it created and confirms the ref is absent.
 
 - Linux / macOS: `.tar.gz` archives named `codex-switch-global-pace-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
 - Windows: `.zip` archives named `codex-switch-global-pace-windows-{amd64,arm64}.zip` plus `.sha256`
@@ -137,7 +146,7 @@ Post-release verification must confirm at least:
 - A platform archive downloaded from GitHub Releases matches its `.sha256`.
 - A current GitHub CLI verifies that archive against `codex-switch-global-pace-build-provenance.json` with the repository, `.github/workflows/release.yml`, exact tag ref, the full commit digest reached by that tag, and self-hosted runners denied.
 - The unpacked release binary reports the CI-injected version with `codex-switch-global-pace --version`.
-- The original release path works, for example `codex-switch-global-pace self-update --check --dev`.
+- After `publish-dev.ps1` succeeds, the release is public and the original release path works, for example `codex-switch-global-pace self-update --check --dev`.
 
 ## Publish a stable release
 
@@ -180,6 +189,13 @@ Check whether the Release workflow was triggered and whether `on.push.tags` stil
 **The Release workflow succeeded but the dev GitHub Release did not change**
 The workflow intentionally stops after creating the verified development bundle. Run `pwsh -NoProfile -File ./scripts/publish-dev.ps1` from the repository root; it selects only a successful Release run whose source SHA still equals the remote `dev` tag.
 
+An existing mutable SHA-bound `dev` prerelease may be either draft or public.
+Do not publish a prior draft manually as a workaround. The publisher records that
+visibility in its recovery journal, parks the old release as an isolated draft,
+and restores the exact original visibility if replacement fails. A successful
+replacement assigns `dev` to only the newly verified candidate and makes that
+candidate public. The prior visibility is used only for exact rollback.
+
 **The remote development-publication lock already exists**
 Do not rerun with a different token or delete the lock speculatively. First make
 sure no publisher process is active and inspect both the lock and any
@@ -190,7 +206,7 @@ and the journal state have been reviewed, remove that one ref explicitly with
 then rerun the publisher so journal recovery happens under a newly acquired lock.
 
 **`self-update --dev` cannot find the new build**
-The GitHub Release tag must be the lowercase literal `dev`. A separate tag such as `v20260712.1.0-dev` creates an independent prerelease that the client channel cannot see.
+The GitHub Release tag must be the lowercase literal `dev` and the release must be public (`draft=false`). A separate tag such as `v20260712.1.0-dev` creates an independent prerelease that the client channel cannot see, and a `dev` draft is intentionally unavailable to unauthenticated clients.
 
 **Should the Cargo.toml version contain `-dev`?**
 No. CI appends `-dev`; the local manifest keeps the clean `YYYYMMDD.N.0` base. Increment `N` before another candidate on the same date or clients will treat it as the version they already have.
