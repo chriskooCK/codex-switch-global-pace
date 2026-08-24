@@ -1554,7 +1554,7 @@ mod tests {
         super::switch_profile("alice").unwrap();
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let updater = std::thread::spawn(move || {
             let result = super::update_profile_tokens_if_refresh_matches_after_lock(
