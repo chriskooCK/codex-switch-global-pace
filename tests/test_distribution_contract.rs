@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -229,51 +228,13 @@ fn self_update_provenance_requirement_is_documented() {
 }
 
 #[test]
-fn wiki_sync_uses_the_reviewed_repository_sources() {
-    let workflow = repo_file(".github/workflows/wiki.yml");
-
-    for required in [
-        "workflow_dispatch:",
-        "branches: [dev]",
-        "docs/wiki/**",
-        "permissions:",
-        "contents: write",
-        "${{ secrets.GITHUB_TOKEN }}",
-        "${GITHUB_REPOSITORY}.wiki.git",
-        "refs/heads/dev:refs/remotes/origin/dev",
-        "git diff --quiet \"$GITHUB_SHA\" refs/remotes/origin/dev -- docs/wiki .github/workflows/wiki.yml",
-        "for page in docs/wiki/*.md; do",
-        "[[ -f \"$page\" && ! -L \"$page\" ]]",
-        "cp -- \"$page\" \"$wiki_dir\"/",
-        "push origin HEAD:master",
-    ] {
-        assert!(
-            workflow.contains(required),
-            "Wiki workflow must contain `{required}`"
-        );
-    }
-    assert!(!workflow.contains("WIKI_TOKEN"));
-    assert!(!workflow.contains("pull_request:"));
-    assert!(!workflow.contains("branches: [dev, master]"));
-}
-
-#[test]
-fn wiki_links_resolve_to_reviewed_pages_and_sources() {
+fn documentation_links_resolve_to_reviewed_pages_and_sources() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let wiki_dir = root.join("docs/wiki");
-    let page_slugs: BTreeSet<String> = fs::read_dir(&wiki_dir)
-        .expect("failed to list Wiki sources")
-        .map(|entry| entry.expect("failed to read Wiki source entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
-        .filter_map(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .collect();
+    let docs_dir = root.join("docs/wiki");
     let repository_prefix = "https://github.com/chriskooCK/codex-switch-global-pace/";
 
-    for entry in fs::read_dir(&wiki_dir).expect("failed to list Wiki sources") {
-        let path = entry.expect("failed to read Wiki source entry").path();
+    for entry in fs::read_dir(&docs_dir).expect("failed to list documentation pages") {
+        let path = entry.expect("failed to read documentation entry").path();
         if path.extension().is_none_or(|extension| extension != "md") {
             continue;
         }
@@ -315,45 +276,40 @@ fn wiki_links_resolve_to_reviewed_pages_and_sources() {
                 continue;
             }
 
-            let (page, anchor) = link
+            let (target, anchor) = link
                 .split_once('#')
-                .map_or((link, None), |(page, anchor)| (page, Some(anchor)));
-            let slug = page.trim_end_matches(".md");
+                .map_or((link, None), |(target, anchor)| (target, Some(anchor)));
             assert!(
-                page_slugs.contains(slug),
-                "{} links to missing Wiki page: {link}",
+                target.ends_with(".md"),
+                "{} uses an extensionless documentation link: {link}",
+                path.display()
+            );
+            let target_path = path
+                .parent()
+                .expect("documentation page must have a parent directory")
+                .join(target);
+            assert!(
+                target_path.exists(),
+                "{} links to missing documentation page: {link}",
                 path.display()
             );
             if let Some(anchor) = anchor {
-                assert_markdown_anchor_exists(&wiki_dir.join(format!("{slug}.md")), anchor);
+                assert_markdown_anchor_exists(&target_path, anchor);
             }
         }
     }
 }
 
 #[test]
-fn wiki_navigation_is_task_oriented_and_progressive() {
+fn documentation_navigation_is_task_oriented_and_progressive() {
     let home = repo_file("docs/wiki/Home.md");
-    let sidebar = repo_file("docs/wiki/_Sidebar.md");
 
     for required in ["## Start here", "## Choose your task", "## Contribute"] {
         assert!(
             home.contains(required),
-            "Wiki Home must contain `{required}`"
+            "documentation Home must contain `{required}`"
         );
     }
-    for required in [
-        "## Start here",
-        "## Use codex-switch-global-pace",
-        "## Get help",
-        "## Contribute",
-    ] {
-        assert!(
-            sidebar.contains(required),
-            "Wiki sidebar must contain `{required}`"
-        );
-    }
-    assert!(!sidebar.contains("### Canonical sources"));
 
     for page in [
         "Architecture-Overview.md",
@@ -371,7 +327,7 @@ fn wiki_navigation_is_task_oriented_and_progressive() {
     ] {
         assert!(
             repo_file(&format!("docs/wiki/{page}")).contains("## Next steps"),
-            "Wiki page {page} must end with explicit next steps"
+            "documentation page {page} must end with explicit next steps"
         );
     }
 }

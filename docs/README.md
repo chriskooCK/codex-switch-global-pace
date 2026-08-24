@@ -1,6 +1,8 @@
 # Documentation
 
-Reader-facing documentation lives in [`docs/wiki/`](wiki) and is published automatically to the [GitHub Wiki](https://github.com/chriskooCK/codex-switch-global-pace/wiki). The Wiki pages are the single set of user and contributor documentation; they are reviewed in pull requests with the code they describe.
+Reader-facing documentation lives in [`docs/wiki/`](wiki). These pages are the
+single set of user and contributor documentation and are reviewed in pull
+requests with the code they describe.
 
 ## Choose a starting point
 
@@ -12,13 +14,13 @@ Reader-facing documentation lives in [`docs/wiki/`](wiki) and is published autom
 | Maintainer | [Architecture overview](wiki/Architecture-Overview.md) | [Release process](RELEASE.md) |
 | Release reader | [Changelog](CHANGELOG.md) | [GitHub Releases](https://github.com/chriskooCK/codex-switch-global-pace/releases) |
 
-## Repository-only documents
+## Maintainer documents
 
-These stay outside the Wiki because they are maintainer- or process-facing:
+These stay outside the reader guides because they are maintainer- or
+process-facing:
 
 - [Release process](RELEASE.md) defines the maintainer-only release gates.
 - [Changelog](CHANGELOG.md) records release-level behavior changes.
-- [Wiki maintenance](WIKI.md) explains how `docs/wiki/` is authored and published.
 - [Architecture decision records](adr/) capture significant one-time decisions.
 - [Contributing](../CONTRIBUTING.md) defines the pull request contract (kept at the repository root so GitHub surfaces it).
 
@@ -29,4 +31,4 @@ These stay outside the Wiki because they are maintainer- or process-facing:
 - Describe observed behavior, not planned behavior.
 - Link to source files for implementation details that may change.
 - Update the relevant `docs/wiki/` page in the same pull request as a behavior change.
-- Do not edit the published Wiki as an independent copy; update `docs/wiki/` and let CI sync it.
+- Keep relative links valid when the pages are rendered directly in the GitHub repository.

@@ -11,7 +11,7 @@ This page takes you from nothing to a working multi-account setup: install codex
 cli_auth_credentials_store = "file"
 ```
 
-Explicit `keyring`, `auto`, and `ephemeral` stores are rejected — permanently by design, because OS keyrings cannot provide the locking and atomic-replace guarantees switching depends on (see [why only the file store is supported](Configuration#why-only-the-file-store-is-supported)). A managed Codex configuration with `forced_login_method = "api"` is also incompatible, because codex-switch-global-pace manages ChatGPT login profiles. In both cases codex-switch-global-pace stops with an actionable error instead of modifying authentication state; after switching to the file store, log in again.
+Explicit `keyring`, `auto`, and `ephemeral` stores are rejected — permanently by design, because OS keyrings cannot provide the locking and atomic-replace guarantees switching depends on (see [why only the file store is supported](Configuration.md#why-only-the-file-store-is-supported)). A managed Codex configuration with `forced_login_method = "api"` is also incompatible, because codex-switch-global-pace manages ChatGPT login profiles. In both cases codex-switch-global-pace stops with an actionable error instead of modifying authentication state; after switching to the file store, log in again.
 
 ## Install
 
@@ -66,7 +66,7 @@ codex-switch-global-pace also notices logins performed outside of it: when the l
 
 ```bash
 codex-switch-global-pace list        # accounts, quota, availability
-codex-switch-global-pace tui         # interactive dashboard
+codex-switch-global-pace             # interactive dashboard
 codex-switch-global-pace use         # switch to the best eligible account
 ```
 
@@ -74,7 +74,7 @@ codex-switch-global-pace use         # switch to the best eligible account
 
 ## Where your data lives
 
-Saved profiles, cache, configuration, and daemon state default to `~/.codex-switch` (`%USERPROFILE%\.codex-switch` on Windows). The live Codex file stays at `$CODEX_HOME/auth.json`. See [Configuration](Configuration) for every path and setting.
+Saved profiles, cache, configuration, and daemon state default to `~/.codex-switch` (`%USERPROFILE%\.codex-switch` on Windows). The live Codex file stays at `$CODEX_HOME/auth.json`. See [Configuration](Configuration.md) for every path and setting.
 
 Never share profile files, `auth.json`, tokens, proxy credentials, or unredacted `--debug` output.
 
@@ -84,6 +84,6 @@ other.
 
 ## Next steps
 
-- Learn account, quota, switching, and daemon workflows in the [Feature guide](Feature-Guide).
-- Look up exact commands and TUI shortcuts in the [Command reference](Command-Reference).
-- Keep the binary current with [Updating](Updating).
+- Learn account, quota, switching, and daemon workflows in the [Feature guide](Feature-Guide.md).
+- Look up exact commands and TUI shortcuts in the [Command reference](Command-Reference.md).
+- Keep the binary current with [Updating](Updating.md).

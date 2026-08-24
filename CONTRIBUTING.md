@@ -44,7 +44,8 @@ Update documentation in the same pull request when behavior changes:
 - `docs/wiki/Developer-Onboarding.md` for engineering workflow changes
 - `docs/CHANGELOG.md` for the current development cycle
 
-The `docs/wiki/` sources are the reader documentation and are published to the GitHub Wiki by CI; never edit the published Wiki directly.
+The `docs/wiki/` directory is the reviewed reader documentation. Update it in
+the same pull request as the behavior it describes.
 
 ## Open the pull request
 

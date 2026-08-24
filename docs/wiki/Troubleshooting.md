@@ -10,10 +10,10 @@ Start with the complete error message, its file path, and the command that produ
 | Windows daemon installation is denied | Open PowerShell as Administrator and retry. |
 | Windows daemon stop says credential work is still in flight | Wait briefly and run `codex-switch-global-pace daemon stop` again. The process is intentionally left running instead of force-killed while a refresh token may be rotating. |
 | TUI layout is broken in Git Bash | Use Windows Terminal or PowerShell. |
-| macOS/Linux self-update reports that the install directory is not writable | Rerun the current installer once to migrate a legacy `/usr/local/bin` direct install to `$HOME/.local/bin`; see [Updating](Updating#install-locations-and-migration). Use `sudo codex-switch-global-pace self-update` only for an intentional `--system` install. |
+| macOS/Linux self-update reports that the install directory is not writable | Rerun the current installer once to migrate a legacy `/usr/local/bin` direct install to `$HOME/.local/bin`; see [Updating](Updating.md#install-locations-and-migration). Use `sudo codex-switch-global-pace self-update` only for an intentional `--system` install. |
 | A dev build should return to stable | Run `codex-switch-global-pace self-update --stable`. |
 | Self-update reports that `gh attestation verify` is unavailable | Install or upgrade [GitHub CLI](https://cli.github.com/), then retry. Direct self-update fails closed until it can verify the release provenance bundle. |
-| An installed daemon ignores `CODEX_SWITCH_HOME` | The generated service forwards only `HOME` and `CODEX_HOME`; add `CODEX_SWITCH_HOME` to the service definition manually. See [Configuration](Configuration#platform-integration). |
+| An installed daemon ignores `CODEX_SWITCH_HOME` | The generated service forwards only `HOME` and `CODEX_HOME`; add `CODEX_SWITCH_HOME` to the service definition manually. See [Configuration](Configuration.md#platform-integration). |
 | The daemon says another daemon is running | `codex-switch` and `codex-switch-global-pace` share the daemon PID and state files. Stop and uninstall the other service; do not run both simultaneously. |
 | HTTPS fails with `invalid peer certificate: UnknownIssuer` | An intercepting proxy is re-signing traffic. See [HTTPS fails with an unknown issuer](#https-fails-with-invalid-peer-certificate-unknownissuer). |
 | An account reports `re-login required (refresh_token_reused)` | The stored refresh token was already spent and cannot be recovered. Run `codex-switch-global-pace login <alias>` for that profile. The verdict is remembered, so the account costs no further requests until you sign in again; `codex-switch-global-pace list -f` asks the server anyway. |
@@ -78,6 +78,6 @@ Include the operating system, terminal, `codex-switch-global-pace --version`, ex
 
 ## Next steps
 
-- Check short behavior and security answers in the [FAQ](FAQ).
-- Review paths and settings in [Configuration](Configuration).
+- Check short behavior and security answers in the [FAQ](FAQ.md).
+- Review paths and settings in [Configuration](Configuration.md).
 - If the problem remains, report the redacted reproduction in the [GitHub issue tracker](https://github.com/chriskooCK/codex-switch-global-pace/issues).

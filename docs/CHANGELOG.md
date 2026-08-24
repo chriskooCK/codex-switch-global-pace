@@ -2,6 +2,14 @@
 
 ## v20260824.2.0 — 2026-08-24
 
+- **One dashboard entry point** — The redundant `tui` subcommand has been
+  removed. Running `codex-switch-global-pace` without a subcommand (including
+  double-clicking the Windows executable) still opens the interactive
+  dashboard.
+- **Repository-hosted documentation** — Removed the failing GitHub Wiki sync
+  workflow and its publication-only maintenance files. The reviewed guides in
+  `docs/wiki/` now link directly to one another and remain available in every
+  clone without a separate Wiki publishing step.
 - **One account-switching workflow** — The `launch` command and its temporary
   credential staging, restoration delay, and configuration have been removed.
   Use `codex-switch-global-pace use` (or select an account in the TUI), then

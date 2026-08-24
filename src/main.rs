@@ -22,7 +22,6 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
 use output::{MessageMode, print_error, user_println};
-use std::ffi::OsString;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug)]
@@ -75,9 +74,9 @@ fn read_last_refresh(path: Result<std::path::PathBuf>) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse_from(with_default_tui(std::env::args_os().collect()));
+    let cli = Cli::parse();
     let use_json = cli.json || cli.json_pretty;
-    let message_mode = if matches!(&cli.command, Commands::Tui) {
+    let message_mode = if cli.command.is_none() {
         MessageMode::Silent
     } else if use_json {
         MessageMode::Stderr
@@ -102,7 +101,7 @@ async fn main() {
         EnvFilter::new("codex_switch_global_pace=debug")
     } else if std::env::var_os("RUST_LOG").is_some() {
         EnvFilter::from_default_env()
-    } else if matches!(&cli.command, Commands::Daemon(_)) {
+    } else if matches!(&cli.command, Some(Commands::Daemon(_))) {
         let level = config::daemon_log_level();
         EnvFilter::new(format!("codex_switch_global_pace={level}"))
     } else {
@@ -153,21 +152,10 @@ async fn main() {
     }
 }
 
-/// A bare executable opens the dashboard. Any supplied argument is left to
-/// clap unchanged so `--help`, `--version`, and invalid invocations retain
-/// their normal CLI semantics.
-fn with_default_tui(mut args: Vec<OsString>) -> Vec<OsString> {
-    if args.len() == 1 {
-        args.push(OsString::from("tui"));
-    }
-    args
-}
-
 #[cfg(test)]
 mod error_reporting_tests {
-    use super::{Cli, Commands, OutputAlreadyReported, should_report_error, with_default_tui};
+    use super::{Cli, OutputAlreadyReported, should_report_error};
     use clap::Parser;
-    use std::ffi::OsString;
 
     #[test]
     fn already_reported_errors_are_not_printed_or_logged_again() {
@@ -177,20 +165,17 @@ mod error_reporting_tests {
 
     #[test]
     fn a_bare_executable_defaults_to_tui() {
-        let cli = Cli::try_parse_from(with_default_tui(vec![OsString::from(
-            "codex-switch-global-pace",
-        )]))
-        .expect("bare executable should parse as the TUI command");
-        assert!(matches!(cli.command, Commands::Tui));
+        let cli = Cli::try_parse_from(["codex-switch-global-pace"])
+            .expect("bare executable should parse without a subcommand");
+        assert!(cli.command.is_none());
     }
 
     #[test]
-    fn supplied_arguments_are_not_rewritten() {
-        let args = vec![
-            OsString::from("codex-switch-global-pace"),
-            OsString::from("--help"),
-        ];
-        assert_eq!(with_default_tui(args.clone()), args);
+    fn removed_tui_command_is_rejected() {
+        let error = Cli::try_parse_from(["codex-switch-global-pace", "tui"])
+            .err()
+            .expect("tui must no longer be accepted as a subcommand");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]
@@ -269,15 +254,15 @@ mod resync_reporting_tests {
     }
 }
 
-async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
+async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
     // Startup auth change detection — skip for commands that manage auth themselves
     let auth_check = if !json {
         let should_check = !matches!(
             &cmd,
-            Commands::Login { .. }
-                | Commands::Import { .. }
-                | Commands::SelfUpdate { .. }
-                | Commands::Open
+            Some(Commands::Login { .. })
+                | Some(Commands::Import { .. })
+                | Some(Commands::SelfUpdate { .. })
+                | Some(Commands::Open)
         );
         if should_check {
             check_auth_change()
@@ -290,30 +275,32 @@ async fn dispatch(cmd: Commands, json: bool) -> Result<()> {
     let auth_handled = !matches!(auth_check, AuthCheckResult::NoChange);
 
     match cmd {
-        Commands::Use {
+        Some(Commands::Use {
             alias,
             consume_card,
-        } => commands::use_cmd(alias.as_deref(), json, consume_card).await?,
-        Commands::List { force } => commands::list_cmd(force, json, auth_handled).await?,
-        Commands::ResetCard { alias, yes } => commands::reset_card_cmd(&alias, yes, json).await?,
-        Commands::Rename { old, new } => commands::rename_cmd(&old, &new, json)?,
-        Commands::Delete { alias, yes } => commands::delete_cmd(&alias, yes, json)?,
-        Commands::Login { alias, device } => {
+        }) => commands::use_cmd(alias.as_deref(), json, consume_card).await?,
+        Some(Commands::List { force }) => commands::list_cmd(force, json, auth_handled).await?,
+        Some(Commands::ResetCard { alias, yes }) => {
+            commands::reset_card_cmd(&alias, yes, json).await?
+        }
+        Some(Commands::Rename { old, new }) => commands::rename_cmd(&old, &new, json)?,
+        Some(Commands::Delete { alias, yes }) => commands::delete_cmd(&alias, yes, json)?,
+        Some(Commands::Login { alias, device }) => {
             commands::login_cmd(alias.as_deref(), device, json).await?
         }
-        Commands::Import { path, alias } => {
+        Some(Commands::Import { path, alias }) => {
             commands::import_cmd(&path, alias.as_deref(), json).await?
         }
-        Commands::SelfUpdate {
+        Some(Commands::SelfUpdate {
             check,
             version,
             dev,
             stable,
-        } => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
-        Commands::Warmup { alias } => commands::warmup_cmd(alias.as_deref(), json).await?,
-        Commands::Tui => tui::run_tui().await?,
-        Commands::Open => commands::open_cmd()?,
-        Commands::Daemon(sub) => daemon::dispatch(sub, json).await?,
+        }) => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
+        Some(Commands::Warmup { alias }) => commands::warmup_cmd(alias.as_deref(), json).await?,
+        Some(Commands::Open) => commands::open_cmd()?,
+        Some(Commands::Daemon(sub)) => daemon::dispatch(sub, json).await?,
+        None => tui::run_tui().await?,
     }
 
     // If startup check actually synced the profile, re-sync after command execution

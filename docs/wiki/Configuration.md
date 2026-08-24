@@ -123,6 +123,6 @@ Every command writes diagnostic logs to `$CODEX_SWITCH_HOME/logs/`, one file per
 
 ## Next steps
 
-- See what these settings control in the [Feature guide](Feature-Guide).
-- Look up the flags that override configuration in the [Command reference](Command-Reference).
-- Diagnose configuration errors with [Troubleshooting](Troubleshooting).
+- See what these settings control in the [Feature guide](Feature-Guide.md).
+- Look up the flags that override configuration in the [Command reference](Command-Reference.md).
+- Diagnose configuration errors with [Troubleshooting](Troubleshooting.md).

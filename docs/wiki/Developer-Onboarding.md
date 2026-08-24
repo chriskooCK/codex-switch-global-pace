@@ -1,6 +1,6 @@
 # Developer onboarding
 
-This guide is for engineers and coding agents taking over `codex-switch-global-pace`. Read the [Architecture overview](Architecture-Overview) before changing authentication, switching, the daemon, or release behavior.
+This guide is for engineers and coding agents taking over `codex-switch-global-pace`. Read the [Architecture overview](Architecture-Overview.md) before changing authentication, switching, the daemon, or release behavior.
 
 ## Prepare the repository
 
@@ -31,7 +31,7 @@ Development and pull requests normally target `dev`. The `master` branch represe
 | TUI behavior | `src/tui/` | State/render unit tests and terminal smoke test |
 | Daemon | `src/daemon/` | Unit tests, daemon integration tests, three-host CI |
 | Installer/update | `scripts/`, `src/update.rs`, release workflow | Distribution contract tests and release artifact checks |
-| Configuration | `src/config.rs`, the [Configuration](Configuration) page | Parsing/default/warning tests |
+| Configuration | `src/config.rs`, the [Configuration](Configuration.md) page | Parsing/default/warning tests |
 
 The direct-install matrix is an intentional compatibility contract: Unix defaults to `$HOME/.local/bin`, Unix `--system` uses `/usr/local/bin`, and Windows uses `%LOCALAPPDATA%\Programs\codex-switch-global-pace`. Keep Unix migration and self-update preflight behavior covered by `tests/test_distribution_contract.rs`; do not replace the platform-specific paths with a single cross-platform abstraction.
 
@@ -95,13 +95,14 @@ GitHub Actions repeats the core checks on Linux, macOS, and Windows. A local pas
 
 Behavior changes must update the closest reader-facing document in the same pull request:
 
-- User-visible commands or behavior: the relevant `docs/wiki/` page ([Feature guide](Feature-Guide), [Command reference](Command-Reference), [Configuration](Configuration), [Updating](Updating), [Troubleshooting](Troubleshooting)) and `README.md` when the quick start is affected
-- Module boundaries or data flow: [Architecture overview](Architecture-Overview) (`docs/wiki/Architecture-Overview.md`)
+- User-visible commands or behavior: the relevant `docs/wiki/` page ([Feature guide](Feature-Guide.md), [Command reference](Command-Reference.md), [Configuration](Configuration.md), [Updating](Updating.md), [Troubleshooting](Troubleshooting.md)) and `README.md` when the quick start is affected
+- Module boundaries or data flow: [Architecture overview](Architecture-Overview.md) (`docs/wiki/Architecture-Overview.md`)
 - Contributor workflow: [`CONTRIBUTING.md`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/CONTRIBUTING.md) or this page
 - Release behavior: [`docs/RELEASE.md`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/docs/RELEASE.md)
 - Release notes: the current cycle's section in [`docs/CHANGELOG.md`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/docs/CHANGELOG.md)
 
-Wiki pages are sourced from `docs/wiki/` and published by CI; never edit the published Wiki directly.
+The pages in `docs/wiki/` are reviewed repository documentation. Update them in
+the same pull request as the behavior they describe.
 
 ## Diagnose failures
 
@@ -115,5 +116,5 @@ Contributors do not move release tags. Maintainers follow [the release process](
 
 ## Next steps
 
-- Learn the system boundaries in [Architecture overview](Architecture-Overview).
-- Before opening a pull request, follow [Contributing](Contributing).
+- Learn the system boundaries in [Architecture overview](Architecture-Overview.md).
+- Before opening a pull request, follow [Contributing](Contributing.md).

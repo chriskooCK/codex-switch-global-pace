@@ -21,7 +21,7 @@ codex-switch-global-pace import ~/auth-backups
 
 Interactive login deduplicates local profiles by `account_id` first and falls back to email when safe. Import is deliberately create-only and never updates an existing profile: Usage API validation proves that the bearer can access a workspace, but a Team workspace ID can be shared by several users and cannot authorize overwriting another saved credential.
 
-Profile deletion is recoverable. An inactive profile is moved under `deleted-profiles/` after confirmation; the active profile cannot be deleted. See [recovery instructions](Troubleshooting#recover-a-deleted-profile).
+Profile deletion is recoverable. An inactive profile is moved under `deleted-profiles/` after confirmation; the active profile cannot be deleted. See [recovery instructions](Troubleshooting.md#recover-a-deleted-profile).
 
 ## External login detection
 
@@ -38,7 +38,7 @@ Use the CLI for scripts and quick inspection, or the TUI for an interactive dash
 ```bash
 codex-switch-global-pace list
 codex-switch-global-pace --json list
-codex-switch-global-pace tui
+codex-switch-global-pace
 ```
 
 The usage model includes the main 5-hour and 7-day windows, additional model-specific pools, reset cards, spend limits, account restrictions, and model capabilities returned by the authenticated service. Cached entries are scoped by profile alias and retain their own fetch time.
@@ -54,7 +54,7 @@ included when its reset timestamp is valid. Missing, expired, inconsistent, or
 failed weekly data is counted as unavailable instead of being guessed. The box
 also shows the nearest included-account reset.
 
-The TUI account detail page is a single scrollable column with identity and organization labels, token expiry times in the local timezone, every quota pool with a pace marker, available reset cards, and the models the account may use. Model names and reasoning-effort capabilities are discovered from the authenticated service at runtime, not hardcoded. The full shortcut list is in the [command reference](Command-Reference#tui-shortcuts) and under `h` inside the TUI.
+The TUI account detail page is a single scrollable column with identity and organization labels, token expiry times in the local timezone, every quota pool with a pace marker, available reset cards, and the models the account may use. Model names and reasoning-effort capabilities are discovered from the authenticated service at runtime, not hardcoded. The full shortcut list is in the [command reference](Command-Reference.md#tui-shortcuts) and under `h` inside the TUI.
 
 ## Select an account
 
@@ -122,7 +122,7 @@ By default, a switch is deferred while an interactive Codex process (`codex`, `c
 
 ## Update the binary
 
-Direct installs support the stable and rolling development channels, verify release checksums and build provenance before replacing the binary, and restart a running daemon around the update. See [Updating](Updating) for channels and installation migration, and [Testing development releases](Development-Releases) for the dev channel.
+Direct installs support the stable and rolling development channels, verify release checksums and build provenance before replacing the binary, and restart a running daemon around the update. See [Updating](Updating.md) for channels and installation migration, and [Testing development releases](Development-Releases.md) for the dev channel.
 
 ```bash
 codex-switch-global-pace self-update --check
@@ -137,6 +137,6 @@ Never publish profile files, `auth.json`, unredacted debug output, proxy credent
 
 ## Next steps
 
-- Need an exact command, flag, or TUI shortcut? Open the [Command reference](Command-Reference).
-- Tune paths, proxy, and daemon behavior in [Configuration](Configuration).
-- Something failed? Start with [Troubleshooting](Troubleshooting).
+- Need an exact command, flag, or TUI shortcut? Open the [Command reference](Command-Reference.md).
+- Tune paths, proxy, and daemon behavior in [Configuration](Configuration.md).
+- Something failed? Start with [Troubleshooting](Troubleshooting.md).
