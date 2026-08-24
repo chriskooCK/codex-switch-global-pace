@@ -110,8 +110,8 @@ Requires Rust 1.88 or newer:
 
 ```bash
 cargo fmt --check
-cargo test --all
-cargo clippy --all-targets -- -D warnings
+cargo test --all --locked
+cargo clippy --all-targets --locked -- -D warnings
 ```
 
 See the [developer onboarding](docs/wiki/Developer-Onboarding.md),

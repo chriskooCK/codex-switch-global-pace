@@ -28,7 +28,9 @@ pub use global_pace::{
 #[allow(unused_imports)]
 pub use parse::parse_usage;
 pub(crate) use reset_credits::reset_credit_expiry_sort_key;
-pub use reset_credits::{consume_earliest_reset_credit, earliest_reset_credit};
+pub use reset_credits::{
+    consume_earliest_reset_credit, consume_reset_credit_by_id, earliest_reset_credit,
+};
 #[allow(unused_imports)]
 pub use scoring::visible_pace_percent;
 pub(crate) use scoring::{

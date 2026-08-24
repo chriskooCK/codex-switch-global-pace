@@ -7,7 +7,7 @@ set -euo pipefail
 #   curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh | bash -s -- --dev
 #   curl -fsSL .../install.sh | bash -s -- --system       # install system-wide (may require sudo)
 #   curl -fsSL .../install.sh | bash -s -- --uninstall    # uninstall this program
-#   CS_VERSION=20260712.1.0 curl -fsSL .../install.sh | bash  # install specific version
+#   curl -fsSL .../install.sh | CS_VERSION=20260712.1.0 bash  # install specific version
 
 REPO="chriskooCK/codex-switch-global-pace"
 USER_INSTALL_DIR="${HOME}/.local/bin"
@@ -23,7 +23,30 @@ info()  { printf '\033[0;34m[info]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[0;33m[warn]\033[0m  %s\n' "$*" >&2; }
 error() { printf '\033[0;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
-resolve_profile_target() (
+SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+
+validate_version() {
+  local version="$1"
+  [[ "$version" =~ $SEMVER_PATTERN ]] || error "Invalid CS_VERSION '${version}'; expected a SemVer version such as 20260824.6.0."
+}
+
+is_homebrew_cellar_path() {
+  case "$1" in
+    */Cellar/codex-switch-global-pace/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+classify_legacy_binary() {
+  LEGACY_RESOLVED="$(resolve_path_target "$LEGACY_BIN")"
+  if is_homebrew_cellar_path "$LEGACY_RESOLVED"; then
+    LEGACY_KIND="homebrew"
+  else
+    LEGACY_KIND="direct"
+  fi
+}
+
+resolve_path_target() (
   local profile_target="$1"
   local link_target link_hops=0 physical_dir
   while [ -L "$profile_target" ]; do
@@ -57,7 +80,7 @@ remove_path_block() (
   local profile_dir tmp_file=""
   [ -f "$profile_file" ] || return 0
   grep -F "$PATH_BLOCK_BEGIN" "$profile_file" >/dev/null 2>&1 || return 0
-  profile_target="$(resolve_profile_target "$profile_file")"
+  profile_target="$(resolve_path_target "$profile_file")"
   profile_identity="$(file_identity "$profile_target")"
   profile_dir="$(dirname "$profile_target")"
   tmp_file="$(mktemp "${profile_dir}/.${BINARY_NAME}.XXXXXX")" || error "Failed to create temporary profile file for ${profile_file}."
@@ -85,7 +108,7 @@ remove_path_block() (
   ' "$profile_target" > "$tmp_file"; then
     error "Failed to remove codex-switch-global-pace PATH block from ${profile_file}."
   fi
-  current_profile_target="$(resolve_profile_target "$profile_file")"
+  current_profile_target="$(resolve_path_target "$profile_file")"
   if [ "$current_profile_target" != "$profile_target" ]; then
     error "Profile link changed while updating ${profile_file}; original file was left unchanged."
   fi
@@ -130,11 +153,22 @@ fi
 if [ "$UNINSTALL" = true ]; then
   info "Uninstalling codex-switch-global-pace..."
 
+  LEGACY_KIND="missing"
+  LEGACY_RESOLVED="$LEGACY_BIN"
+  if [ -e "$LEGACY_BIN" ]; then
+    classify_legacy_binary
+  fi
+  if [ "$LEGACY_KIND" = "homebrew" ] && { [ "$SYSTEM_INSTALL" = true ] || [ ! -x "${INSTALL_DIR}/${BINARY_NAME}" ]; }; then
+    error "Homebrew-managed install detected at ${LEGACY_RESOLVED}. Run 'brew uninstall codex-switch-global-pace'; the direct uninstaller did not change Homebrew files."
+  fi
+
   SERVICE_UNINSTALL_FAILED=false
-  DAEMON_BIN="$(command -v codex-switch-global-pace 2>/dev/null || true)"
-  if [ -z "$DAEMON_BIN" ] && [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
+  if [ -x "${INSTALL_DIR}/${BINARY_NAME}" ]; then
     DAEMON_BIN="${INSTALL_DIR}/${BINARY_NAME}"
-  elif [ -z "$DAEMON_BIN" ] && [ "$SYSTEM_INSTALL" = false ] && [ -x "$LEGACY_BIN" ]; then
+  else
+    DAEMON_BIN="$(command -v codex-switch-global-pace 2>/dev/null || true)"
+  fi
+  if [ -z "$DAEMON_BIN" ] && [ "$SYSTEM_INSTALL" = false ] && [ "$LEGACY_KIND" = "direct" ] && [ -x "$LEGACY_BIN" ]; then
     DAEMON_BIN="$LEGACY_BIN"
   fi
   if [ -n "$DAEMON_BIN" ]; then
@@ -179,7 +213,7 @@ if [ "$UNINSTALL" = true ]; then
   fi
 
   BIN_PATH="${INSTALL_DIR}/${BINARY_NAME}"
-  if [ "$SYSTEM_INSTALL" = false ] && [ ! -f "$BIN_PATH" ] && [ -f "$LEGACY_BIN" ]; then
+  if [ "$SYSTEM_INSTALL" = false ] && [ ! -f "$BIN_PATH" ] && [ "$LEGACY_KIND" = "direct" ] && [ -f "$LEGACY_BIN" ]; then
     BIN_PATH="$LEGACY_BIN"
   fi
   if [ -f "$BIN_PATH" ]; then
@@ -214,6 +248,15 @@ fi
 
 # ── Install ──────────────────────────────────────────────
 
+if [ "$USE_DEV" = true ]; then
+  VERSION="dev"
+else
+  VERSION="${CS_VERSION:-latest}"
+  if [ "$VERSION" != "latest" ]; then
+    validate_version "$VERSION"
+  fi
+fi
+
 # Detect OS and architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
@@ -236,7 +279,10 @@ esac
 MIGRATE_LEGACY=false
 LEGACY_NEEDS_SUDO=false
 if [ "$SYSTEM_INSTALL" = false ] && [ -e "$LEGACY_BIN" ]; then
-  LEGACY_RESOLVED="$(readlink -f "$LEGACY_BIN" 2>/dev/null || realpath "$LEGACY_BIN" 2>/dev/null || echo "$LEGACY_BIN")"
+  classify_legacy_binary
+  if [ "$LEGACY_KIND" = "homebrew" ]; then
+    error "Homebrew-managed install detected at ${LEGACY_RESOLVED}. Run 'brew uninstall codex-switch-global-pace' before using the direct installer; no Homebrew files were changed."
+  fi
   if [ ! -w "$SYSTEM_INSTALL_DIR" ]; then
     info "Legacy system install detected at ${LEGACY_RESOLVED}; migration requires sudo once."
     LEGACY_NEEDS_SUDO=true
@@ -250,10 +296,8 @@ ASSET_NAME="codex-switch-global-pace-${PLATFORM}-${ARCH_NAME}.tar.gz"
 
 # Get release URL
 if [ "$USE_DEV" = true ]; then
-  VERSION="dev"
   DOWNLOAD_URL="https://github.com/${REPO}/releases/download/dev/${ASSET_NAME}"
 else
-  VERSION="${CS_VERSION:-latest}"
   if [ "$VERSION" = "latest" ]; then
     DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
   else

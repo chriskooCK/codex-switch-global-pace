@@ -17,6 +17,7 @@ use crate::output::{user_print, user_println};
 const MAX_ALIAS_LEN: usize = 64;
 
 pub fn profile_auth_path(alias: &str) -> Result<PathBuf> {
+    validate_alias(alias)?;
     Ok(profiles_dir()?.join(alias).join("auth.json"))
 }
 
@@ -619,7 +620,7 @@ pub fn detect_auth_change() -> AuthChange {
                 "auth.json carries no account id and its email matches {} profiles ({}) — \
                  refusing to guess which one to update. \
                  Run `codex-switch-global-pace use <alias>` to restore a known profile, \
-                 or `codex-switch-global-pace save <alias>` to store these credentials explicitly.",
+                 or `codex-switch-global-pace login <alias>` to re-authenticate the intended profile.",
                 ambiguous.len(),
                 ambiguous.join(", ")
             ));
@@ -676,11 +677,11 @@ impl std::fmt::Display for StaleLiveAuth {
             "refusing to overwrite profile '{}': the incoming credentials carry a different \
              refresh_token and cannot be shown to be the newer of the two \
              (incoming: {}; profile: {}). Refresh tokens are single-use, so the older copy is \
-             already revoked and overwriting would destroy the working one. Choose a side \
-             explicitly: `codex-switch-global-pace use {}` keeps the profile's credentials and pushes them \
-             back into ~/.codex/auth.json, after which the two agree again; \
-             `codex-switch-global-pace delete {}` followed by a fresh save keeps the incoming ones.",
-            self.alias, self.live, self.profile, self.alias, self.alias
+             already revoked and overwriting would destroy the working one. \
+             `codex-switch-global-pace use {}` keeps the profile's credentials and pushes them \
+             back into ~/.codex/auth.json. To replace them safely, run \
+             `codex-switch-global-pace login {}` and then `codex-switch-global-pace use {}`.",
+            self.alias, self.live, self.profile, self.alias, self.alias, self.alias
         )
     }
 }
@@ -767,7 +768,7 @@ fn resolve_identity_target(identity: &AccountIdentity) -> Result<Option<String>>
         _ => {
             email_only.sort();
             anyhow::bail!(
-                "Ambiguous account: {} profiles share email '{}' with different workspaces ({}) -- refusing to guess which one to update.\nRun `codex-switch-global-pace save <alias>` with one of the profiles above, or a new alias, to choose explicitly.",
+                "Ambiguous account: {} profiles share email '{}' with different workspaces ({}) -- refusing to guess which one to update.\nRe-run `codex-switch-global-pace login <alias>` with the intended saved profile to choose it explicitly.",
                 email_only.len(),
                 identity.email.as_deref().unwrap_or("unknown"),
                 email_only.join(", ")
@@ -983,6 +984,9 @@ pub fn cmd_delete(alias: &str) -> Result<()> {
         .context("system clock is before the Unix epoch")?
         .as_nanos();
     let archived = deleted_dir.join(format!("{alias}.backup-{timestamp}"));
+    // Cache state is reconstructable; clear it before moving the recoverable
+    // profile so a cache write failure cannot leave the command half-deleted.
+    crate::cache::purge_profile(alias)?;
     std::fs::rename(&dir, &archived).with_context(|| {
         format!(
             "archiving profile directory {} to {}",
@@ -1187,7 +1191,7 @@ pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Resu
         None => resolve_identity_target(&identity)?,
     };
 
-    if let Some(existing) = existing {
+    let (alias, updated) = if let Some(existing) = existing {
         let dst = profile_auth_path(&existing)?;
         // These credentials were just minted, so the freshness gate does not
         // apply: a legacy profile carries no stamp to order against, and
@@ -1197,33 +1201,38 @@ pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Resu
         if dst.exists() {
             ensure_same_account_identity(&existing, &read_auth(&dst)?, &val)?;
         }
-        ensure_profile_parent(&dst)?;
-        write_auth(&dst, &val)?;
-        write_current(&existing)?;
-        return Ok(SaveAction::Updated(existing));
-    }
-
-    let alias = hint_alias
-        .map(|s| s.to_string())
-        .or_else(|| identity.email.as_deref().map(alias_from_email))
-        .unwrap_or_else(|| "account".to_string());
-    validate_alias(&alias)?;
-
-    let alias = if profile_auth_path(&alias)?.exists() {
-        make_unique_alias(&alias)?
+        (existing, true)
     } else {
-        alias
-    };
-    validate_alias(&alias)?;
+        let alias = hint_alias
+            .map(|s| s.to_string())
+            .or_else(|| identity.email.as_deref().map(alias_from_email))
+            .unwrap_or_else(|| "account".to_string());
+        validate_alias(&alias)?;
 
-    let auth_dst = codex_auth_path()?;
-    write_auth(&auth_dst, &val)?;
+        let alias = if profile_auth_path(&alias)?.exists() {
+            make_unique_alias(&alias)?
+        } else {
+            alias
+        };
+        validate_alias(&alias)?;
+        (alias, false)
+    };
 
     let profile_dst = profile_auth_path(&alias)?;
+    let auth_dst = codex_auth_path()?;
+    // Login activates the resulting profile, even when live auth was not
+    // previously associated with a saved profile. Preserve that only copy
+    // before replacing it, just as an explicit profile switch does.
+    backup_auth(&auth_dst)?;
     ensure_profile_parent(&profile_dst)?;
     write_auth(&profile_dst, &val)?;
+    write_auth(&auth_dst, &val)?;
     write_current(&alias)?;
-    Ok(SaveAction::Created(alias))
+    Ok(if updated {
+        SaveAction::Updated(alias)
+    } else {
+        SaveAction::Created(alias)
+    })
 }
 
 #[cfg(test)]
@@ -2328,6 +2337,14 @@ mod tests {
             msg.contains("oai001_20x"),
             "message should list candidate: {msg}"
         );
+        assert!(
+            msg.contains("codex-switch-global-pace login <alias>"),
+            "message should name a command that still exists: {msg}"
+        );
+        assert!(
+            !msg.contains(" save "),
+            "removed command leaked into: {msg}"
+        );
 
         // Neither existing profile was silently overwritten.
         assert_eq!(profile_refresh_token("oai001"), "ref_t");
@@ -2381,10 +2398,10 @@ mod tests {
 
     // ── An explicit alias is the user's own disambiguation ──
 
-    /// Two profiles for one email is exactly the state the ambiguity refusal
-    /// tells the user to resolve with `save <alias>`, so that alias has to be
-    /// obeyed verbatim — redirecting it to the other twin would overwrite the
-    /// single-use refresh token the user was trying to protect.
+    /// Two profiles for one email is exactly the state an explicitly named
+    /// profile disambiguates, so that alias has to be obeyed verbatim —
+    /// redirecting it to the other twin would overwrite the single-use refresh
+    /// token the user was trying to protect.
     fn seed_email_twins() {
         seed_profile(
             "oai001",
@@ -2723,6 +2740,14 @@ mod tests {
             msg.contains("codex-switch-global-pace use alice"),
             "the message must offer a way out, got: {msg}"
         );
+        assert!(
+            msg.contains("codex-switch-global-pace login alice"),
+            "the message must offer a valid re-authorization command, got: {msg}"
+        );
+        assert!(
+            !msg.contains("codex-switch-global-pace save"),
+            "removed command leaked into: {msg}"
+        );
         assert_eq!(profile_refresh_token("alice"), "ref_old");
     }
 
@@ -2823,6 +2848,104 @@ mod tests {
         assert!(format!("{err:#}").contains("oai001"), "{err:#}");
         assert_eq!(profile_refresh_token("oai001"), "ref_t");
         assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
+    }
+
+    #[test]
+    fn login_updating_an_existing_profile_also_activates_it_live() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json(
+            "alice@example.com",
+            "acct_alice",
+            "alice_access",
+            "alice_refresh",
+        );
+        let bob = realistic_auth_json(
+            "bob@example.com",
+            "acct_bob",
+            "bob_access_old",
+            "bob_refresh_old",
+        );
+        seed_profile("alice", &alice);
+        seed_profile("bob", &bob);
+        write_live(&alice);
+        let live_path = crate::auth::codex_auth_path().unwrap();
+        super::write_current("alice").unwrap();
+
+        let minted = realistic_auth_json(
+            "bob@example.com",
+            "acct_bob",
+            "bob_access_new",
+            "bob_refresh_new",
+        );
+        match super::save_auth_value(minted, None) {
+            Ok(super::SaveAction::Updated(alias)) => assert_eq!(alias, "bob"),
+            other => panic!("existing bob profile should be updated, got {other:?}"),
+        }
+
+        assert_eq!(profile_access_token("bob"), "bob_access_new");
+        assert_eq!(profile_access_token("alice"), "alice_access");
+        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
+        assert_eq!(
+            live.pointer("/tokens/access_token")
+                .and_then(|v| v.as_str()),
+            Some("bob_access_new"),
+            "the account named by current must also own live auth.json"
+        );
+        assert_eq!(super::read_current(), "bob");
+        assert_eq!(
+            super::find_matching_profile(&crate::auth::codex_auth_path().unwrap()),
+            Some("bob".to_string())
+        );
+        let live_backup = std::fs::read_dir(live_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("auth.json.bak.")
+            })
+            .expect("activating login must back up the previous live credentials");
+        let backup = crate::auth::read_auth(&live_backup.path()).unwrap();
+        assert_eq!(
+            backup
+                .pointer("/tokens/access_token")
+                .and_then(|value| value.as_str()),
+            Some("alice_access")
+        );
+    }
+
+    #[test]
+    fn deleting_then_reusing_an_alias_does_not_inherit_the_old_accounts_cache() {
+        let _env = TestEnv::new();
+        let alias = "reused";
+        seed_profile(
+            alias,
+            &realistic_auth_json("old@example.com", "acct_old", "old_access", "old_refresh"),
+        );
+        crate::cache::put(alias, &crate::usage::UsageInfo::default());
+        crate::cache::set_last_used(alias).unwrap();
+        crate::cache::put_auth_failure(
+            alias,
+            "old_refresh",
+            &crate::usage::UsageError {
+                summary: "old failure".to_string(),
+                detail: "old failure detail".to_string(),
+            },
+        );
+        assert!(crate::cache::get(alias).is_some());
+        assert_ne!(crate::cache::get_last_used(alias), 0);
+        assert!(crate::cache::get_auth_failure(alias, "old_refresh").is_some());
+
+        cmd_delete(alias).unwrap();
+        seed_profile(
+            alias,
+            &realistic_auth_json("new@example.com", "acct_new", "new_access", "new_refresh"),
+        );
+
+        assert!(crate::cache::get(alias).is_none());
+        assert_eq!(crate::cache::get_last_used(alias), 0);
+        assert!(crate::cache::get_auth_failure(alias, "old_refresh").is_none());
     }
 
     #[test]

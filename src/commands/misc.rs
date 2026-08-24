@@ -108,15 +108,14 @@ pub(crate) fn open_cmd() -> Result<()> {
 
 pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
     let aliases: Vec<String> = match alias {
-        Some(a) => {
-            let path = profile::profile_auth_path(a)?;
-            if !path.exists() {
-                anyhow::bail!("profile '{}' not found", a);
-            }
-            vec![a.to_string()]
-        }
+        Some(a) => vec![a.to_string()],
         None => profile::list_profiles()?,
     };
+    if let Some(a) = alias
+        && !profile::profile_auth_path(a)?.exists()
+    {
+        anyhow::bail!("profile '{}' not found", a);
+    }
 
     if aliases.is_empty() {
         if json {
@@ -240,4 +239,34 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
         anyhow::bail!("one or more warmup operations failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn warmup_rejects_path_traversal_alias_at_the_command_boundary() {
+        let error = super::warmup_cmd(Some("../outside"), false)
+            .await
+            .expect_err("a traversal alias must be rejected before resolving its path");
+        assert_eq!(
+            error.to_string(),
+            "alias may only contain ASCII letters, digits, '_', '-', '.'"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_rejects_absolute_alias_at_the_command_boundary() {
+        let absolute = if cfg!(windows) {
+            r"C:\outside"
+        } else {
+            "/tmp/outside"
+        };
+        let error = super::warmup_cmd(Some(absolute), false)
+            .await
+            .expect_err("an absolute alias must be rejected before resolving its path");
+        assert_eq!(
+            error.to_string(),
+            "alias may only contain ASCII letters, digits, '_', '-', '.'"
+        );
+    }
 }

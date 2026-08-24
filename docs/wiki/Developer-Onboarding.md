@@ -15,7 +15,7 @@ Requirements:
 git clone https://github.com/chriskooCK/codex-switch-global-pace.git
 cd codex-switch-global-pace
 git checkout dev
-cargo test --all
+cargo test --all --locked
 ```
 
 Development and pull requests normally target `dev`. The `master` branch represents stable releases. Do not confuse the `dev` branch with the rolling `dev` tag.
@@ -59,8 +59,8 @@ Before opening a pull request:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all --locked
 cargo audit
 bash -n scripts/install.sh
 ```

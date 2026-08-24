@@ -171,14 +171,21 @@ fn ttl() -> u64 {
 }
 
 fn load_cache() -> CacheFile {
-    let path = match cache_path() {
-        Ok(p) => p,
-        Err(_) => return CacheFile::default(),
-    };
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    load_cache_checked().unwrap_or_default()
+}
+
+fn load_cache_checked() -> Result<CacheFile> {
+    let path = cache_path()?;
+    load_cache_checked_at(&path)
+}
+
+fn load_cache_checked_at(path: &std::path::Path) -> Result<CacheFile> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .with_context(|| format!("parsing cache file {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(CacheFile::default()),
+        Err(error) => Err(error).with_context(|| format!("reading cache file {}", path.display())),
+    }
 }
 
 fn save_cache(cache: &CacheFile) -> Result<()> {
@@ -325,11 +332,20 @@ fn record_auth_failure(
     );
 }
 
-/// Forget everything keyed by `alias`. Returns whether anything was removed.
-fn drop_alias(cache: &mut CacheFile, alias: &str) -> bool {
+/// Forget fetch state keyed by `alias` while preserving selection history.
+/// Returns whether anything was removed.
+fn drop_fetch_state(cache: &mut CacheFile, alias: &str) -> bool {
     let dropped_usage = cache.entries.remove(alias).is_some();
     let dropped_failure = cache.auth_failures.remove(alias).is_some();
     dropped_usage || dropped_failure
+}
+
+/// Forget every cache record owned by a profile alias. Returns whether anything
+/// was removed.
+fn drop_profile_state(cache: &mut CacheFile, alias: &str) -> bool {
+    let dropped_fetch_state = drop_fetch_state(cache, alias);
+    let dropped_last_used = cache.last_used.remove(alias).is_some();
+    dropped_fetch_state || dropped_last_used
 }
 
 fn auth_failure_for<'a>(
@@ -521,8 +537,25 @@ pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
 pub fn invalidate(alias: &str) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache();
-        if drop_alias(&mut cache, alias) {
+        if drop_fetch_state(&mut cache, alias) {
             save_cache(&cache).context("writing usage cache invalidation")?;
+        }
+        Ok(())
+    })
+}
+
+/// Remove all cache state owned by a profile that is being deleted.
+///
+/// Unlike [`invalidate`], profile deletion must also discard last-used history:
+/// the same alias may later be assigned to a different account.
+pub fn purge_profile(alias: &str) -> Result<()> {
+    with_cache_lock(|| {
+        // Deleting a profile must not treat an unreadable or malformed cache
+        // as empty: doing so could archive the profile while its old alias
+        // state remains on disk and later leaks into a replacement profile.
+        let mut cache = load_cache_checked()?;
+        if drop_profile_state(&mut cache, alias) {
+            save_cache(&cache).context("writing deleted-profile cache cleanup")?;
         }
         Ok(())
     })
@@ -767,9 +800,53 @@ mod tests {
         let mut cache = CacheFile::default();
         record_auth_failure(&mut cache, "dead", "refresh_old", "summary", "detail");
 
-        assert!(drop_alias(&mut cache, "dead"));
+        assert!(drop_fetch_state(&mut cache, "dead"));
 
         assert!(auth_failure_for(&cache, "dead", "refresh_old").is_none());
+    }
+
+    #[test]
+    fn purging_a_profile_drops_usage_selection_history_and_auth_failure() {
+        let mut cache = CacheFile::default();
+        cache
+            .entries
+            .insert("reused".to_string(), to_entry(&UsageInfo::default()));
+        cache.last_used.insert("reused".to_string(), 123);
+        record_auth_failure(&mut cache, "reused", "refresh_old", "summary", "detail");
+
+        assert!(drop_profile_state(&mut cache, "reused"));
+        assert!(!cache.entries.contains_key("reused"));
+        assert!(!cache.last_used.contains_key("reused"));
+        assert!(auth_failure_for(&cache, "reused", "refresh_old").is_none());
+    }
+
+    #[test]
+    fn destructive_cache_load_rejects_malformed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, "not-json").unwrap();
+
+        let error = match load_cache_checked_at(&path) {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("profile deletion must stop rather than treating corrupt state as empty")
+            }
+        };
+
+        assert!(format!("{error:#}").contains("parsing cache file"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "not-json");
+    }
+
+    #[test]
+    fn destructive_cache_load_treats_only_a_missing_file_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-cache.json");
+
+        let cache = load_cache_checked_at(&path).unwrap();
+
+        assert!(cache.entries.is_empty());
+        assert!(cache.last_used.is_empty());
+        assert!(cache.auth_failures.is_empty());
     }
 
     #[test]

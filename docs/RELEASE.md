@@ -1,6 +1,6 @@
 # Release process
 
-The daily quality gate is defined by `.github/workflows/ci.yml`. Pushes to `dev` and pull requests targeting `dev` or `master` run tests, Clippy, and a build on Linux, macOS, and Windows. The Linux quality job also runs formatting, `cargo audit`, and installer syntax checks. Release builds are defined by `.github/workflows/release.yml` and run only for `v*` and `dev` tag events.
+The quality gate is defined once by `.github/workflows/ci.yml`. Pushes to `dev` and pull requests targeting `dev` or `master` run tests, Clippy, and a locked build on Linux, macOS, and Windows. The Linux quality job also runs formatting, `cargo audit`, and installer syntax checks. `.github/workflows/release.yml` calls that same workflow for the exact tag commit before any release build can start, then builds only for `v*` and `dev` tag events.
 
 This document is for maintainers. Users should follow the installation and update instructions in the README and do not need to manage Git tags.
 
@@ -62,8 +62,8 @@ Prerequisite: `dev` contains every intended commit and the local worktree is cle
 ```bash
 # 1) Run the local gate. This is a preflight, not the source of release artifacts.
 cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test --all
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all --locked
 cargo audit
 bash -n scripts/install.sh
 
@@ -80,7 +80,8 @@ git push origin :refs/tags/dev
 # 5) Recreate the local dev tag at HEAD.
 git tag -d dev && git tag dev
 
-# 6) Push the tag to build six targets and replace the dev GitHub Release.
+# 6) Push the tag to rerun the exact-source quality gate, build six locked
+#    targets, and replace the dev GitHub Release.
 git push origin refs/tags/dev:refs/tags/dev
 ```
 
@@ -89,6 +90,8 @@ git push origin refs/tags/dev:refs/tags/dev
 > Step 2 likewise requires `refs/heads/dev:refs/heads/dev`.
 
 GitHub Actions Release builds are the only distribution source of truth; do not publish from local `target/release`. The Release job verifies every archive against its `.sha256`, then uses GitHub artifact attestations to generate a Sigstore bundle before creating a GitHub Release. Artifacts are:
+
+Rolling `dev` runs are concurrency-controlled. Immediately before deleting or replacing the rolling release, the workflow also resolves `refs/tags/dev` again and refuses to publish unless it still points to that run's exact source commit.
 
 - Linux / macOS: `.tar.gz` archives named `codex-switch-global-pace-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
 - Windows: `.zip` archives named `codex-switch-global-pace-windows-{amd64,arm64}.zip` plus `.sha256`

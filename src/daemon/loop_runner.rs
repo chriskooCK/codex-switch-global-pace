@@ -37,7 +37,10 @@ fn poll_backoff_secs(poll_secs: u64, consecutive_failures: u32) -> u64 {
 }
 
 fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> f64 {
-    if current_usage.account_limited {
+    // The threshold controls when to consider an optional optimization. It
+    // must not suppress recovery from an account that cannot run at all,
+    // including weekly exhaustion hidden behind a low primary-window value.
+    if !usage::is_available(current_usage) {
         return 100.0;
     }
 
@@ -280,11 +283,12 @@ async fn check_and_switch() -> Result<PollOutcome> {
     }
 
     let mut scored = usage::score_candidates(items, now, safety_7d, team_priority);
-    let current_score = scored.remove(0).score;
+    let current_scored = scored.remove(0);
+    let current_score = current_scored.score;
 
     // 5. Switch if a better candidate was found
     if let Some((best_alias, best_score)) =
-        usage::pick_switch_target(current_score, &scored, safety_7d)
+        usage::pick_switch_target(&current_scored, &scored, safety_7d)
     {
         let (best_alias, best_score) = (best_alias.to_string(), best_score);
         // A switch replaces the live auth.json; doing that under an active
@@ -357,6 +361,31 @@ mod tests {
         };
 
         assert!(current_usage_percent_for_switch(&usage) >= 80.0);
+    }
+
+    #[test]
+    fn exhausted_weekly_usage_bypasses_low_primary_switch_threshold() {
+        let usage = UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(20.0),
+                ..WindowUsage::default()
+            }),
+            secondary: Some(WindowUsage {
+                used_percent: Some(100.0),
+                ..WindowUsage::default()
+            }),
+            ..UsageInfo::default()
+        };
+
+        assert_eq!(current_usage_percent_for_switch(&usage), 100.0);
+    }
+
+    #[test]
+    fn usage_without_any_quota_window_bypasses_switch_threshold() {
+        assert_eq!(
+            current_usage_percent_for_switch(&UsageInfo::default()),
+            100.0
+        );
     }
 
     #[tokio::test]

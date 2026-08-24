@@ -421,14 +421,17 @@ pub fn score_candidates(
         .collect()
 }
 
-/// Daemon switch policy over already-scored candidates: prefer an eligible
-/// candidate that beats `current_score`; fall back to the best ineligible
-/// one only when no candidate is eligible at all.
+/// Daemon switch policy over already-scored candidates. Eligibility is a hard
+/// boundary: an eligible current account is replaced only by a higher-scoring
+/// eligible candidate, while an ineligible current account yields to the best
+/// eligible candidate regardless of raw score. An ineligible alternative is
+/// considered only when every account is ineligible.
 pub fn pick_switch_target<'a>(
-    current_score: f64,
+    current: &ScoredCandidate,
     others: &'a [ScoredCandidate],
     safety_7d: f64,
 ) -> Option<(&'a str, f64)> {
+    let current_eligible = is_candidate_eligible(&current.candidate, safety_7d);
     let mut best_eligible: Option<(&'a str, f64)> = None;
     let mut best_ineligible: Option<(&'a str, f64)> = None;
     let mut any_eligible = false;
@@ -437,15 +440,21 @@ pub fn pick_switch_target<'a>(
         let eligible = is_candidate_eligible(&s.candidate, safety_7d);
         if eligible {
             any_eligible = true;
-            if s.score > current_score && best_eligible.is_none_or(|(_, bs)| s.score > bs) {
+            if (!current_eligible || s.score > current.score)
+                && best_eligible.is_none_or(|(_, bs)| s.score > bs)
+            {
                 best_eligible = Some((s.candidate.alias.as_str(), s.score));
             }
-        } else if s.score > current_score && best_ineligible.is_none_or(|(_, bs)| s.score > bs) {
+        } else if s.score > current.score && best_ineligible.is_none_or(|(_, bs)| s.score > bs) {
             best_ineligible = Some((s.candidate.alias.as_str(), s.score));
         }
     }
 
-    best_eligible.or(if !any_eligible { best_ineligible } else { None })
+    match best_eligible {
+        Some(best) => Some(best),
+        None if any_eligible || current_eligible => None,
+        None => best_ineligible,
+    }
 }
 
 #[cfg(test)]
@@ -620,55 +629,132 @@ mod tests {
     #[test]
     fn test_pick_switch_target_prefers_eligible_above_current() {
         let now = 1_000_000i64;
-        let current = make_candidate("current", 90.0, Some(now + 3600), 50.0, Some(now + 86400));
+        let current = scored(
+            make_candidate("current", 90.0, Some(now + 3600), 50.0, Some(now + 86400)),
+            20.0,
+        );
         let good = make_candidate("good", 10.0, Some(now + 3600), 10.0, Some(now + 5 * 86400));
-        let current_score = score_unified(&current, 20.0);
 
         let others = vec![scored(good, 20.0)];
-        let pick = pick_switch_target(current_score, &others, 20.0);
+        let pick = pick_switch_target(&current, &others, 20.0);
         assert_eq!(pick.map(|(a, _)| a), Some("good"));
     }
 
     #[test]
     fn test_pick_switch_target_ignores_ineligible_when_an_eligible_exists() {
         let now = 1_000_000i64;
-        let current = make_candidate("current", 90.0, Some(now + 3600), 50.0, Some(now + 86400));
-        let current_score = score_unified(&current, 20.0);
+        let current = scored(
+            make_candidate(
+                "current",
+                90.0,
+                Some(now + 3600),
+                94.0,
+                Some(now + 5 * 86400),
+            ),
+            20.0,
+        );
 
         // Eligible but worse than current; ineligible (7d over safety margin) better.
         let weak_eligible =
-            make_candidate("weak", 95.0, Some(now + 3600), 40.0, Some(now + 5 * 86400));
+            make_candidate("weak", 95.0, Some(now + 3600), 94.0, Some(now + 5 * 86400));
         let strong_ineligible = make_candidate(
             "strong",
             0.0,
             Some(now + 18000),
-            95.0,
+            96.0,
             Some(now + 5 * 86400),
         );
 
         let others = vec![scored(weak_eligible, 20.0), scored(strong_ineligible, 20.0)];
         // An eligible candidate exists, so the ineligible one must not be picked,
         // and the eligible one does not beat current — no switch.
-        assert!(pick_switch_target(current_score, &others, 20.0).is_none());
+        assert!(pick_switch_target(&current, &others, 20.0).is_none());
     }
 
     #[test]
     fn test_pick_switch_target_falls_back_when_nothing_is_eligible() {
         let now = 1_000_000i64;
-        let current = make_candidate("current", 100.0, Some(now + 3600), 96.0, Some(now + 86400));
-        let current_score = score_unified(&current, 20.0);
+        let current = scored(
+            make_candidate("current", 100.0, Some(now + 3600), 96.0, Some(now + 86400)),
+            20.0,
+        );
 
         let ineligible = make_candidate(
             "fallback",
             0.0,
             Some(now + 18000),
-            95.0,
+            96.0,
             Some(now + 5 * 86400),
         );
         let others = vec![scored(ineligible, 20.0)];
 
-        let pick = pick_switch_target(current_score, &others, 20.0);
+        let pick = pick_switch_target(&current, &others, 20.0);
         assert_eq!(pick.map(|(a, _)| a), Some("fallback"));
+    }
+
+    #[test]
+    fn test_pick_switch_target_keeps_eligible_current_over_ineligible_alternative() {
+        let now = 1_000_000i64;
+        let current = scored(
+            make_candidate(
+                "current",
+                80.0,
+                Some(now + 4 * 3600),
+                90.0,
+                Some(now + 5 * 86400),
+            ),
+            20.0,
+        );
+        let exhausted = scored(
+            make_candidate(
+                "exhausted",
+                100.0,
+                Some(now + 60),
+                10.0,
+                Some(now + 5 * 86400),
+            ),
+            20.0,
+        );
+
+        assert!(is_candidate_eligible(&current.candidate, 20.0));
+        assert!(!is_candidate_eligible(&exhausted.candidate, 20.0));
+        assert!(exhausted.score > current.score);
+        assert!(pick_switch_target(&current, &[exhausted], 20.0).is_none());
+    }
+
+    #[test]
+    fn test_pick_switch_target_leaves_ineligible_current_for_any_eligible_alternative() {
+        let now = 1_000_000i64;
+        let mut current = scored(
+            make_candidate(
+                "current",
+                100.0,
+                Some(now + 60),
+                10.0,
+                Some(now + 5 * 86400),
+            ),
+            20.0,
+        );
+        let eligible = scored(
+            make_candidate(
+                "eligible",
+                90.0,
+                Some(now + 4 * 3600),
+                90.0,
+                Some(now + 5 * 86400),
+            ),
+            20.0,
+        );
+
+        // Eligibility must dominate any score component (for example team or
+        // reset timing bonuses) left on an account that cannot currently run.
+        current.score = eligible.score + 10_000.0;
+        assert!(!is_candidate_eligible(&current.candidate, 20.0));
+        assert!(is_candidate_eligible(&eligible.candidate, 20.0));
+        assert_eq!(
+            pick_switch_target(&current, &[eligible], 20.0).map(|(alias, _)| alias),
+            Some("eligible")
+        );
     }
 
     #[test]

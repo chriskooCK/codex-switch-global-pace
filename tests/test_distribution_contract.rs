@@ -155,6 +155,7 @@ fn ci_covers_dev_and_all_supported_hosts() {
     let workflow = repo_file(".github/workflows/ci.yml");
 
     for required in [
+        "workflow_call:",
         "push:",
         "pull_request:",
         "workflow_dispatch:",
@@ -176,9 +177,9 @@ fn ci_runs_build_test_lint_format_audit_and_script_parsers() {
     let workflow = repo_file(".github/workflows/ci.yml");
 
     for command in [
-        "cargo test --all",
-        "cargo clippy --all-targets -- -D warnings",
-        "cargo build",
+        "cargo test --all --locked",
+        "cargo clippy --all-targets --locked -- -D warnings",
+        "cargo build --locked",
         "cargo fmt --check",
         "cargo audit",
         "bash -n scripts/install.sh",
@@ -346,6 +347,58 @@ fn release_rejects_shell_metacharacters_in_tags_and_uses_env_in_scripts() {
 }
 
 #[test]
+fn release_reuses_the_exact_source_quality_gate_and_builds_locked() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for required in [
+        "quality:\n    uses: ./.github/workflows/ci.yml",
+        "needs: [quality, meta]",
+        "cargo metadata --locked --no-deps --format-version 1",
+        "cross build --release --locked --target",
+        "cargo build --release --locked --target",
+        "Cargo.lock > Cargo.lock.release",
+        "sub(/\\r$/, \"\")",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "release must preserve exact-source quality/lock gate `{required}`"
+        );
+    }
+    assert_before(&workflow, "quality:", "build:");
+    assert_before(&workflow, "cargo metadata --locked", "Build release binary");
+}
+
+#[test]
+fn rolling_release_serializes_runs_and_rechecks_the_tag_before_deletion() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for required in [
+        "concurrency:",
+        "group: release-${{ github.ref }}",
+        "cancel-in-progress: true",
+        "Confirm rolling tag still targets this source",
+        "git/ref/tags/dev",
+        "${TAG_SHA,,}",
+        "${GITHUB_SHA,,}",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "rolling release freshness contract must contain `{required}`"
+        );
+    }
+    assert_before(
+        &workflow,
+        "Confirm rolling tag still targets this source",
+        "Delete existing dev release",
+    );
+    assert_before(
+        &workflow,
+        "if [[ \"$TAG_KIND\" != \"commit\"",
+        "gh release delete dev --yes",
+    );
+}
+
+#[test]
 fn unix_installer_verifies_checksum_before_extracting() {
     let script = repo_file("scripts/install.sh");
 
@@ -366,6 +419,217 @@ fn unix_installer_verifies_checksum_before_extracting() {
             "Unix installer must contain `{required}`"
         );
     }
+}
+
+#[test]
+fn installers_validate_exact_versions_before_building_download_urls() {
+    let unix = repo_file("scripts/install.sh");
+    let windows = repo_file("scripts/install.ps1");
+
+    for required in [
+        "SEMVER_PATTERN=",
+        "validate_version()",
+        "validate_version \"$VERSION\"",
+        "Invalid CS_VERSION",
+    ] {
+        assert!(
+            unix.contains(required),
+            "Unix installer must contain `{required}`"
+        );
+    }
+    assert_before(
+        &unix,
+        "validate_version \"$VERSION\"",
+        "releases/download/v${VERSION}/${ASSET_NAME}",
+    );
+
+    for required in [
+        "$SemVerPattern =",
+        "function Assert-SupportedVersion",
+        "Assert-SupportedVersion $Version",
+        "Invalid CS_VERSION",
+    ] {
+        assert!(
+            windows.contains(required),
+            "Windows installer must contain `{required}`"
+        );
+    }
+    assert_before(
+        &windows,
+        "Assert-SupportedVersion $Version",
+        "releases/download/v$Version/$AssetName",
+    );
+    assert!(
+        windows.contains("$SemVerPattern = '\\A") && windows.contains("\\z'"),
+        "PowerShell validation must anchor to the absolute start and end of the value"
+    );
+}
+
+#[test]
+fn unix_pinned_install_example_sets_the_variable_on_bash() {
+    let script = repo_file("scripts/install.sh");
+
+    assert!(
+        script.contains("| CS_VERSION=20260712.1.0 bash"),
+        "the pinned-install example must pass CS_VERSION to bash, not curl"
+    );
+    assert!(
+        !script.contains("CS_VERSION=20260712.1.0 curl"),
+        "the pinned-install example must not scope CS_VERSION to curl"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_installer_rejects_a_repository_escape_version_before_network_access() {
+    use std::process::Command;
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new("bash")
+        .arg(root.join("scripts/install.sh"))
+        .env("HOME", home.path())
+        .env(
+            "CS_VERSION",
+            "/../../../../../attacker/evil/releases/download/v9.9.9",
+        )
+        .env_remove("CS_UNINSTALL")
+        .output()
+        .unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!output.status.success());
+    assert!(diagnostic.contains("Invalid CS_VERSION"), "{diagnostic}");
+    assert!(!diagnostic.contains("Downloading:"), "{diagnostic}");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_installer_rejects_a_repository_escape_version_before_network_access() {
+    use std::process::Command;
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-File"])
+        .arg(root.join("scripts/install.ps1"))
+        .env(
+            "CS_VERSION",
+            "/../../../../../attacker/evil/releases/download/v9.9.9",
+        )
+        .env_remove("CS_DEV")
+        .env_remove("CS_UNINSTALL")
+        .output()
+        .unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!output.status.success());
+    assert!(diagnostic.contains("Invalid CS_VERSION"), "{diagnostic}");
+    assert!(!diagnostic.contains("Downloading:"), "{diagnostic}");
+}
+
+#[test]
+fn unix_installer_refuses_to_migrate_a_homebrew_cellar_symlink() {
+    let script = repo_file("scripts/install.sh");
+
+    for required in [
+        "is_homebrew_cellar_path()",
+        "classify_legacy_binary()",
+        "LEGACY_RESOLVED=\"$(resolve_path_target \"$LEGACY_BIN\")\"",
+        "Homebrew-managed install detected",
+        "brew uninstall codex-switch-global-pace",
+        "no Homebrew files were changed",
+    ] {
+        assert!(
+            script.contains(required),
+            "Unix installer must preserve Homebrew ownership guard `{required}`"
+        );
+    }
+    assert_before(
+        &script,
+        "if [ \"$LEGACY_KIND\" = \"homebrew\" ]; then",
+        "MIGRATE_LEGACY=true",
+    );
+
+    let uninstall = script
+        .split("# ── Uninstall")
+        .nth(1)
+        .and_then(|section| section.split("# ── Install").next())
+        .expect("Unix installer must retain distinct uninstall/install sections");
+    assert!(uninstall.contains("classify_legacy_binary"));
+    assert!(uninstall.contains("the direct uninstaller did not change Homebrew files"));
+    assert!(uninstall.contains("[ \"$LEGACY_KIND\" = \"direct\" ]"));
+    assert_before(
+        uninstall,
+        "if [ \"$LEGACY_KIND\" = \"homebrew\" ]",
+        "rm -f \"$BIN_PATH\"",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_homebrew_classifier_executes_against_a_resolved_cellar_symlink() {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    fn section<'a>(script: &'a str, start: &str, end: &str) -> &'a str {
+        let start_index = script
+            .find(start)
+            .unwrap_or_else(|| panic!("missing shell function `{start}`"));
+        let tail = &script[start_index..];
+        let end_index = tail
+            .find(end)
+            .unwrap_or_else(|| panic!("missing shell function boundary `{end}`"));
+        &tail[..end_index]
+    }
+
+    let script = repo_file("scripts/install.sh");
+    let classifier = section(
+        &script,
+        "classify_legacy_binary() {",
+        "resolve_path_target() (",
+    );
+    let resolver = section(&script, "resolve_path_target() (", "file_identity() (");
+    let cellar_matcher = section(
+        &script,
+        "is_homebrew_cellar_path() {",
+        "classify_legacy_binary() {",
+    );
+    let harness = format!(
+        "set -eu\n{cellar_matcher}\n{classifier}\n{resolver}\nclassify_legacy_binary\n[ \"$LEGACY_KIND\" = homebrew ]\nprintf 'refused:%s\\n' \"$LEGACY_RESOLVED\"\n"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let cellar_binary = dir
+        .path()
+        .join("Cellar/codex-switch-global-pace/20260824.7.0/bin/codex-switch-global-pace");
+    fs::create_dir_all(cellar_binary.parent().unwrap()).unwrap();
+    fs::write(&cellar_binary, "homebrew-owned").unwrap();
+    let legacy_link = dir.path().join("legacy-bin");
+    symlink(&cellar_binary, &legacy_link).unwrap();
+
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("LEGACY_BIN", &legacy_link)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.starts_with("refused:")
+            && stdout.contains("/Cellar/codex-switch-global-pace/20260824.7.0/bin/"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read_to_string(cellar_binary).unwrap(), "homebrew-owned");
 }
 
 #[test]
@@ -407,14 +671,14 @@ fn unix_installer_rewrites_shell_profiles_atomically() {
 
     for required in [
         "remove_path_block() (",
-        "resolve_profile_target() (",
+        "resolve_path_target() (",
         "file_identity() (",
         "while [ -L \"$profile_target\" ]",
         "link_target=\"$(readlink \"$profile_target\")\"",
         "cd -P \"$(dirname \"$profile_target\")\" && pwd -P",
         "mktemp \"${profile_dir}/.${BINARY_NAME}.XXXXXX\"",
         "cp -p \"$profile_target\" \"$tmp_file\"",
-        "current_profile_target=\"$(resolve_profile_target \"$profile_file\")\"",
+        "current_profile_target=\"$(resolve_path_target \"$profile_file\")\"",
         "current_profile_identity=\"$(file_identity \"$current_profile_target\")\"",
         "mv -f \"$tmp_file\" \"$profile_target\"",
     ] {
@@ -710,6 +974,10 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
         "& $InstalledBin daemon stop",
         "& $InstalledBin daemon start",
         "The running daemon could not be stopped safely",
+        "$CandidateVersionOutput = & $CandidateBin --version",
+        "the existing installation was not changed",
+        "} finally {",
+        "$RestartError",
     ] {
         assert!(
             script.contains(required),
@@ -717,8 +985,40 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
         );
     }
     assert_before(&script, "--json daemon status", "Move-Item");
+    assert_before(
+        &script,
+        "$CandidateVersionOutput = & $CandidateBin --version",
+        "& $InstalledBin daemon stop",
+    );
     assert_before(&script, "& $InstalledBin daemon stop", "Move-Item");
-    assert_before(&script, "Move-Item", "& $InstalledBin daemon start");
+    assert_before(&script, "} finally {", "& $InstalledBin daemon start");
+}
+
+#[test]
+fn windows_uninstaller_fails_closed_without_a_binary_to_stop_a_running_task() {
+    let script = repo_file("scripts/install.ps1");
+
+    for required in [
+        "Get-ScheduledTask",
+        "$TaskState -notin @(\"Ready\", \"Disabled\")",
+        "installed binary is unavailable for a graceful stop",
+        "$ServiceUninstallFailed = $true",
+        "Unregister-ScheduledTask",
+    ] {
+        assert!(
+            script.contains(required),
+            "Windows uninstaller must contain fail-closed task guard `{required}`"
+        );
+    }
+    assert!(
+        !script.contains("schtasks.exe /End"),
+        "the no-binary fallback must never force-end a running daemon"
+    );
+    assert_before(
+        &script,
+        "$TaskState -notin @(\"Ready\", \"Disabled\")",
+        "Unregister-ScheduledTask",
+    );
 }
 
 #[test]

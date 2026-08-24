@@ -326,7 +326,9 @@ impl MenuState {
                 KeyCode::Char('n') => MenuAction::Rename(info.alias.clone()),
                 KeyCode::Char('r') => MenuAction::RefreshOne(info.alias.clone()),
                 KeyCode::Char('w') => MenuAction::WarmupOne(info.alias.clone()),
-                KeyCode::Char('c') => MenuAction::ConsumeResetCard(info.alias.clone()),
+                KeyCode::Char('c') if info.can_consume_reset_card => {
+                    MenuAction::ConsumeResetCard(info.alias.clone())
+                }
                 KeyCode::Char('d') => MenuAction::DeleteRequest(info.alias.clone()),
                 _ => MenuAction::Noop,
             },
