@@ -137,7 +137,7 @@ pub(crate) fn validate_uninstall_owner(expected_executable: &Path) -> Result<()>
         } else {
             require_no_definitionless_launchd_service()?;
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "linux")]
     {
@@ -146,7 +146,7 @@ pub(crate) fn validate_uninstall_owner(expected_executable: &Path) -> Result<()>
         } else {
             require_no_definitionless_systemd_service()?;
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
@@ -194,7 +194,7 @@ pub(crate) fn is_installed_checked() -> Result<bool> {
         if !installed {
             require_no_definitionless_launchd_service()?;
         }
-        return Ok(installed);
+        Ok(installed)
     }
     #[cfg(target_os = "linux")]
     {
@@ -202,7 +202,7 @@ pub(crate) fn is_installed_checked() -> Result<bool> {
         if !installed {
             require_no_definitionless_systemd_service()?;
         }
-        return Ok(installed);
+        Ok(installed)
     }
     #[cfg(target_os = "windows")]
     {
@@ -2274,13 +2274,15 @@ fn uninstall_task_scheduler(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::acquire_service_operation_lease;
     use super::{
         LAUNCHD_LABEL, SYSTEMD_UNIT_NAME, WINDOWS_TASK_NAME, absolute_service_path,
-        acquire_service_operation_lease, definition_snapshot_matches, launchd_list_contains_label,
-        launchd_plist, systemd_unit, task_listing_contains_name, task_scheduler_command,
-        task_scheduler_failure_message, validate_expected_executable,
-        validate_install_migration_authority, validate_launchd_definition_value,
-        validate_systemd_definition_owner, validate_task_scheduler_definition_owner,
+        definition_snapshot_matches, launchd_list_contains_label, launchd_plist, systemd_unit,
+        task_listing_contains_name, task_scheduler_command, task_scheduler_failure_message,
+        validate_expected_executable, validate_install_migration_authority,
+        validate_launchd_definition_value, validate_systemd_definition_owner,
+        validate_task_scheduler_definition_owner,
     };
     use std::path::{Path, PathBuf};
 

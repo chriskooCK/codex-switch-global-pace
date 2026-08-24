@@ -115,13 +115,15 @@ pub(crate) fn check_uninstall_owner(expected_executable: Option<std::path::PathB
 }
 
 async fn start(foreground: bool, expected_executable: Option<std::path::PathBuf>) -> Result<()> {
-    if let Some(expected_executable) = expected_executable.as_deref() {
-        if foreground {
-            anyhow::bail!("--expected-executable cannot be combined with --foreground");
-        }
-        #[cfg(not(target_os = "windows"))]
+    if expected_executable.is_some() && foreground {
+        anyhow::bail!("--expected-executable cannot be combined with --foreground");
+    }
+    #[cfg(not(target_os = "windows"))]
+    if expected_executable.is_some() {
         anyhow::bail!("--expected-executable is supported only on Windows");
-        #[cfg(target_os = "windows")]
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(expected_executable) = expected_executable.as_deref() {
         return start_windows_installer_owned(expected_executable);
     }
     #[cfg(not(any(unix, target_os = "windows")))]
@@ -254,10 +256,12 @@ fn await_daemon_ready(
 }
 
 fn stop(expected_service_executable: Option<std::path::PathBuf>) -> Result<()> {
-    if let Some(expected_executable) = expected_service_executable.as_deref() {
-        #[cfg(not(target_os = "windows"))]
+    #[cfg(not(target_os = "windows"))]
+    if expected_service_executable.is_some() {
         anyhow::bail!("--expected-service-executable is supported only on Windows");
-        #[cfg(target_os = "windows")]
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(expected_executable) = expected_service_executable.as_deref() {
         return stop_windows_installer_owned(expected_executable);
     }
 
