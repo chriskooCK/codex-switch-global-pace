@@ -1,6 +1,6 @@
 # 中文指南
 
-> 英文 Wiki 是 `codex-switch-global-pace` 的主文档与行为依据。本页提供中文快速入口，不单独维护第二套实现说明。
+> 英文文档是 `codex-switch-global-pace` 的主文档与行为依据。本页提供中文快速入口，不单独维护第二套实现说明。
 
 `codex-switch-global-pace` 用于管理本机多个 OpenAI Codex CLI 登录、查看额度，并在新会话前选择合适账号。Global Weekly Pace 会把所有可用账号的周配额按 reset 时间合并成一个 equal-weight pool；`100%` 是正常配速，以上是 reserve，以下是 deficit。它会操作 Codex 的文件型认证，因此请勿分享 profile、`auth.json`、Token、代理凭据或未经脱敏的 debug 输出。
 
@@ -30,7 +30,7 @@ irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/downl
 
 ```bash
 codex-switch-global-pace login
-codex-switch-global-pace tui
+codex-switch-global-pace          # 打开交互界面
 ```
 
 无浏览器服务器使用 `codex-switch-global-pace login --device`。
@@ -39,17 +39,17 @@ codex-switch-global-pace tui
 
 ## 参与开发版测试
 
-开发版属于滚动 prerelease 通道。安装、验证、回退和问题反馈步骤见 [Testing development releases](Development-Releases)，其中附有中文摘要。
+开发版属于滚动 prerelease 通道。安装、验证、回退和问题反馈步骤见 [Testing development releases](Development-Releases.md)，其中附有中文摘要。
 
 ## 常用入口
 
-- [开始使用](Getting-Started) — 安装、登录和首次启动
-- [功能指南](Feature-Guide) — 主要工作流与安全边界
-- [命令参考](Command-Reference) — 全部命令、全局选项和 TUI 快捷键
-- [配置](Configuration) — 路径、代理与 daemon 设置
-- [更新](Updating) — 更新方式、通道切换和旧版本迁移
-- [故障排查](Troubleshooting) — 常见错误与恢复方式
-- [常见问题](FAQ) — 简短项目说明
+- [开始使用](Getting-Started.md) — 安装、登录和首次启动
+- [功能指南](Feature-Guide.md) — 主要工作流与安全边界
+- [命令参考](Command-Reference.md) — 全部命令、全局选项和 TUI 快捷键
+- [配置](Configuration.md) — 路径、代理与 daemon 设置
+- [更新](Updating.md) — 更新方式、通道切换和旧版本迁移
+- [故障排查](Troubleshooting.md) — 常见错误与恢复方式
+- [常见问题](FAQ.md) — 简短项目说明
 
 命令行为以已安装版本的 `codex-switch-global-pace <命令> --help` 为最终依据。
 
@@ -61,6 +61,6 @@ codex-switch-global-pace tui
 
 ## Next steps
 
-- 第一次使用：继续阅读[开始使用](Getting-Started)。
-- 日常操作：查看[功能指南](Feature-Guide)。
-- 遇到错误：进入[故障排查](Troubleshooting)。
+- 第一次使用：继续阅读[开始使用](Getting-Started.md)。
+- 日常操作：查看[功能指南](Feature-Guide.md)。
+- 遇到错误：进入[故障排查](Troubleshooting.md)。

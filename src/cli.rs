@@ -66,7 +66,7 @@ pub struct Cli {
     pub debug: bool,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -155,8 +155,6 @@ pub enum Commands {
         /// Profile alias to warm up (omit to warm up all profiles)
         alias: Option<String>,
     },
-    /// Open the interactive TUI
-    Tui,
     /// Open the ~/.codex-switch directory in the system file manager
     Open,
     /// Background daemon (Beta) for automatic account switching

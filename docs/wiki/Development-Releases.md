@@ -37,7 +37,7 @@ covers the intended behavior:
 codex-switch-global-pace --version
 codex-switch-global-pace self-update --check --dev
 codex-switch-global-pace list
-codex-switch-global-pace tui
+codex-switch-global-pace
 ```
 
 Do not consume reset cards, delete profiles, install a daemon, or switch a live
@@ -68,6 +68,6 @@ codex-switch-global-pace self-update --stable
 
 ## Next steps
 
-- Review stable update and verification details in [Updating](Updating).
-- Diagnose a failed install or update with [Troubleshooting](Troubleshooting).
-- Review supported workflows in the [Feature guide](Feature-Guide).
+- Review stable update and verification details in [Updating](Updating.md).
+- Diagnose a failed install or update with [Troubleshooting](Troubleshooting.md).
+- Review supported workflows in the [Feature guide](Feature-Guide.md).

@@ -101,5 +101,5 @@ Release artifacts are built only by GitHub Actions for six platform/architecture
 
 ## Next steps
 
-- Set up the repository with [Developer onboarding](Developer-Onboarding).
-- Review test and pull-request requirements in [Contributing](Contributing).
+- Set up the repository with [Developer onboarding](Developer-Onboarding.md).
+- Review test and pull-request requirements in [Contributing](Contributing.md).

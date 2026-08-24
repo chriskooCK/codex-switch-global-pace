@@ -39,7 +39,7 @@ Then add an account or open the dashboard:
 codex-switch-global-pace login
 codex-switch-global-pace list
 codex-switch-global-pace use
-codex-switch-global-pace tui
+codex-switch-global-pace          # open the interactive dashboard
 ```
 
 Running `codex-switch-global-pace` with no arguments opens the TUI. On Windows,

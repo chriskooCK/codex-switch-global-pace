@@ -79,6 +79,6 @@ only when neither program needs the data.
 
 ## Next steps
 
-- Opt into prerelease testing with [Testing development releases](Development-Releases).
-- Diagnose update failures in [Troubleshooting](Troubleshooting).
-- Return to the Wiki [Home](Home).
+- Opt into prerelease testing with [Testing development releases](Development-Releases.md).
+- Diagnose update failures in [Troubleshooting](Troubleshooting.md).
+- Return to the documentation [Home](Home.md).

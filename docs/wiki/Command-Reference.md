@@ -2,9 +2,8 @@
 
 The installed binary remains authoritative: use `codex-switch-global-pace --help` and `codex-switch-global-pace <command> --help` for the exact flags and examples supported by your version.
 
-Running `codex-switch-global-pace` with no subcommand opens the TUI, exactly like
-`codex-switch-global-pace tui`. This also applies when the Windows executable is
-launched directly.
+Running `codex-switch-global-pace` with no subcommand opens the TUI. This also
+applies when the Windows executable is launched directly.
 
 ## Commands
 
@@ -24,7 +23,6 @@ launched directly.
 | `daemon install` | Install the native user service: LaunchAgent on macOS, systemd on Linux, Task Scheduler on Windows (elevated PowerShell required). |
 | `daemon uninstall` | Remove the native user service. |
 | `self-update [--check] [--dev\|--stable] [--version <VERSION>]` | Check or update a direct installation. Without flags it stays on the current channel; `--version` installs a specific newer stable version and conflicts with the channel flags. |
-| `tui` | Open the interactive terminal dashboard. |
 | `open` | Open the codex-switch-global-pace data directory in the platform file manager. |
 
 ## Global options
@@ -84,6 +82,6 @@ Destructive or consumptive actions always require confirmation.
 
 ## Next steps
 
-- See how these commands combine into workflows in the [Feature guide](Feature-Guide).
-- Adjust defaults, proxy, and daemon behavior in [Configuration](Configuration).
-- Check update channels and flags in [Updating](Updating).
+- See how these commands combine into workflows in the [Feature guide](Feature-Guide.md).
+- Adjust defaults, proxy, and daemon behavior in [Configuration](Configuration.md).
+- Check update channels and flags in [Updating](Updating.md).

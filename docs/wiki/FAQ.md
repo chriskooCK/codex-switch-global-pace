@@ -2,7 +2,7 @@
 
 ## Does codex-switch-global-pace support keyring-backed Codex credentials?
 
-No, and this is permanent by design. OS keyrings provide no locking or atomic-replace semantics, and Codex's keyring entry format is an undocumented internal layout that has already changed between versions and platforms. Codex must use `cli_auth_credentials_store = "file"`; if it previously used a keyring store, switch the setting and log in again. See [why only the file store is supported](Configuration#why-only-the-file-store-is-supported).
+No, and this is permanent by design. OS keyrings provide no locking or atomic-replace semantics, and Codex's keyring entry format is an undocumented internal layout that has already changed between versions and platforms. Codex must use `cli_auth_credentials_store = "file"`; if it previously used a keyring store, switch the setting and log in again. See [why only the file store is supported](Configuration.md#why-only-the-file-store-is-supported).
 
 ## Does switching affect an already-running Codex session?
 
@@ -22,22 +22,23 @@ No. It is an optional Beta feature. `codex-switch-global-pace use`, `list`, and 
 
 ## What do the version numbers mean?
 
-Releases use calendar versions in the form `YYYYMMDD.N.0`. Rolling dev builds end in `-dev`; see [Updating](Updating).
+Releases use calendar versions in the form `YYYYMMDD.N.0`. Rolling dev builds end in `-dev`; see [Updating](Updating.md).
 
 ## How do I test the next release?
 
-Use the rolling dev channel only when you are prepared to test prerelease behavior. Follow [Testing development releases](Development-Releases) for installation, verification, rollback, and issue-reporting steps.
+Use the rolling dev channel only when you are prepared to test prerelease behavior. Follow [Testing development releases](Development-Releases.md) for installation, verification, rollback, and issue-reporting steps.
 
 ## How are release binaries verified?
 
-Archives are checked against SHA-256 files and a GitHub build-provenance bundle. Direct self-update runs `gh attestation verify` pinned to this repository, its release workflow, the exact tag ref, and the tag commit digest; see [Updating](Updating#verification).
+Archives are checked against SHA-256 files and a GitHub build-provenance bundle. Direct self-update runs `gh attestation verify` pinned to this repository, its release workflow, the exact tag ref, and the tag commit digest; see [Updating](Updating.md#verification).
 
 ## Where should documentation fixes go?
 
-These Wiki pages are generated from [`docs/wiki/` on the `dev` branch](https://github.com/chriskooCK/codex-switch-global-pace/tree/dev/docs/wiki). Open a pull request against those sources; do not edit the published Wiki directly.
+Documentation fixes belong in `docs/wiki/`. Open a pull request that updates the
+relevant page together with any behavior it describes.
 
 ## Next steps
 
-- New installation: [Getting started](Getting-Started).
-- Daily workflows: [Feature guide](Feature-Guide).
-- Errors and recovery: [Troubleshooting](Troubleshooting).
+- New installation: [Getting started](Getting-Started.md).
+- Daily workflows: [Feature guide](Feature-Guide.md).
+- Errors and recovery: [Troubleshooting](Troubleshooting.md).

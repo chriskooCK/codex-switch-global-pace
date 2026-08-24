@@ -18,13 +18,11 @@ A development release has two gates: push the branch and wait for all three CI h
 
 The final development release before a stable release has an additional acceptance gate:
 
-- Finish code, tests, changelog, README, and repository-backed Wiki sources before publishing the final `dev` build.
+- Finish code, tests, changelog, README, and repository documentation before publishing the final `dev` build.
 - Record the exact commit SHA and ask the maintainer to test that build.
 - After acceptance, make no code, documentation, formatting, lockfile, or metadata changes.
 - Fast-forward `master` to that exact commit and create the stable tag on the same commit.
 - If any change is needed, publish and test a new `dev` build; the previous acceptance no longer qualifies.
-
-The Wiki sync workflow publishes the reviewed `docs/wiki/` sources from `dev`. This publication does not change the accepted source commit; the Wiki content must already match that commit.
 
 ## Version policy
 

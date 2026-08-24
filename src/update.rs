@@ -167,7 +167,7 @@ fn replacement_permission_hint(
 }
 
 pub(crate) fn homebrew_dev_install_hint() -> &'static str {
-    "run `brew uninstall codex-switch-global-pace`, then follow the development-release instructions at https://github.com/chriskooCK/codex-switch-global-pace/wiki/Development-Releases#install-the-rolling-dev-build"
+    "run `brew uninstall codex-switch-global-pace`, then follow the development-release instructions at https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/docs/wiki/Development-Releases.md#install-the-rolling-dev-build"
 }
 
 fn homebrew_dev_install_error() -> String {
@@ -1262,11 +1262,11 @@ mod tests {
         let hint = super::homebrew_dev_install_hint();
         assert!(hint.contains("brew uninstall codex-switch-global-pace"));
         assert!(hint.contains(
-            "github.com/chriskooCK/codex-switch-global-pace/wiki/Development-Releases#install-the-rolling-dev-build"
+            "github.com/chriskooCK/codex-switch-global-pace/blob/dev/docs/wiki/Development-Releases.md#install-the-rolling-dev-build"
         ));
         assert!(
             !hint.contains("blob/master/"),
-            "hint must not point at repository files on master; the published Wiki follows dev"
+            "hint must point at the reviewed development instructions on dev"
         );
         assert!(!hint.contains("| bash"));
         assert!(!hint.contains("self-update"));

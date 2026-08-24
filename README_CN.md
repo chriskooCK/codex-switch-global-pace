@@ -36,7 +36,7 @@ irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/downl
 codex-switch-global-pace login
 codex-switch-global-pace list
 codex-switch-global-pace use
-codex-switch-global-pace tui
+codex-switch-global-pace          # 打开交互式仪表盘
 ```
 
 不带参数运行会直接打开 TUI；Windows 双击

@@ -15,5 +15,5 @@ Never attach credentials, auth files, personal account metadata, or unredacted d
 
 ## Next steps
 
-- New contributor: follow [Developer onboarding](Developer-Onboarding).
-- Auth, profile, daemon, or release change: read the [Architecture overview](Architecture-Overview).
+- New contributor: follow [Developer onboarding](Developer-Onboarding.md).
+- Auth, profile, daemon, or release change: read the [Architecture overview](Architecture-Overview.md).
