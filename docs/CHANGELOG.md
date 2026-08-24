@@ -1,5 +1,17 @@
 # Changelog
 
+## v20260824.4.0 — 2026-08-24
+
+- **Readable Global pace meter** — The Global box now mirrors account quota
+  meters: weighted pool usage fills the shared 0–100% bar, weighted elapsed time
+  supplies the `|` and `↑ pace` position, and the effective Global Pace remains
+  a separate summary value with an explicit reserve, deficit, or normal label.
+  The misleading 0–150% split axis and its fixed 100% divider were removed.
+- **One meter coordinate path** — Global and account rows now share the same
+  fill and marker renderer. Their secondary labels use fixed, non-overlapping
+  regions and render only as complete labels instead of substituting alternate
+  text when space becomes tight.
+
 ## v20260824.3.0 — 2026-08-24
 
 - **Aligned dashboard meters** — Global Weekly Pace and every selected-account

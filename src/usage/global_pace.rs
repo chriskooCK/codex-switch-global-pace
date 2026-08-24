@@ -87,6 +87,10 @@ pub struct GlobalWeeklySummary {
     pub pace_percent: Option<f64>,
     /// Global pace minus the 100% normal baseline.
     pub reserve_percent_points: Option<f64>,
+    /// Equal- or capacity-weighted usage across the included weekly windows.
+    pub aggregate_used_percent: Option<f64>,
+    /// Equal- or capacity-weighted elapsed time across those same windows.
+    pub aggregate_elapsed_percent: Option<f64>,
     /// Sum of account effective percentages, weighted when capacities exist.
     pub effective_capacity: f64,
     /// The corresponding normal baseline (`100` per unit of weight).
@@ -182,26 +186,66 @@ pub fn calculate_global_weekly_summary(
     .then(|| {
         accounts
             .iter()
-            .fold((0.0, 0.0), |(effective, normal), account| {
+            .fold((0.0, 0.0, 0.0, 0.0), |totals, account| {
                 let weight = account.capacity.expect("capacity checked above");
+                let (effective, normal, used, elapsed) = totals;
                 (
                     effective + weight * account.effective_capacity,
                     normal + weight * 100.0,
+                    used + weight * account.used_percent,
+                    elapsed + weight * account.elapsed_percent,
                 )
             })
     })
-    .filter(|(effective, normal)| effective.is_finite() && normal.is_finite() && *normal > 0.0);
+    .filter(|(effective, normal, used, elapsed)| {
+        effective.is_finite()
+            && normal.is_finite()
+            && used.is_finite()
+            && elapsed.is_finite()
+            && *normal > 0.0
+    });
 
-    let (weighting, effective_capacity, normal_capacity) = match capacity_totals {
-        Some((effective, normal)) => (GlobalPaceWeighting::Capacity, effective, normal),
-        None => (
-            GlobalPaceWeighting::Equal,
-            accounts
-                .iter()
-                .map(|account| account.effective_capacity)
-                .sum(),
-            included_accounts as f64 * 100.0,
+    let (
+        weighting,
+        effective_capacity,
+        normal_capacity,
+        aggregate_used_percent,
+        aggregate_elapsed_percent,
+    ) = match capacity_totals {
+        Some((effective, normal, weighted_used, weighted_elapsed)) => (
+            GlobalPaceWeighting::Capacity,
+            effective,
+            normal,
+            Some(weighted_used / normal * 100.0),
+            Some(weighted_elapsed / normal * 100.0),
         ),
+        None => {
+            let account_count = included_accounts as f64;
+            let averages = (included_accounts > 0).then(|| {
+                (
+                    accounts
+                        .iter()
+                        .map(|account| account.used_percent)
+                        .sum::<f64>()
+                        / account_count,
+                    accounts
+                        .iter()
+                        .map(|account| account.elapsed_percent)
+                        .sum::<f64>()
+                        / account_count,
+                )
+            });
+            (
+                GlobalPaceWeighting::Equal,
+                accounts
+                    .iter()
+                    .map(|account| account.effective_capacity)
+                    .sum(),
+                account_count * 100.0,
+                averages.map(|values| values.0),
+                averages.map(|values| values.1),
+            )
+        }
     };
 
     let pace_percent = if normal_capacity > 0.0 {
@@ -213,6 +257,8 @@ pub fn calculate_global_weekly_summary(
     GlobalWeeklySummary {
         pace_percent,
         reserve_percent_points: pace_percent.map(|pace| pace - 100.0),
+        aggregate_used_percent,
+        aggregate_elapsed_percent,
         effective_capacity,
         normal_capacity,
         included_accounts,
@@ -293,6 +339,21 @@ mod tests {
         );
     }
 
+    fn assert_summary_identity(summary: &GlobalWeeklySummary) {
+        let pace = summary.pace_percent.expect("valid pace");
+        let used = summary
+            .aggregate_used_percent
+            .expect("valid aggregate usage");
+        let elapsed = summary
+            .aggregate_elapsed_percent
+            .expect("valid aggregate elapsed time");
+        assert_near(pace, 100.0 - used + elapsed);
+        assert_near(
+            summary.reserve_percent_points.expect("valid reserve"),
+            elapsed - used,
+        );
+    }
+
     #[test]
     fn normal_pace_has_one_hundred_effective_and_zero_reserve() {
         let pace = account(50.0, 50);
@@ -351,6 +412,12 @@ mod tests {
         assert_near(summary.normal_capacity, 300.0);
         assert_near(summary.pace_percent.unwrap(), 106.66666666666667);
         assert_near(summary.reserve_percent_points.unwrap(), 6.666666666666671);
+        assert_near(summary.aggregate_used_percent.unwrap(), 6.666666666666667);
+        assert_near(
+            summary.aggregate_elapsed_percent.unwrap(),
+            13.333333333333334,
+        );
+        assert_summary_identity(&summary);
     }
 
     #[test]
@@ -367,6 +434,9 @@ mod tests {
         assert_near(summary.normal_capacity, 400.0);
         assert_near(summary.pace_percent.unwrap(), 90.0);
         assert_near(summary.reserve_percent_points.unwrap(), -10.0);
+        assert_near(summary.aggregate_used_percent.unwrap(), 50.0);
+        assert_near(summary.aggregate_elapsed_percent.unwrap(), 40.0);
+        assert_summary_identity(&summary);
     }
 
     #[test]
@@ -382,6 +452,21 @@ mod tests {
         assert_near(summary.effective_capacity, 200.0);
         assert_near(summary.normal_capacity, 200.0);
         assert_near(summary.pace_percent.unwrap(), 100.0);
+        assert_near(summary.aggregate_used_percent.unwrap(), 50.0);
+        assert_near(summary.aggregate_elapsed_percent.unwrap(), 50.0);
+    }
+
+    #[test]
+    fn capacity_that_overflows_the_normal_baseline_uses_equal_weighting() {
+        let mut account = input("huge", 50.0, 0);
+        account.capacity = Some(f64::MAX / 75.0);
+
+        let summary = calculate_global_weekly_summary(&[account], NOW);
+
+        assert_eq!(summary.weighting, GlobalPaceWeighting::Equal);
+        assert_near(summary.effective_capacity, 50.0);
+        assert_near(summary.normal_capacity, 100.0);
+        assert_summary_identity(&summary);
     }
 
     #[test]
@@ -406,6 +491,9 @@ mod tests {
         assert_eq!(summary.included_accounts, 1);
         assert_eq!(summary.excluded_accounts, 4);
         assert_near(summary.effective_capacity, 95.0);
+        assert_near(summary.aggregate_used_percent.unwrap(), 100.0);
+        assert_near(summary.aggregate_elapsed_percent.unwrap(), 95.0);
+        assert_summary_identity(&summary);
         assert_eq!(summary.next_reset_alias.as_deref(), Some("exhausted"));
     }
 
@@ -443,6 +531,8 @@ mod tests {
 
         assert_eq!(summary.pace_percent, None);
         assert_eq!(summary.reserve_percent_points, None);
+        assert_eq!(summary.aggregate_used_percent, None);
+        assert_eq!(summary.aggregate_elapsed_percent, None);
         assert_eq!(summary.effective_capacity, 0.0);
         assert_eq!(summary.normal_capacity, 0.0);
         assert_eq!(summary.included_accounts, 0);
