@@ -7,6 +7,7 @@
 
 $ErrorActionPreference = "Stop"
 $Repo = "chriskooCK/codex-switch-global-pace"
+$PackagedReleaseVersion = ""
 $BinaryName = "codex-switch-global-pace.exe"
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\codex-switch-global-pace"
 $DataDir = Join-Path $env:USERPROFILE ".codex-switch"
@@ -21,6 +22,49 @@ function Assert-SupportedVersion {
         [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
     )) {
         throw "Invalid CS_VERSION '$Value'; expected a SemVer version such as 20260824.6.0."
+    }
+}
+
+function Get-CheckedDaemonStatus {
+    param([Parameter(Mandatory = $true)][string]$BinPath)
+
+    $StatusText = (& $BinPath --json daemon status 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "daemon status exited with code ${LASTEXITCODE}: $StatusText"
+    }
+    try {
+        $Status = $StatusText | ConvertFrom-Json
+    } catch {
+        throw "daemon status was not valid JSON: $_"
+    }
+    $RunningProperty = $Status.PSObject.Properties["running"]
+    if ($null -eq $RunningProperty -or $RunningProperty.Value -isnot [bool]) {
+        throw "daemon status did not contain a Boolean 'running' field"
+    }
+    $PlatformProperty = $Status.PSObject.Properties["platform"]
+    if ($null -eq $PlatformProperty -or $null -eq $PlatformProperty.Value) {
+        throw "daemon status did not contain a 'platform' object"
+    }
+    $ServiceProperty = $PlatformProperty.Value.PSObject.Properties["service_installed"]
+    if ($null -eq $ServiceProperty -or $ServiceProperty.Value -isnot [bool]) {
+        throw "daemon status did not contain a Boolean 'platform.service_installed' field"
+    }
+    return $Status
+}
+
+function Stop-And-ConfirmDaemonAbsent {
+    param([Parameter(Mandatory = $true)][string]$BinPath)
+
+    $Before = Get-CheckedDaemonStatus -BinPath $BinPath
+    if ($Before.running -or $Before.platform.service_installed) {
+        & $BinPath daemon stop
+        if ($LASTEXITCODE -ne 0) {
+            throw "daemon stop exited with code $LASTEXITCODE"
+        }
+    }
+    $After = Get-CheckedDaemonStatus -BinPath $BinPath
+    if ($After.running) {
+        throw "daemon still reports running after the stop boundary"
     }
 }
 
@@ -120,6 +164,19 @@ if ($UseDev) {
     }
 }
 
+$ExpectedReleaseVersion = if ($Version -notin @("latest", "dev")) {
+    $Version
+} else {
+    if ([string]::IsNullOrWhiteSpace($PackagedReleaseVersion)) {
+        throw "This installer is not bound to a GitHub Release. Download install.ps1 from the stable or dev Release assets instead of running the repository copy directly."
+    }
+    Assert-SupportedVersion $PackagedReleaseVersion
+    $PackagedReleaseVersion
+}
+if ($UseDev -and $ExpectedReleaseVersion -notmatch '-dev(?:\.|$)') {
+    throw "Development installer expected a -dev release, got '$ExpectedReleaseVersion'."
+}
+
 Write-Host "[info]  Detected: windows/$Arch" -ForegroundColor Blue
 Write-Host "[info]  Downloading: $DownloadUrl" -ForegroundColor Blue
 
@@ -169,107 +226,252 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "candidate version check exited with code ${LASTEXITCODE}: $CandidateVersionOutput"
     }
+    $CandidateVersionLine = (($CandidateVersionOutput | Select-Object -First 1) -as [string]).Trim()
+    $ExpectedVersionLine = "codex-switch-global-pace $ExpectedReleaseVersion"
+    if ($CandidateVersionLine -cne $ExpectedVersionLine) {
+        throw "candidate reported '$CandidateVersionLine', expected '$ExpectedVersionLine'"
+    }
 } catch {
     Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     Write-Host "[error] Downloaded binary failed its pre-install check; the existing installation was not changed: $_" -ForegroundColor Red
     exit 1
 }
 
-# A running daemon holds the installed executable open on Windows. Detect it
-# through the old binary before replacement, stop it gracefully, and remember
-# to restore the previous running state after the verified binary is installed.
+# Stage the verified candidate beside the installed executable before stopping a
+# working daemon. The same-directory rename below is the only publication step,
+# so a download drive and the install drive can never turn this into a partial
+# cross-volume move.
 $InstalledBin = Join-Path $InstallDir $BinaryName
+$InstallDirWasPresent = Test-Path -LiteralPath $InstallDir -PathType Container
+if ((Test-Path -LiteralPath $InstallDir) -and -not $InstallDirWasPresent) {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    Write-Host "[error] Install path exists but is not a directory: $InstallDir" -ForegroundColor Red
+    exit 1
+}
+$ExistingBinaryWasPresent = Test-Path -LiteralPath $InstalledBin -PathType Leaf
+if ((Test-Path -LiteralPath $InstalledBin) -and -not $ExistingBinaryWasPresent) {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    Write-Host "[error] Installed binary path exists but is not a regular file: $InstalledBin" -ForegroundColor Red
+    exit 1
+}
+
+$TransactionId = [Guid]::NewGuid().ToString("N")
+$BinaryStem = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
+$StagedBin = Join-Path $InstallDir ".$BinaryStem.install-$TransactionId.exe"
+$BackupBin = Join-Path $InstallDir ".$BinaryStem.rollback-$TransactionId.exe"
+$FailedBin = Join-Path $InstallDir ".$BinaryStem.failed-$TransactionId.exe"
+$OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+
+try {
+    if (-not $InstallDirWasPresent) {
+        New-Item -ItemType Directory -Path $InstallDir | Out-Null
+    }
+    Copy-Item -LiteralPath $CandidateBin -Destination $StagedBin
+    $StagedVersionOutput = & $StagedBin --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "staged candidate version check exited with code ${LASTEXITCODE}: $StagedVersionOutput"
+    }
+    $StagedVersionLine = (($StagedVersionOutput | Select-Object -First 1) -as [string]).Trim()
+    if ($StagedVersionLine -cne "codex-switch-global-pace $ExpectedReleaseVersion") {
+        throw "staged candidate reported '$StagedVersionLine', expected 'codex-switch-global-pace $ExpectedReleaseVersion'"
+    }
+} catch {
+    $StageError = $_
+    Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
+    if (-not $InstallDirWasPresent -and (Test-Path -LiteralPath $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
+        Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    Write-Host "[error] Could not stage the verified binary; the existing installation was not changed: $StageError" -ForegroundColor Red
+    exit 1
+}
+
+# A running daemon holds the executable open. Its state is part of this
+# transaction, so an unreadable or malformed status is an error rather than a
+# guess that it is stopped.
 $DaemonWasRunning = $false
-if (Test-Path -LiteralPath $InstalledBin) {
-    $DaemonStatusText = (& $InstalledBin --json daemon status 2>$null | Out-String)
-    if ($LASTEXITCODE -eq 0) {
-        try {
-            $DaemonStatus = $DaemonStatusText | ConvertFrom-Json
-            $DaemonWasRunning = [bool]$DaemonStatus.running
-        } catch {
-            Write-Warning "Could not parse the existing daemon status; replacement will continue only if the executable is not locked."
+$DaemonServiceInstalled = $false
+if ($ExistingBinaryWasPresent) {
+    try {
+        $DaemonStatus = Get-CheckedDaemonStatus -BinPath $InstalledBin
+        $DaemonWasRunning = $DaemonStatus.running
+        $DaemonServiceInstalled = $DaemonStatus.platform.service_installed
+    } catch {
+        $StatusError = $_
+        Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
+        if (-not $InstallDirWasPresent -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
+            Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
         }
-    } else {
-        Write-Warning "Could not query the existing daemon status; replacement will continue only if the executable is not locked."
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        Write-Host "[error] Could not determine the existing daemon state; nothing was replaced: $StatusError" -ForegroundColor Red
+        exit 1
     }
 }
 
-if ($DaemonWasRunning) {
-    Write-Host "[info]  Stopping the running daemon before upgrade..." -ForegroundColor Blue
+if ($DaemonWasRunning -or $DaemonServiceInstalled) {
+    Write-Host "[info]  Stopping the existing daemon task before upgrade..." -ForegroundColor Blue
     & $InstalledBin daemon stop
     if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
         Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-        Write-Error "The running daemon could not be stopped safely. Retry 'codex-switch-global-pace daemon stop', then run the installer again."
+        Write-Host "[error] The running daemon could not be stopped safely. The installed binary was not replaced." -ForegroundColor Red
         exit 1
     }
 }
 
 $InstallError = $null
-$RestartError = $null
 $VersionOutput = $null
+$OldBinaryBackedUp = $false
+$NewBinaryPublished = $false
+$PathMutationAttempted = $false
+$DaemonRestarted = $false
+$DaemonRestartAttempted = $false
+$PreviousBinaryRestored = $ExistingBinaryWasPresent
 try {
-    # Install
-    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    Move-Item -LiteralPath $CandidateBin -Destination $InstalledBin -Force
+    if ($ExistingBinaryWasPresent) {
+        Move-Item -LiteralPath $InstalledBin -Destination $BackupBin
+        $OldBinaryBackedUp = $true
+        $PreviousBinaryRestored = $false
+    }
+    Move-Item -LiteralPath $StagedBin -Destination $InstalledBin
+    $NewBinaryPublished = $true
 
-    # Add to PATH if not already present.
-    #
-    # Rebuilt from entries instead of concatenating "$UserPath;$InstallDir": when the
-    # user has no User-scoped Path, or it ends with a separator, that concatenation
-    # produces an empty PATH element. Windows resolves an empty element to the
-    # current working directory when it searches for an executable, so the installer
-    # would leave every directory the user later cd's into on the search path for
-    # every command they run — a persistent change outliving the tool itself.
-    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $PathEntries = @($UserPath -split ";" | Where-Object { $_.Trim() -ne "" })
+    # Preserve the exact original User PATH for rollback. Empty entries are
+    # excluded only from the successful new value because Windows interprets
+    # them as the current working directory.
+    $PathEntries = @($OriginalUserPath -split ";" | Where-Object { $_.Trim() -ne "" })
     if ($PathEntries -notcontains $InstallDir) {
         $NewPath = ($PathEntries + $InstallDir) -join ";"
+        $PathMutationAttempted = $true
         [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
         Write-Host "[info]  Added $InstallDir to user PATH (restart terminal to take effect)" -ForegroundColor Blue
     }
 
-    # Verify the replacement before restoring the daemon.
     $VersionOutput = & $InstalledBin --version 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "Installed binary failed its version check: $VersionOutput"
+        throw "installed binary version check exited with code ${LASTEXITCODE}: $VersionOutput"
+    }
+    $InstalledVersionLine = (($VersionOutput | Select-Object -First 1) -as [string]).Trim()
+    if ($InstalledVersionLine -cne "codex-switch-global-pace $ExpectedReleaseVersion") {
+        throw "installed binary reported '$InstalledVersionLine', expected 'codex-switch-global-pace $ExpectedReleaseVersion'"
+    }
+
+    if ($DaemonWasRunning) {
+        Write-Host "[info]  Restoring the previously running daemon..." -ForegroundColor Blue
+        $DaemonRestartAttempted = $true
+        & $InstalledBin daemon start
+        if ($LASTEXITCODE -ne 0) {
+            throw "daemon start exited with code $LASTEXITCODE"
+        }
+        $DaemonRestarted = $true
+    }
+
+    if ($OldBinaryBackedUp) {
+        Remove-Item -LiteralPath $BackupBin -Force
+        $OldBinaryBackedUp = $false
     }
 } catch {
     $InstallError = $_
-} finally {
-    if ($DaemonWasRunning) {
-        if (Test-Path -LiteralPath $InstalledBin) {
-            Write-Host "[info]  Restoring the previously running daemon..." -ForegroundColor Blue
-            try {
-                & $InstalledBin daemon start
-                if ($LASTEXITCODE -ne 0) {
-                    throw "daemon start exited with code $LASTEXITCODE"
-                }
-            } catch {
-                $RestartError = $_
-            }
-        } else {
-            $RestartError = "The installed executable is missing after replacement."
-        }
-    }
 }
-
-# Temporary-file cleanup cannot be allowed to strand a daemon that was already
-# restored in the finally block.
-Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 
 if ($null -ne $InstallError) {
-    $RestartDetail = if ($null -ne $RestartError) {
-        " The previously running daemon also could not be restored: $RestartError"
-    } else {
-        ""
+    $RollbackErrors = @()
+
+    $DaemonSafeForBinaryRollback = $true
+    if ($DaemonRestarted -or $DaemonRestartAttempted) {
+        try {
+            Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin
+            $DaemonRestarted = $false
+        } catch {
+            $DaemonSafeForBinaryRollback = $false
+            $RollbackErrors += "could not prove the new daemon/task was stopped: $_"
+        }
     }
-    Write-Error "Installation did not finish cleanly. Close any running codex-switch-global-pace process and retry. Details: $InstallError$RestartDetail"
+
+    $NewBinaryMovedAside = $false
+    if ($NewBinaryPublished -and $DaemonSafeForBinaryRollback) {
+        try {
+            if (Test-Path -LiteralPath $InstalledBin) {
+                Move-Item -LiteralPath $InstalledBin -Destination $FailedBin
+                $NewBinaryMovedAside = $true
+            }
+            if ($OldBinaryBackedUp) {
+                Move-Item -LiteralPath $BackupBin -Destination $InstalledBin
+                $OldBinaryBackedUp = $false
+                $PreviousBinaryRestored = $true
+            }
+            if ($NewBinaryMovedAside) {
+                Remove-Item -LiteralPath $FailedBin -Force
+                $NewBinaryMovedAside = $false
+            }
+            $NewBinaryPublished = $false
+        } catch {
+            $BinaryRollbackError = $_
+            if ($NewBinaryMovedAside -and -not (Test-Path -LiteralPath $InstalledBin)) {
+                try {
+                    Move-Item -LiteralPath $FailedBin -Destination $InstalledBin
+                    $NewBinaryMovedAside = $false
+                } catch {
+                    $BinaryRollbackError = "$BinaryRollbackError; executable path recovery also failed: $_"
+                }
+            }
+            $RollbackErrors += "could not restore the previous binary: $BinaryRollbackError"
+        }
+    } elseif (-not $DaemonSafeForBinaryRollback) {
+        $RollbackErrors += "the previous binary remains preserved at $BackupBin; automatic binary rollback was refused"
+    } elseif ($OldBinaryBackedUp) {
+        try {
+            Move-Item -LiteralPath $BackupBin -Destination $InstalledBin
+            $OldBinaryBackedUp = $false
+            $PreviousBinaryRestored = $true
+        } catch {
+            $RollbackErrors += "could not restore the previous binary: $_"
+        }
+    }
+
+    if ($PathMutationAttempted) {
+        try {
+            [Environment]::SetEnvironmentVariable("Path", $OriginalUserPath, "User")
+            $PathMutationAttempted = $false
+        } catch {
+            $RollbackErrors += "could not restore the exact previous User PATH: $_"
+        }
+    }
+
+    if ($DaemonWasRunning -and $DaemonSafeForBinaryRollback -and $PreviousBinaryRestored -and (Test-Path -LiteralPath $InstalledBin)) {
+        try {
+            Write-Host "[info]  Restarting the previous daemon after rollback..." -ForegroundColor Blue
+            & $InstalledBin daemon start
+            if ($LASTEXITCODE -ne 0) {
+                throw "daemon start exited with code $LASTEXITCODE"
+            }
+        } catch {
+            $RollbackErrors += "could not restart the previous daemon: $_"
+        }
+    }
+
+    Remove-Item -LiteralPath $StagedBin -Force -ErrorAction SilentlyContinue
+    if ($NewBinaryMovedAside) {
+        $RollbackErrors += "failed candidate remains at $FailedBin"
+    }
+    if (-not $InstallDirWasPresent -and (Test-Path -LiteralPath $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
+        try {
+            Remove-Item -LiteralPath $InstallDir -Force
+        } catch {
+            $RollbackErrors += "could not remove the newly created empty install directory: $_"
+        }
+    }
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+
+    if ($RollbackErrors.Count -eq 0) {
+        Write-Host "[error] Installation failed and the previous binary, User PATH, and daemon state were restored: $InstallError" -ForegroundColor Red
+    } else {
+        Write-Host "[error] Installation failed: $InstallError. Rollback was incomplete: $($RollbackErrors -join '; ')" -ForegroundColor Red
+    }
     exit 1
 }
-if ($null -ne $RestartError) {
-    Write-Error "The binary was installed, but the previously running daemon could not be restored: $RestartError. Run 'codex-switch-global-pace daemon start' after resolving the reported error."
-    exit 1
-}
+
+Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 
 Write-Host "[info]  Installed: $VersionOutput" -ForegroundColor Blue
 Write-Host "[info]  Run 'codex-switch-global-pace --help' to get started" -ForegroundColor Blue

@@ -63,7 +63,9 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
         return Ok(());
     }
 
-    let current = profile::read_current();
+    // Derive the active row from live credentials. A stale marker must not make
+    // an unrelated profile look active while live auth is untracked.
+    let current = profile::active_profile_from_live().unwrap_or_default();
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config::get().network.max_concurrent,
@@ -122,7 +124,6 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
         }
 
         let alias = row.name.clone();
-        let current = current.clone();
         let sem = semaphore.clone();
         tasks.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
@@ -152,9 +153,9 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
             };
             let usage_result = if needs_usage {
                 Some(if force {
-                    usage::fetch_usage_retried_force(&alias, &path, &current).await
+                    usage::fetch_usage_retried_force(&alias, &path).await
                 } else {
-                    usage::fetch_usage_retried(&alias, &path, &current).await
+                    usage::fetch_usage_retried(&alias, &path).await
                 })
             } else {
                 None
@@ -293,10 +294,10 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     profile::validate_alias(alias)?;
-    if profile::read_current() == alias {
+    if profile::active_profile_from_live().as_deref() == Some(alias) {
         anyhow::bail!("cannot delete the active profile '{alias}'");
     }
-    if !profile::profile_auth_path(alias)?.exists() {
+    if !profile::profile_exists(alias)? {
         anyhow::bail!("profile '{alias}' not found");
     }
 
@@ -459,7 +460,6 @@ pub(crate) async fn select_best_profile(
         );
     }
 
-    let current = profile::read_current();
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config::get().network.max_concurrent,
     ));
@@ -473,7 +473,6 @@ pub(crate) async fn select_best_profile(
             continue;
         }
 
-        let current = current.clone();
         let sem = semaphore.clone();
         tasks.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
@@ -486,7 +485,7 @@ pub(crate) async fn select_best_profile(
                     return None;
                 }
             };
-            match usage::fetch_usage_retried(&alias, &path, &current).await {
+            match usage::fetch_usage_retried(&alias, &path).await {
                 Ok(u) => Some((alias, u)),
                 Err(e) => {
                     tracing::warn!("[{alias}] usage fetch failed during auto-select: {e}");
@@ -569,13 +568,17 @@ pub(crate) async fn select_best_profile(
         .context("revival target disappeared from scored candidates")?;
     let (target_candidate, target_usage) = target_candidate;
     let card_count = target_usage.reset_credits.len() as u64;
+    let target_credit = usage::earliest_reset_credit(&target_usage.reset_credits)
+        .cloned()
+        .context("revival target has no reset card")?;
 
     let approved = match card_policy {
         CardPolicy::Deny => false,
         CardPolicy::PreApproved => true,
         CardPolicy::Prompt => {
-            let expires = usage::earliest_reset_credit(&target_usage.reset_credits)
-                .and_then(|c| c.expires_at.as_deref())
+            let expires = target_credit
+                .expires_at
+                .as_deref()
                 .map(output::format_local_datetime)
                 .unwrap_or_else(|| "no expiry".to_string());
             confirm_default_no(&revival_prompt_message(&target_alias, card_count, &expires))
@@ -599,8 +602,7 @@ pub(crate) async fn select_best_profile(
     }
 
     let target_path = profile::profile_auth_path(&target_alias)?;
-    let current = profile::read_current();
-    match usage::consume_earliest_reset_credit(&target_alias, &target_path).await {
+    match usage::consume_reset_credit_by_id(&target_alias, &target_path, target_credit).await {
         Ok(_consumed) => {
             if let Err(err) = cache::invalidate(&target_alias) {
                 tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
@@ -608,7 +610,6 @@ pub(crate) async fn select_best_profile(
             let failure_summary = match usage::fetch_usage_retried_force(
                 &target_alias,
                 &target_path,
-                &current,
             )
             .await
             {

@@ -91,7 +91,11 @@ git push origin refs/tags/dev:refs/tags/dev
 
 GitHub Actions Release builds are the only distribution source of truth; do not publish from local `target/release`. The Release job verifies every archive against its `.sha256`, then uses GitHub artifact attestations to generate a Sigstore bundle before creating a GitHub Release. Artifacts are:
 
-Rolling `dev` runs are concurrency-controlled. Immediately before deleting or replacing the rolling release, the workflow also resolves `refs/tags/dev` again and refuses to publish unless it still points to that run's exact source commit.
+Release runs are serialized per tag. The workflow resolves lightweight or
+annotated stable/dev tags to their commit before creating a draft, verifies the
+tag again after uploading every asset, and only then publishes the draft. It
+checks once more across that final publication transition and deletes that exact
+Release ID if the tag moved, so a mismatched Release is never left exposed.
 
 - Linux / macOS: `.tar.gz` archives named `codex-switch-global-pace-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
 - Windows: `.zip` archives named `codex-switch-global-pace-windows-{amd64,arm64}.zip` plus `.sha256`

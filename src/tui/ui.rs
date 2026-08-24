@@ -223,11 +223,7 @@ fn editable_input_line(
     cursor: usize,
     hint: &'static str,
 ) -> Line<'static> {
-    let byte_cursor = input
-        .char_indices()
-        .nth(cursor)
-        .map(|(index, _)| index)
-        .unwrap_or(input.len());
+    let byte_cursor = super::app::grapheme_to_byte(input, cursor);
     let (before_cursor, after_cursor) = input.split_at(byte_cursor);
 
     Line::from(vec![
@@ -1758,6 +1754,14 @@ mod tests {
         assert_eq!(
             editable_input_line(" /", "a중b", 3, "").to_string(),
             " /a중b#"
+        );
+        assert_eq!(
+            editable_input_line(" /", "👩‍💻a", 1, "").to_string(),
+            " /👩‍💻#a"
+        );
+        assert_eq!(
+            editable_input_line(" /", "e\u{301}x", 1, "").to_string(),
+            " /e\u{301}#x"
         );
     }
 

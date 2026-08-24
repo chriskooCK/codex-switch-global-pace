@@ -8,7 +8,10 @@ mod parse;
 mod reset_credits;
 mod scoring;
 
-pub(crate) use api::{apply_account_routing_headers, do_refresh_token};
+pub(crate) use api::{
+    apply_account_routing_headers, do_refresh_token, fetch_usage_retried_unattended_leased,
+    fetch_usage_retried_with_existing_lease,
+};
 pub use api::{
     fetch_usage_retried, fetch_usage_retried_force, fetch_usage_retried_unattended,
     refresh_expiring_tokens, validate_import_auth,
@@ -27,10 +30,8 @@ pub use global_pace::{
 };
 #[allow(unused_imports)]
 pub use parse::parse_usage;
-pub(crate) use reset_credits::reset_credit_expiry_sort_key;
-pub use reset_credits::{
-    consume_earliest_reset_credit, consume_reset_credit_by_id, earliest_reset_credit,
-};
+pub use reset_credits::{consume_reset_credit_by_id, earliest_reset_credit};
+pub(crate) use reset_credits::{consume_reset_credit_by_id_leased, reset_credit_expiry_sort_key};
 #[allow(unused_imports)]
 pub use scoring::visible_pace_percent;
 pub(crate) use scoring::{
@@ -325,24 +326,12 @@ impl std::fmt::Display for TerminalAuthError {
 
 impl std::error::Error for TerminalAuthError {}
 
-/// Outcome of one usage fetch attempt.
-///
-/// `refreshed` is populated whenever the auth server issued new tokens during
-/// the attempt — **including when `result` is an error**. The rotated
-/// `refresh_token` is the only one the server will still accept, so callers
-/// must persist it before propagating the failure.
-pub struct UsageFetchOutcome {
-    pub refreshed: Option<RefreshedTokens>,
-    pub result: anyhow::Result<UsageInfo>,
-}
-
 /// Outcome of validating an auth.json on the `import` path.
 ///
-/// Same split as [`UsageFetchOutcome`], and for the same reason: validation
-/// refreshes the credential before it calls the usage API, so `refreshed` is
-/// populated **even when `result` is an error**. `import` owns a local copy of
-/// the auth value, so returning only the error would drop the single credential
-/// the auth server still accepts and brick the account being imported.
+/// Validation invokes its required persistence callback before making any
+/// follow-up usage request. `refreshed` is still populated **even when
+/// `result` is an error**, allowing the import command to distinguish a spent
+/// source credential and report where its durable recovery copy was preserved.
 pub struct ImportValidation {
     pub refreshed: Option<RefreshedTokens>,
     /// Account id that the Usage API accepted for these credentials.
@@ -378,10 +367,36 @@ impl UsageError {
             ),
         }
     }
+
+    /// The profile copy is safe, but its relationship with live Codex auth
+    /// could not be established or updated atomically.
+    pub fn live_activation_incomplete(alias: &str, cause: &anyhow::Error) -> Self {
+        Self {
+            summary: "live auth sync incomplete".to_string(),
+            detail: format!(
+                "[{alias}] refreshed credentials were saved in the profile, but live Codex auth \
+                 could not be synchronized safely: {cause:#}. Fix the reported live-auth path, \
+                 then run `codex-switch-global-pace use {alias}` to activate the saved credential."
+            ),
+        }
+    }
+
+    /// A different writer replaced the profile credential while this refresh
+    /// was in flight, so the compare-and-swap deliberately preserved it.
+    pub fn token_update_superseded(alias: &str) -> Self {
+        Self {
+            summary: "refreshed token superseded".to_string(),
+            detail: format!(
+                "[{alias}] the saved credential changed while token refresh was in progress. \
+                 The refreshed response was not installed because overwriting the newer \
+                 credential would be unsafe; this request was stopped."
+            ),
+        }
+    }
 }
 
-/// One profile whose rotated credentials could not be written to disk during an
-/// opportunistic refresh.
+/// One profile whose rotated credentials could not be committed completely
+/// during an opportunistic refresh.
 ///
 /// Opportunistic refresh is a batch, and the daemon runs it on a timer, so a
 /// single failure must neither abort the remaining profiles nor disappear into

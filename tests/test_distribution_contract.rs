@@ -369,16 +369,34 @@ fn release_reuses_the_exact_source_quality_gate_and_builds_locked() {
 }
 
 #[test]
-fn rolling_release_serializes_runs_and_rechecks_the_tag_before_deletion() {
+fn release_stages_isolated_candidates_and_rechecks_every_tag_before_cutover() {
     let workflow = repo_file(".github/workflows/release.yml");
 
     for required in [
         "concurrency:",
         "group: release-${{ github.ref }}",
-        "cancel-in-progress: true",
-        "Confirm rolling tag still targets this source",
-        "git/ref/tags/dev",
-        "${TAG_SHA,,}",
+        "cancel-in-progress: false",
+        "Prepare release verifiers",
+        "git/ref/tags/${tag}",
+        "git/tags/${sha}",
+        "Confirm release tag still targets this source before publish",
+        "Inspect an existing exact-tag release",
+        "Create isolated candidate draft",
+        "candidate_tag=\"release-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\"",
+        "draft:true",
+        "Upload and verify isolated candidate assets",
+        "Confirm exact tag still targets this source before cutover",
+        "Archive the previous dev release without changing its assets",
+        "Publish verified candidate on the exact tag",
+        "Remove temporary cutover state after verified publication",
+        "if: steps.publish.outputs.complete == 'true'",
+        "cleanup-verified-release-assets",
+        "Verified release %s remains published, but temporary state cleanup failed:",
+        "Roll back an incomplete dev cutover",
+        "Remove only this run's incomplete candidate",
+        "steps.candidate.outputs.id",
+        "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}",
+        "'{tag_name:$tag,name:$name,draft:false,prerelease:$prerelease}'",
         "${GITHUB_SHA,,}",
     ] {
         assert!(
@@ -388,13 +406,193 @@ fn rolling_release_serializes_runs_and_rechecks_the_tag_before_deletion() {
     }
     assert_before(
         &workflow,
-        "Confirm rolling tag still targets this source",
-        "Delete existing dev release",
+        "Confirm release tag still targets this source before publish",
+        "Inspect an existing exact-tag release",
     );
     assert_before(
         &workflow,
-        "if [[ \"$TAG_KIND\" != \"commit\"",
-        "gh release delete dev --yes",
+        "Create isolated candidate draft",
+        "Upload and verify isolated candidate assets",
+    );
+    assert_before(
+        &workflow,
+        "Upload and verify isolated candidate assets",
+        "Archive the previous dev release without changing its assets",
+    );
+    assert_before(
+        &workflow,
+        "Confirm exact tag still targets this source before cutover",
+        "Archive the previous dev release without changing its assets",
+    );
+    assert_before(
+        &workflow,
+        "Archive the previous dev release without changing its assets",
+        "Publish verified candidate on the exact tag",
+    );
+    assert_before(
+        &workflow,
+        "Publish verified candidate on the exact tag",
+        "Remove temporary cutover state after verified publication",
+    );
+    assert!(!workflow.contains("Delete existing dev release"));
+    assert!(!workflow.contains("gh release delete dev"));
+    assert!(!workflow.contains("--clobber"));
+}
+
+#[test]
+fn release_reruns_preserve_published_assets_and_fail_closed_on_drift() {
+    let workflow = repo_file(".github/workflows/release.yml");
+
+    for required in [
+        "releases/tags/${tag}",
+        "Existing stable release ${release_id} metadata differs from this exact source.",
+        "verify-release-assets.sh",
+        "existing-release-assets\" attest",
+        "gh attestation verify",
+        "--bundle \"$provenance_bundle\"",
+        "--signer-workflow \"$GITHUB_REPOSITORY/.github/workflows/release.yml\"",
+        "--source-digest \"$GITHUB_SHA\"",
+        "--source-ref \"$GITHUB_REF\"",
+        "Existing checksum $(basename \"$checksum\") must contain exactly one line.",
+        "[[ ! \"$recorded_digest\" =~ ^[0-9a-fA-F]{64}$",
+        "actual_digest=$(sha256sum -- \"$archive\")",
+        "externalParameters.workflow.path == \".github/workflows/release.yml\"",
+        ".digest.gitCommit == $sha",
+        "echo \"skip=true\" >> \"$GITHUB_OUTPUT\"",
+        "archive_tag=\"dev-archive-${OLD_RELEASE_ID}\"",
+        "refs/tags/${archive_tag}",
+        "echo \"ref_created=true\" >> \"$GITHUB_OUTPUT\"",
+        "ARCHIVE_REF_CREATED: ${{ steps.archive.outputs.ref_created }}",
+        "'{tag_name:\"dev\"}'",
+        "Candidate ${CANDIDATE_ID} changed identity; refusing to delete it during rollback.",
+        "Previous dev release ${OLD_RELEASE_ID} changed identity; refusing rollback.",
+        "${candidate_target,,}",
+        "candidate_draft=$(jq -r '.draft'",
+        "Release ${RELEASE_ID} no longer matches this run; refusing cleanup.",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "transactional rerun contract must contain `{required}`"
+        );
+    }
+    assert_before(
+        &workflow,
+        "existing-release-assets\" attest",
+        "echo \"skip=true\" >> \"$GITHUB_OUTPUT\"",
+    );
+    assert_before(
+        &workflow,
+        "gh attestation verify \"$archive\"",
+        "tar xzf \"$download_dir/codex-switch-global-pace-linux-amd64.tar.gz\"",
+    );
+    assert_before(
+        &workflow,
+        "Upload and verify isolated candidate assets",
+        "refs/tags/${archive_tag}",
+    );
+    let verified_cleanup = workflow
+        .split("- name: Remove temporary cutover state after verified publication")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("- name: Roll back an incomplete dev cutover")
+                .next()
+        })
+        .expect("verified temporary-state cleanup step");
+    for required in [
+        "steps.publish.outputs.complete == 'true'",
+        "cleanup-verified-release-assets",
+        "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}",
+        "git/refs/tags/${archive_tag}",
+        "old archive release ${OLD_RELEASE_ID} remains",
+        "archive ref ${archive_tag} remains",
+        "archive ref ${archive_tag} has no creation proof and was preserved",
+        "Verified release %s remains published, but temporary state cleanup failed:",
+    ] {
+        assert!(
+            verified_cleanup.contains(required),
+            "verified cleanup contract must contain `{required}`"
+        );
+    }
+    assert_before(
+        verified_cleanup,
+        "cleanup-verified-release-assets",
+        "if [[ \"$old_release_safe\" == true ]]",
+    );
+    let old_delete = verified_cleanup
+        .split("if [[ \"$old_release_safe\" == true ]]")
+        .nth(1)
+        .expect("old archive release deletion branch");
+    assert!(old_delete.contains("repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}"));
+    assert!(!verified_cleanup.contains("tag_name:\"dev\""));
+    let rollback = workflow
+        .split("- name: Roll back an incomplete dev cutover")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("- name: Remove only this run's incomplete candidate")
+                .next()
+        })
+        .expect("incomplete dev cutover rollback step");
+    for required in [
+        "${old_target,,}",
+        "$(jq -r '.draft' <<<\"$old\")",
+        "${candidate_target,,}",
+        "candidate_draft=$(jq -r '.draft' <<<\"$candidate\")",
+        "candidate_after_target=$(jq -r '.target_commitish' <<<\"$candidate_after\")",
+        "final deletion state is ambiguous; refusing rollback",
+        "if [[ \"$ARCHIVE_REF_CREATED\" == true ]]",
+    ] {
+        assert!(
+            rollback.contains(required),
+            "rollback ownership contract must contain `{required}`"
+        );
+    }
+    assert_before(
+        rollback,
+        "${candidate_target,,}",
+        "gh api --method DELETE \\",
+    );
+    assert_before(
+        rollback,
+        "gh api --method DELETE \\",
+        "'{tag_name:\"dev\"}'",
+    );
+
+    let incomplete_cleanup = workflow
+        .split("- name: Remove only this run's incomplete candidate")
+        .nth(1)
+        .expect("incomplete candidate cleanup step");
+    for required in [
+        "incomplete-candidate-ref-error",
+        "incomplete-candidate-ref-after-delete-error",
+        "incomplete-candidate-release-error",
+        "incomplete-candidate-release-after-delete-error",
+        "elif ! grep -Eq 'HTTP 404|Not Found' \"$candidate_ref_error\"",
+        "elif grep -Eq 'HTTP 404|Not Found' \"$candidate_release_error\"",
+        "Candidate ref ${CANDIDATE_TAG} deletion state is ambiguous for release ${RELEASE_ID}",
+        "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) deletion state is ambiguous",
+        "${target,,}",
+        "( \"$tag\" == \"$CANDIDATE_TAG\" && \"$draft\" != true )",
+        "( \"$tag\" == \"$final_tag\" && \"$draft\" != false )",
+    ] {
+        assert!(
+            incomplete_cleanup.contains(required),
+            "incomplete cleanup contract must contain `{required}`"
+        );
+    }
+    assert!(!incomplete_cleanup.contains("2>/dev/null"));
+    assert_before(
+        incomplete_cleanup,
+        "Candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID} no longer belongs",
+        "if ! gh api --method DELETE \\",
+    );
+    let release_cleanup = incomplete_cleanup
+        .split("candidate_release_error=")
+        .nth(1)
+        .expect("incomplete candidate release cleanup branch");
+    assert_before(
+        release_cleanup,
+        "Release ${RELEASE_ID} no longer matches this run; refusing cleanup.",
+        "if ! gh api --method DELETE \\",
     );
 }
 
@@ -412,13 +610,111 @@ fn unix_installer_verifies_checksum_before_extracting() {
         "--system",
         "LEGACY_BIN",
         "install -m 0755",
-        "sudo install -m 0755",
+        "stage_and_replace_binary",
+        "rollback_installed_binary",
     ] {
         assert!(
             script.contains(required),
             "Unix installer must contain `{required}`"
         );
     }
+}
+
+#[test]
+fn direct_installers_are_release_bound_and_preflight_exact_candidate_versions() {
+    let unix = repo_file("scripts/install.sh");
+    let windows = repo_file("scripts/install.ps1");
+    let release = repo_file(".github/workflows/release.yml");
+    let unix_install = unix
+        .split("# Download, verify, and extract")
+        .nth(1)
+        .expect("Unix install transaction section");
+
+    for required in [
+        "PACKAGED_RELEASE_VERSION=\"\"",
+        "EXPECTED_RELEASE_VERSION",
+        "verify_candidate_version",
+        "stage_and_replace_binary",
+        "rollback_installed_binary",
+        "commit_installed_binary",
+    ] {
+        assert!(
+            unix.contains(required),
+            "missing Unix contract `{required}`"
+        );
+    }
+    assert_before(
+        unix_install,
+        "verify_candidate_version",
+        "stage_and_replace_binary",
+    );
+    assert_before(
+        unix_install,
+        "stage_and_replace_binary",
+        "commit_installed_binary",
+    );
+    assert_before(
+        unix_install,
+        "commit_installed_binary",
+        "rm -f \"$LEGACY_BIN\"",
+    );
+
+    for required in [
+        "$PackagedReleaseVersion = \"\"",
+        "$ExpectedReleaseVersion",
+        "$CandidateVersionLine -cne $ExpectedVersionLine",
+    ] {
+        assert!(
+            windows.contains(required),
+            "missing Windows contract `{required}`"
+        );
+    }
+    assert!(release.contains("PACKAGED_RELEASE_VERSION=\\\"${RELEASE_VERSION}\\\""));
+    assert!(release.contains("$PackagedReleaseVersion = \\\"${RELEASE_VERSION}\\\""));
+}
+
+#[test]
+fn unix_installer_checks_homebrew_ownership_for_every_install_mode() {
+    let script = repo_file("scripts/install.sh");
+    let install = script
+        .split("# ── Install")
+        .nth(1)
+        .expect("Unix install section");
+
+    assert!(install.contains("if [ -e \"$LEGACY_BIN\" ] || [ -L \"$LEGACY_BIN\" ]; then"));
+    assert_before(
+        install,
+        "classify_legacy_binary",
+        "if [ \"$SYSTEM_INSTALL\" = false ]; then",
+    );
+    assert_before(install, "[ \"$LEGACY_KIND\" = \"homebrew\" ]", "# Install");
+}
+
+#[test]
+fn legacy_service_migration_preserves_the_old_absolute_path_until_reinstall_succeeds() {
+    let script = repo_file("scripts/install.sh");
+    let install = script
+        .split("# Download, verify, and extract")
+        .nth(1)
+        .expect("Unix install transaction section");
+    for required in [
+        "legacy_service_references_binary",
+        "legacy_service_is_running",
+        "MIGRATE_LEGACY_SERVICE=true",
+        "\"$INSTALL_DEST\" daemon install",
+        "\"$LEGACY_BIN\" daemon install",
+        "Both verified binaries were kept",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing service migration contract `{required}`"
+        );
+    }
+    assert_before(
+        install,
+        "\"$INSTALL_DEST\" daemon install",
+        "rm -f \"$LEGACY_BIN\"",
+    );
 }
 
 #[test]
@@ -936,8 +1232,7 @@ fn unix_installer_records_and_cleans_explicit_system_install_intent() {
     for required in [
         "SYSTEM_INSTALL_MARKER",
         ".codex-switch-global-pace-system-install-v1",
-        "install -m 0644 /dev/null \"$SYSTEM_INSTALL_MARKER\"",
-        "sudo install -m 0644 /dev/null \"$SYSTEM_INSTALL_MARKER\"",
+        "run_install_fs install -m 0644 /dev/null \"$SYSTEM_INSTALL_MARKER\"",
         "rm -f \"$LEGACY_BIN\" \"$SYSTEM_INSTALL_MARKER\"",
         "sudo rm -f \"$LEGACY_BIN\" \"$SYSTEM_INSTALL_MARKER\"",
     ] {
@@ -970,28 +1265,87 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
 
     for required in [
         "$DaemonWasRunning",
+        "$DaemonServiceInstalled",
+        "$StagedBin",
+        "$BackupBin",
+        "$FailedBin",
+        "$OriginalUserPath",
+        "$OldBinaryBackedUp",
+        "$NewBinaryPublished",
+        "$PathMutationAttempted",
+        "$DaemonRestarted",
+        "$DaemonRestartAttempted",
+        "function Get-CheckedDaemonStatus",
+        "Boolean 'running' field",
+        "Boolean 'platform.service_installed' field",
+        "function Stop-And-ConfirmDaemonAbsent",
+        "$After = Get-CheckedDaemonStatus -BinPath $BinPath",
+        "$DaemonSafeForBinaryRollback",
+        "automatic binary rollback was refused",
+        ".$BinaryStem.install-$TransactionId.exe",
         "--json daemon status",
         "& $InstalledBin daemon stop",
         "& $InstalledBin daemon start",
         "The running daemon could not be stopped safely",
         "$CandidateVersionOutput = & $CandidateBin --version",
+        "$StagedVersionOutput = & $StagedBin --version",
         "the existing installation was not changed",
-        "} finally {",
-        "$RestartError",
+        "$RollbackErrors",
+        "Restarting the previous daemon after rollback",
     ] {
         assert!(
             script.contains(required),
             "Windows installer must contain the daemon-upgrade safeguard `{required}`"
         );
     }
-    assert_before(&script, "--json daemon status", "Move-Item");
+    assert_before(
+        &script,
+        "$DaemonStatus = Get-CheckedDaemonStatus -BinPath $InstalledBin",
+        "Move-Item -LiteralPath $InstalledBin -Destination $BackupBin",
+    );
     assert_before(
         &script,
         "$CandidateVersionOutput = & $CandidateBin --version",
+        "$StagedBin = Join-Path $InstallDir",
+    );
+    assert_before(
+        &script,
+        "$StagedVersionOutput = & $StagedBin --version",
+        "$DaemonStatus = Get-CheckedDaemonStatus -BinPath $InstalledBin",
+    );
+    assert_before(
+        &script,
+        "$DaemonStatus = Get-CheckedDaemonStatus -BinPath $InstalledBin",
         "& $InstalledBin daemon stop",
     );
     assert_before(&script, "& $InstalledBin daemon stop", "Move-Item");
-    assert_before(&script, "} finally {", "& $InstalledBin daemon start");
+    assert!(
+        script.contains("if ($DaemonWasRunning -or $DaemonServiceInstalled)"),
+        "an installed but currently stopped task must still be ended before its executable is replaced"
+    );
+
+    let rollback_start = script
+        .find("if ($null -ne $InstallError)")
+        .expect("Windows installer must have an explicit rollback branch");
+    let rollback = &script[rollback_start..];
+    assert_before(
+        rollback,
+        "Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin",
+        "if ($NewBinaryPublished -and $DaemonSafeForBinaryRollback)",
+    );
+    assert!(rollback.contains(
+        "$DaemonWasRunning -and $DaemonSafeForBinaryRollback -and $PreviousBinaryRestored"
+    ));
+    assert_before(
+        rollback,
+        "Move-Item -LiteralPath $BackupBin -Destination $InstalledBin",
+        "Restarting the previous daemon after rollback",
+    );
+    assert_before(
+        rollback,
+        "SetEnvironmentVariable(\"Path\", $OriginalUserPath, \"User\")",
+        "Restarting the previous daemon after rollback",
+    );
 }
 
 #[test]
@@ -1046,6 +1400,59 @@ fn self_update_attestation_is_bound_to_the_current_tag_commit() {
         "verify_build_provenance(",
         "if confirmed_digest != source_digest",
     );
+    assert_before(
+        &update,
+        "verify_candidate_binary(&extracted_path",
+        "let confirmed_digest = fetch_tag_commit_sha",
+    );
+    assert_before(
+        &update,
+        "if confirmed_digest != source_digest",
+        "replace_candidate(",
+    );
+}
+
+#[test]
+fn daemon_service_installations_stage_validate_and_rollback() {
+    let service = repo_file("src/daemon/service.rs");
+    for required in [
+        "staged_service_file",
+        "plutil",
+        "systemd-analyze",
+        "rollback_systemd_install",
+        "remove enablement for failed new systemd service",
+        "export existing scheduled task",
+        "codex-switch-global-pace-daemon-install-",
+        "restore_scheduled_task",
+        "wait_for_scheduled_daemon",
+        "cmd.exe /D /V:OFF /S /C",
+    ] {
+        assert!(
+            service.contains(required),
+            "missing service transaction contract `{required}`"
+        );
+    }
+    assert_before(
+        &service,
+        "generated LaunchAgent failed plutil validation",
+        "was_loaded",
+    );
+    assert_before(
+        &service,
+        "generated systemd user service failed validation",
+        "was_active",
+    );
+    assert_before(
+        &service,
+        "create_scheduled_task(&stage_name",
+        "previous_was_running {",
+    );
+}
+
+#[test]
+fn ci_pins_the_audit_executable_version() {
+    let workflow = repo_file(".github/workflows/ci.yml");
+    assert!(workflow.contains("cargo install cargo-audit --version 0.22.2 --locked"));
 }
 
 #[test]
@@ -1110,12 +1517,7 @@ fn release_verifies_archives_before_creating_a_release() {
     assert_before(
         &workflow,
         "Verify release checksums",
-        "Create GitHub Release (dev)",
-    );
-    assert_before(
-        &workflow,
-        "Verify release checksums",
-        "Create GitHub Release (stable)",
+        "Create isolated candidate draft",
     );
 }
 
@@ -1138,28 +1540,21 @@ fn release_attests_archives_before_publishing_them() {
     assert!(workflow.contains("artifacts/*.tar.gz"));
     assert!(workflow.contains("artifacts/*.zip"));
     assert!(workflow.contains("codex-switch-global-pace-build-provenance.json"));
-    assert_eq!(
-        workflow
-            .matches("target_commitish: ${{ github.sha }}")
-            .count(),
-        2,
-        "dev and stable release metadata must both record the source commit"
-    );
+    assert!(workflow.contains("target_commitish:$target"));
+    assert!(workflow.contains("--arg target \"$GITHUB_SHA\""));
+    assert!(workflow.contains("'.target_commitish'"));
     assert_before(
         &workflow,
         "Attest release archives",
-        "Create GitHub Release (dev)",
-    );
-    assert_before(
-        &workflow,
-        "Attest release archives",
-        "Create GitHub Release (stable)",
+        "Create isolated candidate draft",
     );
 }
 
 #[test]
 fn windows_daemon_stop_never_force_kills_a_trusted_process() {
     let daemon = repo_file("src/daemon/mod.rs");
+    let pidfile = repo_file("src/daemon/pidfile.rs");
+    let service = repo_file("src/daemon/service.rs");
     assert!(
         !daemon.contains("pidfile::force_kill(pid)"),
         "a trusted daemon may be rotating credentials; a graceful-stop timeout must fail visibly \
@@ -1169,23 +1564,22 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
     let uninstall_start = daemon.find("fn uninstall()").unwrap();
     let uninstall_end = daemon[uninstall_start..].find("async fn start").unwrap() + uninstall_start;
     let uninstall = &daemon[uninstall_start..uninstall_end];
-    assert_eq!(
-        uninstall.matches("windows_stop_gate(").count(),
-        3,
-        "Windows uninstall must gate both before graceful shutdown and again immediately before \
-         Task Scheduler may force-stop the daemon"
+    assert!(
+        uninstall.matches("pidfile::running_pid_checked()?").count() >= 2,
+        "Windows uninstall must check the PID-lock authority before graceful shutdown and again \
+         immediately before Task Scheduler may force-stop the daemon"
     );
 
     let stop_start = daemon.find("fn stop()").unwrap();
     let stop_end = daemon[stop_start..].find("fn stop_detached").unwrap() + stop_start;
     let stop = &daemon[stop_start..stop_end];
     assert!(
-        stop.contains("windows_stop_gate("),
-        "Windows stop must pass through the PID-lock gate before Task Scheduler may use /End"
+        stop.contains("pidfile::running_pid_checked()?"),
+        "Windows stop must use the checked PID-lock authority before Task Scheduler may use /End"
     );
     assert!(
-        daemon.contains("cleanup_stale_pidfile()?;"),
-        "a false process diagnostic must acquire and remove the stale PID file or fail closed"
+        !daemon.contains("service::is_installed()"),
+        "daemon mutation paths must not fold scheduler or service-marker errors into detached mode"
     );
     let detached_start = daemon.find("fn stop_detached()").unwrap();
     let detached_end = daemon[detached_start..]
@@ -1194,8 +1588,61 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
         + detached_start;
     let detached = &daemon[detached_start..detached_end];
     assert!(
+        detached.contains("pidfile::running_pid_checked()?")
+            && detached.contains("pidfile::request_shutdown(pid)?"),
+        "a live daemon must be selected by its held PID lock and stopped with its generation-bound request"
+    );
+    assert!(
         !detached.contains("let _ = pidfile::cleanup_pidfile();"),
         "Windows graceful-stop completion must propagate a locked PID-file cleanup failure"
+    );
+
+    assert!(
+        pidfile.contains("generation: identity.generation"),
+        "the Windows shutdown request must be bound to the exact daemon generation"
+    );
+    assert!(
+        pidfile.contains("fn legacy_pidfile_lock_is_held_checked"),
+        "the one-version same-file lock migration must share an explicit checked authority probe"
+    );
+    assert!(
+        !pidfile.contains("Command::new(\"tasklist\")")
+            && !daemon.contains("Command::new(\"tasklist\")")
+            && !service.contains("Command::new(\"tasklist\")"),
+        "tasklist must not remain as a daemon transaction authority"
+    );
+
+    let scheduled_stop_start = service
+        .find("fn stop_scheduled_daemon_for_rollback()")
+        .unwrap();
+    let scheduled_stop_end = service[scheduled_stop_start..]
+        .find("fn uninstall_task_scheduler()")
+        .unwrap()
+        + scheduled_stop_start;
+    let scheduled_stop = &service[scheduled_stop_start..scheduled_stop_end];
+    assert!(
+        scheduled_stop.contains("crate::daemon::pidfile::request_shutdown(pid)"),
+        "scheduled-daemon rollback must request shutdown from the generation selected by the PID lock"
+    );
+    assert!(
+        scheduled_stop
+            .matches("crate::daemon::pidfile::running_pid_checked()")
+            .count()
+            >= 3,
+        "scheduled-daemon rollback must wait for checked lock release and recheck immediately before /End"
+    );
+    assert_before(
+        scheduled_stop,
+        "crate::daemon::pidfile::request_shutdown(pid)",
+        "\"/End\"",
+    );
+
+    let service_uninstall_start = service.find("fn uninstall_task_scheduler()").unwrap();
+    let service_uninstall = &service[service_uninstall_start..];
+    assert!(
+        service_uninstall.contains("verify_daemon_absent_after_service_stop(")
+            && service_uninstall.contains("crate::daemon::pidfile::running_pid_checked()"),
+        "service definition removal must require checked PID-lock absence after the scheduler stop"
     );
 }
 
@@ -1297,7 +1744,10 @@ fn plain_self_update_keeps_dev_installs_on_the_dev_channel() {
 
     assert!(command.contains("update::is_dev_version(update::current_version())"));
     assert!(command.contains("update::check_for_dev_update().await?"));
-    assert!(command.contains("update::self_update_dev(show_progress).await"));
+    assert!(command.contains("update::self_update_dev(show_progress, update_lease.clone()).await"));
+    assert!(
+        command.contains("update::self_update(version, show_progress, update_lease.clone()).await")
+    );
     assert!(command.contains("else if stable || version.is_some()"));
     assert_before(&command, "if dev", "else if stable || version.is_some()");
 }

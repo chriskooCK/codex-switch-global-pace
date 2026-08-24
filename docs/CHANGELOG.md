@@ -1,5 +1,34 @@
 # Changelog
 
+## v20260825.1.0 — 2026-08-25
+
+- **One credential-operation boundary** — Usage refresh, model discovery,
+  warmup, reset-card redemption, and known-profile re-login now hold one
+  per-profile OS lease for their complete credential lifetime. Rotated tokens
+  are written before any follow-up request, and the TUI waits for every started
+  credential task before a normal exit instead of cancelling valid responses.
+- **Atomic profile state** — Profile activation commits live authentication and
+  the current marker as one recoverable operation, while newly issued tokens
+  are never rolled back to an already-consumed refresh token. Rename, delete,
+  login, import, cache mutation, and reset-card confirmation fail closed on
+  unreadable state and use the live Codex identity rather than a stale marker.
+- **Race-safe daemon switching** — The daemon distinguishes conversations,
+  authentication mutation, infrastructure, and failed process inspection. It
+  always defers during login/logout or an unknown inspection result and uses a
+  compare-and-switch commit so a long poll cannot override a newer manual
+  account selection.
+- **Deterministic TUI state** — Usage and model responses carry request
+  generations, relogin invalidates stale model data, rename/delete waits for
+  account work, exact reset-card consent is preserved, and search/rename editing
+  now treats combining characters and emoji sequences as whole graphemes.
+- **Transactional distribution** — Installers verify the exact executable
+  version before replacement, migrate a running legacy service only after the
+  new service succeeds, and restore binaries and service state on failure.
+  Self-update rechecks mutable tags after candidate execution, preserves exact
+  recovery files across partial Windows replacement failures, and uses a
+  generation-bound PID lock for daemon transitions. Releases remain drafts
+  until their exact tag and release ID are verified for publish.
+
 ## v20260824.7.0 — 2026-08-24
 
 - **One active-account invariant** — A successful login now updates the saved

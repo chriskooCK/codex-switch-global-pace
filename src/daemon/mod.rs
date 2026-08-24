@@ -25,61 +25,22 @@ fn uninstall() -> Result<()> {
         // Task Scheduler's `/End` is a forced stop. If its daemon is live,
         // give the process the same generation-bound graceful request used by
         // `daemon stop` before removing the task.
-        let pid = pidfile::read_pidfile();
-        let alive = pid.is_some_and(pidfile::process_alive);
-        if let WindowsStopGate::Graceful = windows_stop_gate(pid, alive, pidfile::cleanup_pidfile)?
-        {
+        if pidfile::running_pid_checked()?.is_some() {
             stop_detached()?;
+        } else {
+            pidfile::cleanup_pidfile()?;
         }
         // Re-check immediately before `service::uninstall()` reaches
-        // Task Scheduler's `/End`. A transient false from the wait loop cannot
-        // authorize a force-stop while the daemon still owns its PID lock.
-        let final_pid = pidfile::read_pidfile();
-        let final_alive = final_pid.is_some_and(pidfile::process_alive);
-        if let WindowsStopGate::Graceful =
-            windows_stop_gate(final_pid, final_alive, pidfile::cleanup_pidfile)?
-        {
+        // Task Scheduler's `/End`. Only checked PID-lock absence authorizes
+        // the service layer to reach that force-stop boundary.
+        if let Some(pid) = pidfile::running_pid_checked()? {
             anyhow::bail!(
-                "Daemon is still running after the graceful stop request; refusing to \
-                 force-terminate it during uninstall"
+                "Daemon PID {pid} still owns the PID lock after the graceful stop request; \
+                 refusing to force-terminate it during uninstall"
             );
         }
     }
     service::uninstall()
-}
-
-#[cfg(any(target_os = "windows", test))]
-#[derive(Debug, Eq, PartialEq)]
-enum WindowsStopGate {
-    Graceful,
-    SchedulerSafe,
-}
-
-/// Decide whether Task Scheduler may use `/End`.
-///
-/// Both `process_alive == false` and a missing parsed PID are ambiguous on
-/// Windows because tasklist, path lookup, file reads, parsing, and lock probes
-/// can fail. Removing the PID file requires taking its exclusive lock, so a
-/// diagnostic failure while the daemon still owns that lock returns an error
-/// and fails closed instead of authorizing a forced stop. A genuinely absent
-/// file makes cleanup a harmless no-op.
-#[cfg(any(target_os = "windows", test))]
-fn windows_stop_gate(
-    pid: Option<u32>,
-    process_alive: bool,
-    cleanup_stale_pidfile: impl FnOnce() -> Result<()>,
-) -> Result<WindowsStopGate> {
-    match pid {
-        Some(_) if process_alive => Ok(WindowsStopGate::Graceful),
-        Some(_) => {
-            cleanup_stale_pidfile()?;
-            Ok(WindowsStopGate::SchedulerSafe)
-        }
-        None => {
-            cleanup_stale_pidfile()?;
-            Ok(WindowsStopGate::SchedulerSafe)
-        }
-    }
 }
 
 async fn start(foreground: bool) -> Result<()> {
@@ -90,18 +51,15 @@ async fn start(foreground: bool) -> Result<()> {
     }
     #[cfg(any(unix, target_os = "windows"))]
     {
-        if pidfile::is_daemon_running() {
-            anyhow::bail!(
-                "Daemon is already running (PID {})",
-                pidfile::read_pidfile().unwrap_or(0)
-            );
+        if let Some(pid) = pidfile::running_pid_checked()? {
+            anyhow::bail!("Daemon is already running (PID {pid})");
         }
         // Clean up stale PID file before starting
         pidfile::cleanup_pidfile()?;
         if foreground {
             return run_foreground().await;
         }
-        if service::is_installed() {
+        if service::is_installed_checked()? {
             return service::start_installed();
         }
         start_detached()
@@ -158,6 +116,7 @@ fn await_daemon_ready(
 ) -> Result<u32> {
     let pid = child.id();
     let deadline = std::time::Instant::now() + timeout;
+    let mut last_probe_error = None;
     loop {
         // Did the child exit before initializing?
         if let Ok(Some(status)) = child.try_wait() {
@@ -165,15 +124,29 @@ fn await_daemon_ready(
                 "Daemon process (PID {pid}) exited immediately ({status}); check logs for details"
             );
         }
-        if pidfile::read_pidfile() == Some(pid) {
-            return Ok(pid);
+        match pidfile::running_pid_checked() {
+            Ok(Some(running_pid)) if running_pid == pid => return Ok(pid),
+            Ok(Some(running_pid)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "Daemon startup PID {pid} lost the PID-lock authority to PID {running_pid}; the new child was stopped"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => last_probe_error = Some(error),
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(error) = last_probe_error {
+                return Err(error.context(format!(
+                    "Daemon (PID {pid}) did not publish a valid, locked identity within {}s and was stopped",
+                    timeout.as_secs()
+                )));
+            }
             anyhow::bail!(
-                "Daemon (PID {pid}) did not initialize within {}s (no PID file written) and was \
-                 stopped; check logs",
+                "Daemon (PID {pid}) did not initialize within {}s (no locked PID identity published) and was stopped; check logs",
                 timeout.as_secs()
             );
         }
@@ -186,18 +159,16 @@ fn stop() -> Result<()> {
     {
         // A scheduled task runs the same foreground daemon. Ask that process
         // to unwind first; `/End` would terminate it during credential writes.
-        let pid = pidfile::read_pidfile();
-        let alive = pid.is_some_and(pidfile::process_alive);
-        if let WindowsStopGate::Graceful = windows_stop_gate(pid, alive, pidfile::cleanup_pidfile)?
-        {
+        if pidfile::running_pid_checked()?.is_some() {
             return stop_detached();
         }
+        pidfile::cleanup_pidfile()?;
         // An older or still-starting scheduled task may not have a trusted
         // pidfile. There is no generation-bound process to signal, so Task
         // Scheduler is the only remaining stop authority.
-        if service::is_installed() {
+        if service::is_installed_checked()? {
             service::stop_installed()?;
-            let _ = pidfile::cleanup_pidfile();
+            pidfile::cleanup_pidfile()?;
             return Ok(());
         }
         stop_detached()
@@ -205,11 +176,12 @@ fn stop() -> Result<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        if service::is_installed() {
+        if service::is_installed_checked()? {
+            let pid = pidfile::running_pid_checked()?;
             match service::stop_installed() {
                 Ok(()) => {
-                    wait_until_stopped_or_kill(pidfile::read_pidfile())?;
-                    let _ = pidfile::cleanup_pidfile();
+                    wait_until_stopped_or_kill(pid)?;
+                    pidfile::cleanup_pidfile()?;
                     return Ok(());
                 }
                 Err(err) => {
@@ -223,13 +195,18 @@ fn stop() -> Result<()> {
 }
 
 fn stop_detached() -> Result<()> {
-    let pid = pidfile::read_pidfile()
-        .ok_or_else(|| anyhow::anyhow!("No daemon PID file found; daemon may not be running"))?;
-    if !pidfile::process_alive(pid) {
+    let observed_pid = pidfile::read_pidfile();
+    let Some(pid) = pidfile::running_pid_checked()? else {
+        if observed_pid.is_none() {
+            anyhow::bail!("No daemon PID file found; daemon may not be running");
+        }
         pidfile::cleanup_pidfile()?;
         user_println("Daemon was not running (stale PID file cleaned up)");
         return Ok(());
-    }
+    };
+    #[cfg(target_os = "windows")]
+    pidfile::request_shutdown(pid)?;
+    #[cfg(not(target_os = "windows"))]
     pidfile::send_sigterm(pid)?;
     #[cfg(target_os = "windows")]
     {
@@ -239,9 +216,6 @@ fn stop_detached() -> Result<()> {
                  refusing to force-terminate it. Retry `codex-switch-global-pace daemon stop` shortly."
             )
         })?;
-        // `process_alive` can return false when tasklist fails. Successfully
-        // taking and deleting the PID file is the authoritative completion
-        // proof; a live daemon's held lock makes this fail closed.
         pidfile::cleanup_pidfile()?;
     }
     user_println(&format!("Sent stop signal to daemon (PID {pid})"));
@@ -264,12 +238,13 @@ fn wait_until_stopped_or_kill(pid: Option<u32>) -> Result<()> {
 fn wait_until_stopped(pid: Option<u32>) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let running = match pid.or_else(pidfile::read_pidfile) {
-            Some(pid) => pidfile::process_alive(pid),
-            None => false,
-        };
-        if !running {
-            return Ok(());
+        match pidfile::running_pid_checked()? {
+            None => return Ok(()),
+            Some(current_pid) if pid.is_none() || pid == Some(current_pid) => {}
+            Some(current_pid) => anyhow::bail!(
+                "Daemon generation changed to PID {current_pid} while waiting for PID {:?} to stop",
+                pid
+            ),
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!("Daemon did not stop within 10s");
@@ -285,13 +260,18 @@ pub struct SelfUpdateDaemonRestart {
 }
 
 impl SelfUpdateDaemonRestart {
-    pub fn capture() -> Self {
-        let pid = pidfile::read_pidfile().filter(|pid| pidfile::process_alive(*pid));
-        Self {
+    pub fn capture() -> Result<Self> {
+        let pid = pidfile::running_pid_checked()?;
+        let service_installed = if pid.is_some() {
+            service::is_installed_checked()?
+        } else {
+            false
+        };
+        Ok(Self {
             pid,
-            service_installed: service::is_installed(),
+            service_installed,
             stopped: false,
-        }
+        })
     }
 
     pub fn is_needed(&self) -> bool {
@@ -330,12 +310,28 @@ impl SelfUpdateDaemonRestart {
         self.stopped = false;
         Ok(())
     }
+
+    #[cfg(target_os = "windows")]
+    pub fn stop_failed_restart_before_rollback(&self) -> Result<()> {
+        if !self.stopped {
+            anyhow::bail!("daemon restart state was already committed; refusing binary rollback");
+        }
+        if self.service_installed {
+            service::stop_failed_start_for_self_update()?;
+        } else {
+            // `start_detached` owns the child and kills it before returning an
+            // initialization error. The PID lock is the final absence proof.
+            pidfile::cleanup_pidfile()?;
+        }
+        Ok(())
+    }
 }
 
 fn status(json: bool) -> Result<()> {
     let pidfile = pidfile::pidfile_path()?;
-    let pid = pidfile::read_pidfile();
-    let running = pid.is_some_and(pidfile::process_alive);
+    let running_pid = pidfile::running_pid_checked()?;
+    let running = running_pid.is_some();
+    let pid = running_pid.or_else(pidfile::read_pidfile);
     let state = match (pid, running) {
         (Some(_), true) => "running",
         (Some(_), false) => "stale",
@@ -346,6 +342,7 @@ fn status(json: bool) -> Result<()> {
     let snapshot = if running { state::read() } else { None };
 
     if json {
+        let service_installed = service::is_installed_checked()?;
         let cfg = crate::config::get();
         print_json(&serde_json::json!({
             "running": running,
@@ -359,7 +356,7 @@ fn status(json: bool) -> Result<()> {
                 "daemon_start_supported": cfg!(any(unix, target_os = "windows")),
                 "service_install_supported": cfg!(any(target_os = "macos", target_os = "linux", target_os = "windows")),
                 "service_manager": service_manager_name(),
-                "service_installed": service::is_installed(),
+                "service_installed": service_installed,
             },
             "config": {
                 "poll_interval_secs": cfg.daemon.poll_interval_secs,
@@ -512,76 +509,12 @@ mod tests {
             err.to_string().contains("did not initialize"),
             "unexpected error: {err}"
         );
-        // `process_alive` is not the check to make here: it reads the PID file
-        // first and so answers "no" for any PID once that file is absent,
-        // which is exactly the state under test. Reaping the child is the
-        // direct evidence — it can only have been killed and waited for.
+        // The PID file is intentionally absent in this fixture. Reaping the
+        // child is the direct evidence — it can only have been killed and
+        // waited for.
         assert!(
             child.try_wait().expect("try_wait").is_some(),
             "the daemon reported as failed is still running as PID {pid}"
         );
-    }
-}
-
-#[cfg(test)]
-mod windows_stop_tests {
-    use anyhow::anyhow;
-
-    use super::{WindowsStopGate, windows_stop_gate};
-
-    #[test]
-    fn a_windows_process_probe_failure_cannot_authorize_a_forced_stop() {
-        let err = windows_stop_gate(Some(4242), false, || {
-            Err(anyhow!("PID file is still locked by the daemon"))
-        })
-        .expect_err("an inconclusive process probe must fail closed");
-
-        assert!(err.to_string().contains("still locked"));
-    }
-
-    #[test]
-    fn only_an_unlocked_stale_pidfile_authorizes_the_scheduler_stop() {
-        assert_eq!(
-            windows_stop_gate(Some(4242), false, || Ok(())).unwrap(),
-            WindowsStopGate::SchedulerSafe
-        );
-        assert_eq!(
-            windows_stop_gate(Some(4242), true, || {
-                panic!("a live daemon must use its generation-bound request")
-            })
-            .unwrap(),
-            WindowsStopGate::Graceful
-        );
-    }
-
-    #[test]
-    fn uninstall_rechecks_the_pid_lock_after_a_graceful_request() {
-        assert_eq!(
-            windows_stop_gate(Some(4242), true, || {
-                panic!("the initial live process must receive a graceful request")
-            })
-            .unwrap(),
-            WindowsStopGate::Graceful
-        );
-
-        let err = windows_stop_gate(Some(4242), false, || {
-            Err(anyhow!(
-                "PID lock is still held after a false stopped probe"
-            ))
-        })
-        .expect_err("the final pre-/End gate must fail closed");
-        assert!(err.to_string().contains("still held"));
-    }
-
-    #[test]
-    fn an_unreadable_pidfile_cannot_be_treated_as_no_daemon() {
-        let err = windows_stop_gate(None, false, || {
-            Err(anyhow!(
-                "PID file could not be read but its lock is still held"
-            ))
-        })
-        .expect_err("an ambiguous missing PID identity must still verify the PID-file lock");
-
-        assert!(err.to_string().contains("still held"));
     }
 }

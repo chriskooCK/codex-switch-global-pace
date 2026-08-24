@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::DefaultTerminal;
+use ratatui::{DefaultTerminal, style::Style, text::Line};
 use tokio::sync::Semaphore;
 
 use crate::auth;
@@ -13,13 +13,12 @@ use crate::jwt::AccountInfo;
 use crate::login;
 use crate::output::{format_local_datetime, format_local_timestamp, reset_credits_count};
 use crate::profile::{
-    self, cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
-    switch_profile, sync_current_from_live, validate_alias,
+    self, cmd_delete, list_profiles, profile_auth_path, rename_profile, switch_profile,
+    sync_current_from_live, validate_alias,
 };
 use crate::usage::{
     ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary, Refresh, ResetCredit,
-    UsageError, UsageInfo, calculate_global_weekly_summary, fetch_usage_retried,
-    fetch_usage_retried_force, fetch_usage_retried_unattended, reset_credit_expiry_sort_key,
+    UsageError, UsageInfo, calculate_global_weekly_summary, reset_credit_expiry_sort_key,
 };
 use crate::warmup::ModelEntry;
 
@@ -175,7 +174,23 @@ pub struct WarmupTask {
     alias: String,
     started: Instant,
     slow_reported: bool,
+    lease_control: profile::ProfileLeaseAcquireControl,
     handle: tokio::task::JoinHandle<std::result::Result<(), String>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AccountTaskKind {
+    Usage { request_id: u64 },
+    Model { request_id: u64 },
+    ResetCard,
+}
+
+#[derive(Debug)]
+struct AccountTask {
+    alias: String,
+    kind: AccountTaskKind,
+    lease_control: profile::ProfileLeaseAcquireControl,
+    handle: tokio::task::JoinHandle<()>,
 }
 
 const WARMUP_SLOW_NOTICE: Duration = Duration::from_secs(60);
@@ -208,6 +223,11 @@ pub struct App {
     /// quota request must be allowed to reach its persistence boundary.
     pub warmup_tasks: HashMap<u64, WarmupTask>,
     pub warmup_next_id: u64,
+    /// Join handles for account-scoped network work whose cancellation could
+    /// strand a rotated credential or leave a reset-card outcome unknown.
+    account_tasks: HashMap<u64, AccountTask>,
+    account_task_next_id: u64,
+    shutting_down: bool,
     pub confirm: Option<ConfirmAction>,
     pub rename: Option<RenameState>,
     pub usage_limiter: Arc<Semaphore>,
@@ -259,6 +279,9 @@ impl App {
             reset_cards_in_flight: BTreeSet::new(),
             warmup_tasks: HashMap::new(),
             warmup_next_id: 0,
+            account_tasks: HashMap::new(),
+            account_task_next_id: 0,
+            shutting_down: false,
             confirm: None,
             rename: None,
             usage_limiter: Arc::new(Semaphore::new(cfg.network.max_concurrent)),
@@ -277,6 +300,159 @@ impl App {
             model_requests: HashMap::new(),
             model_next_id: 0,
         }
+    }
+
+    fn track_account_task(
+        &mut self,
+        alias: String,
+        kind: AccountTaskKind,
+        lease_control: profile::ProfileLeaseAcquireControl,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let task_id = self.account_task_next_id;
+        self.account_task_next_id = self.account_task_next_id.wrapping_add(1);
+        self.account_tasks.insert(
+            task_id,
+            AccountTask {
+                alias,
+                kind,
+                lease_control,
+                handle,
+            },
+        );
+    }
+
+    fn account_operation_in_flight(&self, alias: &str) -> bool {
+        self.account_tasks.values().any(|task| task.alias == alias)
+            || self.is_warmup_in_flight(alias)
+            || self.refreshing_requests.contains_key(alias)
+            || self.model_requests.contains_key(alias)
+            || self.reset_cards_in_flight.contains(alias)
+    }
+
+    pub fn has_pending_credential_tasks(&self) -> bool {
+        !self.account_tasks.is_empty() || !self.warmup_tasks.is_empty()
+    }
+
+    /// Observe completed account tasks so panics cannot leave their state
+    /// permanently in flight. Successful tasks deliver their typed result over
+    /// the existing result channels before their JoinHandle becomes finished.
+    pub async fn poll_account_tasks(&mut self) {
+        let finished: Vec<u64> = self
+            .account_tasks
+            .iter()
+            .filter_map(|(task_id, task)| task.handle.is_finished().then_some(*task_id))
+            .collect();
+
+        for task_id in finished {
+            let Some(task) = self.account_tasks.remove(&task_id) else {
+                continue;
+            };
+            let alias = task.alias;
+            let kind = task.kind;
+            let cancelled_before_lease = task.lease_control.is_cancelled();
+            let joined = task.handle.await;
+            if cancelled_before_lease {
+                match kind {
+                    AccountTaskKind::Usage { request_id } => {
+                        let is_current = self
+                            .refreshing_requests
+                            .get(&alias)
+                            .is_some_and(|(active_id, _)| *active_id == request_id);
+                        if is_current {
+                            self.refreshing_requests.remove(&alias);
+                            self.pending_usage_refreshes.remove(&alias);
+                        }
+                    }
+                    AccountTaskKind::Model { request_id } => {
+                        let is_current = self
+                            .model_requests
+                            .get(&alias)
+                            .is_some_and(|active_id| *active_id == request_id);
+                        if is_current {
+                            self.model_requests.remove(&alias);
+                        }
+                    }
+                    AccountTaskKind::ResetCard => {
+                        self.reset_cards_in_flight.remove(&alias);
+                    }
+                }
+                continue;
+            }
+            let Err(error) = joined else { continue };
+            let detail = format!("{error}");
+            match kind {
+                AccountTaskKind::Usage { request_id } => {
+                    let is_current = self
+                        .refreshing_requests
+                        .get(&alias)
+                        .is_some_and(|(active_id, _)| *active_id == request_id);
+                    if is_current {
+                        self.refreshing_requests.remove(&alias);
+                        self.pending_usage_refreshes.remove(&alias);
+                        if let Some(entry) =
+                            self.accounts.iter_mut().find(|entry| entry.alias == alias)
+                        {
+                            entry.usage = UsageStatus::Error(UsageError {
+                                summary: "usage task stopped".to_string(),
+                                detail: format!("usage task stopped ({alias}): {detail}"),
+                            });
+                        }
+                        self.update_view();
+                    }
+                }
+                AccountTaskKind::Model { request_id } => {
+                    let is_current = self
+                        .model_requests
+                        .get(&alias)
+                        .is_some_and(|active_id| *active_id == request_id);
+                    if is_current {
+                        self.model_requests.remove(&alias);
+                        self.model_cache.insert(
+                            alias.clone(),
+                            ModelStatus::Error(format!("model task stopped: {detail}")),
+                        );
+                    }
+                }
+                AccountTaskKind::ResetCard => {
+                    self.reset_cards_in_flight.remove(&alias);
+                }
+            }
+            self.set_status_error(format!("Account task stopped ({alias}): {detail}"), 6);
+        }
+    }
+
+    /// Finish every account operation already started before allowing the Tokio
+    /// runtime to shut down. No additional timeout is layered here: each HTTP
+    /// operation keeps the configured client timeout, and abandoning a refresh
+    /// request after the server received it can lose its single-use token.
+    pub async fn drain_credential_tasks(&mut self) {
+        self.shutting_down = true;
+        // Only the pre-lease phase is safe to cancel: no credential-bearing
+        // request can have left the process yet. Acquisition and shutdown race
+        // through one atomic state transition, so tasks that already own their
+        // lease remain tracked and are drained to their normal network timeout.
+        for task in self.account_tasks.values() {
+            task.lease_control.cancel_waiting();
+        }
+        for task in self.warmup_tasks.values() {
+            task.lease_control.cancel_waiting();
+        }
+        while self.has_pending_credential_tasks() {
+            self.poll_results();
+            self.poll_reset_card_results();
+            self.poll_model_results();
+            self.poll_warmup_results().await;
+            self.poll_account_tasks().await;
+            if self.has_pending_credential_tasks() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        // A sender completes just before its handle, so one final drain applies
+        // messages that arrived between the last channel poll and handle join.
+        self.poll_results();
+        self.poll_reset_card_results();
+        self.poll_model_results();
     }
 
     /// Kick off a model-list fetch for `alias` if the detail panel needs it
@@ -301,13 +477,48 @@ impl App {
         let alias_owned = alias.to_string();
         let tx = self.model_sender.clone();
         let limiter = self.usage_limiter.clone();
-        tokio::spawn(async move {
-            let _permit = limiter.acquire().await;
-            let result = crate::warmup::fetch_models_for_profile(&alias_owned, &path)
-                .await
-                .map_err(|e| e.to_string());
+        let tracked_alias = alias_owned.clone();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_lease_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let permit = tokio::select! {
+                permit = limiter.acquire() => permit.ok(),
+                _ = task_lease_control.cancelled() => None,
+            };
+            let Some(_permit) = permit else { return };
+            let lease = match profile::acquire_profile_lease_async_cancellable(
+                alias_owned.clone(),
+                &task_lease_control,
+            )
+            .await
+            {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = tx
+                        .send((
+                            alias_owned,
+                            request_id,
+                            Err(format!(
+                                "failed to lock profile for model discovery: {error:#}"
+                            )),
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            let result =
+                crate::warmup::fetch_models_for_profile_leased(&alias_owned, &path, &lease)
+                    .await
+                    .map_err(|e| e.to_string());
             let _ = tx.send((alias_owned, request_id, result)).await;
         });
+        self.track_account_task(
+            tracked_alias,
+            AccountTaskKind::Model { request_id },
+            lease_control,
+            handle,
+        );
     }
 
     /// Fetch the model list for the currently-selected account, if the
@@ -639,6 +850,13 @@ impl App {
 
     /// Request delete confirmation for a specific alias (called from menu).
     pub fn request_delete_alias(&mut self, alias: &str) {
+        if self.account_operation_in_flight(alias) {
+            self.set_status(
+                format!("{alias}: wait for the account operation to finish before deleting"),
+                5,
+            );
+            return;
+        }
         let Some(entry) = self.accounts.iter().find(|a| a.alias == alias) else {
             return;
         };
@@ -651,11 +869,18 @@ impl App {
 
     /// Begin rename for a specific alias (called from menu).
     pub fn start_rename_alias(&mut self, alias: &str) {
+        if self.account_operation_in_flight(alias) {
+            self.set_status(
+                format!("{alias}: wait for the account operation to finish before renaming"),
+                5,
+            );
+            return;
+        }
         let Some(entry) = self.accounts.iter().find(|a| a.alias == alias) else {
             return;
         };
         let old = entry.alias.clone();
-        let len = old.chars().count();
+        let len = grapheme_count(&old);
         self.rename = Some(RenameState {
             old_alias: old.clone(),
             input: old,
@@ -669,7 +894,10 @@ impl App {
             tracing::warn!("failed to load profiles: {e}");
             Vec::new()
         });
-        let current = sync_current_from_live().unwrap_or_else(read_current);
+        // The live auth file is the source of truth. If it belongs to an
+        // untracked account, no saved profile is active; retaining the stale
+        // marker here would highlight the account that used to be active.
+        let current = sync_current_from_live();
         self.accounts = profiles
             .into_iter()
             .filter_map(|alias| {
@@ -678,7 +906,7 @@ impl App {
                     Err(_) => return None,
                 };
                 let info = auth::read_account_info(&path);
-                let is_current = alias == current;
+                let is_current = current.as_deref() == Some(alias.as_str());
                 Some(AccountEntry {
                     usage: retained_usage.remove(&alias).unwrap_or(UsageStatus::Idle),
                     alias,
@@ -687,6 +915,15 @@ impl App {
                 })
             })
             .collect();
+        let known_aliases: BTreeSet<&str> = self
+            .accounts
+            .iter()
+            .map(|account| account.alias.as_str())
+            .collect();
+        self.model_cache
+            .retain(|alias, _| known_aliases.contains(alias.as_str()));
+        self.model_requests
+            .retain(|alias, _| known_aliases.contains(alias.as_str()));
         self.marked
             .retain(|alias| self.accounts.iter().any(|account| &account.alias == alias));
         // A reload can follow credential replacement for an existing alias.
@@ -718,6 +955,14 @@ impl App {
         {
             self.selected = view_idx;
         }
+    }
+
+    /// Credentials for one or more saved aliases were replaced. Clear both
+    /// terminal cache entries and active generations: a late response made
+    /// with the previous credentials must not bind to the replacement login.
+    fn invalidate_models_after_credential_reload(&mut self) {
+        self.model_cache.clear();
+        self.model_requests.clear();
     }
 
     /// Recompute `view_indices` based on the current search query.
@@ -935,12 +1180,25 @@ impl App {
         };
         let limiter = self.usage_limiter.clone();
         let tracked_alias = alias.clone();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_lease_control = lease_control.clone();
         let handle = tokio::spawn(async move {
-            let _permit = limiter
-                .acquire()
-                .await
-                .map_err(|error| format!("failed to acquire warmup permit: {error}"))?;
-            crate::warmup::warmup_account(&alias, &path)
+            let permit = tokio::select! {
+                permit = limiter.acquire() => permit.ok(),
+                _ = task_lease_control.cancelled() => None,
+            };
+            let Some(_permit) = permit else { return Ok(()) };
+            let lease = match profile::acquire_profile_lease_async_cancellable(
+                alias.clone(),
+                &task_lease_control,
+            )
+            .await
+            {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(format!("failed to lock profile for warmup: {error:#}")),
+            };
+            crate::warmup::warmup_account_leased(&alias, &path, &lease)
                 .await
                 .map_err(|e| {
                     tracing::error!(alias = %alias, error = %format!("{e:#}"), "warmup failed");
@@ -953,6 +1211,7 @@ impl App {
                 alias: tracked_alias,
                 started: Instant::now(),
                 slow_reported: false,
+                lease_control,
                 handle,
             },
         );
@@ -1031,7 +1290,12 @@ impl App {
                 continue;
             };
             let alias = task.alias;
-            match task.handle.await {
+            let cancelled_before_lease = task.lease_control.is_cancelled();
+            let joined = task.handle.await;
+            if cancelled_before_lease {
+                continue;
+            }
+            match joined {
                 Ok(Ok(())) => {
                     self.set_status(format!("Warmed up {alias} — refreshing usage..."), 4);
                     to_refresh.insert(alias);
@@ -1045,6 +1309,9 @@ impl App {
             }
         }
         for alias in to_refresh {
+            if self.shutting_down {
+                continue;
+            }
             if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
                 // Always force a fresh fetch after warmup while keeping the previous
                 // quota visible until the replacement arrives.
@@ -1087,6 +1354,9 @@ impl App {
             }
         }
         for alias in to_refresh {
+            if self.shutting_down {
+                continue;
+            }
             if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
                 self.fetch_usage_for(idx, Refresh::Forced);
             }
@@ -1155,7 +1425,6 @@ impl App {
                 return;
             }
         };
-        let current = read_current();
         let limiter = self.usage_limiter.clone();
 
         if needs_usage && !matches!(self.accounts[idx].usage, UsageStatus::Loaded(_)) {
@@ -1171,20 +1440,51 @@ impl App {
                 .insert(alias.clone(), (request_id, refresh));
             request_id
         });
-        tokio::spawn(async move {
-            let _permit = limiter.acquire().await;
+        let tracked_alias = alias.clone();
+        let tracked_request_id = request_id;
+        let lease_control = needs_usage.then(profile::ProfileLeaseAcquireControl::new);
+        let task_lease_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let permit = match task_lease_control.as_ref() {
+                Some(control) => tokio::select! {
+                    permit = limiter.acquire() => permit.ok(),
+                    _ = control.cancelled() => None,
+                },
+                None => limiter.acquire().await.ok(),
+            };
+            let Some(_permit) = permit else { return };
             if needs_usage {
-                let result = match refresh {
-                    Refresh::Cached => fetch_usage_retried(&alias, &path, &current).await,
-                    Refresh::Unattended => {
-                        fetch_usage_retried_unattended(&alias, &path, &current).await
-                    }
-                    Refresh::Forced => fetch_usage_retried_force(&alias, &path, &current).await,
-                };
+                let control = task_lease_control
+                    .as_ref()
+                    .expect("usage work has lease control");
+                let lease =
+                    match profile::acquire_profile_lease_async_cancellable(alias.clone(), control)
+                        .await
+                    {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) => return,
+                        Err(error) => {
+                            let result = Err(UsageError {
+                                summary: "profile lock failed".to_string(),
+                                detail: format!(
+                                    "[{alias}] could not lock profile for usage refresh: {error:#}"
+                                ),
+                            });
+                            let _ = usage_tx
+                                .send((alias, request_id.expect("usage request id"), result))
+                                .await;
+                            return;
+                        }
+                    };
+                let result = crate::usage::fetch_usage_retried_with_existing_lease(
+                    &alias, &path, refresh, &lease,
+                )
+                .await;
                 // Usage is independent of best-effort workspace metadata.
                 let _ = usage_tx
                     .send((alias.clone(), request_id.expect("usage request id"), result))
                     .await;
+                drop(lease);
             }
             if needs_workspace {
                 // Read auth after usage because that path may have refreshed the token.
@@ -1198,6 +1498,18 @@ impl App {
                 let _ = workspace_tx.send(alias).await;
             }
         });
+        if let Some(request_id) = tracked_request_id {
+            self.track_account_task(
+                tracked_alias,
+                AccountTaskKind::Usage { request_id },
+                lease_control.expect("tracked usage work has lease control"),
+                handle,
+            );
+        } else {
+            // Workspace-only lookups do not touch refresh credentials. They may
+            // be cancelled on process exit without stranding account state.
+            drop(handle);
+        }
     }
 
     fn refresh_indices(&mut self, target_indices: &[usize], refresh: Refresh) {
@@ -1258,7 +1570,9 @@ impl App {
             crate::cache::apply_workspace_name(&mut self.accounts[idx].info);
             refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
             changed = true;
-            if let Some(refresh) = self.pending_usage_refreshes.remove(&alias) {
+            if let Some(refresh) = self.pending_usage_refreshes.remove(&alias)
+                && !self.shutting_down
+            {
                 self.fetch_usage_for(idx, refresh);
             }
         }
@@ -1286,9 +1600,8 @@ impl App {
             match switch_profile(&alias) {
                 Ok(()) => {
                     let _ = cache::set_last_used(&alias);
-                    let current = read_current();
                     for a in &mut self.accounts {
-                        a.is_current = a.alias == current;
+                        a.is_current = a.alias == alias;
                     }
                     self.set_status(format!("Switched to {alias}"), 3);
                 }
@@ -1303,20 +1616,49 @@ impl App {
             None => return,
         };
         match action {
-            ConfirmAction::Delete(alias) => match cmd_delete(&alias) {
-                Ok(()) => {
-                    self.set_status(format!("Deleted {alias} (recoverable)"), 3);
-                    self.load_profiles();
-                    self.refresh(Refresh::Forced);
+            ConfirmAction::Delete(alias) => {
+                if self.account_operation_in_flight(&alias) {
+                    self.set_status(
+                        format!(
+                            "{alias}: wait for the account operation to finish before deleting"
+                        ),
+                        5,
+                    );
+                    return;
                 }
-                Err(e) => self.set_status_error(format!("Delete failed: {e}"), 5),
-            },
+                if crate::profile::active_profile_from_live().as_deref() == Some(alias.as_str()) {
+                    self.set_status_error("Cannot delete the active profile".to_string(), 3);
+                    return;
+                }
+                match cmd_delete(&alias) {
+                    Ok(()) => {
+                        self.model_cache.remove(&alias);
+                        self.model_requests.remove(&alias);
+                        self.set_status(format!("Deleted {alias} (recoverable)"), 3);
+                        self.load_profiles();
+                        self.refresh(Refresh::Forced);
+                    }
+                    Err(e) => self.set_status_error(format!("Delete failed: {e}"), 5),
+                }
+            }
             ConfirmAction::BatchDelete(aliases) => {
+                if let Some(alias) = aliases
+                    .iter()
+                    .find(|alias| self.account_operation_in_flight(alias))
+                {
+                    self.set_status(
+                        format!(
+                            "{alias}: wait for the account operation to finish before deleting"
+                        ),
+                        5,
+                    );
+                    return;
+                }
                 let mut ok = 0usize;
                 let mut errors: Vec<String> = Vec::new();
-                let current = read_current();
+                let current = crate::profile::active_profile_from_live();
                 for alias in &aliases {
-                    if alias == &current {
+                    if current.as_deref() == Some(alias.as_str()) {
                         errors.push(format!("{alias}: active, skipped"));
                         continue;
                     }
@@ -1359,25 +1701,71 @@ impl App {
             }
         };
         let alias_owned = alias.to_string();
+        let tracked_alias = alias_owned.clone();
         let tx = self.reset_card_sender.clone();
         self.set_status(format!("Using reset card for {alias}..."), 6);
-        tokio::spawn(async move {
-            let result = crate::usage::consume_reset_credit_by_id(&alias_owned, &path, credit)
-                .await
-                .map_err(|error| {
-                    let unknown = error.outcome_unknown_after_request();
-                    reset_card_failure_from_outcome(
-                        unknown,
-                        error.user_facing_unknown_message(&alias_owned),
-                        format!("Reset card failed ({alias_owned}): {error}"),
-                    )
-                });
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_lease_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let lease = match profile::acquire_profile_lease_async_cancellable(
+                alias_owned.clone(),
+                &task_lease_control,
+            )
+            .await
+            {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return,
+                Err(error) => {
+                    let failure = reset_card_failure_from_outcome(
+                        false,
+                        String::new(),
+                        format!(
+                            "Reset card failed ({alias_owned}): profile lock failed: {error:#}"
+                        ),
+                    );
+                    let _ = tx.send((alias_owned, Err(failure))).await;
+                    return;
+                }
+            };
+            let result = crate::usage::consume_reset_credit_by_id_leased(
+                &alias_owned,
+                &path,
+                credit,
+                &lease,
+            )
+            .await
+            .map_err(|error| {
+                let unknown = error.outcome_unknown_after_request();
+                reset_card_failure_from_outcome(
+                    unknown,
+                    error.user_facing_unknown_message(&alias_owned),
+                    format!("Reset card failed ({alias_owned}): {error}"),
+                )
+            });
             let _ = tx.send((alias_owned, result)).await;
         });
+        self.track_account_task(
+            tracked_alias,
+            AccountTaskKind::ResetCard,
+            lease_control,
+            handle,
+        );
     }
 
     pub fn request_batch_delete(&mut self) {
         if self.marked.is_empty() {
+            return;
+        }
+        if let Some(alias) = self
+            .marked
+            .iter()
+            .find(|alias| self.account_operation_in_flight(alias))
+            .cloned()
+        {
+            self.set_status(
+                format!("{alias}: wait for the account operation to finish before deleting"),
+                5,
+            );
             return;
         }
         let aliases: Vec<String> = self.marked.iter().cloned().collect();
@@ -1434,32 +1822,53 @@ impl App {
     }
 
     pub fn handle_rename_key(&mut self, code: KeyCode) -> bool {
-        let state = match &mut self.rename {
-            Some(s) => s,
-            None => return false,
-        };
         match code {
             KeyCode::Esc => {
                 self.rename = None;
                 return false;
             }
             KeyCode::Enter => {
+                let Some(state) = self.rename.as_ref() else {
+                    return false;
+                };
                 let old = state.old_alias.clone();
                 let new = state.input.trim().to_string();
-                self.rename = None;
                 if new.is_empty() || new == old {
+                    self.rename = None;
                     return false;
                 }
                 if let Err(err) = validate_alias(&new) {
+                    self.rename = None;
                     self.set_status_error(format!("Invalid alias: {err}"), 3);
                     return false;
                 }
+                // Auto refresh may have started while the editor was open.
+                // Keep the user's input intact and let them retry once the
+                // operation completes rather than blocking the event loop on
+                // the profile lease.
+                if let Some(alias) = [&old, &new]
+                    .into_iter()
+                    .find(|alias| self.account_operation_in_flight(alias))
+                {
+                    self.set_status(
+                        format!(
+                            "{alias}: wait for the account operation to finish before renaming"
+                        ),
+                        5,
+                    );
+                    return true;
+                }
+                self.rename = None;
                 match rename_profile(&old, &new) {
                     Ok(()) => {
                         let was_marked = self.marked.remove(&old);
                         if was_marked {
                             self.marked.insert(new.clone());
                         }
+                        self.model_cache.remove(&old);
+                        self.model_cache.remove(&new);
+                        self.model_requests.remove(&old);
+                        self.model_requests.remove(&new);
                         self.set_status(format!("Renamed {old} -> {new}"), 3);
                         self.load_profiles();
                         if let Some(account_idx) = self.accounts.iter().position(|a| a.alias == new)
@@ -1474,39 +1883,12 @@ impl App {
                 }
                 return false;
             }
-            KeyCode::Backspace if state.cursor > 0 => {
-                state.cursor -= 1;
-                let byte_pos = char_to_byte(&state.input, state.cursor);
-                state.input.remove(byte_pos);
+            _ => {
+                let Some(state) = self.rename.as_mut() else {
+                    return false;
+                };
+                edit_grapheme_input(&mut state.input, &mut state.cursor, code);
             }
-            KeyCode::Delete => {
-                let char_count = state.input.chars().count();
-                if state.cursor < char_count {
-                    let byte_pos = char_to_byte(&state.input, state.cursor);
-                    state.input.remove(byte_pos);
-                }
-            }
-            KeyCode::Left if state.cursor > 0 => {
-                state.cursor -= 1;
-            }
-            KeyCode::Right => {
-                let char_count = state.input.chars().count();
-                if state.cursor < char_count {
-                    state.cursor += 1;
-                }
-            }
-            KeyCode::Home => {
-                state.cursor = 0;
-            }
-            KeyCode::End => {
-                state.cursor = state.input.chars().count();
-            }
-            KeyCode::Char(c) => {
-                let byte_pos = char_to_byte(&state.input, state.cursor);
-                state.input.insert(byte_pos, c);
-                state.cursor += 1;
-            }
-            _ => {}
         }
         true
     }
@@ -1528,39 +1910,9 @@ impl App {
                 KeyCode::Enter => {
                     accept_search = true;
                 }
-                KeyCode::Backspace if state.cursor > 0 => {
-                    state.cursor -= 1;
-                    let byte_pos = char_to_byte(&state.query, state.cursor);
-                    state.query.remove(byte_pos);
+                _ => {
+                    edit_grapheme_input(&mut state.query, &mut state.cursor, code);
                 }
-                KeyCode::Delete => {
-                    let char_count = state.query.chars().count();
-                    if state.cursor < char_count {
-                        let byte_pos = char_to_byte(&state.query, state.cursor);
-                        state.query.remove(byte_pos);
-                    }
-                }
-                KeyCode::Left if state.cursor > 0 => {
-                    state.cursor -= 1;
-                }
-                KeyCode::Right => {
-                    let char_count = state.query.chars().count();
-                    if state.cursor < char_count {
-                        state.cursor += 1;
-                    }
-                }
-                KeyCode::Home => {
-                    state.cursor = 0;
-                }
-                KeyCode::End => {
-                    state.cursor = state.query.chars().count();
-                }
-                KeyCode::Char(c) => {
-                    let byte_pos = char_to_byte(&state.query, state.cursor);
-                    state.query.insert(byte_pos, c);
-                    state.cursor += 1;
-                }
-                _ => {}
             }
         }
 
@@ -1722,6 +2074,17 @@ pub async fn run() -> Result<()> {
     result
 }
 
+/// Preserve an event-loop error while still reaching the same credential-safe
+/// shutdown boundary as an explicit `q`. Rendering and terminal input can fail
+/// after a refresh request has reached the server, so returning immediately
+/// would otherwise drop its task with a rotated token only in memory.
+async fn drain_credential_tasks_on_error<T>(app: &mut App, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        app.drain_credential_tasks().await;
+    }
+    result
+}
+
 async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App::new();
     app.load_profiles();
@@ -1737,17 +2100,28 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.poll_warmup_results().await;
         app.poll_reset_card_results();
         app.poll_model_results();
+        app.poll_account_tasks().await;
         app.poll_update();
         app.tick();
         app.run_due_auto_refresh();
         app.ensure_models_loaded_for_selected();
 
-        terminal
+        let draw_result = terminal
             .draw(|f| super::ui::render(f, &mut app))
-            .context("drawing TUI")?;
+            .context("drawing TUI");
+        drain_credential_tasks_on_error(&mut app, draw_result).await?;
 
-        if event::poll(Duration::from_millis(100)).context("polling terminal events")?
-            && let Event::Key(key) = event::read().context("reading terminal event")?
+        let event_ready = drain_credential_tasks_on_error(
+            &mut app,
+            event::poll(Duration::from_millis(100)).context("polling terminal events"),
+        )
+        .await?;
+        if event_ready
+            && let Event::Key(key) = drain_credential_tasks_on_error(
+                &mut app,
+                event::read().context("reading terminal event"),
+            )
+            .await?
         {
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -1804,7 +2178,20 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
             }
 
             match code {
-                KeyCode::Char('q') => break,
+                KeyCode::Char('q') => {
+                    app.shutting_down = true;
+                    if app.has_pending_credential_tasks() {
+                        app.set_status(
+                            "Finishing active account operations before exit...".to_string(),
+                            60,
+                        );
+                        // Failure to paint the exit notice must not skip the
+                        // credential-safety boundary below.
+                        let _ = terminal.draw(|frame| super::ui::render(frame, &mut app));
+                        app.drain_credential_tasks().await;
+                    }
+                    break;
+                }
                 KeyCode::Esc => {
                     if app.search.is_some() {
                         app.search = None;
@@ -1835,7 +2222,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                 KeyCode::Char(' ') => app.toggle_mark(),
                 KeyCode::Char('/') => {
                     if let Some(search) = &mut app.search {
-                        search.cursor = search.query.chars().count();
+                        search.cursor = grapheme_count(&search.query);
                     } else {
                         app.search = Some(SearchState {
                             query: String::new(),
@@ -1979,7 +2366,7 @@ async fn perform_oauth(
         println!("Flow: browser (PKCE)\n");
     }
 
-    let result = run_oauth_inner(mode, device).await;
+    let result = run_oauth_inner(mode, device, None).await;
 
     // Flush stdout so any buffered output (e.g. device code URL) appears
     // before TUI repaints, particularly important on Windows.
@@ -1999,6 +2386,11 @@ async fn perform_oauth(
     crate::output::set_message_mode(crate::output::MessageMode::Silent);
     resume_tui_after_plain_output(terminal);
 
+    // Replacement writes preserve the profile copy even when a later live-auth
+    // update reports an error. Invalidate generations for every completed OAuth
+    // attempt so a result fetched with pre-login credentials can never repopulate
+    // the cache after such a partial commit.
+    app.invalidate_models_after_credential_reload();
     match result {
         Ok(msg) => {
             app.set_status(msg, 5);
@@ -2019,42 +2411,45 @@ async fn perform_oauth(
 /// duration; OAuth output goes to the cooked terminal so the user sees
 /// browser prompts / device codes / progress.
 ///
-/// User can abort the whole batch with Ctrl+C between rounds (handled by
-/// the underlying login::run_device_*) or by closing the browser tab.
-fn batch_relogin_not_attempted(total: usize, ok: usize, failed: usize, cancelled: bool) -> usize {
-    total.saturating_sub(ok + failed + usize::from(cancelled))
+/// Ctrl+C requests that the batch stop after the current round reaches its
+/// credential-commit boundary. A round still waiting for OAuth may also return
+/// [`login::LoginCancelled`] itself, before it has credentials to persist.
+fn batch_relogin_not_attempted(
+    total: usize,
+    ok: usize,
+    failed: usize,
+    cancelled_accounts: usize,
+) -> usize {
+    total.saturating_sub(ok + failed + cancelled_accounts)
 }
 
-async fn finish_login_or_cancel<T, LoginFuture, CancelFuture>(
+/// Record a stop request without dropping credential work that may already
+/// have reached the server. A round still waiting for its alias lease is
+/// cancelled at that safe boundary; once lease acquisition wins, the round
+/// reaches its commit boundary before the batch stops.
+async fn finish_login_or_stop_after_round<T, LoginFuture, StopFuture>(
     login_future: LoginFuture,
-    cancel_future: CancelFuture,
-) -> Result<T>
+    stop_future: StopFuture,
+    lease_control: &profile::ProfileLeaseAcquireControl,
+) -> (Result<T>, bool, Option<anyhow::Error>)
 where
     LoginFuture: std::future::Future<Output = Result<T>>,
-    CancelFuture: std::future::Future<Output = std::io::Result<()>>,
+    StopFuture: std::future::Future<Output = std::io::Result<()>>,
 {
     tokio::pin!(login_future);
-    tokio::pin!(cancel_future);
+    tokio::pin!(stop_future);
     tokio::select! {
         biased;
-        result = &mut login_future => result,
-        signal = &mut cancel_future => {
-            signal.context("listening for Ctrl+C during batch re-login")?;
-            Err(login::LoginCancelled.into())
+        signal = &mut stop_future => {
+            let signal_error = signal
+                .context("listening for Ctrl+C during batch re-login")
+                .err();
+            lease_control.cancel_waiting();
+            let result = login_future.await;
+            (result, signal_error.is_none(), signal_error)
         }
+        result = &mut login_future => (result, false, None),
     }
-}
-
-async fn finish_refresh_then_commit<T, RefreshFuture, Commit>(
-    refresh_future: RefreshFuture,
-    commit: Commit,
-) -> Result<T>
-where
-    RefreshFuture: std::future::Future<Output = ()>,
-    Commit: FnOnce() -> Result<T>,
-{
-    refresh_future.await;
-    commit()
 }
 
 async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, device: bool) {
@@ -2076,31 +2471,51 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
 
     let mut ok = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
-    let mut cancelled = false;
+    let mut cancelled_accounts = 0usize;
+    let mut stop_requested = false;
+    let mut stop_listener_error = None;
+    let stop_signal = tokio::signal::ctrl_c();
+    tokio::pin!(stop_signal);
 
     for (i, alias) in aliases.iter().enumerate() {
         println!("\n--- [{}/{}] {alias} ---", i + 1, total);
         let mode = OAuthMode::Relogin(alias.clone());
-        match finish_login_or_cancel(run_oauth_inner(mode, device), tokio::signal::ctrl_c()).await {
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let (result, stop_after_round, listener_error) = finish_login_or_stop_after_round(
+            run_oauth_inner(mode, device, Some(&lease_control)),
+            stop_signal.as_mut(),
+            &lease_control,
+        )
+        .await;
+        match result {
             Ok(_) => ok += 1,
             Err(e) if login::is_login_cancelled(&e) => {
                 eprintln!("[cancelled] Batch re-login stopped by user");
-                cancelled = true;
-                break;
+                cancelled_accounts = 1;
             }
             Err(e) => {
                 eprintln!("[err] {alias}: {e}");
                 failed.push((alias.clone(), e.to_string()));
             }
         }
+        if let Some(error) = listener_error {
+            eprintln!("[err] Ctrl+C listener failed: {error}");
+            stop_listener_error = Some(error);
+        }
+        if cancelled_accounts > 0 || stop_after_round || stop_listener_error.is_some() {
+            stop_requested = stop_after_round;
+            break;
+        }
     }
 
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    if cancelled {
-        let not_attempted = batch_relogin_not_attempted(total, ok, failed.len(), true);
+    let stopped = stop_requested || cancelled_accounts > 0 || stop_listener_error.is_some();
+    if stopped {
+        let not_attempted =
+            batch_relogin_not_attempted(total, ok, failed.len(), cancelled_accounts);
         println!(
-            "\n=== Batch cancelled: {ok} ok, {} failed, 1 cancelled, {not_attempted} not attempted ===",
-            failed.len()
+            "\n=== Batch stopped: {ok} ok, {} failed, {cancelled_accounts} cancelled, {not_attempted} not attempted ===",
+            failed.len(),
         );
     } else {
         println!("\n=== Batch complete: {ok} ok, {} failed ===", failed.len());
@@ -2117,19 +2532,28 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     resume_tui_after_plain_output(terminal);
 
     app.marked.clear();
-    let summary = if cancelled {
-        let not_attempted = batch_relogin_not_attempted(total, ok, failed.len(), true);
-        format!("Batch re-login cancelled: {ok} ok, 1 cancelled, {not_attempted} not attempted")
+    let summary = if let Some(error) = &stop_listener_error {
+        format!("Batch re-login stopped after Ctrl+C listener failed: {error}")
+    } else if stopped {
+        let not_attempted =
+            batch_relogin_not_attempted(total, ok, failed.len(), cancelled_accounts);
+        format!(
+            "Batch re-login stopped: {ok} ok, {} failed, {cancelled_accounts} cancelled, {not_attempted} not attempted",
+            failed.len()
+        )
     } else if failed.is_empty() {
         format!("Batch re-login: {ok} ok")
     } else {
         format!("Batch re-login: {ok} ok, {} failed", failed.len())
     };
-    if failed.is_empty() && !cancelled {
+    if failed.is_empty() && !stopped {
         app.set_status(summary, 8);
     } else {
         app.set_status_error(summary, 8);
     }
+    // See `perform_oauth`: a failed round may still have preserved new profile
+    // credentials before a live-auth update failed.
+    app.invalidate_models_after_credential_reload();
     app.load_profiles_preserving_selection();
     app.refresh(Refresh::Forced);
     if app.auto_refresh_enabled {
@@ -2137,53 +2561,58 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 }
 
-async fn run_oauth_inner(mode: OAuthMode, device: bool) -> Result<String> {
-    let tokens = if device {
-        login::run_device_code_auth().await?
-    } else {
-        login::run_device_auth().await?
-    };
-    let (auth_val, info) = login::build_auth_from_tokens(&tokens);
-
+async fn run_oauth_inner(
+    mode: OAuthMode,
+    device: bool,
+    lease_control: Option<&profile::ProfileLeaseAcquireControl>,
+) -> Result<String> {
     match mode {
         OAuthMode::Add => {
-            let refresh_auth = auth_val.clone();
-            finish_refresh_then_commit(
-                async {
-                    if let Err(err) = crate::workspace::refresh_for_auth(&refresh_auth).await {
-                        tracing::debug!(
-                            "workspace metadata unavailable before TUI login save: {err}"
-                        );
-                    }
-                },
-                || {
-                    let action = profile::save_auth_value(auth_val, None)?;
-                    let alias = action.alias().to_string();
-                    let verb = action.action(); // "created" / "updated"
-                    let email_disp = info.email.as_deref().unwrap_or("unknown");
-                    println!("[ok] Account {verb}: {alias} ({email_disp})");
-                    Ok(format!("Account {verb}: {alias}"))
-                },
-            )
-            .await
+            let tokens = if device {
+                login::run_device_code_auth().await?
+            } else {
+                login::run_device_auth().await?
+            };
+            let (auth_val, info) = login::build_auth_from_tokens(&tokens);
+            let action = profile::save_auth_value(auth_val.clone(), None)?;
+            let alias = action.alias().to_string();
+            let verb = action.action(); // "created" / "updated"
+            let email_disp = info.email.as_deref().unwrap_or("unknown");
+            println!("[ok] Account {verb}: {alias} ({email_disp})");
+            if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
+                tracing::debug!("workspace metadata unavailable after TUI login save: {err}");
+            }
+            Ok(format!("Account {verb}: {alias}"))
         }
         OAuthMode::Relogin(alias) => {
-            finish_refresh_then_commit(
-                async {
-                    if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
-                        tracing::debug!(
-                            "workspace metadata unavailable before TUI re-login save: {err}"
-                        );
+            // The target alias is known before OAuth begins. Hold its lease
+            // across authentication and commit so no usage, model, warmup, or
+            // reset operation can race the credential being replaced.
+            let lease = match lease_control {
+                Some(control) => {
+                    match profile::acquire_profile_lease_async_cancellable(alias.clone(), control)
+                        .await?
+                    {
+                        Some(lease) => lease,
+                        None => return Err(login::LoginCancelled.into()),
                     }
-                },
-                || {
-                    profile::replace_profile_auth_and_live_if_current(&alias, &auth_val)?;
-                    let email_disp = info.email.as_deref().unwrap_or("unknown");
-                    println!("[ok] Re-logged in: {alias} ({email_disp})");
-                    Ok(format!("Re-logged in: {alias}"))
-                },
-            )
-            .await
+                }
+                None => profile::acquire_profile_lease_async(alias.clone()).await?,
+            };
+            let tokens = if device {
+                login::run_device_code_auth().await?
+            } else {
+                login::run_device_auth().await?
+            };
+            let (auth_val, info) = login::build_auth_from_tokens(&tokens);
+            profile::replace_profile_auth_and_live_if_current_leased(&lease, &auth_val)?;
+            drop(lease);
+            let email_disp = info.email.as_deref().unwrap_or("unknown");
+            println!("[ok] Re-logged in: {alias} ({email_disp})");
+            if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
+                tracing::debug!("workspace metadata unavailable after TUI re-login save: {err}");
+            }
+            Ok(format!("Re-logged in: {alias}"))
         }
     }
 }
@@ -2203,33 +2632,111 @@ fn handle_help_key(app: &mut App, code: KeyCode) {
     }
 }
 
-/// Convert a char-based cursor position to a byte offset in a string.
-fn char_to_byte(s: &str, char_pos: usize) -> usize {
-    s.char_indices()
-        .nth(char_pos)
-        .map(|(byte_idx, _)| byte_idx)
-        .unwrap_or(s.len())
+/// Byte boundaries for the same Unicode grapheme clusters ratatui renders.
+/// Cursor state is an index into this vector, not a scalar-value offset, so
+/// combining marks and emoji ZWJ sequences are never split by editing.
+fn grapheme_boundaries(input: &str) -> Vec<usize> {
+    let line = Line::from(input);
+    let mut boundaries = Vec::with_capacity(input.chars().count() + 1);
+    boundaries.push(0);
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let end = boundaries.last().copied().unwrap_or(0) + grapheme.symbol.len();
+        boundaries.push(end);
+    }
+    debug_assert_eq!(boundaries.last().copied(), Some(input.len()));
+    boundaries
+}
+
+pub(super) fn grapheme_count(input: &str) -> usize {
+    grapheme_boundaries(input).len().saturating_sub(1)
+}
+
+pub(super) fn grapheme_to_byte(input: &str, cursor: usize) -> usize {
+    let boundaries = grapheme_boundaries(input);
+    boundaries.get(cursor).copied().unwrap_or(input.len())
+}
+
+fn grapheme_cursor_after_byte(input: &str, byte: usize) -> usize {
+    let target = byte.min(input.len());
+    grapheme_boundaries(input)
+        .into_iter()
+        .position(|boundary| boundary >= target)
+        .unwrap_or_else(|| grapheme_count(input))
+}
+
+fn edit_grapheme_input(input: &mut String, cursor: &mut usize, code: KeyCode) {
+    *cursor = (*cursor).min(grapheme_count(input));
+    match code {
+        KeyCode::Backspace if *cursor > 0 => {
+            let start = grapheme_to_byte(input, *cursor - 1);
+            let end = grapheme_to_byte(input, *cursor);
+            input.replace_range(start..end, "");
+            *cursor -= 1;
+        }
+        KeyCode::Delete if *cursor < grapheme_count(input) => {
+            let start = grapheme_to_byte(input, *cursor);
+            let end = grapheme_to_byte(input, *cursor + 1);
+            input.replace_range(start..end, "");
+        }
+        KeyCode::Left if *cursor > 0 => *cursor -= 1,
+        KeyCode::Right if *cursor < grapheme_count(input) => *cursor += 1,
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = grapheme_count(input),
+        KeyCode::Char(character) => {
+            let byte = grapheme_to_byte(input, *cursor);
+            input.insert(byte, character);
+            *cursor = grapheme_cursor_after_byte(input, byte + character.len_utf8());
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountEntry, App, ConfirmAction, ModelStatus, UsageStatus, WarmupTask,
-        batch_relogin_not_attempted, finish_login_or_cancel, finish_refresh_then_commit,
-        refresh_fetches_loaded_usage, refresh_forces_negative_caches,
-        reset_card_failure_from_outcome, retained_usage_by_alias,
+        AccountEntry, AccountTaskKind, App, ConfirmAction, ModelStatus, SearchState, UsageStatus,
+        WarmupTask, batch_relogin_not_attempted, drain_credential_tasks_on_error,
+        finish_login_or_stop_after_round, refresh_fetches_loaded_usage,
+        refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
     };
     use crate::{
         jwt::{AccountInfo, OrgInfo},
+        login, profile,
         usage::{Refresh, ResetCredit, UsageInfo, WindowUsage},
         warmup::ModelEntry,
     };
+    use crossterm::event::KeyCode;
     use std::time::Instant;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
-    fn cancelled_batch_counts_the_current_account_as_attempted() {
-        assert_eq!(batch_relogin_not_attempted(3, 1, 0, true), 1);
-        assert_eq!(batch_relogin_not_attempted(3, 1, 1, false), 1);
+    fn stopped_batch_distinguishes_cancelled_from_completed_accounts() {
+        assert_eq!(batch_relogin_not_attempted(3, 1, 0, 1), 1);
+        assert_eq!(batch_relogin_not_attempted(3, 1, 0, 0), 2);
+        assert_eq!(batch_relogin_not_attempted(3, 1, 1, 0), 1);
     }
 
     #[test]
@@ -2278,33 +2785,451 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_batch_login_wins_over_a_simultaneous_cancel() {
-        let result = finish_login_or_cancel(async { Ok("saved") }, async { Ok(()) }).await;
+    async fn simultaneous_stop_is_recorded_after_completed_batch_round() {
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let (result, stop_requested, signal_error) = finish_login_or_stop_after_round(
+            async { Ok("saved") },
+            async { Ok(()) },
+            &lease_control,
+        )
+        .await;
 
         assert_eq!(result.unwrap(), "saved");
+        assert!(stop_requested);
+        assert!(signal_error.is_none());
     }
 
     #[tokio::test]
-    async fn cancel_stops_an_unfinished_batch_login_round() {
-        let login = std::future::pending::<anyhow::Result<&'static str>>();
-        let result = finish_login_or_cancel(login, async { Ok(()) }).await;
+    async fn stop_request_waits_for_the_current_batch_round_to_finish() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let login = async move {
+            release_rx.await.expect("test releases the login round");
+            anyhow::Ok("saved")
+        };
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let completion = finish_login_or_stop_after_round(login, async { Ok(()) }, &lease_control);
+        tokio::pin!(completion);
 
-        assert!(crate::login::is_login_cancelled(&result.unwrap_err()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut completion)
+                .await
+                .is_err(),
+            "a stop request must not drop the current login round"
+        );
+        release_tx.send(()).expect("login receiver remains alive");
+        let (result, stop_requested, signal_error) = completion.await;
+
+        assert_eq!(result.unwrap(), "saved");
+        assert!(stop_requested);
+        assert!(signal_error.is_none());
     }
 
     #[tokio::test]
-    async fn cancellation_before_workspace_refresh_finishes_does_not_commit_credentials() {
-        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let committed_by_save = committed.clone();
-        let login = finish_refresh_then_commit(std::future::pending(), move || {
-            committed_by_save.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok("saved")
+    async fn shutdown_drain_waits_for_started_account_work() {
+        let mut app = App::new();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_by_task = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
         });
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::ResetCard,
+            profile::ProfileLeaseAcquireControl::new(),
+            handle,
+        );
 
-        let result = finish_login_or_cancel(login, async { Ok(()) }).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.drain_credential_tasks(),
+        )
+        .await
+        .expect("drain must finish once the tracked task finishes");
 
-        assert!(crate::login::is_login_cancelled(&result.unwrap_err()));
-        assert!(!committed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(app.account_tasks.is_empty());
+        assert!(app.shutting_down);
+    }
+
+    #[tokio::test]
+    async fn event_loop_error_drains_started_account_work_and_preserves_the_error() {
+        let mut app = App::new();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_by_task = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::ResetCard,
+            profile::ProfileLeaseAcquireControl::new(),
+            handle,
+        );
+
+        let error = drain_credential_tasks_on_error::<()>(
+            &mut app,
+            Err(anyhow::anyhow!("terminal read failed")),
+        )
+        .await
+        .expect_err("the original event-loop error must be returned");
+
+        assert_eq!(error.to_string(), "terminal read failed");
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(app.account_tasks.is_empty());
+        assert!(app.shutting_down);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_cancels_a_task_contended_before_profile_lease_acquisition() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
+
+        let mut app = App::new();
+        app.reset_cards_in_flight.insert("account".into());
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_control = lease_control.clone();
+        let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired_by_task = acquired.clone();
+        let handle = tokio::spawn(async move {
+            attempted_tx.send(()).unwrap();
+            if crate::profile::acquire_profile_lease_async_cancellable("account", &task_control)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                acquired_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        attempted_rx.await.expect("lease attempt started");
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::ResetCard,
+            lease_control,
+            handle,
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.drain_credential_tasks(),
+        )
+        .await
+        .expect("shutdown must cancel a task that is only waiting for its lease");
+
+        assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(app.account_tasks.is_empty());
+        assert!(app.reset_cards_in_flight.is_empty());
+        drop(held_lease);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drains_a_task_after_profile_lease_acquisition() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+
+        let mut app = App::new();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_control = lease_control.clone();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_by_task = completed.clone();
+        let handle = tokio::spawn(async move {
+            let _lease =
+                crate::profile::acquire_profile_lease_async_cancellable("account", &task_control)
+                    .await
+                    .unwrap()
+                    .expect("lease must be acquired before shutdown");
+            acquired_tx.send(()).unwrap();
+            finish_rx.await.expect("test releases credential work");
+            completed_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::ResetCard,
+            lease_control,
+            handle,
+        );
+        acquired_rx.await.expect("task acquired its profile lease");
+
+        {
+            let drain = app.drain_credential_tasks();
+            tokio::pin!(drain);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut drain)
+                    .await
+                    .is_err(),
+                "shutdown must not cancel work after lease acquisition"
+            );
+            finish_tx.send(()).expect("credential task remains alive");
+            tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+                .await
+                .expect("drain finishes after the credential task reaches completion");
+        }
+
+        assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(app.account_tasks.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_stop_cancels_a_round_contended_before_profile_lease_acquisition() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let login_control = lease_control.clone();
+        let (attempted_tx, mut attempted_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let login = async move {
+            attempted_tx.send(()).unwrap();
+            match crate::profile::acquire_profile_lease_async_cancellable("account", &login_control)
+                .await?
+            {
+                Some(_lease) => anyhow::Ok("saved"),
+                None => Err(login::LoginCancelled.into()),
+            }
+        };
+        let stop = async move {
+            stop_rx.await.map_err(std::io::Error::other)?;
+            Ok(())
+        };
+        let completion = finish_login_or_stop_after_round(login, stop, &lease_control);
+        tokio::pin!(completion);
+        tokio::select! {
+            attempted = &mut attempted_rx => attempted.expect("lease attempt started"),
+            result = &mut completion => panic!("contended round ended before stop: {result:?}"),
+        }
+
+        stop_tx.send(()).expect("stop listener remains alive");
+        let (result, stop_requested, signal_error) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), completion)
+                .await
+                .expect("pre-lease batch round must stop promptly");
+
+        assert!(login::is_login_cancelled(&result.unwrap_err()));
+        assert!(stop_requested);
+        assert!(signal_error.is_none());
+        drop(held_lease);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_stop_drains_a_round_after_profile_lease_acquisition() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let login_control = lease_control.clone();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let login = async move {
+            let _lease =
+                crate::profile::acquire_profile_lease_async_cancellable("account", &login_control)
+                    .await?
+                    .expect("round acquires its lease before stop");
+            acquired_tx.send(()).unwrap();
+            finish_rx.await.expect("test releases the login round");
+            anyhow::Ok("saved")
+        };
+        let stop = async move {
+            stop_rx.await.map_err(std::io::Error::other)?;
+            Ok(())
+        };
+        let completion = finish_login_or_stop_after_round(login, stop, &lease_control);
+        tokio::pin!(completion);
+        tokio::select! {
+            acquired = acquired_rx => acquired.expect("round acquired its lease"),
+            result = &mut completion => panic!("round ended before stop: {result:?}"),
+        }
+
+        stop_tx.send(()).expect("stop listener remains alive");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut completion)
+                .await
+                .is_err(),
+            "a post-lease stop request must await the current round"
+        );
+        finish_tx.send(()).expect("login round remains alive");
+        let (result, stop_requested, signal_error) = completion.await;
+
+        assert_eq!(result.unwrap(), "saved");
+        assert!(stop_requested);
+        assert!(signal_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn rename_and_delete_do_not_block_on_in_flight_account_work() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        let handle = tokio::spawn(std::future::pending());
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::ResetCard,
+            profile::ProfileLeaseAcquireControl::new(),
+            handle,
+        );
+
+        app.start_rename_alias("account");
+        assert!(app.rename.is_none());
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("before renaming"))
+        );
+
+        app.status_msg = None;
+        app.request_delete_alias("account");
+        assert!(app.confirm.is_none());
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("before deleting"))
+        );
+
+        let task = app.account_tasks.remove(&0).expect("tracked task");
+        task.handle.abort();
+        let _ = task.handle.await;
+    }
+
+    #[tokio::test]
+    async fn rename_does_not_wait_on_an_in_flight_destination_alias() {
+        let mut app = App::new();
+        for alias in ["old", "existing"] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Idle,
+                is_current: false,
+            });
+        }
+        app.view_indices.extend([0, 1]);
+        let handle = tokio::spawn(std::future::pending());
+        app.track_account_task(
+            "existing".into(),
+            AccountTaskKind::ResetCard,
+            profile::ProfileLeaseAcquireControl::new(),
+            handle,
+        );
+        app.start_rename_alias("old");
+        let rename = app.rename.as_mut().expect("rename editor opens");
+        rename.input = "existing".into();
+        rename.cursor = super::grapheme_count(&rename.input);
+
+        assert!(app.handle_rename_key(KeyCode::Enter));
+        assert!(app.rename.is_some(), "input is retained for a later retry");
+        assert!(app.status_msg.as_deref().is_some_and(
+            |message| message.starts_with("existing:") && message.contains("before renaming")
+        ));
+
+        let task = app.account_tasks.remove(&0).expect("tracked task");
+        task.handle.abort();
+        let _ = task.handle.await;
+    }
+
+    #[test]
+    fn search_edits_whole_unicode_graphemes() {
+        let mut app = App::new();
+        app.search = Some(SearchState {
+            query: "👩‍💻a".to_string(),
+            cursor: 2,
+        });
+        app.search_active = true;
+
+        app.handle_search_key(KeyCode::Left);
+        app.handle_search_key(KeyCode::Backspace);
+
+        let state = app.search.as_ref().expect("search remains active");
+        assert_eq!(state.query, "a");
+        assert_eq!(state.cursor, 0);
+
+        app.handle_search_key(KeyCode::Home);
+        app.handle_search_key(KeyCode::Char('e'));
+        app.handle_search_key(KeyCode::Char('\u{301}'));
+        let state = app.search.as_ref().expect("search remains active");
+        assert_eq!(state.query, "e\u{301}a");
+        assert_eq!(
+            state.cursor, 1,
+            "combining mark joins the preceding grapheme"
+        );
+
+        app.handle_search_key(KeyCode::Backspace);
+        let state = app.search.as_ref().expect("search remains active");
+        assert_eq!(state.query, "a");
+        assert_eq!(state.cursor, 0);
+    }
+
+    #[test]
+    fn model_results_from_before_credential_reload_are_ignored() {
+        let mut app = App::new();
+        app.model_cache
+            .insert("account".into(), ModelStatus::Loading);
+        app.model_requests.insert("account".into(), 4);
+        app.model_sender
+            .try_send(("account".into(), 4, Ok(vec![ModelEntry::default()])))
+            .unwrap();
+
+        app.invalidate_models_after_credential_reload();
+        app.poll_model_results();
+
+        assert!(!app.model_cache.contains_key("account"));
+        assert!(!app.model_requests.contains_key("account"));
+    }
+
+    #[test]
+    fn untracked_live_auth_does_not_leave_stale_profile_active() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/tracked/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        crate::auth::write_auth(
+            &profile_path,
+            &serde_json::json!({
+                "tokens": { "access_token": "tracked", "refresh_token": "tracked-refresh" }
+            }),
+        )
+        .unwrap();
+        crate::auth::write_auth(
+            &codex_home.join("auth.json"),
+            &serde_json::json!({
+                "tokens": { "access_token": "untracked", "refresh_token": "untracked-refresh" }
+            }),
+        )
+        .unwrap();
+        std::fs::write(home.path().join("current"), "tracked").unwrap();
+
+        let mut app = App::new();
+        app.load_profiles();
+
+        assert_eq!(app.accounts.len(), 1);
+        assert!(!app.accounts[0].is_current);
     }
 
     #[tokio::test]
@@ -2323,6 +3248,7 @@ mod tests {
                 alias: "account".into(),
                 started: Instant::now() - std::time::Duration::from_secs(61),
                 slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
                 handle,
             },
         );
@@ -2374,6 +3300,7 @@ mod tests {
                 alias: "account".into(),
                 started: Instant::now(),
                 slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
                 handle,
             },
         );

@@ -111,6 +111,33 @@ struct HeldTokenRequests {
     release: Arc<tokio::sync::Semaphore>,
 }
 
+/// Parks one specific bearer-token usage request so the test can inspect the
+/// profile at the precise refresh-response/follow-up-GET boundary.
+#[derive(Clone)]
+struct UsageGate {
+    bearer: String,
+    arrived: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+struct HeldUsageRequest {
+    arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl HeldUsageRequest {
+    async fn wait_until_arrived(&mut self) {
+        tokio::time::timeout(Duration::from_secs(10), self.arrivals.recv())
+            .await
+            .expect("follow-up usage request did not arrive within 10s")
+            .expect("usage endpoint gate closed");
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 impl HeldTokenRequests {
     /// Block until `n` refresh requests are parked in the handler. Returns the
     /// `refresh_token` each of them presented, in arrival order.
@@ -154,6 +181,7 @@ struct MockState {
     winner_writes: HashMap<String, ConcurrentWinner>,
     /// When set, hold every token request until the test releases it.
     gate: Option<TokenGate>,
+    usage_gate: Option<UsageGate>,
 }
 
 type SharedState = Arc<Mutex<MockState>>;
@@ -245,6 +273,17 @@ impl MockServer {
         HeldTokenRequests { arrivals, release }
     }
 
+    fn hold_usage_request(&self, bearer: &str) -> HeldUsageRequest {
+        let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        self.state.lock().unwrap().usage_gate = Some(UsageGate {
+            bearer: bearer.to_string(),
+            arrived,
+            release: release.clone(),
+        });
+        HeldUsageRequest { arrivals, release }
+    }
+
     fn token_calls(&self) -> Vec<String> {
         self.state.lock().unwrap().token_calls.clone()
     }
@@ -270,18 +309,31 @@ async fn usage_handler(State(state): State<SharedState>, headers: HeaderMap) -> 
         .unwrap_or_default()
         .to_string();
 
-    let mut guard = state.lock().unwrap();
-    guard.usage_calls.push(bearer.clone());
-    let Some(replies) = guard.usage.get(&bearer).cloned() else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"detail": format!("unknown token {bearer}")})),
-        )
-            .into_response();
+    let (chosen, gate) = {
+        let mut guard = state.lock().unwrap();
+        guard.usage_calls.push(bearer.clone());
+        let chosen = match guard.usage.get(&bearer).cloned() {
+            Some(replies) => {
+                let cursor = guard.usage_cursor.entry(bearer.clone()).or_insert(0);
+                let chosen = next_reply(&replies, *cursor);
+                *cursor += 1;
+                chosen
+            }
+            None => reply(
+                StatusCode::UNAUTHORIZED,
+                json!({"detail": format!("unknown token {bearer}")}),
+            ),
+        };
+        (chosen, guard.usage_gate.clone())
     };
-    let cursor = guard.usage_cursor.entry(bearer).or_insert(0);
-    let chosen = next_reply(&replies, *cursor);
-    *cursor += 1;
+
+    if let Some(gate) = gate.filter(|gate| gate.bearer == bearer) {
+        let _ = gate.arrived.send(());
+        if let Ok(permit) = gate.release.acquire().await {
+            permit.forget();
+        }
+    }
+
     (chosen.status, axum::Json(chosen.body)).into_response()
 }
 
@@ -485,7 +537,7 @@ async fn rotated_refresh_token_is_persisted_even_when_usage_fails_afterwards() {
     .await;
     let fx = fixture(&server, "team1", "old_access");
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team1", &fx.profile_path, "team1")
+    let err = codex_switch::usage::fetch_usage_retried_force("team1", &fx.profile_path)
         .await
         .expect_err("usage must fail in this scenario");
 
@@ -498,6 +550,49 @@ async fn rotated_refresh_token_is_persisted_even_when_usage_fails_afterwards() {
         server.token_calls(),
         vec!["refresh_old".to_string()],
         "the consumed refresh token must never be replayed"
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn rotated_refresh_token_is_persisted_before_the_follow_up_usage_get() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![
+            (
+                "old_access".to_string(),
+                vec![reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"detail": "access token expired"}),
+                )],
+            ),
+            ("access_1".to_string(), vec![usage_ok()]),
+        ],
+        vec![rotation(1)],
+    )
+    .await;
+    let fx = fixture(&server, "persist-before-get", "old_access");
+    let mut held_usage = server.hold_usage_request("access_1");
+    let profile_path = fx.profile_path.clone();
+    let fetch = tokio::spawn(async move {
+        codex_switch::usage::fetch_usage_retried_force("persist-before-get", &profile_path).await
+    });
+
+    held_usage.wait_until_arrived().await;
+    let token_while_get_is_blocked = stored_refresh_token(&fx.profile_path);
+    held_usage.release();
+    fetch
+        .await
+        .expect("usage task must not panic")
+        .expect("usage succeeds after the gate opens");
+
+    assert_eq!(
+        token_while_get_is_blocked, "refresh_1",
+        "the rotated credential must be durable before the follow-up GET reaches the server"
+    );
+    assert_eq!(
+        server.usage_calls(),
+        vec!["old_access".to_string(), "access_1".to_string()]
     );
     server.shutdown();
 }
@@ -544,8 +639,7 @@ async fn each_retry_round_presents_the_rotated_refresh_token() {
     .await;
     let fx = fixture(&server, "team2", "old_access");
 
-    let _ =
-        codex_switch::usage::fetch_usage_retried_force("team2", &fx.profile_path, "team2").await;
+    let _ = codex_switch::usage::fetch_usage_retried_force("team2", &fx.profile_path).await;
 
     assert_eq!(
         server.token_calls(),
@@ -597,7 +691,7 @@ async fn object_shaped_oauth_error_is_reported_with_code_and_message() {
     .await;
     let fx = fixture(&server, "team3", "old_access");
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team3", &fx.profile_path, "team3")
+    let err = codex_switch::usage::fetch_usage_retried_force("team3", &fx.profile_path)
         .await
         .expect_err("a rejected refresh token must fail");
 
@@ -637,7 +731,7 @@ async fn string_shaped_oauth_error_is_reported_with_description() {
     .await;
     let fx = fixture(&server, "team5", "old_access");
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team5", &fx.profile_path, "team5")
+    let err = codex_switch::usage::fetch_usage_retried_force("team5", &fx.profile_path)
         .await
         .expect_err("an invalid_grant refresh must fail");
 
@@ -683,7 +777,7 @@ async fn reused_refresh_token_stops_retrying_after_a_single_auth_request() {
     .await;
     let fx = fixture(&server, "team4", &stale_access);
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team4", &fx.profile_path, "team4")
+    let err = codex_switch::usage::fetch_usage_retried_force("team4", &fx.profile_path)
         .await
         .expect_err("a reused refresh token must fail");
 
@@ -727,7 +821,7 @@ async fn refresh_that_cannot_be_saved_fails_the_account_instead_of_reporting_suc
     .await;
     let fx = fixture_with_unwritable_profile(&server, "team6", "old_access");
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team6", &fx.profile_path, "team6")
+    let err = codex_switch::usage::fetch_usage_retried_force("team6", &fx.profile_path)
         .await
         .expect_err("a rotated token that never reached disk must not be reported as success");
 
@@ -795,8 +889,7 @@ async fn refresh_that_cannot_be_saved_does_not_burn_another_rotation() {
     .await;
     let fx = fixture_with_unwritable_profile(&server, "team7", "old_access");
 
-    let _ =
-        codex_switch::usage::fetch_usage_retried_force("team7", &fx.profile_path, "team7").await;
+    let _ = codex_switch::usage::fetch_usage_retried_force("team7", &fx.profile_path).await;
 
     assert_eq!(
         server.token_calls(),
@@ -805,17 +898,17 @@ async fn refresh_that_cannot_be_saved_does_not_burn_another_rotation() {
     );
     assert_eq!(
         server.usage_calls(),
-        vec!["old_access".to_string(), "access_1".to_string()],
-        "the account must stop retrying once the rotated token failed to persist"
+        vec!["old_access".to_string()],
+        "the rotated token must be persisted before any follow-up usage request is sent"
     );
     server.shutdown();
 }
 
 /// Two profiles whose access tokens are already past expiry, so opportunistic
-/// refresh picks both up. `blocked` is the profile in use, and its live
-/// `$CODEX_HOME/auth.json` is occupied by a directory — the profile copy is
-/// written, the live copy cannot be, and Codex would go on presenting a token
-/// the auth server just invalidated.
+/// refresh picks both up. The stale marker claims `blocked` is active while
+/// live `$CODEX_HOME/auth.json` is occupied by a directory. Neither profile may
+/// trust that marker as a fallback: both save their profile copy, then report
+/// that live-auth ownership could not be determined safely.
 struct OpportunisticFixture {
     keeper_profile: PathBuf,
     _guards: Vec<EnvVarGuard>,
@@ -876,9 +969,9 @@ fn opportunistic_server_replies() -> Vec<(String, Reply)> {
 }
 
 /// D7: opportunistic refresh spends the same single-use rotation as any other
-/// refresh, and the daemon runs it on a timer. A write that fails there is a
-/// silently bricked account with no trace the user can act on, so the failure
-/// has to reach the caller instead of dying in a log line.
+/// refresh, and the daemon runs it on a timer. If live-auth ownership cannot be
+/// read, every rotated profile must fail closed after preserving its own copy;
+/// the stale current marker must not nominate one profile as active.
 #[tokio::test]
 async fn opportunistic_refresh_reports_the_profile_whose_token_could_not_be_saved() {
     let _lock = ENV_LOCK.lock().await;
@@ -887,26 +980,32 @@ async fn opportunistic_refresh_reports_the_profile_whose_token_could_not_be_save
 
     let failures = codex_switch::usage::refresh_expiring_tokens().await;
 
+    let mut failed_aliases = failures
+        .iter()
+        .map(|failure| failure.alias.as_str())
+        .collect::<Vec<_>>();
+    failed_aliases.sort_unstable();
     assert_eq!(
-        failures
-            .iter()
-            .map(|f| f.alias.as_str())
-            .collect::<Vec<_>>(),
-        vec!["blocked"],
-        "the profile whose rotated token could not be saved must be reported"
+        failed_aliases,
+        vec!["blocked", "keeper"],
+        "all profiles whose live-auth ownership could not be verified must be reported"
     );
     let detail = &failures[0].error.detail;
     assert!(
-        detail.contains("could not be saved"),
-        "detail must state that saving the rotated credentials failed: {detail}"
+        detail.contains("were saved in the profile")
+            && detail.contains("live Codex auth could not be synchronized safely"),
+        "detail must distinguish a saved profile from incomplete live-auth sync: {detail}"
     );
     assert!(
         detail.contains("reading") && detail.contains("auth.json"),
         "detail must carry the underlying IO/permission cause: {detail}"
     );
     assert!(
-        failures[0].error.summary.contains("not saved"),
-        "summary must stay usable as a short status line: {}",
+        failures[0]
+            .error
+            .summary
+            .contains("live auth sync incomplete"),
+        "summary must name the incomplete live-auth synchronization: {}",
         failures[0].error.summary
     );
     server.shutdown();
@@ -1166,7 +1265,17 @@ async fn import_validation_hands_back_rotated_tokens_when_usage_fails() {
         },
     });
 
-    let outcome = codex_switch::usage::validate_import_auth(&mut val).await;
+    let stage_path = home
+        .path()
+        .join("recovery")
+        .join("rotated-import-test.json");
+    let outcome =
+        codex_switch::usage::validate_import_auth(&mut val, |value| -> anyhow::Result<()> {
+            std::fs::create_dir_all(stage_path.parent().unwrap())?;
+            std::fs::write(&stage_path, serde_json::to_vec_pretty(value)?)?;
+            Ok(())
+        })
+        .await;
 
     assert!(
         outcome.result.is_err(),
@@ -1189,6 +1298,190 @@ async fn import_validation_hands_back_rotated_tokens_when_usage_fails() {
         server.token_calls(),
         vec!["refresh_old".to_string()],
         "the consumed refresh token must never be replayed"
+    );
+    server.shutdown();
+}
+
+/// D8b: returning rotated import tokens to the caller is not enough. The
+/// process can stop while the follow-up usage GET is in flight, so the callback
+/// that owns app-managed staging must complete before that GET is sent.
+#[tokio::test]
+async fn import_rotation_is_staged_before_the_follow_up_usage_get() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![("access_1".to_string(), vec![usage_ok()])],
+        vec![rotation(1)],
+    )
+    .await;
+    let mut held_usage = server.hold_usage_request("access_1");
+    let home = tempfile::tempdir().unwrap();
+    let _guards = env_guards(&server, home.path());
+    let stage_path = home
+        .path()
+        .join("recovery")
+        .join("rotated-import-test.json");
+    let task_stage_path = stage_path.clone();
+    let mut val = json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": "old_id",
+            "access_token": expired_jwt(),
+            "refresh_token": "refresh_old",
+            "account_id": "acct_import",
+        },
+    });
+
+    let validation = tokio::spawn(async move {
+        let outcome =
+            codex_switch::usage::validate_import_auth(&mut val, |value| -> anyhow::Result<()> {
+                std::fs::create_dir_all(task_stage_path.parent().unwrap())?;
+                std::fs::write(&task_stage_path, serde_json::to_vec_pretty(value)?)?;
+                Ok(())
+            })
+            .await;
+        (outcome, val)
+    });
+
+    held_usage.wait_until_arrived().await;
+    assert_eq!(
+        stored_refresh_token(&stage_path),
+        "refresh_1",
+        "the only usable refresh token must already be durable while the follow-up GET is pending"
+    );
+    held_usage.release();
+
+    let (outcome, val) = validation.await.unwrap();
+    assert!(outcome.result.is_ok());
+    assert_eq!(
+        val.pointer("/tokens/refresh_token").and_then(Value::as_str),
+        Some("refresh_1")
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn import_stage_failure_prevents_the_follow_up_usage_get() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![("access_1".to_string(), vec![usage_ok()])],
+        vec![rotation(1)],
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    let _guards = env_guards(&server, home.path());
+    let mut val = json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": "old_id",
+            "access_token": expired_jwt(),
+            "refresh_token": "refresh_old",
+            "account_id": "acct_import",
+        },
+    });
+
+    let outcome = codex_switch::usage::validate_import_auth(&mut val, |_| -> anyhow::Result<()> {
+        anyhow::bail!("recovery disk unavailable")
+    })
+    .await;
+
+    let error = outcome
+        .result
+        .expect_err("validation must stop when durable staging fails");
+    assert!(format!("{error:#}").contains("recovery disk unavailable"));
+    assert_eq!(server.token_calls(), vec!["refresh_old".to_string()]);
+    assert_eq!(
+        server.usage_calls(),
+        Vec::<String>::new(),
+        "no follow-up usage request may leave the process before staging succeeds"
+    );
+    assert_eq!(
+        outcome
+            .refreshed
+            .as_ref()
+            .map(|tokens| tokens.refresh_token.as_str()),
+        Some("refresh_1"),
+        "the caller still needs the issued token to attempt synchronous recovery"
+    );
+    server.shutdown();
+}
+
+/// A validation can rotate twice: an import with no access token obtains one,
+/// then the first usage request can reject it and consume the newly issued
+/// refresh token. If updating the durable stage for that second rotation
+/// fails, the second bearer must never leave the process and the caller must
+/// receive the latest in-memory credential for synchronous recovery.
+#[tokio::test]
+async fn second_import_rotation_stage_failure_prevents_the_second_follow_up_get() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![
+            (
+                "access_1".to_string(),
+                vec![reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"detail": "first refreshed bearer rejected"}),
+                )],
+            ),
+            ("access_2".to_string(), vec![usage_ok()]),
+        ],
+        vec![rotation(1), rotation(2)],
+    )
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    let _guards = env_guards(&server, home.path());
+    let stage_path = home
+        .path()
+        .join("recovery")
+        .join("rotated-import-test.json");
+    let mut persist_calls = 0usize;
+    let mut val = json!({
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": "old_id",
+            "access_token": null,
+            "refresh_token": "refresh_old",
+            "account_id": "acct_import",
+        },
+    });
+
+    let outcome =
+        codex_switch::usage::validate_import_auth(&mut val, |value| -> anyhow::Result<()> {
+            persist_calls += 1;
+            if persist_calls == 2 {
+                anyhow::bail!("second recovery-stage write failed");
+            }
+            std::fs::create_dir_all(stage_path.parent().unwrap())?;
+            std::fs::write(&stage_path, serde_json::to_vec_pretty(value)?)?;
+            Ok(())
+        })
+        .await;
+
+    let error = outcome
+        .result
+        .expect_err("validation must stop when the second durable stage write fails");
+    assert!(format!("{error:#}").contains("second recovery-stage write failed"));
+    assert_eq!(persist_calls, 2);
+    assert_eq!(stored_refresh_token(&stage_path), "refresh_1");
+    assert_eq!(
+        val.pointer("/tokens/refresh_token").and_then(Value::as_str),
+        Some("refresh_2"),
+        "the caller must retain the latest token even when staging it fails"
+    );
+    assert_eq!(
+        outcome
+            .refreshed
+            .as_ref()
+            .map(|tokens| tokens.refresh_token.as_str()),
+        Some("refresh_2")
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string(), "refresh_1".to_string()]
+    );
+    assert_eq!(
+        server.usage_calls(),
+        vec!["access_1".to_string()],
+        "access_2 must not be sent before its rotated refresh token is durable"
     );
     server.shutdown();
 }
@@ -1221,7 +1514,7 @@ async fn refresh_rejected_by_a_concurrent_winner_recovers_from_the_stored_token(
         },
     );
 
-    let usage = codex_switch::usage::fetch_usage_retried_force("team8", &fx.profile_path, "team8")
+    let usage = codex_switch::usage::fetch_usage_retried_force("team8", &fx.profile_path)
         .await
         .unwrap_or_else(|err| {
             panic!(
@@ -1265,7 +1558,7 @@ async fn refresh_rejected_with_an_unchanged_profile_still_requires_a_new_login()
     .await;
     let fx = fixture(&server, "team9", &stale_access);
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team9", &fx.profile_path, "team9")
+    let err = codex_switch::usage::fetch_usage_retried_force("team9", &fx.profile_path)
         .await
         .expect_err("an unchanged profile means the rejection is real");
 
@@ -1346,7 +1639,7 @@ async fn concurrent_rotation_recovery_is_granted_at_most_once() {
         );
     }
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team10", &fx.profile_path, "team10")
+    let err = codex_switch::usage::fetch_usage_retried_force("team10", &fx.profile_path)
         .await
         .expect_err("every refresh in this scenario is rejected");
 
@@ -1411,10 +1704,10 @@ async fn two_fetches_against_rejected_credential(
     .await;
     let fx = fixture(&server, alias, &stale_access);
 
-    let first = codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path, alias)
+    let first = codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path)
         .await
         .expect_err("the auth server rejected the credential");
-    let second = codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path, alias)
+    let second = codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path)
         .await
         .expect_err("nothing changed, so the account is still unusable");
 
@@ -1535,14 +1828,14 @@ async fn signing_in_again_clears_the_recorded_verdict() {
     .await;
     let fx = fixture(&server, "revived", &stale_access);
 
-    codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path, "revived")
+    codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path)
         .await
         .expect_err("the first credential is spent");
 
     // What `login` / `import` leave behind: a different refresh token.
     write_auth_file(&fx.profile_path, "new_id", &fresh_access, "refresh_new");
 
-    let usage = codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path, "revived")
+    let usage = codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path)
         .await
         .expect("a freshly signed-in profile must be fetched, not written off");
 
@@ -1574,7 +1867,7 @@ async fn opportunistic_refresh_skips_a_credential_the_server_already_rejected() 
     .await;
     let fx = fixture(&server, "dead_tail", &stale_access);
 
-    codex_switch::usage::fetch_usage_retried("dead_tail", &fx.profile_path, "dead_tail")
+    codex_switch::usage::fetch_usage_retried("dead_tail", &fx.profile_path)
         .await
         .expect_err("the credential is spent");
     let after_fetch = server.token_calls().len();
@@ -1652,7 +1945,7 @@ async fn profile_with_a_recorded_verdict(alias: &'static str) -> (MockServer, Fi
     .await;
     let fx = fixture(&server, alias, &stale_access);
 
-    codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path, alias)
+    codex_switch::usage::fetch_usage_retried(alias, &fx.profile_path)
         .await
         .expect_err("the credential is spent");
     let calls = server.token_calls().len();
@@ -1669,13 +1962,9 @@ async fn an_unattended_refresh_does_not_re_present_a_rejected_credential() {
     let _lock = ENV_LOCK.lock().await;
     let (server, fx, after_first) = profile_with_a_recorded_verdict("daemon_dead").await;
 
-    let err = codex_switch::usage::fetch_usage_retried_unattended(
-        "daemon_dead",
-        &fx.profile_path,
-        "daemon_dead",
-    )
-    .await
-    .expect_err("the account is still unusable");
+    let err = codex_switch::usage::fetch_usage_retried_unattended("daemon_dead", &fx.profile_path)
+        .await
+        .expect_err("the account is still unusable");
 
     assert_eq!(
         server.token_calls().len(),
@@ -1699,7 +1988,7 @@ async fn an_explicit_force_still_re_presents_a_rejected_credential() {
     let _lock = ENV_LOCK.lock().await;
     let (server, fx, after_first) = profile_with_a_recorded_verdict("forced_dead").await;
 
-    codex_switch::usage::fetch_usage_retried_force("forced_dead", &fx.profile_path, "forced_dead")
+    codex_switch::usage::fetch_usage_retried_force("forced_dead", &fx.profile_path)
         .await
         .expect_err("the credential really is spent");
 
@@ -1724,7 +2013,7 @@ async fn an_unattended_refresh_still_ignores_a_fresh_usage_cache() {
         MockServer::start(vec![(access.clone(), vec![usage_ok()])], vec![rotation(1)]).await;
     let fx = fixture(&server, "warm", &access);
 
-    codex_switch::usage::fetch_usage_retried("warm", &fx.profile_path, "warm")
+    codex_switch::usage::fetch_usage_retried("warm", &fx.profile_path)
         .await
         .expect("the first read populates the cache");
     assert_eq!(
@@ -1734,7 +2023,7 @@ async fn an_unattended_refresh_still_ignores_a_fresh_usage_cache() {
         server.usage_calls()
     );
 
-    codex_switch::usage::fetch_usage_retried("warm", &fx.profile_path, "warm")
+    codex_switch::usage::fetch_usage_retried("warm", &fx.profile_path)
         .await
         .expect("a cached read succeeds");
     assert_eq!(
@@ -1744,7 +2033,7 @@ async fn an_unattended_refresh_still_ignores_a_fresh_usage_cache() {
         server.usage_calls()
     );
 
-    codex_switch::usage::fetch_usage_retried_unattended("warm", &fx.profile_path, "warm")
+    codex_switch::usage::fetch_usage_retried_unattended("warm", &fx.profile_path)
         .await
         .expect("an unattended refresh succeeds");
     assert_eq!(

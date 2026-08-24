@@ -20,8 +20,9 @@ The updater requires the matching archive, `.sha256` file, and
 Release. It verifies SHA-256, resolves the release tag to its commit, and runs
 `gh attestation verify` pinned to this repository, `.github/workflows/release.yml`,
 the exact tag ref, and that commit digest. Self-hosted-runner attestations are
-rejected, and the tag is resolved again before replacement so a moved tag aborts
-the update.
+rejected. The extracted candidate must execute and report the exact Release
+version; only then is the tag resolved again immediately before replacement, so
+a moved tag or unusable package leaves the installed binary unchanged.
 
 A current [GitHub CLI](https://cli.github.com/) with attestation support is
 required. If a daemon is running, self-update stops it before replacement and
@@ -52,7 +53,11 @@ The direct installer uses `$HOME/.local/bin` on macOS/Linux and
 `%LOCALAPPDATA%\Programs\codex-switch-global-pace` on Windows. Unix
 administrators may opt into `/usr/local/bin` with `--system`. Rerunning the
 installer migrates an older system-wide copy of this same binary name to the
-user-owned location and preserves profile data.
+user-owned location and preserves profile data. If a running daemon service
+still records the legacy absolute path, the installer transactionally reinstalls
+it with the new user binary before removing the old one. An installed but
+inactive legacy service is left untouched with explicit uninstall/reinstall
+instructions because silently starting it would change the user's service state.
 
 Before downloading, self-update confirms that the current executable directory
 can accept a replacement. Permission failures therefore surface before any

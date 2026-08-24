@@ -11,7 +11,10 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  # Never overlap two publications for the same movable tag. In particular, a
+  # cancelled older run must not be able to clean up a draft reused by a newer
+  # run for that tag.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -217,8 +220,12 @@ jobs:
       - name: Add installers and install notes
         shell: bash
         run: |
-          cp scripts/install.sh artifacts/install.sh
-          cp scripts/install.ps1 artifacts/install.ps1
+          sed "s/^PACKAGED_RELEASE_VERSION=\"\"/PACKAGED_RELEASE_VERSION=\"${RELEASE_VERSION}\"/" \
+            scripts/install.sh > artifacts/install.sh
+          sed "s/^\$PackagedReleaseVersion = \"\"/\$PackagedReleaseVersion = \"${RELEASE_VERSION}\"/" \
+            scripts/install.ps1 > artifacts/install.ps1
+          grep -Fqx "PACKAGED_RELEASE_VERSION=\"${RELEASE_VERSION}\"" artifacts/install.sh
+          grep -Fqx "\$PackagedReleaseVersion = \"${RELEASE_VERSION}\"" artifacts/install.ps1
           cat > artifacts/INSTALL.md << 'EOF'
           ## Quick install
 
@@ -236,11 +243,11 @@ jobs:
 
           The program reuses profiles and configuration under `~/.codex-switch`.
           EOF
-      - name: Generate dev release body
-        if: needs.meta.outputs.is_dev == 'true'
+      - name: Generate release body
         shell: bash
         run: |
-          cat > dev_body.md << EOF
+          if [[ "${{ needs.meta.outputs.is_dev }}" == true ]]; then
+            cat > release_body.md << EOF
           Development build from \`${GITHUB_REF}\` at ${GITHUB_SHA}.
 
           Use \`codex-switch-global-pace self-update --dev\` to install, or \`codex-switch-global-pace self-update --stable\` to return to stable.
@@ -251,52 +258,750 @@ jobs:
 
           Version: \`${RELEASE_VERSION}\`
           EOF
-      - name: Confirm rolling tag still targets this source
-        if: needs.meta.outputs.is_dev == 'true'
+          else
+            cat > release_body.md << EOF
+          Profiles and configuration under \`~/.codex-switch\` are preserved.
+
+          \`curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/${GITHUB_REF#refs/tags/}/install.sh | bash\`
+          EOF
+          fi
+      - name: Verify packaged release version
+        shell: bash
+        run: |
+          candidate_dir="$RUNNER_TEMP/release-version-check"
+          mkdir -p "$candidate_dir"
+          tar xzf artifacts/codex-switch-global-pace-linux-amd64.tar.gz -C "$candidate_dir"
+          chmod +x "$candidate_dir/codex-switch-global-pace"
+          actual_output=$($candidate_dir/codex-switch-global-pace --version)
+          actual=${actual_output%%$'\n'*}
+          actual=${actual%$'\r'}
+          expected="codex-switch-global-pace ${RELEASE_VERSION}"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Packaged binary version mismatch: expected '$expected', found '$actual'" >&2
+            exit 1
+          fi
+      - name: Prepare release verifiers
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/verify-release-tag.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          object=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}")
+          kind=$(jq -r '.object.type' <<<"$object")
+          sha=$(jq -r '.object.sha' <<<"$object")
+          for _ in 1 2 3 4 5; do
+            if [[ "$kind" == commit ]]; then
+              if [[ "${sha,,}" == "${GITHUB_SHA,,}" ]]; then
+                exit 0
+              fi
+              echo "release tag ${tag} moved: expected ${GITHUB_SHA}, found ${sha}" >&2
+              exit 2
+            fi
+            if [[ "$kind" != tag ]]; then
+              echo "release tag ${tag} resolved to unsupported object ${kind}:${sha}" >&2
+              exit 2
+            fi
+            object=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}")
+            kind=$(jq -r '.object.type' <<<"$object")
+            sha=$(jq -r '.object.sha' <<<"$object")
+          done
+          echo "release tag ${tag} has more than five nested annotated tags" >&2
+          exit 2
+          EOF
+          chmod +x "$RUNNER_TEMP/verify-release-tag.sh"
+          cat > "$RUNNER_TEMP/verify-release-assets.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          release_id=$1
+          expected_dir=$2
+          download_dir=$3
+          provenance_mode=${4:-exact}
+          mkdir -p "$download_dir"
+          assets=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100")
+          mapfile -t expected_names < <(find "$expected_dir" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          mapfile -t remote_names < <(jq -r '.[].name' <<<"$assets" | LC_ALL=C sort)
+          if ! diff -u <(printf '%s\n' "${expected_names[@]}") <(printf '%s\n' "${remote_names[@]}"); then
+            echo "Release ${release_id} asset names do not exactly match the candidate." >&2
+            exit 1
+          fi
+          for name in "${expected_names[@]}"; do
+            matches=$(jq --arg name "$name" '[.[] | select(.name == $name)] | length' <<<"$assets")
+            if [[ "$matches" != 1 ]]; then
+              echo "Release ${release_id} has ${matches} assets named ${name}." >&2
+              exit 1
+            fi
+            asset=$(jq -c --arg name "$name" '.[] | select(.name == $name)' <<<"$assets")
+            asset_id=$(jq -r '.id' <<<"$asset")
+            state=$(jq -r '.state' <<<"$asset")
+            size=$(jq -r '.size' <<<"$asset")
+            if [[ ! "$asset_id" =~ ^[1-9][0-9]*$ || "$state" != uploaded || ! "$size" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Release ${release_id} asset ${name} is not a complete non-empty upload." >&2
+              exit 1
+            fi
+            downloaded="$download_dir/$name"
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$downloaded"
+            if [[ "$provenance_mode" == attest ]]; then
+              case "$name" in
+                *.tar.gz|*.zip|*.sha256)
+                  continue
+                  ;;
+                codex-switch-global-pace-build-provenance.json)
+                  jq empty "$downloaded"
+                  continue
+                  ;;
+              esac
+            fi
+            if ! cmp -s "$expected_dir/$name" "$downloaded"; then
+              echo "Release ${release_id} asset ${name} differs from the verified candidate." >&2
+              exit 1
+            fi
+          done
+          if [[ "$provenance_mode" == attest ]]; then
+            provenance_bundle="$download_dir/codex-switch-global-pace-build-provenance.json"
+            for archive in "$download_dir"/*.tar.gz "$download_dir"/*.zip; do
+              verification=$(gh attestation verify "$archive" \
+                --repo "$GITHUB_REPOSITORY" \
+                --bundle "$provenance_bundle" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+                --source-digest "$GITHUB_SHA" \
+                --source-ref "$GITHUB_REF" \
+                --format json)
+              if ! jq -e \
+                --arg sha "$GITHUB_SHA" \
+                --arg ref "$GITHUB_REF" \
+                --arg repository "https://github.com/${GITHUB_REPOSITORY}" \
+                'any(.[];
+                  .verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.ref == $ref and
+                  .verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.repository == $repository and
+                  .verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.path == ".github/workflows/release.yml" and
+                  any(.verificationResult.statement.predicate.buildDefinition.resolvedDependencies[]?;
+                    .digest.gitCommit == $sha))' <<<"$verification" > /dev/null; then
+                echo "Existing release asset $(basename "$archive") is not attested to ${GITHUB_SHA}." >&2
+                exit 1
+              fi
+            done
+            for archive in "$download_dir"/*.tar.gz "$download_dir"/*.zip; do
+              checksum="${archive}.sha256"
+              if [[ "$(wc -l < "$checksum")" != 1 ]]; then
+                echo "Existing checksum $(basename "$checksum") must contain exactly one line." >&2
+                exit 1
+              fi
+              IFS=$' \t' read -r recorded_digest recorded_name trailing < "$checksum"
+              recorded_name=${recorded_name#\*}
+              archive_name=$(basename "$archive")
+              if [[ ! "$recorded_digest" =~ ^[0-9a-fA-F]{64}$ || \
+                    "$recorded_name" != "$archive_name" || -n "$trailing" ]]; then
+                echo "Existing checksum $(basename "$checksum") has an invalid record." >&2
+                exit 1
+              fi
+              actual_digest=$(sha256sum -- "$archive")
+              actual_digest=${actual_digest%% *}
+              if [[ "${actual_digest,,}" != "${recorded_digest,,}" ]]; then
+                echo "Existing checksum $(basename "$checksum") does not match ${archive_name}." >&2
+                exit 1
+              fi
+            done
+            version_dir="$download_dir/version-check"
+            mkdir -p "$version_dir"
+            tar xzf "$download_dir/codex-switch-global-pace-linux-amd64.tar.gz" -C "$version_dir"
+            chmod +x "$version_dir/codex-switch-global-pace"
+            actual_output=$($version_dir/codex-switch-global-pace --version)
+            actual=${actual_output%%$'\n'*}
+            actual=${actual%$'\r'}
+            expected="codex-switch-global-pace ${RELEASE_VERSION}"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "Existing release binary version mismatch: expected '$expected', found '$actual'." >&2
+              exit 1
+            fi
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/verify-release-assets.sh"
+      - name: Confirm release tag still targets this source before publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: "$RUNNER_TEMP/verify-release-tag.sh"
+      - name: Inspect an existing exact-tag release
+        id: existing
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/dev")
-          TAG_KIND=$(jq -r '.object.type' <<<"$TAG_OBJECT")
-          TAG_SHA=$(jq -r '.object.sha' <<<"$TAG_OBJECT")
-          if [[ "$TAG_KIND" != "commit" || "${TAG_SHA,,}" != "${GITHUB_SHA,,}" ]]; then
-            echo "dev tag moved or is not a lightweight commit tag: expected ${GITHUB_SHA}, found ${TAG_KIND}:${TAG_SHA}" >&2
+          tag="${GITHUB_REF#refs/tags/}"
+          error_file="$RUNNER_TEMP/existing-release-error"
+          if release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$error_file"); then
+            :
+          elif grep -Eq 'HTTP 404|Not Found' "$error_file"; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "old_id=" >> "$GITHUB_OUTPUT"
+            echo "old_target=" >> "$GITHUB_OUTPUT"
+            exit 0
+          else
+            cat "$error_file" >&2
             exit 1
           fi
-      - name: Delete existing dev release
-        if: needs.meta.outputs.is_dev == 'true'
-        run: |
-          if gh release view dev > /dev/null 2>&1; then
-            gh release delete dev --yes
+          release_id=$(jq -r '.id' <<<"$release")
+          target=$(jq -r '.target_commitish' <<<"$release")
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ || \
+                "$(jq -r '.tag_name' <<<"$release")" != "$tag" || \
+                "$(jq -r '.draft' <<<"$release")" != false ]]; then
+            echo "Existing release for ${tag} is not a published exact-tag release." >&2
+            exit 1
           fi
+          if [[ "${{ needs.meta.outputs.is_dev }}" == true ]]; then
+            if [[ ! "$target" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "Existing dev release ${release_id} has no immutable source SHA to archive." >&2
+              exit 1
+            fi
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "old_id=${release_id}" >> "$GITHUB_OUTPUT"
+            echo "old_target=${target}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          expected_prerelease="${{ needs.meta.outputs.prerelease }}"
+          if [[ "${target,,}" != "${GITHUB_SHA,,}" || \
+                "$(jq -r '.prerelease' <<<"$release")" != "$expected_prerelease" || \
+                "$(jq -r '.name' <<<"$release")" != "$tag" ]]; then
+            echo "Existing stable release ${release_id} metadata differs from this exact source." >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/verify-release-assets.sh" \
+            "$release_id" artifacts "$RUNNER_TEMP/existing-release-assets" attest
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "old_id=" >> "$GITHUB_OUTPUT"
+          echo "old_target=" >> "$GITHUB_OUTPUT"
+      - name: Create isolated candidate draft
+        id: candidate
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create GitHub Release (dev)
-        if: needs.meta.outputs.is_dev == 'true'
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
-        with:
-          tag_name: dev
-          target_commitish: ${{ github.sha }}
-          name: "dev (${{ needs.meta.outputs.version }})"
-          prerelease: true
-          body_path: dev_body.md
-          files: artifacts/*
+        run: |
+          candidate_tag="release-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          candidate_release_error="$RUNNER_TEMP/candidate-release-preflight-error"
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${candidate_tag}" \
+            > /dev/null 2>"$candidate_release_error"; then
+            echo "Candidate tag ${candidate_tag} already exists; refusing to reuse it." >&2
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_release_error"; then
+            cat "$candidate_release_error" >&2
+            echo "Could not prove candidate release ${candidate_tag} is absent." >&2
+            exit 1
+          fi
+          candidate_ref_error="$RUNNER_TEMP/candidate-ref-preflight-error"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${candidate_tag}" \
+            > /dev/null 2>"$candidate_ref_error"; then
+            echo "Candidate ref ${candidate_tag} already exists; refusing to reuse it." >&2
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+            cat "$candidate_ref_error" >&2
+            echo "Could not prove candidate ref ${candidate_tag} is absent." >&2
+            exit 1
+          fi
+          if [[ "${{ needs.meta.outputs.is_dev }}" == true ]]; then
+            release_name="dev (${RELEASE_VERSION})"
+            prerelease=true
+            generate_notes=false
+          else
+            release_name="${GITHUB_REF#refs/tags/}"
+            prerelease="${{ needs.meta.outputs.prerelease }}"
+            generate_notes=true
+          fi
+          jq -n \
+            --arg tag "$candidate_tag" \
+            --arg target "$GITHUB_SHA" \
+            --arg name "$release_name" \
+            --rawfile body release_body.md \
+            --argjson prerelease "$prerelease" \
+            --argjson generate_notes "$generate_notes" \
+            '{tag_name:$tag,target_commitish:$target,name:$name,body:$body,draft:true,prerelease:$prerelease,generate_release_notes:$generate_notes}' \
+            > "$RUNNER_TEMP/candidate-release.json"
+          release=$(gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases" \
+            --input "$RUNNER_TEMP/candidate-release.json")
+          release_id=$(jq -r '.id' <<<"$release")
+          if [[ ! "$release_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "GitHub did not return a valid candidate release ID." >&2
+            exit 1
+          fi
+          echo "id=${release_id}" >> "$GITHUB_OUTPUT"
+          echo "tag=${candidate_tag}" >> "$GITHUB_OUTPUT"
+          if [[ \
+                "$(jq -r '.tag_name' <<<"$release")" != "$candidate_tag" || \
+                "$(jq -r '.target_commitish' <<<"$release")" != "$GITHUB_SHA" || \
+                "$(jq -r '.draft' <<<"$release")" != true ]]; then
+            echo "GitHub did not create the isolated candidate draft as requested." >&2
+            exit 1
+          fi
+      - name: Upload and verify isolated candidate assets
+        if: steps.candidate.outputs.id != ''
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create GitHub Release (stable)
-        if: needs.meta.outputs.is_dev != 'true'
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
-        with:
-          tag_name: v${{ needs.meta.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          name: v${{ needs.meta.outputs.version }}
-          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
-          generate_release_notes: true
-          body: |
-            Profiles and configuration under `~/.codex-switch` are preserved.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          RELEASE_ID: ${{ steps.candidate.outputs.id }}
+        run: |
+          gh release upload "$CANDIDATE_TAG" artifacts/*
+          "$RUNNER_TEMP/verify-release-assets.sh" \
+            "$RELEASE_ID" artifacts "$RUNNER_TEMP/candidate-release-assets" exact
+      - name: Confirm exact tag still targets this source before cutover
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: "$RUNNER_TEMP/verify-release-tag.sh"
+      - name: Archive the previous dev release without changing its assets
+        id: archive
+        if: needs.meta.outputs.is_dev == 'true' && steps.existing.outputs.old_id != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD_RELEASE_ID: ${{ steps.existing.outputs.old_id }}
+          OLD_TARGET: ${{ steps.existing.outputs.old_target }}
+        run: |
+          archive_tag="dev-archive-${OLD_RELEASE_ID}"
+          echo "tag=${archive_tag}" >> "$GITHUB_OUTPUT"
+          echo "begun=true" >> "$GITHUB_OUTPUT"
+          old=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}")
+          if [[ "$(jq -r '.tag_name' <<<"$old")" != dev || \
+                "$(jq -r '.draft' <<<"$old")" != false || \
+                "$(jq -r '.target_commitish' <<<"$old")" != "$OLD_TARGET" ]]; then
+            echo "The previous dev release changed before archival; refusing cutover." >&2
+            exit 1
+          fi
+          archive_release_error="$RUNNER_TEMP/archive-release-preflight-error"
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${archive_tag}" \
+            > /dev/null 2>"$archive_release_error"; then
+            echo "Archive release ${archive_tag} already exists; refusing to overwrite it." >&2
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$archive_release_error"; then
+            cat "$archive_release_error" >&2
+            echo "Could not prove archive release ${archive_tag} is absent." >&2
+            exit 1
+          fi
+          archive_ref_error="$RUNNER_TEMP/archive-ref-preflight-error"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${archive_tag}" \
+            > /dev/null 2>"$archive_ref_error"; then
+            echo "Archive ref ${archive_tag} already exists; refusing to overwrite it." >&2
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$archive_ref_error"; then
+            cat "$archive_ref_error" >&2
+            echo "Could not prove archive ref ${archive_tag} is absent." >&2
+            exit 1
+          fi
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f "ref=refs/tags/${archive_tag}" -f "sha=${OLD_TARGET}" > /dev/null
+          echo "ref_created=true" >> "$GITHUB_OUTPUT"
+          created_ref=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${archive_tag}")
+          if [[ "$(jq -r '.object.type' <<<"$created_ref")" != commit || \
+                "$(jq -r '.object.sha' <<<"$created_ref")" != "$OLD_TARGET" ]]; then
+            echo "Archive ref ${archive_tag} was not created at ${OLD_TARGET}." >&2
+            exit 1
+          fi
+          archived=$(jq -n --arg tag "$archive_tag" '{tag_name:$tag}' | \
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}" --input -)
+          if [[ "$(jq -r '.id' <<<"$archived")" != "$OLD_RELEASE_ID" || \
+                "$(jq -r '.tag_name' <<<"$archived")" != "$archive_tag" || \
+                "$(jq -r '.target_commitish' <<<"$archived")" != "$OLD_TARGET" || \
+                "$(jq -r '.draft' <<<"$archived")" != false ]]; then
+            echo "The previous dev release was not archived exactly as requested." >&2
+            exit 1
+          fi
+      - name: Publish verified candidate on the exact tag
+        id: publish
+        if: steps.existing.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.candidate.outputs.id }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if [[ "${{ needs.meta.outputs.is_dev }}" == true ]]; then
+            release_name="dev (${RELEASE_VERSION})"
+            prerelease=true
+          else
+            release_name="$tag"
+            prerelease="${{ needs.meta.outputs.prerelease }}"
+          fi
+          candidate=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          if [[ "$(jq -r '.tag_name' <<<"$candidate")" != "$CANDIDATE_TAG" || \
+                "$(jq -r '.target_commitish' <<<"$candidate")" != "$GITHUB_SHA" || \
+                "$(jq -r '.draft' <<<"$candidate")" != true ]]; then
+            echo "Candidate release changed after verification; refusing publication." >&2
+            exit 1
+          fi
+          jq -n --arg tag "$tag" --arg name "$release_name" \
+            --argjson prerelease "$prerelease" \
+            '{tag_name:$tag,name:$name,draft:false,prerelease:$prerelease}' \
+            > "$RUNNER_TEMP/publish-release.json"
+          published=$(gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            --input "$RUNNER_TEMP/publish-release.json")
+          if [[ "$(jq -r '.id' <<<"$published")" != "$RELEASE_ID" || \
+                "$(jq -r '.tag_name' <<<"$published")" != "$tag" || \
+                "$(jq -r '.target_commitish' <<<"$published")" != "$GITHUB_SHA" || \
+                "$(jq -r '.draft' <<<"$published")" != false || \
+                "$(jq -r '.prerelease' <<<"$published")" != "$prerelease" ]]; then
+            echo "GitHub did not publish the expected release ${RELEASE_ID} for ${tag}." >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/verify-release-tag.sh"
+          "$RUNNER_TEMP/verify-release-assets.sh" \
+            "$RELEASE_ID" artifacts "$RUNNER_TEMP/published-release-assets" exact
+          echo "complete=true" >> "$GITHUB_OUTPUT"
+      - name: Remove temporary cutover state after verified publication
+        if: steps.publish.outputs.complete == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.candidate.outputs.id }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          OLD_RELEASE_ID: ${{ steps.existing.outputs.old_id }}
+          OLD_TARGET: ${{ steps.existing.outputs.old_target }}
+          ARCHIVE_TAG: ${{ steps.archive.outputs.tag }}
+          ARCHIVE_REF_CREATED: ${{ steps.archive.outputs.ref_created }}
+        run: |
+          final_tag="${GITHUB_REF#refs/tags/}"
+          published=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")
+          if [[ "$(jq -r '.id' <<<"$published")" != "$RELEASE_ID" || \
+                "$(jq -r '.tag_name' <<<"$published")" != "$final_tag" || \
+                "$(jq -r '.target_commitish' <<<"$published")" != "$GITHUB_SHA" || \
+                "$(jq -r '.draft' <<<"$published")" != false ]]; then
+            echo "Published release ${RELEASE_ID} changed before temporary-state cleanup; nothing was deleted." >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/verify-release-tag.sh"
+          "$RUNNER_TEMP/verify-release-assets.sh" \
+            "$RELEASE_ID" artifacts "$RUNNER_TEMP/cleanup-verified-release-assets" exact
 
-            `curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/v${{ needs.meta.outputs.version }}/install.sh | bash`
-          files: artifacts/*
+          cleanup_errors=()
+          candidate_ref_error="$RUNNER_TEMP/candidate-ref-cleanup-error"
+          if candidate_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" \
+            2>"$candidate_ref_error"); then
+            candidate_ref_sha=$(jq -r '.object.sha' <<<"$candidate_ref")
+            if [[ "$(jq -r '.object.type' <<<"$candidate_ref")" != commit || \
+                  "${candidate_ref_sha,,}" != "${GITHUB_SHA,,}" ]]; then
+              cleanup_errors+=("candidate ref ${CANDIDATE_TAG} changed identity and was preserved")
+            else
+              if ! gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/git/refs/tags/${CANDIDATE_TAG}"; then
+                echo "Deletion of candidate ref ${CANDIDATE_TAG} returned an error; checking its final state." >&2
+              fi
+              candidate_after_error="$RUNNER_TEMP/candidate-ref-after-delete-error"
+              if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" \
+                > /dev/null 2>"$candidate_after_error"; then
+                cleanup_errors+=("candidate ref ${CANDIDATE_TAG} remains")
+              elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_after_error"; then
+                cleanup_errors+=("candidate ref ${CANDIDATE_TAG} deletion could not be confirmed")
+              fi
+            fi
+          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+            cleanup_errors+=("candidate ref ${CANDIDATE_TAG} could not be inspected")
+          fi
+
+          if [[ -n "$OLD_RELEASE_ID" ]]; then
+            archive_tag="${ARCHIVE_TAG:-dev-archive-${OLD_RELEASE_ID}}"
+            old_release_safe=false
+            old_release_absent=false
+            old_error="$RUNNER_TEMP/old-archive-release-cleanup-error"
+            if old=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}" 2>"$old_error"); then
+              old_target=$(jq -r '.target_commitish' <<<"$old")
+              if [[ "$(jq -r '.id' <<<"$old")" == "$OLD_RELEASE_ID" && \
+                    "$(jq -r '.tag_name' <<<"$old")" == "$archive_tag" && \
+                    "${old_target,,}" == "${OLD_TARGET,,}" && \
+                    "$(jq -r '.draft' <<<"$old")" == false ]]; then
+                old_release_safe=true
+              else
+                cleanup_errors+=("old archive release ${OLD_RELEASE_ID} changed identity and was preserved")
+              fi
+            elif grep -Eq 'HTTP 404|Not Found' "$old_error"; then
+              old_release_absent=true
+            else
+              cleanup_errors+=("old archive release ${OLD_RELEASE_ID} could not be inspected")
+            fi
+
+            if [[ "$old_release_safe" == true ]]; then
+              if ! gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}"; then
+                echo "Deletion of old archive release ${OLD_RELEASE_ID} returned an error; checking its final state." >&2
+              fi
+              old_after_error="$RUNNER_TEMP/old-archive-release-after-delete-error"
+              if gh api "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}" \
+                > /dev/null 2>"$old_after_error"; then
+                cleanup_errors+=("old archive release ${OLD_RELEASE_ID} remains")
+              elif grep -Eq 'HTTP 404|Not Found' "$old_after_error"; then
+                old_release_absent=true
+              else
+                cleanup_errors+=("old archive release ${OLD_RELEASE_ID} deletion could not be confirmed")
+              fi
+            fi
+
+            if [[ "$old_release_absent" == true ]]; then
+              if [[ "$ARCHIVE_REF_CREATED" != true ]]; then
+                cleanup_errors+=("archive ref ${archive_tag} has no creation proof and was preserved")
+              else
+                archive_ref_error="$RUNNER_TEMP/archive-ref-cleanup-error"
+                if archive_ref=$(gh api \
+                  "repos/${GITHUB_REPOSITORY}/git/ref/tags/${archive_tag}" \
+                  2>"$archive_ref_error"); then
+                  archive_ref_sha=$(jq -r '.object.sha' <<<"$archive_ref")
+                  if [[ "$(jq -r '.object.type' <<<"$archive_ref")" != commit || \
+                        "${archive_ref_sha,,}" != "${OLD_TARGET,,}" ]]; then
+                    cleanup_errors+=("archive ref ${archive_tag} changed identity and was preserved")
+                  else
+                    if ! gh api --method DELETE \
+                      "repos/${GITHUB_REPOSITORY}/git/refs/tags/${archive_tag}"; then
+                      echo "Deletion of archive ref ${archive_tag} returned an error; checking its final state." >&2
+                    fi
+                    archive_after_error="$RUNNER_TEMP/archive-ref-after-delete-error"
+                    if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${archive_tag}" \
+                      > /dev/null 2>"$archive_after_error"; then
+                      cleanup_errors+=("archive ref ${archive_tag} remains")
+                    elif ! grep -Eq 'HTTP 404|Not Found' "$archive_after_error"; then
+                      cleanup_errors+=("archive ref ${archive_tag} deletion could not be confirmed")
+                    fi
+                  fi
+                elif ! grep -Eq 'HTTP 404|Not Found' "$archive_ref_error"; then
+                  cleanup_errors+=("archive ref ${archive_tag} could not be inspected")
+                fi
+              fi
+            fi
+          fi
+
+          if (( ${#cleanup_errors[@]} > 0 )); then
+            printf 'Verified release %s remains published, but temporary state cleanup failed:\n' \
+              "$RELEASE_ID" >&2
+            printf ' - %s\n' "${cleanup_errors[@]}" >&2
+            exit 1
+          fi
+      - name: Roll back an incomplete dev cutover
+        if: always() && needs.meta.outputs.is_dev == 'true' && steps.existing.outputs.old_id != '' && steps.publish.outputs.complete != 'true'
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD_RELEASE_ID: ${{ steps.existing.outputs.old_id }}
+          OLD_TARGET: ${{ steps.existing.outputs.old_target }}
+          CANDIDATE_ID: ${{ steps.candidate.outputs.id }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+          ARCHIVE_TAG: ${{ steps.archive.outputs.tag }}
+          ARCHIVE_REF_CREATED: ${{ steps.archive.outputs.ref_created }}
+        run: |
+          archive_tag="${ARCHIVE_TAG:-dev-archive-${OLD_RELEASE_ID}}"
+          old=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}")
+          old_tag=$(jq -r '.tag_name' <<<"$old")
+          old_target=$(jq -r '.target_commitish' <<<"$old")
+          if [[ "$(jq -r '.id' <<<"$old")" != "$OLD_RELEASE_ID" || \
+                "${old_target,,}" != "${OLD_TARGET,,}" || \
+                "$(jq -r '.draft' <<<"$old")" != false ]]; then
+            echo "Previous dev release ${OLD_RELEASE_ID} changed identity; refusing rollback." >&2
+            exit 1
+          fi
+          if [[ "$old_tag" == "$archive_tag" ]]; then
+            if [[ -n "$CANDIDATE_ID" ]]; then
+              candidate_error="$RUNNER_TEMP/rollback-candidate-error"
+              if candidate=$(gh api \
+                "repos/${GITHUB_REPOSITORY}/releases/${CANDIDATE_ID}" \
+                2>"$candidate_error"); then
+                candidate_tag=$(jq -r '.tag_name' <<<"$candidate")
+                candidate_target=$(jq -r '.target_commitish' <<<"$candidate")
+                candidate_draft=$(jq -r '.draft' <<<"$candidate")
+                if [[ "$(jq -r '.id' <<<"$candidate")" != "$CANDIDATE_ID" || \
+                      "${candidate_target,,}" != "${GITHUB_SHA,,}" || \
+                      ( "$candidate_tag" == "$CANDIDATE_TAG" && "$candidate_draft" != true ) || \
+                      ( "$candidate_tag" == dev && "$candidate_draft" != false ) || \
+                      ( "$candidate_tag" != "$CANDIDATE_TAG" && "$candidate_tag" != dev ) ]]; then
+                  echo "Candidate ${CANDIDATE_ID} changed identity; refusing to delete it during rollback." >&2
+                  exit 1
+                fi
+                if ! gh api --method DELETE \
+                  "repos/${GITHUB_REPOSITORY}/releases/${CANDIDATE_ID}"; then
+                  echo "Candidate deletion returned an error; checking its final state." >&2
+                fi
+                candidate_after_error="$RUNNER_TEMP/rollback-candidate-after-delete-error"
+                if candidate_after=$(gh api \
+                  "repos/${GITHUB_REPOSITORY}/releases/${CANDIDATE_ID}" \
+                  2>"$candidate_after_error"); then
+                  candidate_after_tag=$(jq -r '.tag_name' <<<"$candidate_after")
+                  candidate_after_target=$(jq -r '.target_commitish' <<<"$candidate_after")
+                  candidate_after_draft=$(jq -r '.draft' <<<"$candidate_after")
+                  if [[ "$(jq -r '.id' <<<"$candidate_after")" != "$CANDIDATE_ID" || \
+                        "${candidate_after_target,,}" != "${GITHUB_SHA,,}" || \
+                        ( "$candidate_after_tag" == "$CANDIDATE_TAG" && "$candidate_after_draft" != true ) || \
+                        ( "$candidate_after_tag" == dev && "$candidate_after_draft" != false ) || \
+                        ( "$candidate_after_tag" != "$CANDIDATE_TAG" && "$candidate_after_tag" != dev ) ]]; then
+                    echo "Candidate ${CANDIDATE_ID} changed identity after deletion was requested; refusing rollback." >&2
+                    exit 1
+                  fi
+                  if ! gh api --method DELETE \
+                    "repos/${GITHUB_REPOSITORY}/releases/${CANDIDATE_ID}"; then
+                    echo "Candidate retry deletion returned an error; checking its final state." >&2
+                  fi
+                  candidate_final_error="$RUNNER_TEMP/rollback-candidate-final-error"
+                  if gh api "repos/${GITHUB_REPOSITORY}/releases/${CANDIDATE_ID}" \
+                    > /dev/null 2>"$candidate_final_error"; then
+                    echo "Candidate ${CANDIDATE_ID} remains; refusing to retag the previous release." >&2
+                    exit 1
+                  elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_final_error"; then
+                    cat "$candidate_final_error" >&2
+                    echo "Candidate ${CANDIDATE_ID} final deletion state is ambiguous; refusing rollback." >&2
+                    exit 1
+                  fi
+                elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_after_error"; then
+                  cat "$candidate_after_error" >&2
+                  echo "Candidate ${CANDIDATE_ID} deletion could not be confirmed; refusing rollback." >&2
+                  exit 1
+                fi
+                touch "$RUNNER_TEMP/release-${CANDIDATE_ID}.removed"
+              elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_error"; then
+                cat "$candidate_error" >&2
+                echo "Candidate ${CANDIDATE_ID} could not be inspected; refusing rollback." >&2
+                exit 1
+              fi
+            fi
+            restore_error="$RUNNER_TEMP/rollback-old-release-restore-error"
+            if ! jq -n '{tag_name:"dev"}' | gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}" \
+              --input - > /dev/null 2>"$restore_error"; then
+              cat "$restore_error" >&2
+              echo "Restoring the previous dev release returned an error; checking its final state." >&2
+            fi
+            restored=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${OLD_RELEASE_ID}")
+            restored_target=$(jq -r '.target_commitish' <<<"$restored")
+            if [[ "$(jq -r '.id' <<<"$restored")" != "$OLD_RELEASE_ID" || \
+                  "$(jq -r '.tag_name' <<<"$restored")" != dev || \
+                  "${restored_target,,}" != "${OLD_TARGET,,}" || \
+                  "$(jq -r '.draft' <<<"$restored")" != false ]]; then
+              echo "Could not restore the previous dev release after failed cutover." >&2
+              exit 1
+            fi
+          elif [[ "$old_tag" != dev ]]; then
+            echo "Previous dev release moved to unexpected tag ${old_tag}; refusing an unsafe rollback." >&2
+            exit 1
+          fi
+          if [[ "$ARCHIVE_REF_CREATED" == true ]]; then
+            archive_ref_error="$RUNNER_TEMP/rollback-archive-ref-error"
+            if ref=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${archive_tag}" \
+              2>"$archive_ref_error"); then
+              if [[ "$(jq -r '.object.type' <<<"$ref")" != commit || \
+                    "$(jq -r '.object.sha' <<<"$ref")" != "$OLD_TARGET" ]]; then
+                echo "Archive ref ${archive_tag} no longer belongs to this run." >&2
+                exit 1
+              fi
+              if ! gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/git/refs/tags/${archive_tag}"; then
+                echo "Archive ref deletion returned an error; checking its final state." >&2
+              fi
+              archive_after_error="$RUNNER_TEMP/rollback-archive-ref-after-delete-error"
+              if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${archive_tag}" \
+                > /dev/null 2>"$archive_after_error"; then
+                echo "Archive ref ${archive_tag} remains after rollback." >&2
+                exit 1
+              elif ! grep -Eq 'HTTP 404|Not Found' "$archive_after_error"; then
+                cat "$archive_after_error" >&2
+                echo "Archive ref ${archive_tag} deletion could not be confirmed." >&2
+                exit 1
+              fi
+            elif ! grep -Eq 'HTTP 404|Not Found' "$archive_ref_error"; then
+              cat "$archive_ref_error" >&2
+              echo "Archive ref ${archive_tag} could not be inspected during rollback." >&2
+              exit 1
+            fi
+          fi
+      - name: Remove only this run's incomplete candidate
+        if: always() && steps.candidate.outputs.id != '' && steps.publish.outputs.complete != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.candidate.outputs.id }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          candidate_ref_error="$RUNNER_TEMP/incomplete-candidate-ref-error"
+          if candidate_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" \
+            2>"$candidate_ref_error"); then
+            if [[ "$(jq -r '.object.type' <<<"$candidate_ref")" != commit || \
+                  "$(jq -r '.object.sha' <<<"$candidate_ref")" != "$GITHUB_SHA" ]]; then
+              echo "Candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID} no longer belongs to this run; it was preserved." >&2
+              exit 1
+            fi
+            if ! gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${CANDIDATE_TAG}"; then
+              echo "Candidate ref ${CANDIDATE_TAG} deletion returned an error; checking its final state." >&2
+            fi
+            candidate_ref_after_error="$RUNNER_TEMP/incomplete-candidate-ref-after-delete-error"
+            if candidate_ref_after=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" \
+              2>"$candidate_ref_after_error"); then
+              if [[ "$(jq -r '.object.type' <<<"$candidate_ref_after")" != commit || \
+                    "$(jq -r '.object.sha' <<<"$candidate_ref_after")" != "$GITHUB_SHA" ]]; then
+                echo "Candidate ref ${CANDIDATE_TAG} changed identity after deletion was requested; it was preserved." >&2
+              else
+                echo "Candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID} remains; rerun cleanup after checking GitHub." >&2
+              fi
+              exit 1
+            elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_after_error"; then
+              cat "$candidate_ref_after_error" >&2
+              echo "Candidate ref ${CANDIDATE_TAG} deletion state is ambiguous for release ${RELEASE_ID}; rerun cleanup after checking GitHub." >&2
+              exit 1
+            fi
+          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+            cat "$candidate_ref_error" >&2
+            echo "Could not inspect candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID}; nothing else was changed." >&2
+            exit 1
+          fi
+          if [[ -e "$RUNNER_TEMP/release-${RELEASE_ID}.removed" ]]; then
+            exit 0
+          fi
+          candidate_release_error="$RUNNER_TEMP/incomplete-candidate-release-error"
+          if release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            2>"$candidate_release_error"); then
+            :
+          elif grep -Eq 'HTTP 404|Not Found' "$candidate_release_error"; then
+            exit 0
+          else
+            cat "$candidate_release_error" >&2
+            echo "Could not inspect candidate release ${RELEASE_ID} (${CANDIDATE_TAG}); it was preserved." >&2
+            exit 1
+          fi
+          tag=$(jq -r '.tag_name' <<<"$release")
+          target=$(jq -r '.target_commitish' <<<"$release")
+          draft=$(jq -r '.draft' <<<"$release")
+          final_tag="${GITHUB_REF#refs/tags/}"
+          if [[ "$(jq -r '.id' <<<"$release")" != "$RELEASE_ID" || \
+                "${target,,}" != "${GITHUB_SHA,,}" || \
+                ( "$tag" == "$CANDIDATE_TAG" && "$draft" != true ) || \
+                ( "$tag" == "$final_tag" && "$draft" != false ) || \
+                ( "$tag" != "$CANDIDATE_TAG" && "$tag" != "$final_tag" ) ]]; then
+            echo "Release ${RELEASE_ID} no longer matches this run; refusing cleanup." >&2
+            exit 1
+          fi
+          if ! gh api --method DELETE \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"; then
+            echo "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) deletion returned an error; checking its final state." >&2
+          fi
+          candidate_release_after_error="$RUNNER_TEMP/incomplete-candidate-release-after-delete-error"
+          if release_after=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            2>"$candidate_release_after_error"); then
+            after_tag=$(jq -r '.tag_name' <<<"$release_after")
+            after_target=$(jq -r '.target_commitish' <<<"$release_after")
+            after_draft=$(jq -r '.draft' <<<"$release_after")
+            if [[ "$(jq -r '.id' <<<"$release_after")" != "$RELEASE_ID" || \
+                  "${after_target,,}" != "${GITHUB_SHA,,}" || \
+                  ( "$after_tag" == "$CANDIDATE_TAG" && "$after_draft" != true ) || \
+                  ( "$after_tag" == "$final_tag" && "$after_draft" != false ) || \
+                  ( "$after_tag" != "$CANDIDATE_TAG" && "$after_tag" != "$final_tag" ) ]]; then
+              echo "Candidate release ${RELEASE_ID} changed identity after deletion was requested; it was preserved." >&2
+            else
+              echo "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) remains; rerun cleanup after checking GitHub." >&2
+            fi
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_release_after_error"; then
+            cat "$candidate_release_after_error" >&2
+            echo "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) deletion state is ambiguous; rerun cleanup after checking GitHub." >&2
+            exit 1
+          fi
+          echo "Removed this run's incomplete candidate release ${RELEASE_ID}."

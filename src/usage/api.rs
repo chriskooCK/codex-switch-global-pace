@@ -11,7 +11,7 @@ use super::parse::parse_usage_checked;
 use super::reset_credits::enrich_reset_credits;
 use super::{
     ImportValidation, MAX_RETRIES, RETRY_DELAY, Refresh, RefreshedTokens, TerminalAuthError,
-    TokenPersistFailure, UsageError, UsageFetchOutcome, UsageInfo,
+    TokenPersistFailure, UsageError, UsageInfo,
 };
 
 pub(crate) fn apply_account_routing_headers(
@@ -180,9 +180,8 @@ pub(super) fn extract_error_summary(err: &str) -> String {
 pub async fn fetch_usage_retried(
     alias: &str,
     profile_path: &Path,
-    current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Cached).await
+    fetch_usage_retried_inner(alias, profile_path, Refresh::Cached).await
 }
 
 /// Bypass the usage TTL for current numbers, but leave a recorded auth verdict
@@ -190,9 +189,8 @@ pub async fn fetch_usage_retried(
 pub async fn fetch_usage_retried_unattended(
     alias: &str,
     profile_path: &Path,
-    current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Unattended).await
+    fetch_usage_retried_inner(alias, profile_path, Refresh::Unattended).await
 }
 
 /// Bypass every cache, including a recorded auth verdict. Only for a person
@@ -200,9 +198,35 @@ pub async fn fetch_usage_retried_unattended(
 pub async fn fetch_usage_retried_force(
     alias: &str,
     profile_path: &Path,
-    current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Forced).await
+    fetch_usage_retried_inner(alias, profile_path, Refresh::Forced).await
+}
+
+/// Usage discovery performed as one stage of a larger credential operation
+/// that already owns this profile's lease (currently warmup). Acquiring again
+/// would deadlock because the OS lease is deliberately non-reentrant.
+pub(crate) async fn fetch_usage_retried_unattended_leased(
+    alias: &str,
+    profile_path: &Path,
+    lease: &crate::profile::ProfileLease,
+) -> std::result::Result<UsageInfo, UsageError> {
+    fetch_usage_retried_with_lease(alias, profile_path, Refresh::Unattended, lease).await
+}
+
+/// TUI usage discovery after its cancellable lease-acquisition phase has
+/// completed. Cache semantics remain identical to the ordinary entry points;
+/// the caller owns the lease so shutdown can distinguish pre-network waiting
+/// from credential work that must be drained.
+pub(crate) async fn fetch_usage_retried_with_existing_lease(
+    alias: &str,
+    profile_path: &Path,
+    refresh: Refresh,
+    lease: &crate::profile::ProfileLease,
+) -> std::result::Result<UsageInfo, UsageError> {
+    if let Some(cached) = usage_cache_hit(alias, refresh).await {
+        return Ok(cached);
+    }
+    fetch_usage_retried_with_lease(alias, profile_path, refresh, lease).await
 }
 
 /// Write credentials the auth server just rotated back to the profile.
@@ -212,19 +236,28 @@ pub async fn fetch_usage_retried_force(
 /// still accepts. Losing it bricks the account, which makes this a reportable
 /// failure rather than something to warn about and walk past.
 fn persist_refreshed_tokens(
-    alias: &str,
+    lease: &crate::profile::ProfileLease,
     presented_refresh_token: &str,
     new_tokens: &RefreshedTokens,
 ) -> std::result::Result<(), UsageError> {
-    crate::profile::update_profile_tokens_if_refresh_matches(
-        alias,
+    let alias = lease.alias();
+    let update = crate::profile::update_profile_tokens_if_refresh_matches_leased(
+        lease,
         presented_refresh_token,
         &new_tokens.id_token,
         &new_tokens.access_token,
         &new_tokens.refresh_token,
     )
-    .map(|_| ())
-    .map_err(|err| UsageError::token_persist_failed(alias, &err))
+    .map_err(|err| UsageError::token_persist_failed(alias, &err))?;
+    match update {
+        crate::profile::RefreshTokenUpdate::Saved => Ok(()),
+        crate::profile::RefreshTokenUpdate::Superseded => {
+            Err(UsageError::token_update_superseded(alias))
+        }
+        crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } => {
+            Err(UsageError::live_activation_incomplete(alias, &cause))
+        }
+    }
 }
 
 fn resolve_refreshed_tokens(
@@ -319,17 +352,52 @@ fn reload_rotated_credentials(
 async fn fetch_usage_retried_inner(
     alias: &str,
     profile_path: &Path,
-    _current_alias: &str,
     refresh: Refresh,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    if !refresh.skips_usage_cache() {
-        if let Some(cached) = crate::cache::get_async(alias).await {
-            debug!("{alias}: cache hit");
-            return Ok(cached);
-        }
-        debug!("{alias}: cache miss, fetching from API");
-    } else {
+    if let Some(cached) = usage_cache_hit(alias, refresh).await {
+        return Ok(cached);
+    }
+
+    let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+        .await
+        .map_err(|error| UsageError {
+            summary: "profile lock failed".to_string(),
+            detail: format!("[{alias}] could not lock profile for usage refresh: {error:#}"),
+        })?;
+    fetch_usage_retried_with_lease(alias, profile_path, refresh, &lease).await
+}
+
+async fn usage_cache_hit(alias: &str, refresh: Refresh) -> Option<UsageInfo> {
+    if refresh.skips_usage_cache() {
         debug!("{alias}: {refresh:?} refresh, bypassing the usage cache");
+        return None;
+    }
+    match crate::cache::get_async(alias).await {
+        Some(cached) => {
+            debug!("{alias}: cache hit");
+            Some(cached)
+        }
+        None => {
+            debug!("{alias}: cache miss, fetching from API");
+            None
+        }
+    }
+}
+
+async fn fetch_usage_retried_with_lease(
+    alias: &str,
+    profile_path: &Path,
+    refresh: Refresh,
+    lease: &crate::profile::ProfileLease,
+) -> std::result::Result<UsageInfo, UsageError> {
+    if lease.alias() != alias {
+        return Err(UsageError {
+            summary: "profile lock mismatch".to_string(),
+            detail: format!(
+                "usage request for '{alias}' received lease for '{}'",
+                lease.alias()
+            ),
+        });
     }
 
     let val = auth::read_auth(profile_path).map_err(|e| {
@@ -407,39 +475,49 @@ async fn fetch_usage_retried_inner(
             refresh_token = Some(stored.refresh_token);
         }
 
-        let outcome = fetch_usage_with_refresh(
-            alias,
-            &at,
-            id_token.as_deref(),
-            refresh_token.as_deref(),
-            account_id.as_deref(),
-            is_fedramp,
-        )
-        .await;
+        let mut rotated_tokens = None;
+        let mut persist_failure = None;
+        let result = {
+            let mut persist_before_follow_up =
+                |presented: &str, tokens: RefreshedTokens| -> Result<()> {
+                    match persist_refreshed_tokens(lease, presented, &tokens) {
+                        Ok(()) => {
+                            rotated_tokens = Some(tokens);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            let detail = error.detail.clone();
+                            persist_failure = Some(error);
+                            Err(anyhow::anyhow!(detail))
+                        }
+                    }
+                };
+            fetch_usage_with_refresh(
+                alias,
+                &at,
+                id_token.as_deref(),
+                refresh_token.as_deref(),
+                account_id.as_deref(),
+                is_fedramp,
+                &mut persist_before_follow_up,
+            )
+            .await
+        };
 
-        // The auth server rotates `refresh_token` on every use and rejects the
-        // previous one as reused. Persist and adopt the new credentials before
-        // looking at the result, or the next attempt would replay a dead token
-        // and turn a transient failure into a permanent lockout.
-        //
-        // A write failure aborts this account outright: the rotated token lives
-        // only in memory while the old one is already dead, and another round
-        // would just spend a second single-use token we equally cannot keep.
-        // Other aliases refresh in their own calls and are unaffected.
-        if let Some(new_tokens) = &outcome.refreshed {
-            let presented = refresh_token.as_deref().ok_or_else(|| {
-                UsageError::token_persist_failed(
-                    alias,
-                    &anyhow::anyhow!("refresh response without presented refresh_token"),
-                )
-            })?;
-            persist_refreshed_tokens(alias, presented, new_tokens)?;
-            at = new_tokens.access_token.clone();
-            id_token = Some(new_tokens.id_token.clone());
-            refresh_token = Some(new_tokens.refresh_token.clone());
+        // Persistence is invoked synchronously from the successful refresh
+        // branch, before that branch can send its follow-up usage GET. A failed
+        // write is terminal for this call: retrying would spend another
+        // single-use token that we still cannot keep.
+        if let Some(error) = persist_failure {
+            return Err(error);
+        }
+        if let Some(new_tokens) = rotated_tokens {
+            at = new_tokens.access_token;
+            id_token = Some(new_tokens.id_token);
+            refresh_token = Some(new_tokens.refresh_token);
         }
 
-        match outcome.result {
+        match result {
             Ok(usage) => {
                 crate::cache::put_async(alias, &usage).await;
                 return Ok(usage);
@@ -482,46 +560,27 @@ async fn fetch_usage_retried_inner(
     })
 }
 
-/// Fetch usage; on 401/403 automatically refresh the token and retry once.
+/// Fetch usage, automatically refreshing on expiry or a 401/403 response.
 ///
-/// Returns tokens and result separately: a rotated `refresh_token` is the only
-/// credential the auth server will still accept, so it is reported even when
-/// the usage call afterwards failed.
-pub async fn fetch_usage_with_refresh(
-    alias: &str,
-    access_token: &str,
-    id_token: Option<&str>,
-    refresh_token: Option<&str>,
-    account_id: Option<&str>,
-    is_fedramp: bool,
-) -> UsageFetchOutcome {
-    let mut refreshed = None;
-    let result = fetch_usage_capturing_refresh(
-        alias,
-        access_token,
-        id_token,
-        refresh_token,
-        account_id,
-        is_fedramp,
-        &mut refreshed,
-    )
-    .await;
-    UsageFetchOutcome { refreshed, result }
-}
-
-/// Inner body of [`fetch_usage_with_refresh`]. Every successful refresh is
-/// written into `refreshed` *before* any further fallible step, so `?`/`bail!`
-/// can never discard a rotated token.
+/// `persist_rotation` runs synchronously immediately after a refresh response
+/// is decoded and before any follow-up usage request. It must durably save the
+/// rotated credential: returning `Ok(())` without doing so can lose the only
+/// refresh token the auth server still accepts if this future is later
+/// cancelled. A persistence error stops the request before another token can be
+/// spent.
 #[allow(clippy::too_many_arguments)]
-async fn fetch_usage_capturing_refresh(
+pub async fn fetch_usage_with_refresh<F>(
     alias: &str,
     access_token: &str,
     id_token: Option<&str>,
     refresh_token: Option<&str>,
     account_id: Option<&str>,
     is_fedramp: bool,
-    refreshed: &mut Option<RefreshedTokens>,
-) -> Result<UsageInfo> {
+    persist_rotation: &mut F,
+) -> Result<UsageInfo>
+where
+    F: FnMut(&str, RefreshedTokens) -> Result<()>,
+{
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
     let mut rejected_refresh: Option<anyhow::Error> = None;
@@ -536,7 +595,7 @@ async fn fetch_usage_capturing_refresh(
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
                 let bearer = new_tokens.access_token.clone();
-                *refreshed = Some(new_tokens);
+                persist_rotation(rt, new_tokens)?;
 
                 let resp = apply_account_routing_headers(
                     client
@@ -620,7 +679,7 @@ async fn fetch_usage_capturing_refresh(
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
                 let bearer = new_tokens.access_token.clone();
-                *refreshed = Some(new_tokens);
+                persist_rotation(rt, new_tokens)?;
 
                 let resp2 = apply_account_routing_headers(
                     client
@@ -663,14 +722,20 @@ async fn fetch_usage_capturing_refresh(
 
 /// Validate an auth.json being imported, refreshing its credentials if needed.
 ///
-/// Returns the rotation and the validation result as separate fields: the
-/// caller's `val` is a local copy, so a rotated `refresh_token` reported only
-/// through `Ok(..)` would be dropped by the caller's `?` on the very failures
-/// that make it matter. See [`ImportValidation`].
-pub async fn validate_import_auth(val: &mut serde_json::Value) -> ImportValidation {
+/// `persist_rotation` must durably write the updated auth value. It runs for
+/// every successful refresh before any follow-up usage request is sent; an
+/// error stops validation immediately rather than leaving a new single-use
+/// token only in memory. See [`ImportValidation`].
+pub async fn validate_import_auth<F>(
+    val: &mut serde_json::Value,
+    mut persist_rotation: F,
+) -> ImportValidation
+where
+    F: FnMut(&serde_json::Value) -> Result<()>,
+{
     let mut refreshed = None;
     let mut validated_account_id = None;
-    let result = validate_import_auth_capturing_refresh(val, &mut refreshed)
+    let result = validate_import_auth_capturing_refresh(val, &mut refreshed, &mut persist_rotation)
         .await
         .map(|(usage, account_id)| {
             validated_account_id = Some(account_id);
@@ -683,30 +748,40 @@ pub async fn validate_import_auth(val: &mut serde_json::Value) -> ImportValidati
     }
 }
 
-/// Record a rotation and write it into the auth value being validated.
+/// Record a rotation, write it into the auth value being validated, and persist
+/// that value before the caller can make another network request.
 ///
 /// `refreshed` is assigned *before* the fallible write so that a failure to
 /// update the value still leaves the caller holding the live credentials.
-fn adopt_refreshed_tokens(
+fn adopt_refreshed_tokens<F>(
     val: &mut serde_json::Value,
     tokens: RefreshedTokens,
     refreshed: &mut Option<RefreshedTokens>,
-) -> Result<()> {
+    persist_rotation: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&serde_json::Value) -> Result<()>,
+{
     let tokens = refreshed.insert(tokens);
     auth::apply_tokens(
         val,
         &tokens.id_token,
         &tokens.access_token,
         &tokens.refresh_token,
-    )
+    )?;
+    persist_rotation(val).context("persisting rotated import credentials")
 }
 
-/// Inner body of [`validate_import_auth`]. Every rotation reaches `refreshed`
-/// before any further fallible step, so `?`/`bail!` can never discard one.
-async fn validate_import_auth_capturing_refresh(
+/// Inner body of [`validate_import_auth`]. Every rotation reaches both
+/// `refreshed` and durable storage before a follow-up usage request.
+async fn validate_import_auth_capturing_refresh<F>(
     val: &mut serde_json::Value,
     refreshed: &mut Option<RefreshedTokens>,
-) -> Result<(UsageInfo, String)> {
+    persist_rotation: &mut F,
+) -> Result<(UsageInfo, String)>
+where
+    F: FnMut(&serde_json::Value) -> Result<()>,
+{
     let (access_token, refresh_token) = auth::extract_tokens(val);
     let id_token = auth::extract_id_token(val);
     let account_info = crate::jwt::parse_account_info(val);
@@ -719,19 +794,22 @@ async fn validate_import_auth_capturing_refresh(
             let validated_account_id = account_id
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("imported auth must contain an account_id"))?;
-            let outcome = fetch_usage_with_refresh(
-                alias,
-                &at,
-                id_token.as_deref(),
-                rt.as_deref(),
-                Some(&validated_account_id),
-                is_fedramp,
-            )
-            .await;
-            if let Some(tokens) = outcome.refreshed {
-                adopt_refreshed_tokens(val, tokens, refreshed)?;
-            }
-            let usage = outcome.result?;
+            let usage = {
+                let mut persist_before_follow_up =
+                    |_: &str, tokens: RefreshedTokens| -> Result<()> {
+                        adopt_refreshed_tokens(val, tokens, refreshed, persist_rotation)
+                    };
+                fetch_usage_with_refresh(
+                    alias,
+                    &at,
+                    id_token.as_deref(),
+                    rt.as_deref(),
+                    Some(&validated_account_id),
+                    is_fedramp,
+                    &mut persist_before_follow_up,
+                )
+                .await?
+            };
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
@@ -745,25 +823,28 @@ async fn validate_import_auth_capturing_refresh(
                 first.id_token.clone(),
                 first.refresh_token.clone(),
             );
-            adopt_refreshed_tokens(val, first, refreshed)?;
+            adopt_refreshed_tokens(val, first, refreshed, persist_rotation)?;
 
             let validated_account_id = crate::jwt::parse_account_info(val)
                 .account_id
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("refreshed auth must contain an account_id"))?;
-            let outcome = fetch_usage_with_refresh(
-                alias,
-                &access_token,
-                Some(&id_token),
-                Some(&refresh_token),
-                Some(&validated_account_id),
-                is_fedramp,
-            )
-            .await;
-            if let Some(tokens) = outcome.refreshed {
-                adopt_refreshed_tokens(val, tokens, refreshed)?;
-            }
-            let usage = outcome.result?;
+            let usage = {
+                let mut persist_before_follow_up =
+                    |_: &str, tokens: RefreshedTokens| -> Result<()> {
+                        adopt_refreshed_tokens(val, tokens, refreshed, persist_rotation)
+                    };
+                fetch_usage_with_refresh(
+                    alias,
+                    &access_token,
+                    Some(&id_token),
+                    Some(&refresh_token),
+                    Some(&validated_account_id),
+                    is_fedramp,
+                    &mut persist_before_follow_up,
+                )
+                .await?
+            };
             if let Err(err) = crate::workspace::refresh_for_auth(val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
@@ -899,14 +980,7 @@ pub async fn refresh_expiring_tokens_within(
     let now = auth::now_unix_secs();
 
     // Collect current tokens for profiles expiring soon.
-    let mut candidates: Vec<(
-        String,
-        std::path::PathBuf,
-        Option<String>,
-        String,
-        String,
-        i64,
-    )> = Vec::new();
+    let mut candidates: Vec<(String, std::path::PathBuf, String, i64)> = Vec::new();
     for alias in &profiles {
         let path = match crate::profile::profile_auth_path(alias) {
             Ok(p) => p,
@@ -940,7 +1014,7 @@ pub async fn refresh_expiring_tokens_within(
         };
         let remaining = exp - now;
         if remaining < OPPORTUNISTIC_REFRESH_MARGIN {
-            candidates.push((alias.clone(), path, id_token, at, rt, exp));
+            candidates.push((alias.clone(), path, rt, exp));
         }
     }
 
@@ -949,7 +1023,7 @@ pub async fn refresh_expiring_tokens_within(
     }
 
     // Sort by expiration: soonest first
-    candidates.sort_by_key(|c| c.5);
+    candidates.sort_by_key(|c| c.3);
     candidates.truncate(OPPORTUNISTIC_REFRESH_LIMIT);
 
     let count = candidates.len();
@@ -980,11 +1054,39 @@ pub async fn refresh_expiring_tokens_within(
 
     loop {
         while tasks.len() < OPPORTUNISTIC_REFRESH_CONCURRENCY && started_at.elapsed() < budget {
-            let Some((alias, path, id_token, access_token, rt, exp)) = queued.next() else {
+            let Some((alias, path, rt, exp)) = queued.next() else {
                 break;
             };
             let client = client.clone();
             tasks.spawn(async move {
+                let lease = match crate::profile::acquire_profile_lease_async(alias.clone()).await {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        debug!("[{alias}] opportunistic refresh could not lock profile: {error:#}");
+                        return None;
+                    }
+                };
+                // Candidate discovery is intentionally lock-free. Re-read after
+                // acquiring the lease so no credential observed before the
+                // lease can be sent to the auth server after another operation
+                // rotated it.
+                let value = match auth::read_auth(&path) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        debug!("[{alias}] opportunistic refresh could not reload auth: {error:#}");
+                        return None;
+                    }
+                };
+                let (access_token, current_refresh_token) = auth::extract_tokens(&value);
+                let access_token = access_token?;
+                let current_refresh_token = current_refresh_token?;
+                if current_refresh_token != rt {
+                    debug!(
+                        "[{alias}] opportunistic refresh skipped: credential changed before lease"
+                    );
+                    return None;
+                }
+                let id_token = auth::extract_id_token(&value);
                 let remaining = exp - auth::now_unix_secs();
                 debug!("[{alias}] token expires in {remaining}s, refreshing");
 
@@ -997,7 +1099,7 @@ pub async fn refresh_expiring_tokens_within(
                 )
                 .await
                 {
-                    Ok(new_tokens) => match persist_refreshed_tokens(&alias, &rt, &new_tokens) {
+                    Ok(new_tokens) => match persist_refreshed_tokens(&lease, &rt, &new_tokens) {
                         Ok(()) => {
                             info!("[{alias}] opportunistic token refresh succeeded");
                             None

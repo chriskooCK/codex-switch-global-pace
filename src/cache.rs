@@ -283,7 +283,7 @@ pub fn get(alias: &str) -> Option<UsageInfo> {
 /// Store usage result in cache.
 pub fn put(alias: &str, usage: &UsageInfo) {
     if let Err(err) = with_cache_lock(|| {
-        let mut cache = load_cache();
+        let mut cache = load_cache_checked()?;
         cache.entries.insert(alias.to_string(), to_entry(usage));
         save_cache(&cache)
     }) {
@@ -399,7 +399,7 @@ pub fn get_auth_failure(alias: &str, refresh_token: &str) -> Option<UsageError> 
 /// Remember that the auth server refused `refresh_token` for good.
 pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) {
     if let Err(err) = with_cache_lock(|| {
-        let mut cache = load_cache();
+        let mut cache = load_cache_checked()?;
         record_auth_failure(
             &mut cache,
             alias,
@@ -430,7 +430,7 @@ pub fn set_workspace_name(account_id: &str, name: Option<&str>) -> Result<()> {
     }
     let name = name.map(str::trim).filter(|name| !name.is_empty());
     with_cache_lock(|| {
-        let mut cache = load_cache();
+        let mut cache = load_cache_checked()?;
         let changed = update_workspace_name(&mut cache, account_id, name);
         if changed {
             save_cache(&cache)?;
@@ -536,7 +536,7 @@ pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
 /// that read from cache anyway.
 pub fn invalidate(alias: &str) -> Result<()> {
     with_cache_lock(|| {
-        let mut cache = load_cache();
+        let mut cache = load_cache_checked()?;
         if drop_fetch_state(&mut cache, alias) {
             save_cache(&cache).context("writing usage cache invalidation")?;
         }
@@ -613,7 +613,7 @@ pub fn get_last_used(alias: &str) -> i64 {
 /// Record that an alias was just selected by `use`.
 pub fn set_last_used(alias: &str) -> Result<()> {
     with_cache_lock(|| {
-        let mut cache = load_cache();
+        let mut cache = load_cache_checked()?;
         cache
             .last_used
             .insert(alias.to_string(), crate::auth::now_unix_secs());
@@ -623,7 +623,7 @@ pub fn set_last_used(alias: &str) -> Result<()> {
 
 pub fn rename(old: &str, new: &str) -> Result<()> {
     with_cache_lock(|| {
-        let mut cache = load_cache();
+        let mut cache = load_cache_checked()?;
         if migrate_alias(&mut cache, old, new) {
             save_cache(&cache)?;
         }
@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_cache_load_rejects_malformed_state() {
+    fn cache_mutation_load_rejects_malformed_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.json");
         std::fs::write(&path, "not-json").unwrap();
@@ -829,7 +829,7 @@ mod tests {
         let error = match load_cache_checked_at(&path) {
             Err(error) => error,
             Ok(_) => {
-                panic!("profile deletion must stop rather than treating corrupt state as empty")
+                panic!("cache mutation must stop rather than treating corrupt state as empty")
             }
         };
 
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_cache_load_treats_only_a_missing_file_as_empty() {
+    fn cache_mutation_load_treats_only_a_missing_file_as_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing-cache.json");
 

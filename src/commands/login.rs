@@ -9,11 +9,10 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
         profile::validate_alias(a)?;
     }
 
-    if let Some(a) = alias {
-        let dst = profile::profile_auth_path(a)?;
-        if dst.exists() {
-            return reauth_profile(a, device, json).await;
-        }
+    if let Some(a) = alias
+        && profile::profile_exists(a)?
+    {
+        return reauth_profile(a, device, json).await;
     }
 
     let tokens = if device {
@@ -64,7 +63,11 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
 }
 
 async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
+    let lease = profile::acquire_profile_lease_async(alias.to_string()).await?;
     let dst = profile::profile_auth_path(alias)?;
+    // Re-check only after the lease is held: a rename/delete may have won the
+    // race between command dispatch and lease acquisition.
+    crate::auth::read_auth(&dst)?;
     let old_info = crate::auth::read_account_info(&dst);
 
     if !json {
@@ -81,7 +84,8 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
         login::run_device_auth().await?
     };
     let (auth_val, new_info) = login::build_auth_from_tokens(&tokens);
-    profile::replace_profile_auth_and_live_if_current(alias, &auth_val)?;
+    profile::replace_profile_auth_and_live_if_current_leased(&lease, &auth_val)?;
+    drop(lease);
     if let Err(err) = workspace::refresh_for_auth(&auth_val).await {
         tracing::debug!("workspace metadata unavailable after re-login: {err}");
     }

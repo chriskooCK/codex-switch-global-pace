@@ -239,8 +239,7 @@ pub fn calculate_global_weekly_summary(
                 GlobalPaceWeighting::Equal,
                 accounts
                     .iter()
-                    .map(|account| account.effective_capacity)
-                    .sum(),
+                    .fold(0.0, |total, account| total + account.effective_capacity),
                 account_count * 100.0,
                 averages.map(|values| values.0),
                 averages.map(|values| values.1),
@@ -534,6 +533,7 @@ mod tests {
         assert_eq!(summary.aggregate_used_percent, None);
         assert_eq!(summary.aggregate_elapsed_percent, None);
         assert_eq!(summary.effective_capacity, 0.0);
+        assert!(summary.effective_capacity.is_sign_positive());
         assert_eq!(summary.normal_capacity, 0.0);
         assert_eq!(summary.included_accounts, 0);
         assert_eq!(summary.excluded_accounts, 2);

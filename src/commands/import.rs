@@ -19,25 +19,34 @@ fn rotated_credentials(stage: &str) -> bool {
     stage == STAGE_TOKEN_ROTATED || stage == STAGE_TOKEN_ROTATION_LOST
 }
 
-/// Save credentials after the auth server rotated them and a later import step
-/// failed.
+/// Promote or preserve the durable stage written immediately after the auth
+/// server rotated credentials when a later import step fails.
 ///
 /// They go to the profile store rather than back to the source file: it is the
 /// tool's own storage, so it stays writable when the imported dump is not (auth
 /// dumps are routinely copied in read-only), and it is where a successful
-/// import would have put them. Validation never completed, so the rescue always
-/// creates a unique profile rather than overwriting an existing identity. The
-/// source file keeps the consumed token either way — that is unavoidable once
-/// the server has rotated it — so the message has to steer the user away from
-/// re-importing it.
+/// import would have put them. Validation never completed, so recovery never
+/// overwrites an existing identity: it creates a unique profile when safe and
+/// otherwise retains the exact credential in the private recovery directory.
+/// The source file keeps the consumed token either way — that is unavoidable
+/// once the server has rotated it — so the message has to steer the user away
+/// from re-importing it.
 fn rescue_rotated_credentials(
     source: &std::path::Path,
     val: serde_json::Value,
     alias: Option<&str>,
     suggested_alias: Option<&str>,
+    stage: Option<profile::ImportRotationStage>,
     cause: &anyhow::Error,
 ) -> profile::ImportFailure {
-    match profile::save_recovered_import_auth_value(val, alias, suggested_alias) {
+    let staged_path = stage.as_ref().and_then(|stage| {
+        stage
+            .contains(&val)
+            .ok()
+            .filter(|contains_latest| *contains_latest)
+            .map(|_| stage.path().to_path_buf())
+    });
+    match profile::save_recovered_import_auth_value_with_stage(val, alias, suggested_alias, stage) {
         Ok(profile::RecoveredImportAction::Profile(action)) => profile::ImportFailure {
             source: source.to_path_buf(),
             stage: STAGE_TOKEN_ROTATED,
@@ -65,14 +74,26 @@ fn rescue_rotated_credentials(
                 ),
             }
         }
-        Err(save_error) => profile::ImportFailure {
-            source: source.to_path_buf(),
-            stage: STAGE_TOKEN_ROTATION_LOST,
-            error: format!(
-                "import failed after the auth server rotated this account's credentials \
-                 ({cause}), and {}",
-                unsaveable_rotation_reason(&save_error)
-            ),
+        Err(save_error) => match staged_path {
+            Some(path) => profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: STAGE_TOKEN_ROTATED,
+                error: format!(
+                    "import failed after credential rotation ({cause}), and promoting the staged \
+                     credentials also failed ({save_error:#}). The usable credentials remain at \
+                     {}. Keep that file private and sign in again before deleting it.",
+                    path.display()
+                ),
+            },
+            None => profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: STAGE_TOKEN_ROTATION_LOST,
+                error: format!(
+                    "import failed after the auth server rotated this account's credentials \
+                     ({cause}), and {}",
+                    unsaveable_rotation_reason(&save_error)
+                ),
+            },
         },
     }
 }
@@ -280,23 +301,34 @@ async fn import_one_file(
         .as_deref()
         .map(profile::alias_from_email);
 
+    let mut rotation_stage: Option<profile::ImportRotationStage> = None;
+    let validation = usage::validate_import_auth(&mut val, |rotated| {
+        if let Some(stage) = rotation_stage.as_mut() {
+            stage.persist(rotated)
+        } else {
+            rotation_stage = Some(profile::stage_import_rotation(rotated)?);
+            Ok(())
+        }
+    })
+    .await;
     let usage::ImportValidation {
         refreshed,
         validated_account_id,
         result,
-    } = usage::validate_import_auth(&mut val).await;
+    } = validation;
     let rotated = refreshed.is_some();
     let usage = match result {
         Ok(usage) => usage,
-        // A rotation already happened inside the validation, so `val` now holds
-        // the only credentials the auth server still accepts. They must be
-        // written somewhere durable before this failure is reported.
+        // The rotation callback already staged the only credentials the auth
+        // server still accepts. Hand that stage to recovery before reporting
+        // the later validation failure.
         Err(error) if rotated => {
             return Err(rescue_rotated_credentials(
                 source,
                 val,
                 alias,
                 suggested_alias.as_deref(),
+                rotation_stage.take(),
                 &error,
             ));
         }
@@ -311,8 +343,8 @@ async fn import_one_file(
 
     // This second structure check inspects the *refreshed* value, so a
     // malformed refresh reply fails it at a point where the source file's
-    // token is already spent. `val` is then the only credential the auth
-    // server still accepts and has to be rescued, exactly as above.
+    // token is already spent. The durable stage must be promoted or preserved,
+    // exactly as above.
     let mut account = match auth::validate_auth_value(&val) {
         Ok(account) => account,
         Err(error) if rotated => {
@@ -321,6 +353,7 @@ async fn import_one_file(
                 val,
                 alias,
                 suggested_alias.as_deref(),
+                rotation_stage.take(),
                 &error,
             ));
         }
@@ -339,25 +372,48 @@ async fn import_one_file(
         stage: "usage_validation",
         error: "Usage API validation did not bind an account_id".to_string(),
     })?;
-    let action = match profile::save_imported_auth_value(
+    let staged_path = match (rotated, rotation_stage.as_ref()) {
+        (true, Some(stage)) => Some(stage.path().to_path_buf()),
+        (true, None) => {
+            return Err(profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: STAGE_TOKEN_ROTATION_LOST,
+                error: "usage validation completed with rotated credentials but no durable import stage"
+                    .to_string(),
+            });
+        }
+        (false, _) => None,
+    };
+    let action = match profile::save_imported_auth_value_with_stage(
         &val,
         alias,
         &validated_account_id,
         suggested_alias.as_deref(),
+        rotation_stage.take(),
     ) {
         Ok(action) => action,
-        // Policy may change while the network call is in flight, and storage
-        // may fail after validation. In either case `val` is now the only copy
-        // of a rotated credential, so try both profile and quarantine recovery
-        // before declaring it lost.
+        // A validated commit failure must not be retried under another alias:
+        // that could bypass the duplicate-identity or managed-policy boundary.
+        // The exact staged file stays in recovery and is the durable copy.
         Err(error) if rotated => {
-            return Err(rescue_rotated_credentials(
-                source,
-                val,
-                alias,
-                suggested_alias.as_deref(),
-                &error,
-            ));
+            let Some(recovery) = staged_path.as_deref() else {
+                return Err(profile::ImportFailure {
+                    source: source.to_path_buf(),
+                    stage: STAGE_TOKEN_ROTATION_LOST,
+                    error: "validated rotated credentials lost their durable import stage"
+                        .to_string(),
+                });
+            };
+            return Err(profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: STAGE_TOKEN_ROTATED,
+                error: format!(
+                    "validated import could not be committed ({error:#}); the rotated credential \
+                     copy was quarantined at {} and was not made into an activatable profile. \
+                     Keep that file private and sign in again before deleting it.",
+                    recovery.display()
+                ),
+            });
         }
         Err(error) => {
             return Err(profile::ImportFailure {
