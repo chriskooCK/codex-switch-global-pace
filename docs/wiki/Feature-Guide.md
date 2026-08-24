@@ -54,6 +54,12 @@ included when its reset timestamp is valid. Missing, expired, inconsistent, or
 failed weekly data is counted as unavailable instead of being guessed. The box
 also shows the nearest included-account reset.
 
+Every quota meter uses the same relative state: yellow when actual usage is
+ahead of elapsed-time pace, and green when usage is at or behind pace. The
+Global meter compares aggregate usage with aggregate elapsed time in exactly
+the same way. Fully exhausted quotas are red, unavailable comparisons are
+neutral, and quota labels carry no warning suffix.
+
 The TUI account detail page is a single scrollable column with identity and organization labels, token expiry times in the local timezone, every quota pool with a pace marker, available reset cards, and the models the account may use. Model names and reasoning-effort capabilities are discovered from the authenticated service at runtime, not hardcoded. The full shortcut list is in the [command reference](Command-Reference.md#tui-shortcuts) and under `h` inside the TUI.
 
 ## Select an account

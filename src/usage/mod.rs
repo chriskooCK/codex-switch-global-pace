@@ -29,9 +29,14 @@ pub use global_pace::{
 pub use parse::parse_usage;
 pub(crate) use reset_credits::reset_credit_expiry_sort_key;
 pub use reset_credits::{consume_earliest_reset_credit, earliest_reset_credit};
+#[allow(unused_imports)]
+pub use scoring::visible_pace_percent;
+pub(crate) use scoring::{
+    QuotaPaceState, normalized_quota_usage, quota_pace_state, visible_pace_marker,
+};
 pub use scoring::{
     is_available, is_candidate_eligible, pace_percent, pick_switch_target, score_candidates,
-    usage_has_active_warmup_window, visible_pace_percent,
+    usage_has_active_warmup_window,
 };
 #[allow(unused_imports)]
 pub use scoring::{score_unified, warmup_window_active};
@@ -41,6 +46,25 @@ pub struct WindowUsage {
     pub used_percent: Option<f64>,
     pub resets_at: Option<i64>,
     pub window_minutes: Option<i64>,
+}
+
+/// Resolve the label and duration from window metadata, using the caller's
+/// explicit slot definition only when the API omitted that metadata.
+pub(crate) fn quota_window_spec(
+    window: &WindowUsage,
+    default_label: &str,
+    default_secs: i64,
+) -> (String, i64) {
+    match window.window_minutes {
+        Some(minutes) if minutes > 0 && minutes % 1_440 == 0 => {
+            (format!("{}d", minutes / 1_440), minutes.saturating_mul(60))
+        }
+        Some(minutes) if minutes > 0 && minutes % 60 == 0 => {
+            (format!("{}h", minutes / 60), minutes.saturating_mul(60))
+        }
+        Some(minutes) => (format!("{minutes}m"), minutes.saturating_mul(60)),
+        None => (default_label.to_string(), default_secs),
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -413,6 +437,24 @@ mod pool_row_tests {
         assert!(!rows[0].unavailable);
         assert_eq!(rows[0].primary.as_ref().unwrap().used_percent, Some(42.0));
         assert_eq!(rows[0].secondary.as_ref().unwrap().used_percent, Some(10.0));
+    }
+
+    #[test]
+    fn quota_window_spec_prefers_metadata_over_the_slot_default() {
+        let weekly = WindowUsage {
+            window_minutes: Some(10_080),
+            ..Default::default()
+        };
+        let omitted = WindowUsage::default();
+
+        assert_eq!(
+            quota_window_spec(&weekly, "5h", WINDOW_5H_SECS),
+            ("7d".to_string(), WINDOW_7D_SECS)
+        );
+        assert_eq!(
+            quota_window_spec(&omitted, "5h", WINDOW_5H_SECS),
+            ("5h".to_string(), WINDOW_5H_SECS)
+        );
     }
 
     #[test]

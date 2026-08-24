@@ -64,6 +64,12 @@ valid. Accounts whose usage or weekly reset cannot be trusted are reported as
 unavailable. The current API does not expose a reliable comparable weekly
 capacity, so accounts are weighted equally.
 
+Quota meters use one relative rule everywhere: yellow means actual usage is
+ahead of the elapsed-time pace, while green means usage is at or behind pace.
+The Global meter applies the same rule to aggregate usage and aggregate elapsed
+time. A fully exhausted quota is red, and unavailable comparisons stay neutral;
+quota labels do not append warning punctuation.
+
 ## Existing profiles and daemon compatibility
 
 The application deliberately reuses the original data directory:

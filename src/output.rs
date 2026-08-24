@@ -196,19 +196,21 @@ pub fn global_weekly_to_json(summary: &GlobalWeeklySummary) -> JsonGlobalWeekly 
     }
 }
 
-fn window_to_json(w: &WindowUsage, label: &str, window_secs: i64) -> JsonWindow {
+fn window_to_json(w: &WindowUsage, default_label: &str, default_secs: i64) -> Option<JsonWindow> {
+    let used = w.used_percent?;
+    crate::usage::normalized_quota_usage(Some(used))?;
+    let (label, window_secs) = crate::usage::quota_window_spec(w, default_label, default_secs);
     let resets_in_seconds = w.resets_at.map(|ts| ts - crate::auth::now_unix_secs());
-    let used = w.used_percent.unwrap_or(0.0);
     let pace = crate::usage::pace_percent(w, window_secs);
-    JsonWindow {
-        label: label.to_string(),
+    Some(JsonWindow {
+        label,
         used_percent: used,
         resets_at: w.resets_at,
         resets_in_seconds,
         remaining_percent: (100.0 - used).max(0.0),
         pace_percent: pace,
-        over_pace: pace.map(|p| used > p),
-    }
+        over_pace: pace.map(|pace| used > pace),
+    })
 }
 
 fn reset_credit_to_json(credit: &ResetCredit) -> JsonResetCredit {
@@ -228,11 +230,11 @@ fn additional_limit_to_json(l: &AdditionalRateLimit) -> JsonAdditionalLimit {
         primary: l
             .primary
             .as_ref()
-            .map(|w| Box::new(window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS))),
+            .and_then(|w| window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS).map(Box::new)),
         secondary: l
             .secondary
             .as_ref()
-            .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
+            .and_then(|w| window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS).map(Box::new)),
     }
 }
 
@@ -248,14 +250,12 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                 .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
             JsonUsage::Ok {
                 fetched_at,
-                primary: u
-                    .primary
-                    .as_ref()
-                    .map(|w| Box::new(window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS))),
-                secondary: u
-                    .secondary
-                    .as_ref()
-                    .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
+                primary: u.primary.as_ref().and_then(|w| {
+                    window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS).map(Box::new)
+                }),
+                secondary: u.secondary.as_ref().and_then(|w| {
+                    window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS).map(Box::new)
+                }),
                 credits_balance: u.credits_balance,
                 unlimited_credits: u.unlimited_credits,
                 reset_credits_available_count: u.reset_credits_available_count,
@@ -606,6 +606,27 @@ mod tests {
             json.pointer("/reset_credits/0/expires_at"),
             Some(&Value::Null)
         );
+    }
+
+    #[test]
+    fn json_does_not_invent_a_window_when_usage_is_missing() {
+        let missing = WindowUsage {
+            used_percent: None,
+            resets_at: Some(crate::auth::now_unix_secs() + 60),
+            window_minutes: Some(crate::usage::WINDOW_5H_SECS / 60),
+        };
+        let usage = UsageInfo {
+            primary: Some(missing.clone()),
+            additional_limits: vec![AdditionalRateLimit {
+                primary: Some(missing),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
+        assert_eq!(json["primary"], Value::Null);
+        assert!(json.pointer("/additional_limits/0/primary").is_none());
     }
 
     #[test]

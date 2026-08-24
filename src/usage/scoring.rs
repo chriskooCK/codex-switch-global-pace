@@ -56,27 +56,77 @@ pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
     main_active && additional_active
 }
 
-/// Calculate pace: the expected used_percent if consumption were even across the window.
-/// Returns None if resets_at is unavailable.
+/// Calculate pace: the expected used percentage if consumption were even across the window.
+/// Invalid or stale windows cannot produce a meaningful comparison.
 pub fn pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
+    if window_secs <= 0 {
+        return None;
+    }
     let resets_at = w.resets_at?;
     let now = auth::now_unix_secs();
-    let remaining_secs = (resets_at - now).max(0) as f64;
-    let elapsed_secs = (window_secs as f64 - remaining_secs).clamp(0.0, window_secs as f64);
-    Some((elapsed_secs / window_secs as f64 * 100.0).clamp(0.0, 100.0))
+    let remaining_secs = resets_at.checked_sub(now)?;
+    if remaining_secs <= 0 || remaining_secs > window_secs {
+        return None;
+    }
+    let elapsed_secs = window_secs - remaining_secs;
+    Some(elapsed_secs as f64 / window_secs as f64 * 100.0)
 }
 
-/// Pace marker for UI/text rendering.
-/// Hide it when the UI would already render `0% left`, because there is no meaningful
-/// remaining quota to pace against.
-pub fn visible_pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
-    let used = w.used_percent.unwrap_or(0.0).min(100.0);
-    let remaining = (100.0 - used).max(0.0);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaPaceState {
+    Exhausted,
+    UsageAhead,
+    PaceAheadOrEqual,
+    Unavailable,
+}
+
+/// Clamp a valid quota percentage for display without inventing missing data.
+pub(crate) fn normalized_quota_usage(used_percent: Option<f64>) -> Option<f64> {
+    used_percent
+        .filter(|used| used.is_finite() && *used >= 0.0)
+        .map(|used| used.min(100.0))
+}
+
+/// Classify quota presentation once so every renderer maps the same state to color.
+pub(crate) fn quota_pace_state(
+    used_percent: Option<f64>,
+    pace_percent: Option<f64>,
+) -> QuotaPaceState {
+    let Some(used) = normalized_quota_usage(used_percent) else {
+        return QuotaPaceState::Unavailable;
+    };
+    if used >= 100.0 {
+        return QuotaPaceState::Exhausted;
+    }
+    let Some(pace) = pace_percent.filter(|pace| pace.is_finite() && (0.0..=100.0).contains(pace))
+    else {
+        return QuotaPaceState::Unavailable;
+    };
+    if used > pace {
+        QuotaPaceState::UsageAhead
+    } else {
+        QuotaPaceState::PaceAheadOrEqual
+    }
+}
+
+/// Keep a pace marker only while the quota amount is known and visibly remains.
+pub(crate) fn visible_pace_marker(
+    used_percent: Option<f64>,
+    pace_percent: Option<f64>,
+) -> Option<f64> {
+    let used = normalized_quota_usage(used_percent)?;
+    let remaining = 100.0 - used;
     if remaining.round() <= 0.0 {
         None
     } else {
-        pace_percent(w, window_secs)
+        pace_percent.filter(|pace| pace.is_finite() && (0.0..=100.0).contains(pace))
     }
+}
+
+/// Public compatibility wrapper for library consumers that need a window marker.
+#[allow(dead_code)]
+pub fn visible_pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
+    visible_pace_marker(w.used_percent, pace_percent(w, window_secs))
 }
 
 /// Whether an account is currently usable (both windows have remaining quota).
@@ -895,23 +945,83 @@ mod tests {
     }
 
     #[test]
-    fn test_visible_pace_percent_hidden_when_ui_shows_zero_left() {
+    fn pace_marker_is_hidden_when_ui_shows_zero_left() {
         let w = WindowUsage {
             used_percent: Some(99.6),
             resets_at: Some(auth::now_unix_secs() + 3600),
             window_minutes: None,
         };
-        assert_eq!(visible_pace_percent(&w, WINDOW_5H_SECS), None);
+        assert_eq!(
+            visible_pace_marker(w.used_percent, pace_percent(&w, WINDOW_5H_SECS)),
+            None
+        );
     }
 
     #[test]
-    fn test_visible_pace_percent_shown_when_remaining_exists() {
+    fn quota_pace_state_owns_all_presentation_boundaries() {
+        assert_eq!(
+            quota_pace_state(Some(1.0), Some(0.0)),
+            QuotaPaceState::UsageAhead
+        );
+        assert_eq!(
+            quota_pace_state(Some(50.0), Some(50.0)),
+            QuotaPaceState::PaceAheadOrEqual
+        );
+        assert_eq!(
+            quota_pace_state(Some(95.0), Some(99.0)),
+            QuotaPaceState::PaceAheadOrEqual
+        );
+        assert_eq!(
+            quota_pace_state(Some(99.6), Some(50.0)),
+            QuotaPaceState::UsageAhead
+        );
+        assert_eq!(
+            quota_pace_state(Some(100.0), None),
+            QuotaPaceState::Exhausted
+        );
+        assert_eq!(
+            quota_pace_state(None, Some(20.0)),
+            QuotaPaceState::Unavailable
+        );
+        assert_eq!(
+            quota_pace_state(Some(f64::NAN), Some(20.0)),
+            QuotaPaceState::Unavailable
+        );
+    }
+
+    #[test]
+    fn pace_requires_a_current_consistent_window() {
+        let now = auth::now_unix_secs();
+        let window = |resets_at| WindowUsage {
+            used_percent: Some(20.0),
+            resets_at: Some(resets_at),
+            window_minutes: None,
+        };
+
+        assert_eq!(pace_percent(&window(now - 1), WINDOW_5H_SECS), None);
+        assert_eq!(
+            pace_percent(&window(now + WINDOW_5H_SECS + 60), WINDOW_5H_SECS),
+            None
+        );
+        assert_eq!(pace_percent(&window(now + 60), 0), None);
+        assert_eq!(pace_percent(&window(now + 60), -1), None);
+    }
+
+    #[test]
+    fn pace_marker_is_shown_when_remaining_exists() {
         let w = WindowUsage {
             used_percent: Some(99.4),
             resets_at: Some(auth::now_unix_secs() + 3600),
             window_minutes: None,
         };
-        assert!(visible_pace_percent(&w, WINDOW_5H_SECS).is_some());
+        assert!(visible_pace_marker(w.used_percent, pace_percent(&w, WINDOW_5H_SECS)).is_some());
+    }
+
+    #[test]
+    fn visible_pace_marker_requires_known_remaining_quota() {
+        assert_eq!(visible_pace_marker(None, Some(50.0)), None);
+        assert_eq!(visible_pace_marker(Some(99.6), Some(50.0)), None);
+        assert_eq!(visible_pace_marker(Some(99.4), Some(50.0)), Some(50.0));
     }
 
     #[test]
