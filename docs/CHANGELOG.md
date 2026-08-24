@@ -1,5 +1,12 @@
 # Changelog
 
+## v20260824.5.0 — 2026-08-24
+
+- **Short-terminal quota detail** — Removed unused vertical padding inside the
+  selected-account box so the Global pace marker row does not hide the final
+  additional quota meter on an 80×24 terminal. Horizontal meter alignment and
+  the explicit spacing between quota pools remain unchanged.
+
 ## v20260824.4.0 — 2026-08-24
 
 - **Readable Global pace meter** — The Global box now mirrors account quota
