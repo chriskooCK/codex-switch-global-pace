@@ -3,7 +3,7 @@
 **A multi-account manager and global weekly quota dashboard for
 [OpenAI Codex CLI](https://github.com/openai/codex).** It treats the weekly
 allowances of all available profiles as one pool, while preserving the login,
-switching, launch, warmup, reset-card, JSON, and daemon workflows from its
+switching, warmup, reset-card, JSON, and daemon workflows from its
 one-time `codex-switch` source snapshot.
 
 [中文说明](README_CN.md) · [Documentation](docs/wiki/Home.md) ·
@@ -39,12 +39,13 @@ Then add an account or open the dashboard:
 codex-switch-global-pace login
 codex-switch-global-pace list
 codex-switch-global-pace use
-codex-switch-global-pace launch
 codex-switch-global-pace tui
 ```
 
 Running `codex-switch-global-pace` with no arguments opens the TUI. On Windows,
 double-clicking `codex-switch-global-pace.exe` therefore opens the same dashboard.
+`use` changes the live account used by the next Codex process; restart an
+already-running Codex app or CLI after switching.
 
 ## Global Weekly Pace
 

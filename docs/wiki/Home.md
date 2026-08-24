@@ -15,9 +15,9 @@
 | I want to… | Start here |
 |---|---|
 | Install codex-switch-global-pace and add my first account | [Getting started](Getting-Started) |
-| Manage accounts, watch quota, select, launch, or run the daemon | [Feature guide](Feature-Guide) |
+| Manage accounts, watch quota, switch accounts, or run the daemon | [Feature guide](Feature-Guide) |
 | Look up an exact command, flag, or TUI shortcut | [Command reference](Command-Reference) |
-| Configure paths, proxy, cache, daemon, or launch behavior | [Configuration](Configuration) |
+| Configure paths, proxy, cache, or daemon behavior | [Configuration](Configuration) |
 | Update the binary or move between release channels | [Updating](Updating) |
 | Install or test the rolling `dev` build | [Testing development releases](Development-Releases) |
 | Diagnose an error or recover a profile | [Troubleshooting](Troubleshooting) |

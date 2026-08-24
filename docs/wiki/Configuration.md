@@ -71,14 +71,10 @@ token_check_interval_secs = 300    # proactive token refresh; 0 is normalized to
 notify = false                     # desktop notification on switch
 log_level = "error"                # daemon log level; empty is normalized to "error"
 defer_switch_while_codex_running = true  # hold a pending switch during interactive Codex sessions
-
-[launch]
-restore_delay_secs = 3             # seconds before restoring auth.json after launch
 ```
 
-`launch.restore_delay_secs` is a compatibility delay, not a handshake; increase it only if the local Codex process reads authentication later than three seconds after launch.
-
 The legacy `[use] mode` and `[use] min_remaining` keys are ignored and produce a startup warning; the unified scoring algorithm replaced the old selection modes.
+The removed `[launch]` table is also ignored with a startup warning and can be deleted from existing configuration files.
 
 ## Environment variables
 

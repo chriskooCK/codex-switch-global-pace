@@ -22,8 +22,6 @@ pub struct AppConfig {
     pub use_cfg: UseConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
-    #[serde(default)]
-    pub launch: LaunchConfig,
 }
 
 impl AppConfig {
@@ -54,13 +52,6 @@ impl AppConfig {
                 "config.daemon.token_check_interval_secs=0 is invalid; using 300 instead".into(),
             );
             self.daemon.token_check_interval_secs = 300;
-        }
-        // Not merely a tidy default: at zero, `launch` restores the original
-        // auth.json before Codex has read the staged one, so the session runs
-        // on the wrong account with nothing reporting it.
-        if self.launch.restore_delay_secs == 0 {
-            warnings.push("config.launch.restore_delay_secs=0 is invalid; using 3 instead".into());
-            self.launch.restore_delay_secs = 3;
         }
         self
     }
@@ -168,33 +159,18 @@ impl Default for DaemonConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct LaunchConfig {
-    /// Seconds to wait after starting codex before restoring auth.json (default: 3).
-    /// Codex CLI reads auth.json only at startup; this delay ensures it finishes reading
-    /// before the original auth is restored.
-    pub restore_delay_secs: u64,
-}
-
-impl Default for LaunchConfig {
-    fn default() -> Self {
-        Self {
-            restore_delay_secs: 3,
-        }
-    }
-}
-
 pub fn config_path() -> anyhow::Result<PathBuf> {
     Ok(app_home()?.join("config.toml"))
 }
 
-/// Probe struct to detect deprecated `[use]` keys that are silently ignored.
+/// Probe fields that the active configuration schema intentionally ignores.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct DeprecatedConfigProbe {
     #[serde(rename = "use")]
     use_cfg: Option<DeprecatedUseProbe>,
+    #[serde(rename = "launch")]
+    removed_launch: Option<toml::Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,20 +185,26 @@ fn deprecated_key_warnings(raw: &str) -> Vec<String> {
     let Ok(probe) = toml::from_str::<DeprecatedConfigProbe>(raw) else {
         return warnings;
     };
-    let Some(use_cfg) = probe.use_cfg else {
-        return warnings;
-    };
-    if use_cfg.mode.is_some() {
-        warnings.push(
-            "config: [use] 'mode' is deprecated and ignored in v0.0.13+, \
-             the adaptive algorithm replaces all selection modes"
-                .into(),
-        );
+    if let Some(use_cfg) = probe.use_cfg {
+        if use_cfg.mode.is_some() {
+            warnings.push(
+                "config: [use] 'mode' is deprecated and ignored in v0.0.13+, \
+                 the adaptive algorithm replaces all selection modes"
+                    .into(),
+            );
+        }
+        if use_cfg.min_remaining.is_some() {
+            warnings.push(
+                "config: [use] 'min_remaining' is deprecated and ignored in v0.0.13+, \
+                 the adaptive algorithm replaces all selection modes"
+                    .into(),
+            );
+        }
     }
-    if use_cfg.min_remaining.is_some() {
+    if probe.removed_launch.is_some() {
         warnings.push(
-            "config: [use] 'min_remaining' is deprecated and ignored in v0.0.13+, \
-             the adaptive algorithm replaces all selection modes"
+            "config: [launch] is ignored because the launch command was removed in \
+             v20260824.2.0; delete this table"
                 .into(),
         );
     }
@@ -335,7 +317,7 @@ pub fn daemon_log_level() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::load_from_str;
+    use super::{load_from_str, load_from_str_with_warnings};
 
     #[test]
     fn daemon_zero_intervals_use_defaults() {
@@ -354,20 +336,16 @@ cache_refresh_interval_secs = 0
         assert_eq!(config.daemon.cache_refresh_interval_secs, 300);
     }
 
-    /// A zero restore delay makes `launch` put the original auth.json back
-    /// before Codex has read the staged one, so the session silently runs on
-    /// the wrong account. Every sibling interval already gets this treatment.
     #[test]
-    fn launch_zero_restore_delay_uses_default_and_warns() {
-        let (config, warnings) =
-            super::load_from_str_with_warnings("[launch]\nrestore_delay_secs = 0\n").unwrap();
+    fn removed_launch_config_is_ignored_with_a_warning() {
+        let (_, warnings) =
+            load_from_str_with_warnings("[launch]\nrestore_delay_secs = 3\n").unwrap();
 
-        assert_eq!(config.launch.restore_delay_secs, 3);
         assert!(
             warnings
                 .iter()
-                .any(|warning| warning.contains("restore_delay_secs")),
-            "a silently-corrected launch delay is what hands Codex the wrong account: {warnings:?}"
+                .any(|warning| warning.contains("[launch]") && warning.contains("removed")),
+            "removed configuration must not look active: {warnings:?}"
         );
     }
 }

@@ -68,10 +68,9 @@ codex-switch-global-pace also notices logins performed outside of it: when the l
 codex-switch-global-pace list        # accounts, quota, availability
 codex-switch-global-pace tui         # interactive dashboard
 codex-switch-global-pace use         # switch to the best eligible account
-codex-switch-global-pace launch      # select, start Codex, restore auth afterwards
 ```
 
-`use` without an alias ranks all accounts with the adaptive scoring algorithm; `use <alias>` switches explicitly. Codex reads authentication at startup, so restart Codex after a manual switch — or use `launch`, which handles staging and restoration for you.
+`use` without an alias ranks all accounts with the adaptive scoring algorithm; `use <alias>` switches explicitly. Codex reads authentication at startup, so restart Codex after switching.
 
 ## Where your data lives
 
@@ -85,6 +84,6 @@ other.
 
 ## Next steps
 
-- Learn account, quota, launch, and daemon workflows in the [Feature guide](Feature-Guide).
+- Learn account, quota, switching, and daemon workflows in the [Feature guide](Feature-Guide).
 - Look up exact commands and TUI shortcuts in the [Command reference](Command-Reference).
 - Keep the binary current with [Updating](Updating).

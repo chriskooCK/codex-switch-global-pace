@@ -85,7 +85,7 @@ GitHub Actions repeats the core checks on Linux, macOS, and Windows. A local pas
 - Never log or commit tokens, profile files, emails, account IDs, workspace names, or proxy credentials.
 - Validate external JSON and CLI input at their boundaries; do not scatter duplicate internal checks.
 - Keep JSON stdout machine-readable. Route progress and diagnostics to stderr.
-- Serialize live-auth mutations with `auth.lock` and temporary launch staging with `launch.lock`.
+- Serialize live-auth mutations with `auth.lock`. Preserve the compatibility-first `launch.lock` ordering while this project shares state with older `codex-switch` binaries.
 - Use atomic replacement for credentials, cache, and daemon state.
 - Keep profile deletion recoverable and refuse deletion of the active profile.
 - Do not remove a daemon PID file without proving lock ownership.

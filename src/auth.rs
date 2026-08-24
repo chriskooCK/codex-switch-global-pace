@@ -541,8 +541,8 @@ pub fn backup_auth(path: &Path) -> Result<()> {
 
 /// A backup path no earlier backup already occupies.
 ///
-/// Nanoseconds rather than seconds: two switches inside one second are ordinary
-/// (`use` followed by `launch`, or any script), and a second-resolution name
+/// Nanoseconds rather than seconds: two scripted switches inside one second are
+/// ordinary, and a second-resolution name
 /// made the later backup overwrite the earlier one — quietly retaining fewer
 /// real recovery points than `MAX_BACKUPS` promises.
 ///
@@ -946,8 +946,8 @@ mod tests {
         names
     }
 
-    /// Two switches inside one second are ordinary — `use` then `launch`, or
-    /// any script. A second-resolution backup name made the later one overwrite
+    /// Two scripted switches inside one second are ordinary. A
+    /// second-resolution backup name made the later one overwrite
     /// the earlier, so the pre-switch credentials the user expected to be able
     /// to recover were gone and `MAX_BACKUPS` retained fewer real recovery
     /// points than it claims.

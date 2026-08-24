@@ -79,20 +79,9 @@ If every account is ineligible, the best fallback is reported instead of pretend
 
 Switching replaces the live `$CODEX_HOME/auth.json` atomically while holding a process lock. Restart Codex after a manual switch because Codex reads the file at startup.
 
-## Launch Codex with a profile
-
-`launch` selects or stages a profile, starts Codex, then restores the previous live authentication after the configured compatibility delay:
-
-```bash
-codex-switch-global-pace launch work -- --model gpt-5.4
-codex-switch-global-pace launch -- --full-auto
-```
-
-The launch lock serializes overlapping launch sessions. The restore delay is configurable (`launch.restore_delay_secs`) because Codex does not expose an authentication-read handshake.
-
 ## Recover exhausted accounts
 
-When the whole candidate pool is exhausted, an interactive `use` or `launch` can offer to consume the earliest-expiring reset card. Automation must opt in explicitly:
+When the whole candidate pool is exhausted, an interactive `use` can offer to consume the earliest-expiring reset card. Automation must opt in explicitly:
 
 ```bash
 codex-switch-global-pace use --consume-card
@@ -149,5 +138,5 @@ Never publish profile files, `auth.json`, unredacted debug output, proxy credent
 ## Next steps
 
 - Need an exact command, flag, or TUI shortcut? Open the [Command reference](Command-Reference).
-- Tune paths, proxy, daemon, and launch behavior in [Configuration](Configuration).
+- Tune paths, proxy, and daemon behavior in [Configuration](Configuration).
 - Something failed? Start with [Troubleshooting](Troubleshooting).

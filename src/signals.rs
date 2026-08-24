@@ -12,7 +12,7 @@ use anyhow::Result;
 /// Listens for the signals that mean "wind down now".
 pub(crate) struct ShutdownListener {
     #[cfg(unix)]
-    sigterm: Option<tokio::signal::unix::Signal>,
+    sigterm: tokio::signal::unix::Signal,
     #[cfg(unix)]
     sigint: tokio::signal::unix::Signal,
     #[cfg(not(unix))]
@@ -23,36 +23,16 @@ impl ShutdownListener {
     /// SIGTERM and SIGINT (Ctrl+C on Windows), for a process that owns its own
     /// lifetime and should shut down cleanly on either.
     pub(crate) fn new() -> Result<Self> {
-        Self::build(true)
-    }
-
-    /// Ctrl+C only.
-    ///
-    /// For a command that merely needs to unwind a critical section and then
-    /// keep running. Registering SIGTERM there would be a regression rather
-    /// than a hardening: tokio's registration is process-wide and permanent, so
-    /// after the critical section the command would go on ignoring `kill` for
-    /// as long as it lives.
-    pub(crate) fn interrupt_only() -> Result<Self> {
-        Self::build(false)
-    }
-
-    fn build(include_terminate: bool) -> Result<Self> {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             Ok(Self {
-                sigterm: include_terminate
-                    .then(|| signal(SignalKind::terminate()))
-                    .transpose()?,
+                sigterm: signal(SignalKind::terminate())?,
                 sigint: signal(SignalKind::interrupt())?,
             })
         }
         #[cfg(not(unix))]
         {
-            // Windows has no SIGTERM; console Ctrl+C is the only equivalent, so
-            // both constructors listen for the same thing.
-            let _ = include_terminate;
             Ok(Self {
                 ctrl_c: tokio::signal::windows::ctrl_c()?,
             })
@@ -65,19 +45,9 @@ impl ShutdownListener {
     pub(crate) async fn recv(&mut self) {
         #[cfg(unix)]
         {
-            match self.sigterm.as_mut() {
-                Some(sigterm) => {
-                    tokio::select! {
-                        _ = sigterm.recv() => {},
-                        _ = self.sigint.recv() => {},
-                    }
-                }
-                // `None` only means the stream ended, which tokio does not do
-                // for a live registration; treating it as a shutdown is the
-                // safe reading either way.
-                None => {
-                    self.sigint.recv().await;
-                }
+            tokio::select! {
+                _ = self.sigterm.recv() => {},
+                _ = self.sigint.recv() => {},
             }
         }
         #[cfg(not(unix))]
@@ -87,12 +57,8 @@ impl ShutdownListener {
     }
 }
 
-/// Serialises every test that raises a signal at this process.
-///
-/// A raise is process-wide, so two such tests running on different threads of
-/// the same test binary observe each other's signals. This module and
-/// `commands::launch` both have one, and they compile into the same binary.
-#[cfg(test)]
+/// Serialises tests that raise a signal at this process.
+#[cfg(all(test, unix))]
 pub(crate) static RAISE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(all(test, unix))]
@@ -128,32 +94,5 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), listener.recv())
             .await
             .expect("a SIGTERM delivered while the loop was busy must not be lost");
-    }
-
-    /// An interrupt-only listener must ignore SIGTERM outright rather than
-    /// register a handler for it: registering is irreversible for the life of
-    /// the process, so a command that only wants to unwind a short critical
-    /// section would otherwise stop responding to `kill` forever after.
-    #[tokio::test]
-    async fn interrupt_only_listener_does_not_answer_sigterm() {
-        let _raise = RAISE_LOCK.lock().await;
-        let mut listener = ShutdownListener::interrupt_only().expect("interrupt listener");
-
-        // Registered so the raise below cannot terminate this test process --
-        // proving the point requires surviving the signal, not the default
-        // action for it.
-        let mut witness = signal(SignalKind::terminate()).expect("witness listener");
-
-        // SAFETY: raising SIGTERM at our own process, with `witness`
-        // registered first so the default terminate action cannot fire.
-        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-        witness.recv().await;
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), listener.recv())
-                .await
-                .is_err(),
-            "an interrupt-only listener must leave SIGTERM to the rest of the program"
-        );
     }
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## v20260824.2.0 — 2026-08-24
+
+- **One account-switching workflow** — The `launch` command and its temporary
+  credential staging, restoration delay, and configuration have been removed.
+  Use `codex-switch-global-pace use` (or select an account in the TUI), then
+  restart Codex so the next process reads the active account. The historical
+  `launch.lock` is still honored only as a shared-state safety barrier against
+  older `codex-switch` processes; this binary can no longer launch Codex.
+
 ## v20260824.1.0 — 2026-08-24
 
 - **Independent Global Pace distribution** — The project is now distributed as
