@@ -36,13 +36,63 @@ const GLOBAL_PACE_WARNING_MIN: f64 = 90.0;
 const GLOBAL_WEEKLY_FULL_HEIGHT: u16 = 4;
 const GLOBAL_WEEKLY_COMPACT_HEIGHT: u16 = 1;
 const MIN_ACCOUNT_TABLE_HEIGHT: u16 = 6;
-const GLOBAL_PACE_BAR_MIN_WIDTH: usize = 86;
-const GLOBAL_PACE_BAR_BASELINE_CELLS: usize = 18;
-const GLOBAL_PACE_BAR_RESERVE_CELLS: usize = 6;
 const GLOBAL_PACE_BAR_RESERVE_RANGE: f64 = 50.0;
+const USAGE_BAR_LABEL_COLUMN_WIDTH: u16 = 6;
+const USAGE_BAR_SUFFIX_WIDTH: u16 = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UsageBarAreas {
+    label: Rect,
+    bar: Rect,
+    suffix: Rect,
+}
 
 fn base() -> Style {
     Style::default().bg(BG)
+}
+
+fn usage_bar_areas(area: Rect) -> UsageBarAreas {
+    let row = Rect {
+        height: area.height.min(1),
+        ..area
+    };
+    let label_column_width = row.width.min(USAGE_BAR_LABEL_COLUMN_WIDTH);
+    let remaining_width = row.width.saturating_sub(label_column_width);
+    let suffix_width = remaining_width.min(USAGE_BAR_SUFFIX_WIDTH);
+    let bar_width = remaining_width.saturating_sub(suffix_width);
+    let bar_x = row.x.saturating_add(label_column_width);
+    let suffix_x = bar_x.saturating_add(bar_width);
+
+    UsageBarAreas {
+        label: Rect {
+            // Keep the final column blank so dynamic window labels never run
+            // directly into the first meter cell.
+            width: label_column_width.saturating_sub(1),
+            ..row
+        },
+        bar: Rect {
+            x: bar_x,
+            width: bar_width,
+            ..row
+        },
+        suffix: Rect {
+            x: suffix_x,
+            width: suffix_width,
+            ..row
+        },
+    }
+}
+
+fn render_usage_bar_row(
+    f: &mut Frame,
+    areas: UsageBarAreas,
+    label: Line<'static>,
+    bar: Line<'static>,
+    suffix: Line<'static>,
+) {
+    f.render_widget(Paragraph::new(label).style(base()), areas.label);
+    f.render_widget(Paragraph::new(bar).style(base()), areas.bar);
+    f.render_widget(Paragraph::new(suffix).style(base()), areas.suffix);
 }
 
 fn status_message_color(is_error: bool) -> Color {
@@ -139,50 +189,49 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
 
     let block = Block::default()
         .title(format!(
-            " Global Weekly Pace · {} weight ",
+            " Global Weekly Pace · 100% normal · {} weight ",
             summary.weighting.as_str()
         ))
         .borders(Borders::ALL)
         .border_style(base().fg(C_BLUE))
         .style(base());
-    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner = block.inner(area);
+    let content = Rect {
+        x: inner.x.saturating_add(1),
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    let inner_width = content.width as usize;
     let pace_color = global_pace_color(summary.pace_percent);
 
-    let first_line = match (summary.pace_percent, summary.reserve_percent_points) {
-        (Some(pace), Some(reserve)) => {
-            let mut spans = vec![
-                Span::styled(
-                    format!("{pace:.1}%"),
-                    base().fg(pace_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" · {} reserve", format_reserve(reserve)),
-                    base().fg(pace_color),
-                ),
-            ];
-            if inner_width >= GLOBAL_PACE_BAR_MIN_WIDTH {
-                spans.extend([
-                    Span::styled("  deficit ", base().fg(DIM)),
-                    Span::styled(
-                        global_pace_bar(
-                            pace,
-                            GLOBAL_PACE_BAR_BASELINE_CELLS,
-                            GLOBAL_PACE_BAR_RESERVE_CELLS,
-                        ),
-                        base().fg(pace_color),
-                    ),
-                    Span::styled(" reserve · │ 100% normal", base().fg(DIM)),
-                ]);
-            } else if inner_width >= 45 {
-                spans.push(Span::styled(" · 100% = normal", base().fg(DIM)));
-            }
-            Line::from(spans)
-        }
-        _ => Line::from(Span::styled(
-            "No valid current weekly quota data",
-            base().fg(DIM),
-        )),
+    f.render_widget(block, area);
+
+    let gauge_area = Rect {
+        height: content.height.min(1),
+        ..content
     };
+    match (summary.pace_percent, summary.reserve_percent_points) {
+        (Some(pace), Some(reserve)) => {
+            let areas = usage_bar_areas(gauge_area);
+            render_usage_bar_row(
+                f,
+                areas,
+                Line::from(Span::styled("7d", base().fg(C_WHITE))),
+                Line::from(Span::styled(
+                    global_pace_bar(pace, areas.bar.width as usize),
+                    base().fg(pace_color),
+                )),
+                Line::from(Span::styled(
+                    format!(" {pace:>5.1}% {reserve:+6.1}%p reserve"),
+                    base().fg(pace_color).add_modifier(Modifier::BOLD),
+                )),
+            );
+        }
+        _ => f.render_widget(
+            Paragraph::new("No valid current weekly quota data").style(base().fg(DIM)),
+            gauge_area,
+        ),
+    }
 
     let counts = format!(
         "{} included / {} unavailable",
@@ -219,15 +268,16 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
         text
     };
 
-    f.render_widget(
-        Paragraph::new(vec![
-            first_line,
-            Line::from(Span::styled(second_text, base().fg(C_GRAY))),
-        ])
-        .block(block)
-        .style(base()),
-        area,
-    );
+    if content.height > 1 {
+        f.render_widget(
+            Paragraph::new(second_text).style(base().fg(C_GRAY)),
+            Rect {
+                y: content.y.saturating_add(1),
+                height: 1,
+                ..content
+            },
+        );
+    }
 }
 
 fn compact_global_weekly_line(
@@ -240,7 +290,7 @@ fn compact_global_weekly_line(
     } else {
         " Global: "
     };
-    let Some(pace) = summary.pace_percent else {
+    let (Some(pace), Some(reserve)) = (summary.pace_percent, summary.reserve_percent_points) else {
         return Line::from(vec![
             Span::styled(prefix, base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
             Span::styled(
@@ -253,7 +303,6 @@ fn compact_global_weekly_line(
         ]);
     };
     let pace_color = global_pace_color(Some(pace));
-    let reserve = summary.reserve_percent_points.unwrap_or(pace - 100.0);
     let mut suffix = format!(" · {}", format_reserve(reserve));
     if width >= 64 {
         suffix.push_str(&format!(
@@ -316,10 +365,19 @@ fn format_capacity(capacity: f64) -> String {
     }
 }
 
-/// A two-sided meter whose divider is the normal 100% baseline. The left side
-/// fills from 0 to 100; pace above normal extends into the reserve side. The
-/// reserve display is capped at +50% so extreme values cannot consume layout.
-fn global_pace_bar(pace_percent: f64, baseline_cells: usize, reserve_cells: usize) -> String {
+/// A two-sided meter whose divider is the normal 100% baseline. Its total width
+/// is supplied by the shared usage-bar layout, so Global and account meters
+/// occupy the same columns. The visible range is 0..150%.
+fn global_pace_bar(pace_percent: f64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let drawable_cells = width - 1;
+    let baseline_cells = ((100.0 / (100.0 + GLOBAL_PACE_BAR_RESERVE_RANGE)) * drawable_cells as f64)
+        .round()
+        .clamp(0.0, drawable_cells as f64) as usize;
+    let reserve_cells = drawable_cells.saturating_sub(baseline_cells);
     let baseline_filled = ((pace_percent.clamp(0.0, 100.0) / 100.0) * baseline_cells as f64)
         .round()
         .clamp(0.0, baseline_cells as f64) as usize;
@@ -1099,7 +1157,7 @@ fn render_usage_gauge(
     now: i64,
     area: Rect,
 ) {
-    let used = w.used_percent.unwrap_or(0.0).min(100.0);
+    let used = w.used_percent.unwrap_or(0.0).clamp(0.0, 100.0);
     let remaining_pct = (100.0 - used).max(0.0);
     let pace = crate::usage::visible_pace_percent(w, window_secs);
     let over = used >= 10.0 && pace.is_some_and(|p| used > p);
@@ -1109,13 +1167,10 @@ fn render_usage_gauge(
         .unwrap_or_else(|| "--".into());
     let remaining_secs = w.resets_at.map(|ts| ts - now).unwrap_or(0);
 
-    // Row 1: block-char bar  "5h  ████████░░|░░░░░░░  25% used  75% left"
+    // Row 1: fixed label and metrics columns around the shared-width meter.
     let gauge_area = Rect { height: 1, ..area };
-    let label_text = format!("{label}  ");
-    let suffix = format!("  {used:.0}% used  {remaining_pct:.0}% left");
-    let bar_width = (gauge_area.width as usize)
-        .saturating_sub(label_text.len())
-        .saturating_sub(suffix.len());
+    let areas = usage_bar_areas(gauge_area);
+    let bar_width = areas.bar.width as usize;
 
     let used_color = if used >= 90.0 {
         C_RED
@@ -1128,22 +1183,7 @@ fn render_usage_gauge(
     let remaining_style = base().fg(remaining_color(remaining_pct));
     let pace_style = base().fg(C_WHITE).add_modifier(Modifier::BOLD);
 
-    // L2: if bar_width is 0 (extremely narrow terminal), skip bar rendering entirely
-    if bar_width == 0 {
-        let reset_area = Rect {
-            y: area.y + 1,
-            height: 1,
-            ..area
-        };
-        let reset_text = format!("resets in {reset_str}");
-        f.render_widget(
-            Paragraph::new(reset_text).style(base().fg(reset_color(remaining_secs))),
-            reset_area,
-        );
-        return;
-    }
-
-    let pace_pos = pace.map(|p| {
+    let pace_pos = pace.filter(|_| bar_width > 0).map(|p| {
         ((p / 100.0) * bar_width as f64)
             .round()
             .clamp(0.0, bar_width.saturating_sub(1) as f64) as usize
@@ -1152,7 +1192,7 @@ fn render_usage_gauge(
         .round()
         .clamp(0.0, bar_width as f64) as usize;
 
-    let mut spans = vec![Span::styled(label_text.clone(), base().fg(C_WHITE))];
+    let mut spans = Vec::new();
 
     if let Some(pp) = pace_pos {
         let before_used = pp.min(used_pos);
@@ -1186,9 +1226,16 @@ fn render_usage_gauge(
     }
 
     let suffix_color = if over { C_YELLOW } else { DIM };
-    spans.push(Span::styled(suffix, base().fg(suffix_color)));
-
-    f.render_widget(Paragraph::new(Line::from(spans)).style(base()), gauge_area);
+    render_usage_bar_row(
+        f,
+        areas,
+        Line::from(Span::styled(label.to_string(), base().fg(C_WHITE))),
+        Line::from(spans),
+        Line::from(Span::styled(
+            format!("  {used:>3.0}% used  {remaining_pct:>3.0}% left"),
+            base().fg(suffix_color),
+        )),
+    );
 
     // Row 2: "started HH:MM" left, "↑ pace" at pace position, "resets in ..." right
     let reset_area = Rect {
@@ -1208,7 +1255,7 @@ fn render_usage_gauge(
     let reset_start = total_width.saturating_sub(reset_text.len());
 
     let row2 = if let Some(pp) = pace_pos {
-        let arrow_offset = label_text.len() + pp;
+        let arrow_offset = areas.bar.x.saturating_sub(reset_area.x) as usize + pp;
         let pace_label = "\u{2191} pace"; // ↑ pace  (display width = 6, byte len = 8)
         const PACE_LABEL_DISPLAY_WIDTH: usize = 6;
         let pace_end = arrow_offset + PACE_LABEL_DISPLAY_WIDTH;
@@ -1253,7 +1300,10 @@ fn render_usage_gauge(
             let gap = reset_start.saturating_sub(started_len);
             spans.push(Span::styled(" ".repeat(gap), base()));
         } else {
-            spans.push(Span::styled(" ".repeat(label_text.len()), base()));
+            spans.push(Span::styled(
+                " ".repeat(areas.bar.x.saturating_sub(reset_area.x) as usize),
+                base(),
+            ));
         }
         spans.push(Span::styled(reset_text, reset_style));
         Line::from(spans)
@@ -1411,17 +1461,21 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW,
-        GLOBAL_PACE_BAR_BASELINE_CELLS, GLOBAL_PACE_BAR_RESERVE_CELLS,
-        GLOBAL_WEEKLY_COMPACT_HEIGHT, GLOBAL_WEEKLY_FULL_HEIGHT, global_pace_bar,
-        global_pace_color, global_weekly_panel_height, plan_color, render_global_weekly_pace,
+        C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, GLOBAL_WEEKLY_COMPACT_HEIGHT,
+        GLOBAL_WEEKLY_FULL_HEIGHT, global_pace_bar, global_pace_color, global_weekly_panel_height,
+        plan_color, render_detail_panel, render_global_weekly_pace, render_usage_gauge,
         render_usage_gauges, status_message_color, table_text_widths, usage_gauges_height,
     };
+    use crate::jwt::AccountInfo;
+    use crate::tui::app::{AccountEntry, App, UsageStatus};
     use crate::usage::{
         AdditionalRateLimit, GlobalPaceWeighting, GlobalWeeklySummary, UsageInfo, WindowUsage,
     };
+    use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use ratatui::{Terminal, backend::TestBackend};
+
+    type MeterBounds = Option<(u16, u16)>;
 
     fn row_text(backend: &TestBackend, y: u16) -> String {
         let area = backend.buffer().area;
@@ -1434,6 +1488,47 @@ mod tests {
                     .symbol()
             })
             .collect()
+    }
+
+    fn meter_bounds(backend: &TestBackend, y: u16) -> MeterBounds {
+        let width = backend.buffer().area.width;
+        let mut best = None;
+        let mut x = 0;
+
+        while x < width {
+            let symbol = backend
+                .buffer()
+                .cell((x, y))
+                .expect("cell inside test buffer")
+                .symbol();
+            if !matches!(symbol, "█" | "░" | "|" | "│") {
+                x += 1;
+                continue;
+            }
+
+            let start = x;
+            let mut has_fill_cell = false;
+            while x < width {
+                let symbol = backend
+                    .buffer()
+                    .cell((x, y))
+                    .expect("cell inside test buffer")
+                    .symbol();
+                if !matches!(symbol, "█" | "░" | "|" | "│") {
+                    break;
+                }
+                has_fill_cell |= matches!(symbol, "█" | "░");
+                x += 1;
+            }
+
+            if has_fill_cell
+                && best.is_none_or(|(best_start, best_end)| x - start > best_end - best_start)
+            {
+                best = Some((start, x));
+            }
+        }
+
+        best
     }
 
     #[test]
@@ -1456,6 +1551,46 @@ mod tests {
         }
     }
 
+    fn dashboard_meter_bounds(width: u16, is_current: bool) -> (MeterBounds, MeterBounds) {
+        let now = crate::auth::now_unix_secs();
+        let usage = UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(35.0),
+                resets_at: Some(now + crate::usage::WINDOW_5H_SECS / 2),
+                window_minutes: Some(crate::usage::WINDOW_5H_SECS / 60),
+            }),
+            ..UsageInfo::default()
+        };
+        let mut app = App::new();
+        app.accounts = vec![AccountEntry {
+            alias: "work".to_string(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(usage)),
+            is_current,
+        }];
+        app.update_view();
+
+        let backend = TestBackend::new(width, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let summary = global_summary(now);
+        terminal
+            .draw(|frame| {
+                render_global_weekly_pace(
+                    frame,
+                    &summary,
+                    now,
+                    Rect::new(0, 0, width, GLOBAL_WEEKLY_FULL_HEIGHT),
+                );
+                render_detail_panel(frame, &app, Rect::new(0, 4, width, 6));
+            })
+            .unwrap();
+
+        (
+            meter_bounds(terminal.backend(), 1),
+            meter_bounds(terminal.backend(), 6),
+        )
+    }
+
     #[test]
     fn global_pace_color_uses_normal_baseline_thresholds() {
         assert_eq!(global_pace_color(Some(100.0)), C_GREEN);
@@ -1466,23 +1601,23 @@ mod tests {
 
     #[test]
     fn global_bar_marks_normal_and_extends_reserve_to_the_right() {
-        let normal = global_pace_bar(
-            100.0,
-            GLOBAL_PACE_BAR_BASELINE_CELLS,
-            GLOBAL_PACE_BAR_RESERVE_CELLS,
-        );
-        let reserve = global_pace_bar(
-            106.7,
-            GLOBAL_PACE_BAR_BASELINE_CELLS,
-            GLOBAL_PACE_BAR_RESERVE_CELLS,
-        );
+        let width = 70;
+        let normal = global_pace_bar(100.0, width);
+        let reserve = global_pace_bar(106.7, width);
+        let normal_cells: Vec<char> = normal.chars().collect();
+        let divider = normal_cells
+            .iter()
+            .position(|character| *character == '│')
+            .expect("normal divider");
 
-        assert_eq!(
-            normal.chars().position(|character| character == '│'),
-            Some(GLOBAL_PACE_BAR_BASELINE_CELLS)
-        );
-        assert!(normal.ends_with(&"░".repeat(GLOBAL_PACE_BAR_RESERVE_CELLS)));
+        assert_eq!(normal_cells.len(), width);
+        assert!(normal_cells[..divider].iter().all(|cell| *cell == '█'));
+        assert!(normal_cells[divider + 1..].iter().all(|cell| *cell == '░'));
         assert!(reserve.contains("│█"));
+
+        for width in [0, 1, 2, 25, 70, 120] {
+            assert_eq!(global_pace_bar(106.7, width).chars().count(), width);
+        }
     }
 
     #[test]
@@ -1513,14 +1648,74 @@ mod tests {
             .map(|y| row_text(terminal.backend(), y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Global Weekly Pace · equal weight"));
-        assert!(rendered.contains("106.7% · +6.7%p reserve"));
-        assert!(rendered.contains("deficit "));
+        assert!(rendered.contains("Global Weekly Pace · 100% normal · equal weight"));
+        assert!(rendered.contains("106.7%"));
+        assert!(rendered.contains("+6.7%p reserve"));
         assert!(rendered.contains("│█"));
-        assert!(rendered.contains("reserve · │ 100% normal"));
         assert!(rendered.contains("Effective 320% / Normal 300%"));
         assert!(rendered.contains("3 included / 1 unavailable"));
         assert!(rendered.contains("Next reset: work2 in 3h18m"));
+    }
+
+    #[test]
+    fn account_meter_bounds_do_not_depend_on_percentage_or_label_length() {
+        for width in [40, 70, 110] {
+            let mut expected = None;
+            for (used, label) in [
+                (0.0, "5h"),
+                (8.0, "7d"),
+                (9.0, "14d"),
+                (10.0, "30m"),
+                (89.0, "5h"),
+                (90.0, "7d"),
+                (99.0, "14d"),
+                (100.0, "1000m"),
+            ] {
+                let backend = TestBackend::new(width, 2);
+                let mut terminal = Terminal::new(backend).unwrap();
+                let window = WindowUsage {
+                    used_percent: Some(used),
+                    resets_at: None,
+                    window_minutes: None,
+                };
+
+                terminal
+                    .draw(|frame| {
+                        render_usage_gauge(
+                            frame,
+                            &window,
+                            label,
+                            crate::usage::WINDOW_7D_SECS,
+                            1_000_000,
+                            frame.area(),
+                        )
+                    })
+                    .unwrap();
+
+                let bounds = meter_bounds(terminal.backend(), 0);
+                assert!(bounds.is_some(), "meter missing at width {width}");
+                if let Some(expected) = expected {
+                    assert_eq!(bounds, Some(expected), "used={used}, label={label}");
+                } else {
+                    expected = bounds;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_and_account_meters_share_the_same_columns() {
+        for width in [32, 40, 70, 110] {
+            for is_current in [false, true] {
+                let (global, account) = dashboard_meter_bounds(width, is_current);
+                assert_eq!(global, account, "width={width}, active={is_current}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_layout_does_not_invent_an_alternate_meter() {
+        assert_eq!(dashboard_meter_bounds(20, true), (None, None));
     }
 
     #[test]
