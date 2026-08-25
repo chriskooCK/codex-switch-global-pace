@@ -2760,13 +2760,12 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&binary, permissions).unwrap();
     let harness = format!(
-        "{definitions}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nDAEMON_BOUNDARY_PID=\nDAEMON_BOUNDARY_ACTIVE=false\nDAEMON_BOUNDARY_ROLLBACK_SAFE=false\nDAEMON_STATE_CAPTURED=false\nstart_daemon_update_boundary \"$BIN\" \"$BIN\" \"$BIN\"\n[ \"$DAEMON_WAS_RUNNING\" = true ]\n[ \"$DAEMON_SERVICE_INSTALLED\" = true ]\n[ \"$(cat \"$DAEMON_FIXTURE_STATE\")\" = false ]\nrestore_daemon_update_boundary_old_state\n[ \"$DAEMON_BOUNDARY_ACTIVE\" = false ]\n[ \"$(cat \"$DAEMON_FIXTURE_STATE\")\" = true ]\nprintf 'transaction-ok\\n'\n"
+        "{definitions}\ncreate_direct_installer_temp_directory\ntrap 'cleanup_installer_temp_directory' EXIT\nDAEMON_BOUNDARY_PID=\nDAEMON_BOUNDARY_ACTIVE=false\nDAEMON_BOUNDARY_ROLLBACK_SAFE=false\nDAEMON_STATE_CAPTURED=false\nstart_daemon_update_boundary \"$BIN\" \"$BIN\" \"$BIN\"\n[ \"$DAEMON_WAS_RUNNING\" = true ]\n[ \"$DAEMON_SERVICE_INSTALLED\" = true ]\n[ \"$(cat \"$DAEMON_FIXTURE_STATE\")\" = false ]\nrestore_daemon_update_boundary_old_state\n[ \"$DAEMON_BOUNDARY_ACTIVE\" = false ]\n[ \"$(cat \"$DAEMON_FIXTURE_STATE\")\" = true ]\nprintf 'transaction-ok\\n'\n"
     );
     let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("BIN", &binary)
         .env("DAEMON_FIXTURE_STATE", &state)
-        .env("TMPDIR", dir.path())
         .output()
         .unwrap();
     assert!(
@@ -3056,7 +3055,14 @@ fn unix_installer_bounds_symlink_resolution_and_binds_recursive_temp_cleanup() {
     for required in [
         "SYMLINK_RESOLUTION_MAX_HOPS=40",
         "[ \"$link_hops\" -le \"$SYMLINK_RESOLUTION_MAX_HOPS\" ]",
+        "create_direct_installer_temp_directory() {",
+        "probe=\"$(mktemp -d)\"",
+        "physical_parent=\"$(CDPATH= cd -P \"$logical_parent\" && pwd -P)\"",
+        "mktemp -d \"${TMP_DIR_PARENT%/}/.${BINARY_NAME}.XXXXXXXXXX\"",
+        "Physical installer temporary root became an alias during creation; preserved",
+        "Physical installer temporary root changed during creation; preserved",
         "cleanup_installer_temp_directory() {",
+        "temporary parent is no longer the recorded physical path; preserved",
         "TMP_DIR_PARENT_IDENTITY",
         "TMP_DIR_IDENTITY",
         "temporary directory identity changed; preserved",
@@ -3070,6 +3076,117 @@ fn unix_installer_bounds_symlink_resolution_and_binds_recursive_temp_cleanup() {
         );
     }
     assert_eq!(script.matches("rm -rf -- \"$TMP_DIR\"").count(), 1);
+    assert_eq!(
+        script
+            .matches("create_direct_installer_temp_directory")
+            .count(),
+        2,
+        "the installer must define and invoke one shared physical-root temp initializer"
+    );
+    assert!(!script.contains("TMP_DIR=\"$(mktemp -d)\""));
+
+    let initializer = script
+        .split("create_direct_installer_temp_directory() {")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("render_profile_without_managed_path_block() {")
+                .next()
+        })
+        .unwrap();
+    let parent_binding = initializer
+        .find("TMP_DIR_PARENT_IDENTITY=\"$(file_identity \"$TMP_DIR_PARENT\")\"")
+        .unwrap();
+    let probe_removal = initializer.find("rmdir \"$physical_probe\"").unwrap();
+    let final_creation = initializer
+        .find("TMP_DIR=\"$(mktemp -d \"${TMP_DIR_PARENT%/}/.${BINARY_NAME}.XXXXXXXXXX\")\"")
+        .unwrap();
+    let physical_rechecks = initializer
+        .match_indices(
+            "observed_physical_parent=\"$(CDPATH= cd -P \"$TMP_DIR_PARENT\" && pwd -P)\"",
+        )
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        physical_rechecks.len(),
+        2,
+        "the physical root must be re-resolved after probe removal and final creation"
+    );
+    assert!(
+        parent_binding < probe_removal
+            && probe_removal < physical_rechecks[0]
+            && physical_rechecks[0] < final_creation
+            && final_creation < physical_rechecks[1],
+        "the installer must bind the selected root before removing its probe and re-resolve it after each namespace mutation"
+    );
+
+    let install_tail = script
+        .split("# Download, verify, and extract.")
+        .nth(1)
+        .unwrap();
+    let state_initialization = install_tail.find("\nINSTALL_STAGE=").unwrap();
+    let transaction_initialization = install_tail.find("reset_managed_path_transaction").unwrap();
+    let exit_trap = install_tail
+        .find("trap 'cleanup_install_exit' EXIT")
+        .unwrap();
+    let interrupt_trap = install_tail.find("trap 'exit 130' INT").unwrap();
+    let initializer_call = install_tail
+        .find("create_direct_installer_temp_directory")
+        .unwrap();
+    let temp_initializations = [
+        "\nTMP_DIR=\"\"",
+        "\nTMP_DIR_PARENT=\"\"",
+        "\nTMP_DIR_PARENT_IDENTITY=\"\"",
+        "\nTMP_DIR_IDENTITY=\"\"",
+        "\nTMP_CLEANUP_ERROR=\"\"",
+    ]
+    .map(|assignment| install_tail.find(assignment).unwrap());
+    assert!(
+        state_initialization < transaction_initialization
+            && temp_initializations
+                .iter()
+                .all(|offset| transaction_initialization < *offset && *offset < exit_trap)
+            && exit_trap < interrupt_trap
+            && interrupt_trap < initializer_call,
+        "installer state, every temporary cleanup field, and traps must exist before temporary-directory initialization"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_installer_temp_initializer_publishes_only_a_physical_direct_path() {
+    use std::os::unix::fs::symlink;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script.split("# Parse arguments").next().unwrap();
+    let fixture = support::tempdir();
+    let physical_root = fixture.path().join("physical-temp-root");
+    let aliased_root = fixture.path().join("aliased-temp-root");
+    fs::create_dir(&physical_root).unwrap();
+    symlink(&physical_root, &aliased_root).unwrap();
+
+    let harness = format!(
+        r#"{definitions}
+TMP_DIR=""
+trap 'cleanup_installer_temp_directory' EXIT
+create_direct_installer_temp_directory
+[ "$(CDPATH= cd -P "$TMP_DIR" && pwd -P)" = "$TMP_DIR" ]
+printf payload > "$TMP_DIR/probe"
+"$CANDIDATE_BIN" __installer-file-op token --source "$TMP_DIR/probe" >/dev/null
+"#
+    );
+    let output = unix_installer_test_command()
+        .args(["-c", &harness])
+        .env("TMPDIR", &aliased_root)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -3183,6 +3300,18 @@ if cleanup_installer_temp_directory; then
   exit 21
 fi
 [ -d "$TMP_DIR" ]
+
+TMP_DIR="$1/parent/owned"
+mkdir -p "$TMP_DIR"
+TMP_DIR_PARENT="$(dirname "$TMP_DIR")"
+TMP_DIR_PARENT_IDENTITY="$(file_identity "$TMP_DIR_PARENT")"
+TMP_DIR_IDENTITY="$(file_identity "$TMP_DIR")"
+mv "$TMP_DIR_PARENT" "$1/parent-held"
+ln -s "$1/parent-held" "$TMP_DIR_PARENT"
+if cleanup_installer_temp_directory; then
+  exit 22
+fi
+[ -d "$1/parent-held/owned" ]
 "#
         ),
     )
@@ -3228,14 +3357,13 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
+            "{function_prefix}\ncreate_direct_installer_temp_directory\ntrap 'cleanup_installer_temp_directory' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile_link)
-        .env("TMPDIR", temp.path())
         .output()
         .unwrap();
 
@@ -3272,8 +3400,8 @@ fn unix_path_addition_uses_the_shared_transaction_and_rolls_back_exactly() {
     fs::write(&profile, "export KEEP=1\n").unwrap();
     let harness = format!(
         r#"{definitions}
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+create_direct_installer_temp_directory
+trap 'cleanup_installer_temp_directory' EXIT
 PLATFORM=linux
 reset_managed_path_transaction
 prepare_managed_path_addition
@@ -3287,7 +3415,6 @@ rollback_managed_path_changes
     let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
-        .env("TMPDIR", home.path())
         .env("SHELL", "/bin/bash")
         .env("PATH", "/usr/bin:/bin")
         .output()
@@ -3314,8 +3441,8 @@ fn unix_path_rollback_preserves_a_fixed_original_when_the_profile_is_replaced() 
     fs::write(&profile, "export KEEP=1\n").unwrap();
     let harness = format!(
         r#"{definitions}
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+create_direct_installer_temp_directory
+trap 'cleanup_installer_temp_directory' EXIT
 PLATFORM=linux
 reset_managed_path_transaction
 prepare_managed_path_addition
@@ -3334,7 +3461,6 @@ fi
     let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
-        .env("TMPDIR", home.path())
         .env("SHELL", "/bin/bash")
         .env("PATH", "/usr/bin:/bin")
         .output()
@@ -3385,14 +3511,13 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
+            "{function_prefix}\ncreate_direct_installer_temp_directory\ntrap 'cleanup_installer_temp_directory' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile_link)
-        .env("TMPDIR", temp.path())
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("PROFILE_LINK", &profile_link)
         .env("REPLACEMENT_PROFILE", &replacement_profile)
@@ -3452,7 +3577,7 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
+            "{function_prefix}\ncreate_direct_installer_temp_directory\ntrap 'cleanup_installer_temp_directory' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
@@ -3460,7 +3585,6 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(current.join("profile"))
-        .env("TMPDIR", temp.path())
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("CURRENT_LINK", &current)
         .env("NEW_DIR", &dir_b)
@@ -3511,7 +3635,7 @@ fn unix_installer_aborts_if_profile_inode_changes() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
+            "{function_prefix}\ncreate_direct_installer_temp_directory\ntrap 'cleanup_installer_temp_directory' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
@@ -3519,7 +3643,6 @@ fn unix_installer_aborts_if_profile_inode_changes() {
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile)
-        .env("TMPDIR", temp.path())
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("PROFILE_FILE", &profile)
         .env("REPLACEMENT_PROFILE", &replacement)

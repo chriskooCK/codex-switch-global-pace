@@ -83,7 +83,10 @@
   is revalidated before executable recovery copies are removed. The verified
   Windows and Unix direct installers now retain those same service/PID
   authorities across install and uninstall instead of splitting stop, file,
-  PATH, and service mutations among independent child commands. Stable release
+  PATH, and service mutations among independent child commands. Unix installers
+  resolve the operating system's selected temporary root before creating the
+  artifact directory, so aliased roots such as macOS `/var` cannot bypass or
+  conflict with direct-path validation. Stable release
   candidates use one deterministic tag per release; interrupted drafts are
   discovered through the authenticated paginated release list, rejected when
   duplicate, and reverified by release ID before cleanup. Mismatched remote state
