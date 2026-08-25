@@ -3245,6 +3245,12 @@ mod tests {
         }
     }
 
+    fn publish_test_path(path: &std::path::Path, contents: &[u8]) {
+        let staged = path.with_extension("publishing");
+        std::fs::write(&staged, contents).expect("write staged test marker");
+        std::fs::rename(&staged, path).expect("publish complete test marker");
+    }
+
     #[test]
     fn lifecycle_holder_survives_parent_process_group_interrupt() {
         match std::env::var(SIGNAL_ISOLATION_TEST_ROLE).as_deref() {
@@ -3255,11 +3261,12 @@ mod tests {
                 std::io::stdin()
                     .read_to_end(&mut input)
                     .expect("wait for coordinator EOF");
-                std::fs::write(
-                    std::env::var_os(SIGNAL_ISOLATION_TEST_SENTINEL).expect("holder sentinel path"),
+                let sentinel =
+                    std::env::var_os(SIGNAL_ISOLATION_TEST_SENTINEL).expect("holder sentinel path");
+                publish_test_path(
+                    std::path::Path::new(&sentinel),
                     b"holder finalized after EOF",
-                )
-                .expect("write holder finalization sentinel");
+                );
                 return;
             }
             Ok("coordinator") => {
@@ -3293,11 +3300,9 @@ mod tests {
                         break;
                     }
                 }
-                std::fs::write(
-                    std::env::var_os(SIGNAL_ISOLATION_TEST_READY).expect("coordinator ready path"),
-                    b"ready",
-                )
-                .expect("publish coordinator readiness");
+                let ready =
+                    std::env::var_os(SIGNAL_ISOLATION_TEST_READY).expect("coordinator ready path");
+                publish_test_path(std::path::Path::new(&ready), b"ready");
                 loop {
                     std::thread::park();
                 }
