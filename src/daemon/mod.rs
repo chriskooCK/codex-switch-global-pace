@@ -17,6 +17,7 @@ const DAEMON_BOUNDARY_OLD_RESTORED: &str = "old state restored";
 const DAEMON_BOUNDARY_OLD_FAILED: &str = "old state failed";
 const DAEMON_BOUNDARY_FINAL_CONFIRMED: &str = "final state confirmed";
 const DAEMON_BOUNDARY_AUTHORITY_RELEASED: &str = "lifecycle authority released";
+const STATUS_LAST_ERROR_MAX_CHARS: usize = 512;
 pub(crate) const DAEMON_TRANSITION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10);
 const GENERATION_SETTLE_DIAGNOSTIC_INTERVAL: std::time::Duration = DAEMON_TRANSITION_TIMEOUT;
@@ -59,15 +60,29 @@ enum SelfUpdateBoundaryClientPhase {
 pub(crate) struct SelfUpdateDaemonBoundaryClient {
     child: Option<std::process::Child>,
     input: Option<std::process::ChildStdin>,
-    output: std::io::BufReader<std::process::ChildStdout>,
+    output: Option<std::io::BufReader<std::process::ChildStdout>>,
     phase: SelfUpdateBoundaryClientPhase,
 }
 
-fn isolate_lifecycle_holder_from_terminal_interrupt(command: &mut std::process::Command) {
+pub(crate) fn isolate_background_child_from_terminal_interrupt(
+    command: &mut std::process::Command,
+) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
+        unsafe {
+            // SAFETY: setsid is async-signal-safe and this pre-exec closure
+            // performs no allocation or other process-global mutation. A new
+            // session also creates a new process group and drops the inherited
+            // controlling terminal, covering both Ctrl+C and terminal hangup.
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
     }
     #[cfg(windows)]
     {
@@ -77,47 +92,368 @@ fn isolate_lifecycle_holder_from_terminal_interrupt(command: &mut std::process::
     }
 }
 
+#[cfg(windows)]
+pub(crate) struct VerifiedBackgroundSpawn {
+    _executable_pin: std::fs::File,
+    ready_nonce: String,
+}
+
+#[cfg(windows)]
+impl VerifiedBackgroundSpawn {
+    pub(crate) fn ready_nonce(&self) -> &str {
+        &self.ready_nonce
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn prepare_verified_background_spawn(
+    executable: &std::path::Path,
+    expected: &crate::fs_ops::FileToken,
+) -> Result<VerifiedBackgroundSpawn> {
+    use rand::Rng as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_SHARE_READ,
+    };
+
+    let metadata = std::fs::symlink_metadata(executable).with_context(|| {
+        format!(
+            "inspecting verified background executable {}",
+            executable.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "verified background executable is not a direct regular file: {}",
+            executable.display()
+        );
+    }
+    let mut executable_pin = std::fs::OpenOptions::new()
+        .access_mode(FILE_GENERIC_READ)
+        // Read sharing is sufficient for the child image loader. Excluding
+        // delete and write sharing pins both this namespace occupant and its
+        // bytes through spawn/readiness, closing A->B->A races.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(executable)
+        .with_context(|| {
+            format!(
+                "pinning verified background executable {}",
+                executable.display()
+            )
+        })?;
+    let observed = crate::fs_ops::token_for_file(&mut executable_pin).with_context(|| {
+        format!(
+            "binding verified background executable {}",
+            executable.display()
+        )
+    })?;
+    if &observed != expected {
+        anyhow::bail!(
+            "background executable changed before it could be pinned: {}",
+            executable.display()
+        );
+    }
+    let mut nonce = [0_u8; 16];
+    rand::rng().fill_bytes(&mut nonce);
+    Ok(VerifiedBackgroundSpawn {
+        _executable_pin: executable_pin,
+        ready_nonce: hex::encode(nonce),
+    })
+}
+
+pub(crate) fn validate_background_ready_nonce(ready_nonce: &str) -> Result<()> {
+    let decoded =
+        hex::decode(ready_nonce).context("background readiness nonce is not hexadecimal")?;
+    if decoded.len() != 16 || ready_nonce.len() != 32 {
+        anyhow::bail!("background readiness nonce must encode exactly 128 bits");
+    }
+    Ok(())
+}
+
+const BACKGROUND_MARKER_LINE_MAX_BYTES: usize = 512;
+const LIFECYCLE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn read_bounded_background_marker<R: std::io::BufRead>(
+    reader: &mut R,
+    purpose: &str,
+) -> Result<(String, usize)> {
+    use std::io::BufRead as _;
+
+    let mut line = Vec::with_capacity(BACKGROUND_MARKER_LINE_MAX_BYTES + 1);
+    let mut limited =
+        std::io::Read::take(&mut *reader, (BACKGROUND_MARKER_LINE_MAX_BYTES + 1) as u64);
+    let read = limited
+        .read_until(b'\n', &mut line)
+        .with_context(|| format!("reading bounded {purpose} marker"))?;
+    if read == 0 {
+        anyhow::bail!("{purpose} closed stdout before its marker");
+    }
+    if read > BACKGROUND_MARKER_LINE_MAX_BYTES {
+        anyhow::bail!(
+            "{purpose} exceeded the {BACKGROUND_MARKER_LINE_MAX_BYTES}-byte marker line limit"
+        );
+    }
+    if line.last() != Some(&b'\n') {
+        anyhow::bail!("{purpose} closed stdout with an incomplete marker");
+    }
+    while matches!(line.last(), Some(b'\r' | b'\n')) {
+        line.pop();
+    }
+    let marker =
+        String::from_utf8(line).with_context(|| format!("{purpose} emitted a non-UTF-8 marker"))?;
+    Ok((marker, read))
+}
+
+pub(crate) fn terminate_and_reap_background_child(
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus> {
+    if let Some(status) = child
+        .try_wait()
+        .context("checking failed background child")?
+    {
+        return Ok(status);
+    }
+    if let Err(kill_error) = child.kill() {
+        if let Some(status) = child
+            .try_wait()
+            .context("rechecking background child after termination failed")?
+        {
+            return Ok(status);
+        }
+        return Err(kill_error).context("terminating failed background child");
+    }
+    child.wait().context("reaping terminated background child")
+}
+
+pub(crate) fn terminate_background_child_on_error(
+    child: &mut std::process::Child,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    error.context(
+        terminate_and_reap_background_child(child)
+            .map(|status| format!("child was terminated and reaped ({status})"))
+            .unwrap_or_else(|reap| format!("child termination/reap failed: {reap:#}")),
+    )
+}
+
+fn background_marker_failure(
+    marker_error: anyhow::Error,
+    reap: Result<std::process::ExitStatus>,
+    reader_joined: std::thread::Result<()>,
+) -> anyhow::Error {
+    let cleanup_detail = match (reap, reader_joined) {
+        (Ok(status), Ok(())) => format!("child was terminated and reaped ({status})"),
+        (Err(error), Ok(())) => format!("child termination/reap failed: {error:#}"),
+        (Ok(status), Err(_)) => {
+            format!("child was reaped ({status}), but its marker reader panicked")
+        }
+        (Err(error), Err(_)) => {
+            format!("child termination/reap failed ({error:#}) and its marker reader panicked")
+        }
+    };
+    marker_error.context(cleanup_detail)
+}
+
+pub(crate) fn read_background_marker_line(
+    child: &mut std::process::Child,
+    output: &mut Option<std::io::BufReader<std::process::ChildStdout>>,
+    timeout: Option<std::time::Duration>,
+    purpose: &'static str,
+) -> Result<(String, usize)> {
+    let mut reader = output
+        .take()
+        .with_context(|| format!("{purpose} marker channel is closed"))?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let reader_thread = std::thread::spawn(move || {
+        let result = read_bounded_background_marker(&mut reader, purpose);
+        let _ = sender.send((reader, result));
+    });
+
+    enum ReceiveFailure {
+        Timeout(std::time::Duration),
+        Disconnected,
+    }
+    let received = match timeout {
+        Some(timeout) => receiver.recv_timeout(timeout).map_err(|error| match error {
+            std::sync::mpsc::RecvTimeoutError::Timeout => ReceiveFailure::Timeout(timeout),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => ReceiveFailure::Disconnected,
+        }),
+        None => receiver.recv().map_err(|_| ReceiveFailure::Disconnected),
+    };
+    match received {
+        Ok((reader, Ok(marker))) => {
+            reader_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("{purpose} marker reader panicked"))?;
+            *output = Some(reader);
+            Ok(marker)
+        }
+        Ok((reader, Err(marker_error))) => {
+            drop(reader);
+            let reap = terminate_and_reap_background_child(child);
+            Err(background_marker_failure(
+                marker_error,
+                reap,
+                reader_thread.join(),
+            ))
+        }
+        Err(ReceiveFailure::Timeout(timeout)) => {
+            let reap = terminate_and_reap_background_child(child);
+            let marker_error = anyhow::anyhow!(
+                "{purpose} did not emit a complete marker within {}s",
+                timeout.as_secs_f64()
+            );
+            // Killing and reaping the exact child is the readiness boundary.
+            // Do not join a blocked pipe reader here: an untrusted descendant
+            // could inherit stdout and otherwise defeat the deadline even
+            // after the spawned child was conclusively reaped.
+            drop(reader_thread);
+            let cleanup_detail = reap
+                .map(|status| format!("child was terminated and reaped ({status})"))
+                .unwrap_or_else(|error| format!("child termination/reap failed: {error:#}"));
+            Err(marker_error.context(cleanup_detail))
+        }
+        Err(ReceiveFailure::Disconnected) => {
+            let reap = terminate_and_reap_background_child(child);
+            let marker_error = anyhow::anyhow!("{purpose} marker reader stopped unexpectedly");
+            Err(background_marker_failure(
+                marker_error,
+                reap,
+                reader_thread.join(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn await_expected_background_marker(
+    child: &mut std::process::Child,
+    stdout: std::process::ChildStdout,
+    expected_marker: &str,
+    timeout: std::time::Duration,
+    total_max_bytes: usize,
+    purpose: &'static str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut output = Some(std::io::BufReader::new(stdout));
+    let mut total = 0_usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let (marker, bytes) =
+            read_background_marker_line(child, &mut output, Some(remaining), purpose)?;
+        total = total
+            .checked_add(bytes)
+            .with_context(|| format!("{purpose} marker byte count overflowed"))?;
+        if total > total_max_bytes {
+            output.take();
+            let error = anyhow::anyhow!(
+                "{purpose} exceeded the {total_max_bytes}-byte total marker output limit"
+            );
+            return Err(terminate_background_child_on_error(child, error));
+        }
+        if marker == expected_marker {
+            output.take();
+            return Ok(());
+        }
+    }
+}
+
 impl SelfUpdateDaemonBoundaryClient {
     pub(crate) fn start() -> Result<Self> {
         let executable = std::env::current_exe()
             .context("locating the public executable for the self-update lifecycle holder")?;
         service::validate_expected_executable(&executable)?;
+        #[cfg(windows)]
+        let executable_token = crate::fs_ops::token_for_path(&executable)
+            .context("binding the public executable for the self-update lifecycle holder")?;
+        #[cfg(windows)]
+        let verified_spawn = prepare_verified_background_spawn(&executable, &executable_token)?;
+        #[cfg(windows)]
+        let ready_nonce = verified_spawn.ready_nonce().to_string();
         let mut command = std::process::Command::new(&executable);
         command
             .arg("__hold-daemon-update-boundary")
             .arg("--initial-executable")
             .arg(&executable)
             .arg("--replacement-executable")
-            .arg(&executable)
+            .arg(&executable);
+        #[cfg(windows)]
+        command
+            .arg("--expected-executable-token")
+            .arg(executable_token.to_string())
+            .arg("--ready-nonce")
+            .arg(&ready_nonce);
+        command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
-        isolate_lifecycle_holder_from_terminal_interrupt(&mut command);
+        isolate_background_child_from_terminal_interrupt(&mut command);
         let mut child = command
             .spawn()
             .context("starting the independent self-update daemon lifecycle holder")?;
-        let input = child
-            .stdin
-            .take()
-            .context("self-update lifecycle holder has no stdin control channel")?;
-        let output = child
-            .stdout
-            .take()
-            .context("self-update lifecycle holder has no stdout marker channel")?;
+        let input = match child.stdin.take() {
+            Some(input) => input,
+            None => {
+                let error =
+                    anyhow::anyhow!("self-update lifecycle holder has no stdin control channel");
+                return Err(terminate_background_child_on_error(&mut child, error));
+            }
+        };
+        let output = match child.stdout.take() {
+            Some(output) => output,
+            None => {
+                drop(input);
+                let error =
+                    anyhow::anyhow!("self-update lifecycle holder has no stdout marker channel");
+                return Err(terminate_background_child_on_error(&mut child, error));
+            }
+        };
         let mut client = Self {
             child: Some(child),
             input: Some(input),
-            output: std::io::BufReader::new(output),
+            output: Some(std::io::BufReader::new(output)),
             phase: SelfUpdateBoundaryClientPhase::Stopped,
         };
-        let marker = client.read_marker()?;
+        let marker = client.read_marker_with_timeout(Some(LIFECYCLE_READY_TIMEOUT))?;
+        #[cfg(windows)]
+        let ready_prefix = format!("{INSTALLER_DAEMON_BOUNDARY_PREFIX} ready {ready_nonce} ");
+        #[cfg(not(windows))]
         let ready_prefix = format!("{INSTALLER_DAEMON_BOUNDARY_PREFIX} ready ");
-        if !marker.starts_with(&ready_prefix) {
-            anyhow::bail!(
-                "self-update lifecycle holder returned an unexpected initial marker: {marker}"
+        let state = match marker.strip_prefix(&ready_prefix) {
+            Some(state) => state,
+            None => {
+                let error = anyhow::anyhow!(
+                    "self-update lifecycle holder returned an unexpected initial marker: {marker}"
+                );
+                return Err(client.reject_initial_readiness(error));
+            }
+        };
+        let valid_state = [
+            installer_state_line(true, true),
+            installer_state_line(true, false),
+            installer_state_line(false, true),
+            installer_state_line(false, false),
+        ]
+        .contains(&state);
+        if !valid_state {
+            let error = anyhow::anyhow!(
+                "self-update lifecycle holder returned an invalid initial state: {marker}"
             );
+            return Err(client.reject_initial_readiness(error));
         }
+        #[cfg(windows)]
+        drop(verified_spawn);
         Ok(client)
+    }
+
+    fn reject_initial_readiness(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.input.take();
+        self.output.take();
+        let Some(mut child) = self.child.take() else {
+            return error.context("self-update lifecycle holder was already released");
+        };
+        terminate_background_child_on_error(&mut child, error)
     }
 
     pub(crate) fn restart_replacement(&mut self) -> Result<SelfUpdateBoundaryRestart> {
@@ -269,32 +605,34 @@ impl SelfUpdateDaemonBoundaryClient {
     }
 
     fn read_marker(&mut self) -> Result<String> {
-        use std::io::BufRead as _;
-        let mut marker = String::new();
-        if self
-            .output
-            .read_line(&mut marker)
-            .context("reading self-update lifecycle holder marker")?
-            == 0
-        {
-            let status = self
-                .child
+        // Once the pinned image has attested its initial readiness, lifecycle
+        // operations may legitimately retain service/PID authority while an
+        // external contender settles. Never release that authority on a wall
+        // clock; the reader still enforces the bounded marker line.
+        self.read_marker_with_timeout(None)
+    }
+
+    fn read_marker_with_timeout(&mut self, timeout: Option<std::time::Duration>) -> Result<String> {
+        let result = read_background_marker_line(
+            self.child
                 .as_mut()
-                .context("self-update lifecycle holder process was already released")?
-                .try_wait()
-                .context("checking self-update lifecycle holder status")?;
-            anyhow::bail!(
-                "self-update lifecycle holder closed its marker channel before acknowledgement{}",
-                status
-                    .map(|value| format!(" (exit status {value})"))
-                    .unwrap_or_default()
-            );
+                .context("self-update lifecycle holder process was already released")?,
+            &mut self.output,
+            timeout,
+            "self-update lifecycle holder",
+        )
+        .map(|(marker, _)| marker);
+        if result.is_err() {
+            self.input.take();
+            self.output.take();
+            self.child.take();
         }
-        Ok(marker.trim_end_matches(['\r', '\n']).to_string())
+        result
     }
 
     fn close_and_wait(&mut self) -> Result<()> {
         self.input.take();
+        self.output.take();
         let status = self
             .child
             .take()
@@ -681,12 +1019,14 @@ fn start_detached_executable_locked(
     exe: &std::path::Path,
     _service_lease: &service::ServiceOperationLease,
 ) -> Result<()> {
-    let mut child = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(["daemon", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    isolate_background_child_from_terminal_interrupt(&mut command);
+    let mut child = command.spawn()?;
 
     let pid = await_daemon_ready(&mut child, STARTUP_TIMEOUT)?;
     user_println(&format!("Daemon started (PID {pid})"));
@@ -2406,20 +2746,29 @@ fn run_installer_daemon_boundary_protocol<R: std::io::BufRead, W: std::io::Write
     transaction: &mut SelfUpdateDaemonRestart,
     replacement_executable: &std::path::Path,
     uninstall_paths_match: bool,
+    ready_nonce: Option<&str>,
     input: &mut R,
     output: &mut W,
     phase: &mut InstallerBoundaryPhase,
 ) -> Result<()> {
     let initial_running = transaction.initial_pid.is_some();
     let initial_service_installed = transaction.service_installed;
+    let ready_state = if let Some(ready_nonce) = ready_nonce {
+        format!(
+            "ready {ready_nonce} {}",
+            installer_state_line(initial_running, initial_service_installed)
+        )
+    } else {
+        format!(
+            "ready {}",
+            installer_state_line(initial_running, initial_service_installed)
+        )
+    };
     publish_installer_daemon_boundary_state(
         output,
         phase,
         InstallerBoundaryPhase::Stopped,
-        &format!(
-            "ready {}",
-            installer_state_line(initial_running, initial_service_installed)
-        ),
+        &ready_state,
     )?;
 
     loop {
@@ -2590,8 +2939,32 @@ fn run_installer_daemon_boundary_protocol<R: std::io::BufRead, W: std::io::Write
 pub(crate) fn hold_installer_daemon_update_boundary(
     initial_executable: std::path::PathBuf,
     replacement_executable: std::path::PathBuf,
+    expected_executable_token: Option<&str>,
+    ready_nonce: Option<&str>,
 ) -> Result<()> {
     service::validate_expected_executable(&replacement_executable)?;
+    match (expected_executable_token, ready_nonce) {
+        (Some(expected_executable_token), Some(ready_nonce)) => {
+            validate_background_ready_nonce(ready_nonce)?;
+            let expected_executable_token = expected_executable_token
+                .parse::<crate::fs_ops::FileToken>()
+                .context("parsing self-update lifecycle holder executable token")?;
+            let current_executable = std::env::current_exe()
+                .context("locating the self-update lifecycle holder executable")?;
+            let observed = crate::fs_ops::token_for_path(&current_executable)
+                .context("binding the self-update lifecycle holder executable")?;
+            if observed != expected_executable_token {
+                anyhow::bail!(
+                    "self-update lifecycle holder executable changed before readiness: {}",
+                    current_executable.display()
+                );
+            }
+        }
+        (None, None) => {}
+        _ => anyhow::bail!(
+            "self-update lifecycle holder requires both executable token and readiness nonce"
+        ),
+    }
     let uninstall_paths_match = initial_executable == replacement_executable;
     let mut transaction = SelfUpdateDaemonRestart::capture_for_executable(initial_executable)?;
     let mut phase = InstallerBoundaryPhase::Stopping;
@@ -2606,6 +2979,7 @@ pub(crate) fn hold_installer_daemon_update_boundary(
             &mut transaction,
             &replacement_executable,
             uninstall_paths_match,
+            ready_nonce,
             &mut input,
             &mut output,
             &mut phase,
@@ -2651,7 +3025,7 @@ fn status(json: bool) -> Result<()> {
     };
 
     // Loop-written snapshot; only meaningful while the daemon is running.
-    let snapshot = if running { state::read() } else { None };
+    let snapshot = if running { state::read()? } else { None };
 
     if json {
         let service_installed = service::is_installed_checked()?;
@@ -2679,7 +3053,7 @@ fn status(json: bool) -> Result<()> {
                 "notify": cfg.daemon.notify,
                 "log_level": cfg.daemon.log_level,
             }
-        }));
+        }))?;
         if state == "stale" {
             pidfile::cleanup_pidfile()?;
         }
@@ -2712,6 +3086,7 @@ fn status(json: bool) -> Result<()> {
                         ));
                     }
                     if let Some(err) = &snap.last_error {
+                        let err = bounded_status_last_error(err);
                         user_println(&format!(
                             "  Last error ({} consecutive): {err}",
                             snap.consecutive_failures
@@ -2754,6 +3129,10 @@ fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn bounded_status_last_error(error: &str) -> String {
+    crate::safe_text::bounded_terminal_text(error, STATUS_LAST_ERROR_MAX_CHARS)
+}
+
 #[cfg(any(unix, target_os = "windows"))]
 fn format_unix(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0)
@@ -2777,6 +3156,229 @@ fn service_manager_name() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unsupported"
+    }
+}
+
+#[cfg(test)]
+mod status_text_tests {
+    use super::{STATUS_LAST_ERROR_MAX_CHARS, bounded_status_last_error};
+
+    #[test]
+    fn persisted_last_error_is_control_free_and_bounded_at_terminal_boundary() {
+        let persisted = format!(
+            "upstream\u{1b}]52;clipboard\u{7}\n{}",
+            "x".repeat(STATUS_LAST_ERROR_MAX_CHARS + 100)
+        );
+
+        let rendered = bounded_status_last_error(&persisted);
+
+        assert!(rendered.chars().all(|ch| !ch.is_control()));
+        assert_eq!(rendered.chars().count(), STATUS_LAST_ERROR_MAX_CHARS);
+        assert!(rendered.starts_with("upstream]52;clipboard"));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod background_marker_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    const ROLE_ENV: &str = "CSGP_BACKGROUND_MARKER_TEST_ROLE";
+    const TEST_NAME: &str =
+        "daemon::background_marker_tests::bounded_marker_failures_terminate_and_reap_child";
+    const NOMINAL_TRANSITION_TIMEOUT_REGRESSION: std::time::Duration =
+        std::time::Duration::from_millis(500);
+
+    fn spawn_fixture(role: &str) -> std::process::Child {
+        let executable = std::env::current_exe().expect("locate unit-test executable");
+        let mut command = std::process::Command::new(executable);
+        command
+            .arg(TEST_NAME)
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(ROLE_ENV, role)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        super::isolate_background_child_from_terminal_interrupt(&mut command);
+        command.spawn().expect("spawn marker protocol fixture")
+    }
+
+    fn assert_reaped(child: &mut std::process::Child) {
+        assert!(
+            child.try_wait().expect("inspect marker fixture").is_some(),
+            "marker protocol failure returned while its exact child remained live"
+        );
+    }
+
+    #[test]
+    fn bounded_marker_failures_terminate_and_reap_child() {
+        match std::env::var(ROLE_ENV).as_deref() {
+            Ok("silent") => {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return;
+            }
+            Ok("oversized") => {
+                println!("{}", "x".repeat(BACKGROUND_MARKER_LINE_MAX_BYTES + 1));
+                std::io::stdout().flush().expect("flush oversized marker");
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return;
+            }
+            Ok("chatter") => {
+                for _ in 0..256 {
+                    println!("untrusted marker chatter");
+                }
+                std::io::stdout().flush().expect("flush marker chatter");
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return;
+            }
+            Ok("inherited-pipe-parent") => {
+                let executable = std::env::current_exe().expect("locate pipe descendant");
+                let mut descendant = std::process::Command::new(executable)
+                    .arg(TEST_NAME)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(ROLE_ENV, "inherited-pipe-descendant")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn inherited-pipe descendant");
+                let _descendant_reaper = std::thread::spawn(move || {
+                    let _ = descendant.wait();
+                });
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                return;
+            }
+            Ok("inherited-pipe-descendant") => {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                return;
+            }
+            Ok("delayed-authority") => {
+                std::thread::sleep(std::time::Duration::from_millis(750));
+                println!("authority settled");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush delayed authority marker");
+                return;
+            }
+            Ok(other) => panic!("unexpected background marker fixture role {other}"),
+            Err(_) => {}
+        }
+
+        let mut silent = spawn_fixture("silent");
+        let silent_stdout = silent.stdout.take().expect("silent fixture stdout");
+        let mut silent_output = Some(std::io::BufReader::new(silent_stdout));
+        let silent_error = loop {
+            match super::read_background_marker_line(
+                &mut silent,
+                &mut silent_output,
+                Some(std::time::Duration::from_millis(500)),
+                "silent lifecycle marker fixture",
+            ) {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            format!("{silent_error:#}").contains("did not emit a complete marker"),
+            "{silent_error:#}"
+        );
+        assert_reaped(&mut silent);
+
+        let mut oversized = spawn_fixture("oversized");
+        let oversized_stdout = oversized.stdout.take().expect("oversized fixture stdout");
+        let mut oversized_output = Some(std::io::BufReader::new(oversized_stdout));
+        let oversized_error = loop {
+            match super::read_background_marker_line(
+                &mut oversized,
+                &mut oversized_output,
+                Some(std::time::Duration::from_secs(10)),
+                "malformed lifecycle marker fixture",
+            ) {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            format!("{oversized_error:#}").contains("marker line limit"),
+            "{oversized_error:#}"
+        );
+        assert_reaped(&mut oversized);
+
+        let mut chatter = spawn_fixture("chatter");
+        let chatter_stdout = chatter.stdout.take().expect("chatter fixture stdout");
+        let chatter_error = super::await_expected_background_marker(
+            &mut chatter,
+            chatter_stdout,
+            "never ready",
+            std::time::Duration::from_secs(10),
+            1024,
+            "chattering cleanup marker fixture",
+        )
+        .expect_err("marker chatter must hit the aggregate byte bound");
+        assert!(
+            format!("{chatter_error:#}").contains("total marker output limit"),
+            "{chatter_error:#}"
+        );
+        assert_reaped(&mut chatter);
+
+        let mut inherited_pipe = spawn_fixture("inherited-pipe-parent");
+        let inherited_stdout = inherited_pipe
+            .stdout
+            .take()
+            .expect("inherited-pipe fixture stdout");
+        let mut inherited_output = Some(std::io::BufReader::new(inherited_stdout));
+        let started = std::time::Instant::now();
+        let inherited_error = loop {
+            match super::read_background_marker_line(
+                &mut inherited_pipe,
+                &mut inherited_output,
+                Some(std::time::Duration::from_millis(500)),
+                "inherited-pipe marker fixture",
+            ) {
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            format!("{inherited_error:#}").contains("did not emit a complete marker"),
+            "{inherited_error:#}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "an inherited stdout handle defeated the marker deadline"
+        );
+        assert_reaped(&mut inherited_pipe);
+
+        let mut delayed = spawn_fixture("delayed-authority");
+        let delayed_stdout = delayed.stdout.take().expect("delayed fixture stdout");
+        let mut delayed_output = Some(std::io::BufReader::new(delayed_stdout));
+        let started = std::time::Instant::now();
+        let marker = loop {
+            let (marker, _) = super::read_background_marker_line(
+                &mut delayed,
+                &mut delayed_output,
+                None,
+                "trusted lifecycle authority fixture",
+            )
+            .expect("trusted lifecycle marker has no wall-clock deadline");
+            if marker == "authority settled" {
+                break marker;
+            }
+        };
+        assert_eq!(marker, "authority settled");
+        assert!(
+            started.elapsed() > NOMINAL_TRANSITION_TIMEOUT_REGRESSION,
+            "trusted lifecycle authority did not exercise a wait beyond the nominal transition timeout"
+        );
+        assert!(
+            delayed
+                .wait()
+                .expect("reap delayed authority fixture")
+                .success(),
+            "delayed trusted authority fixture failed"
+        );
     }
 }
 
@@ -3325,8 +3927,10 @@ mod tests {
     const SIGNAL_ISOLATION_TEST_ROLE: &str = "CSGP_SIGNAL_ISOLATION_TEST_ROLE";
     const SIGNAL_ISOLATION_TEST_SENTINEL: &str = "CSGP_SIGNAL_ISOLATION_TEST_SENTINEL";
     const SIGNAL_ISOLATION_TEST_READY: &str = "CSGP_SIGNAL_ISOLATION_TEST_READY";
-    const SIGNAL_ISOLATION_TEST_NAME: &str =
-        "daemon::tests::lifecycle_holder_survives_parent_process_group_interrupt";
+    const SIGNAL_ISOLATION_SIGINT_TEST_NAME: &str =
+        "daemon::tests::detached_background_child_survives_parent_process_group_interrupt";
+    const SIGNAL_ISOLATION_SIGHUP_TEST_NAME: &str =
+        "daemon::tests::detached_background_child_survives_parent_session_hangup";
     const SIGNAL_ISOLATION_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn wait_for_test_path(path: &std::path::Path, purpose: &str) {
@@ -3347,8 +3951,7 @@ mod tests {
         std::fs::rename(&staged, path).expect("publish complete test marker");
     }
 
-    #[test]
-    fn lifecycle_holder_survives_parent_process_group_interrupt() {
+    fn run_signal_isolation_test(test_name: &str, signal: libc::c_int, signal_name: &str) {
         match std::env::var(SIGNAL_ISOLATION_TEST_ROLE).as_deref() {
             Ok("holder") => {
                 println!("holder ready");
@@ -3369,7 +3972,7 @@ mod tests {
                 let executable = std::env::current_exe().expect("locate test executable");
                 let mut command = std::process::Command::new(executable);
                 command
-                    .arg(SIGNAL_ISOLATION_TEST_NAME)
+                    .arg(test_name)
                     .arg("--exact")
                     .arg("--nocapture")
                     .env(SIGNAL_ISOLATION_TEST_ROLE, "holder")
@@ -3381,7 +3984,7 @@ mod tests {
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null());
-                super::isolate_lifecycle_holder_from_terminal_interrupt(&mut command);
+                super::isolate_background_child_from_terminal_interrupt(&mut command);
                 // The coordinator is deliberately killed while this isolated child survives;
                 // waiting here would invalidate the process-group isolation contract.
                 #[allow(
@@ -3389,6 +3992,15 @@ mod tests {
                     reason = "the coordinator intentionally exits before its isolated child"
                 )]
                 let mut holder = command.spawn().expect("spawn isolated holder helper");
+                let holder_session = unsafe {
+                    // SAFETY: this read-only query accepts the live child PID.
+                    libc::getsid(holder.id() as libc::pid_t)
+                };
+                assert_eq!(
+                    holder_session,
+                    holder.id() as libc::pid_t,
+                    "isolated child did not become its own session leader"
+                );
                 let mut output =
                     std::io::BufReader::new(holder.stdout.take().expect("holder stdout"));
                 let mut marker = String::new();
@@ -3402,6 +4014,18 @@ mod tests {
                         break;
                     }
                 }
+                let previous_handler = unsafe {
+                    // SAFETY: this disposable coordinator resets only the
+                    // signal selected by its parent test before advertising
+                    // readiness, making termination deterministic even if the
+                    // test runner inherited SIG_IGN from its shell.
+                    libc::signal(signal, libc::SIG_DFL)
+                };
+                assert_ne!(
+                    previous_handler,
+                    libc::SIG_ERR,
+                    "reset {signal_name} disposition in coordinator"
+                );
                 let ready =
                     std::env::var_os(SIGNAL_ISOLATION_TEST_READY).expect("coordinator ready path");
                 publish_test_path(std::path::Path::new(&ready), b"ready");
@@ -3419,7 +4043,7 @@ mod tests {
         let executable = std::env::current_exe().expect("locate test executable");
         let mut command = std::process::Command::new(executable);
         command
-            .arg(SIGNAL_ISOLATION_TEST_NAME)
+            .arg(test_name)
             .arg("--exact")
             .arg("--nocapture")
             .env(SIGNAL_ISOLATION_TEST_ROLE, "coordinator")
@@ -3428,27 +4052,49 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        super::isolate_lifecycle_holder_from_terminal_interrupt(&mut command);
+        super::isolate_background_child_from_terminal_interrupt(&mut command);
         let mut coordinator = command.spawn().expect("spawn interrupt coordinator");
+        let coordinator_session = unsafe {
+            // SAFETY: this read-only query accepts the live child PID.
+            libc::getsid(coordinator.id() as libc::pid_t)
+        };
+        assert_eq!(
+            coordinator_session,
+            coordinator.id() as libc::pid_t,
+            "coordinator did not enter its disposable session"
+        );
         wait_for_test_path(&ready, "coordinator readiness");
 
         let coordinator_group = -(coordinator.id() as i32);
-        // SAFETY: the child was placed in a new process group whose ID is its
-        // PID. SIGINT is delivered only to that disposable coordinator group.
-        let signal_result = unsafe { libc::kill(coordinator_group, libc::SIGINT) };
-        assert_eq!(signal_result, 0, "send SIGINT to coordinator process group");
+        // SAFETY: setsid made the child a session and process-group leader, so
+        // the negative PID targets only that disposable coordinator group.
+        let signal_result = unsafe { libc::kill(coordinator_group, signal) };
+        assert_eq!(
+            signal_result, 0,
+            "send {signal_name} to coordinator process group"
+        );
         let status = coordinator
             .wait()
             .expect("wait for interrupted coordinator");
         assert!(
             !status.success(),
-            "SIGINT did not terminate the coordinator"
+            "{signal_name} did not terminate the coordinator"
         );
         wait_for_test_path(&finalized, "isolated holder EOF finalization");
         assert_eq!(
             std::fs::read(&finalized).expect("read holder finalization sentinel"),
             b"holder finalized after EOF"
         );
+    }
+
+    #[test]
+    fn detached_background_child_survives_parent_process_group_interrupt() {
+        run_signal_isolation_test(SIGNAL_ISOLATION_SIGINT_TEST_NAME, libc::SIGINT, "SIGINT");
+    }
+
+    #[test]
+    fn detached_background_child_survives_parent_session_hangup() {
+        run_signal_isolation_test(SIGNAL_ISOLATION_SIGHUP_TEST_NAME, libc::SIGHUP, "SIGHUP");
     }
 
     #[test]

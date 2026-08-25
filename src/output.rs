@@ -6,7 +6,9 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::jwt::AccountInfo;
-use crate::usage::{AdditionalRateLimit, GlobalWeeklySummary, ResetCredit, UsageInfo, WindowUsage};
+use crate::usage::{
+    AdditionalRateLimit, GlobalWeeklySummary, ResetCredit, UsageInfo, UsageParseIssue, WindowUsage,
+};
 
 // ── JSON types ───────────────────────────────────────────
 
@@ -70,6 +72,8 @@ pub enum JsonUsage {
         reset_credits_error: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         additional_limits: Vec<JsonAdditionalLimit>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        parse_issues: Vec<UsageParseIssue>,
     },
     Err {
         error: String,
@@ -266,6 +270,7 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                     .iter()
                     .map(additional_limit_to_json)
                     .collect(),
+                parse_issues: u.parse_issues.clone(),
             }
         }
     }
@@ -463,17 +468,17 @@ fn message_mode() -> MessageMode {
     }
 }
 
-fn serialize<T: serde::Serialize>(val: &T) -> String {
+fn serialize<T: serde::Serialize>(val: &T) -> serde_json::Result<String> {
     if is_pretty() {
         serde_json::to_string_pretty(val)
     } else {
         serde_json::to_string(val)
     }
-    .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
-pub fn print_json<T: serde::Serialize>(val: &T) {
-    println!("{}", serialize(val));
+pub fn print_json<T: serde::Serialize>(val: &T) -> serde_json::Result<()> {
+    println!("{}", serialize(val)?);
+    Ok(())
 }
 
 pub fn print_error(msg: &str) {
@@ -481,7 +486,10 @@ pub fn print_error(msg: &str) {
         ok: false,
         error: msg.to_string(),
     };
-    println!("{}", serialize(&e));
+    println!(
+        "{}",
+        serialize(&e).expect("JsonError contains only infallibly serializable fields")
+    );
 }
 
 pub fn user_print(msg: &str) {
@@ -582,7 +590,27 @@ fn progress_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::ser::Error as _;
     use serde_json::Value;
+
+    struct FailingSerialization;
+
+    impl serde::Serialize for FailingSerialization {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(S::Error::custom("bad \"payload\"\nnext"))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_is_reported_to_the_command_boundary() {
+        let error = print_json(&FailingSerialization)
+            .expect_err("a payload serialization failure must not be converted into success");
+
+        assert_eq!(error.to_string(), "bad \"payload\"\nnext");
+    }
 
     #[test]
     fn test_reset_credit_without_expiry_uses_explicit_text_and_json_null() {
@@ -627,6 +655,29 @@ mod tests {
         let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
         assert_eq!(json["primary"], Value::Null);
         assert!(json.pointer("/additional_limits/0/primary").is_none());
+    }
+
+    #[test]
+    fn json_preserves_typed_usage_parse_issues() {
+        let usage = UsageInfo {
+            parse_issues: vec![UsageParseIssue::InvalidAdditionalRateLimits {
+                detail: "item 0 has no rate_limit object".to_string(),
+            }],
+            ..UsageInfo::default()
+        };
+
+        let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
+
+        assert_eq!(
+            json.pointer("/parse_issues/0/field"),
+            Some(&Value::String("invalid_additional_rate_limits".to_string()))
+        );
+        assert_eq!(
+            json.pointer("/parse_issues/0/detail"),
+            Some(&Value::String(
+                "item 0 has no rate_limit object".to_string()
+            ))
+        );
     }
 
     #[test]

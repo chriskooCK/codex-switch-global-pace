@@ -517,55 +517,6 @@ async fn warmup_additional_models(
     Ok(())
 }
 
-/// Write credentials the auth server just rotated back to the profile.
-///
-/// OpenAI's `refresh_token` is single-use: the previous one is already dead
-/// server-side the moment these arrive, so a failed write leaves the only
-/// credential the server still accepts in this process's memory. Finishing the
-/// warmup (or the `/models` fetch) with it would exit successfully and hand the
-/// user a profile that silently stops working at the next start, which makes
-/// this a reportable failure rather than something to warn about and walk past.
-///
-/// The result model is shared with the usage path so a profile write failure,
-/// a superseding writer, and an incomplete live-auth activation remain
-/// distinguishable instead of all being reported as lost credentials.
-///
-/// Each caller owns a single account, so propagating this aborts that account
-/// only — batch drivers keep processing the rest.
-fn persist_refreshed_tokens(
-    lease: &crate::profile::ProfileLease,
-    authorization: crate::profile::FreshCredentialsActivationAuthorization,
-    presented_refresh_token: &str,
-    refreshed: &crate::usage::RefreshedTokens,
-) -> Result<()> {
-    let alias = lease.alias();
-    let update = crate::profile::update_profile_tokens_if_refresh_matches_leased(
-        lease,
-        authorization,
-        presented_refresh_token,
-        &refreshed.id_token,
-        &refreshed.access_token,
-        &refreshed.refresh_token,
-    )
-    .map_err(|err| {
-        anyhow::anyhow!(
-            "{}",
-            crate::usage::UsageError::token_persist_failed(alias, &err).detail
-        )
-    })?;
-    match update {
-        crate::profile::RefreshTokenUpdate::Saved => Ok(()),
-        crate::profile::RefreshTokenUpdate::Superseded => bail!(
-            "{}",
-            crate::usage::UsageError::token_update_superseded(alias).detail
-        ),
-        crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } => bail!(
-            "{}",
-            crate::usage::UsageError::live_activation_incomplete(alias, &cause).detail
-        ),
-    }
-}
-
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
 ///
 /// The 5-hour and 7-day windows only start after the first real API call.
@@ -642,22 +593,27 @@ pub(crate) async fn warmup_account_leased(
                     "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                 )
             })?;
-        match crate::usage::do_refresh_token(
-            alias,
-            &client,
-            id_token.as_deref(),
-            Some(&access_token),
-            rt,
-        )
-        .await
-        {
-            Ok(refreshed) => {
-                persist_refreshed_tokens(lease, activation_authorization, rt, &refreshed)?;
+        match crate::usage::do_refresh_token(alias, &client, id_token.as_deref(), rt).await {
+            Ok(resolution) => {
+                let refreshed = crate::usage::persist_refresh_resolution(
+                    lease,
+                    activation_authorization,
+                    rt,
+                    resolution,
+                )
+                .map_err(|error| anyhow::anyhow!(error.detail))?;
                 access_token = refreshed.access_token;
                 id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
             }
             Err(e) => {
+                if e.downcast_ref::<crate::usage::RefreshOutcomeUnknown>()
+                    .is_some()
+                {
+                    return Err(e.context(format!(
+                        "{alias}: proactive token refresh outcome is unknown; warmup stopped without replaying the single-use credential"
+                    )));
+                }
                 if e.downcast_ref::<crate::usage::TerminalAuthError>()
                     .is_some()
                 {
@@ -791,17 +747,16 @@ pub(crate) async fn warmup_account_leased(
                             )
                         },
                     )?;
-                match crate::usage::do_refresh_token(
-                    alias,
-                    &client,
-                    id_token.as_deref(),
-                    Some(&access_token),
-                    rt,
-                )
-                .await
+                match crate::usage::do_refresh_token(alias, &client, id_token.as_deref(), rt).await
                 {
-                    Ok(refreshed) => {
-                        persist_refreshed_tokens(lease, activation_authorization, rt, &refreshed)?;
+                    Ok(resolution) => {
+                        let refreshed = crate::usage::persist_refresh_resolution(
+                            lease,
+                            activation_authorization,
+                            rt,
+                            resolution,
+                        )
+                        .map_err(|error| anyhow::anyhow!(error.detail))?;
                         let mut retry_resp = make_request(
                             &client,
                             &refreshed.access_token,
@@ -883,19 +838,17 @@ pub(crate) async fn fetch_models_for_profile_leased(
                     "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                 )
             })?;
-        match crate::usage::do_refresh_token(
-            alias,
-            &client,
-            id_token.as_deref(),
-            Some(&access_token),
-            rt,
-        )
-        .await
-        {
-            Ok(refreshed) => {
+        match crate::usage::do_refresh_token(alias, &client, id_token.as_deref(), rt).await {
+            Ok(resolution) => {
                 // No degrade here: the refresh *worked*, so the old token this
                 // would fall back to has already been invalidated server-side.
-                persist_refreshed_tokens(lease, activation_authorization, rt, &refreshed)?;
+                let refreshed = crate::usage::persist_refresh_resolution(
+                    lease,
+                    activation_authorization,
+                    rt,
+                    resolution,
+                )
+                .map_err(|error| anyhow::anyhow!(error.detail))?;
                 access_token = refreshed.access_token;
             }
             // Deliberate degrade: fall through and try /models with the
@@ -903,6 +856,14 @@ pub(crate) async fn fetch_models_for_profile_leased(
             // Still worth a diagnosable trace — silently swallowing this
             // sent people chasing an unrelated /models error instead of the
             // real cause (a rejected/expired refresh_token).
+            Err(e)
+                if e.downcast_ref::<crate::usage::RefreshOutcomeUnknown>()
+                    .is_some() =>
+            {
+                return Err(e.context(format!(
+                    "{alias}: proactive token refresh outcome is unknown; model discovery stopped without replaying the single-use credential"
+                )));
+            }
             Err(e) => warn!(
                 "[{alias}] proactive token refresh failed, continuing with existing token: {e:#}"
             ),
@@ -1475,6 +1436,15 @@ mod tests {
             format!("header.{payload}.signature")
         }
 
+        fn test_id_token() -> String {
+            make_jwt(&serde_json::json!({
+                "email": "warmup-test@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-warmup-test"
+                }
+            }))
+        }
+
         /// An access_token JWT that `is_token_expiring` already treats as expired,
         /// so `warmup_account`'s pre-warmup proactive refresh always fires.
         fn expired_access_token() -> String {
@@ -1484,7 +1454,7 @@ mod tests {
         fn write_test_auth(path: &std::path::Path, access_token: &str, refresh_token: &str) {
             let val = serde_json::json!({
                 "tokens": {
-                    "id_token": make_jwt(&serde_json::json!({})),
+                    "id_token": test_id_token(),
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                 }
@@ -1692,6 +1662,46 @@ mod tests {
             );
         }
 
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn unknown_pre_refresh_outcome_stops_without_replaying_the_credential() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = tempfile::tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+            let alias = "unknown-refresh-test";
+            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
+            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
+            write_test_auth(
+                &profile_path,
+                &expired_access_token(),
+                "refresh-token-unknown",
+            );
+            let (token_calls, _guards) = start_mock_server(
+                StatusCode::OK,
+                serde_json::json!({
+                    "id_token": test_id_token(),
+                    "access_token": "new-access",
+                    "refresh_token": ""
+                }),
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+
+            let error = warmup_account(alias, &profile_path)
+                .await
+                .expect_err("an unknown refresh outcome must stop warmup");
+
+            assert!(format!("{error:#}").contains("outcome is unknown"));
+            assert_eq!(
+                token_calls.load(Ordering::SeqCst),
+                1,
+                "the presented single-use credential must never be replayed"
+            );
+        }
+
         // ── `fetch_models_for_profile` must not swallow a refresh failure ──
 
         #[derive(Clone, Default)]
@@ -1857,7 +1867,7 @@ mod tests {
                             (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
-                                    "id_token": make_jwt(&serde_json::json!({})),
+                                    "id_token": test_id_token(),
                                     "access_token": live_access_token(),
                                     "refresh_token": format!("rotated-refresh-{n}"),
                                 })),

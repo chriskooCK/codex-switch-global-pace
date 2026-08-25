@@ -1,6 +1,6 @@
 use super::render::print_usage_line;
 use crate::output::{self, ProgressReporter, account_to_json, print_json, usage_to_json};
-use crate::{auth, cache, color, profile, usage};
+use crate::{auth, color, profile, usage};
 use anyhow::Result;
 
 /// Validation failed, but the auth server had already rotated the credentials
@@ -17,6 +17,13 @@ const STAGE_TOKEN_ROTATION_LOST: &str = "token_rotation_lost";
 /// get their own marker instead of blending into the skip list.
 fn rotated_credentials(stage: &str) -> bool {
     stage == STAGE_TOKEN_ROTATED || stage == STAGE_TOKEN_ROTATION_LOST
+}
+
+fn format_import_failure_line(status: &str, source: &str, stage: &str, error: &str) -> String {
+    let source = crate::safe_text::terminal_text(source);
+    let stage = crate::safe_text::terminal_text(stage);
+    let error = crate::safe_text::terminal_text(error);
+    format!("  {status} {source} [{stage}] {error}")
 }
 
 /// Promote or preserve the durable stage written immediately after the auth
@@ -133,7 +140,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
                 ok: true,
                 alias: imported.alias,
                 action: imported.action.to_string(),
-            });
+            })?;
         } else {
             println!(
                 "{}",
@@ -200,7 +207,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
                     error: item.error.clone(),
                 })
                 .collect(),
-        });
+        })?;
         if all_skipped {
             return Err(super::super::OutputAlreadyReported.into());
         }
@@ -218,7 +225,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
             println!(
                 "  {} {} -> {} ({})",
                 color::status_tag("OK"),
-                item.source.display(),
+                crate::safe_text::terminal_text(&item.source.display().to_string()),
                 item.alias,
                 item.action
             );
@@ -227,21 +234,17 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
         }
 
         for item in &report.skipped {
-            let line = format!(
-                "  {} {} [{}] {}",
-                color::status_tag(if rotated_credentials(item.stage) {
-                    "Rotated"
-                } else {
-                    "Skip"
-                }),
-                item.source.display(),
-                item.stage,
-                item.error
-            );
+            let source = item.source.display().to_string();
             if rotated_credentials(item.stage) {
+                let line =
+                    format_import_failure_line("[Rotated]", &source, item.stage, &item.error);
                 println!("{}", color::warn(&line));
             } else {
-                println!("{line}");
+                let status = color::status_tag("Skip");
+                println!(
+                    "{}",
+                    format_import_failure_line(&status, &source, item.stage, &item.error)
+                );
             }
         }
 
@@ -356,7 +359,7 @@ async fn import_one_file(
     // malformed refresh reply fails it at a point where the source file's
     // token is already spent. The durable stage must be promoted or preserved,
     // exactly as above.
-    let mut account = match auth::validate_auth_value(&val) {
+    let account = match auth::validate_auth_value(&val) {
         Ok(account) => account,
         Err(error) if rotated => {
             drop(credential_reservation.take());
@@ -377,8 +380,6 @@ async fn import_one_file(
             });
         }
     };
-    cache::apply_workspace_name(&mut account);
-
     let validated_account_id = validated_account_id.ok_or_else(|| profile::ImportFailure {
         source: source.to_path_buf(),
         stage: "usage_validation",
@@ -447,4 +448,28 @@ async fn import_one_file(
         account,
         usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_import_failure_line;
+
+    #[test]
+    fn failure_row_preserves_trusted_ansi_after_sanitizing_untrusted_fields() {
+        let status = "\u{1b}[32m[Skip]\u{1b}[39m";
+        let rendered = format_import_failure_line(
+            status,
+            "dump\u{1b}]52;c;path\u{7}.json",
+            "save\nnext",
+            "server\u{1b}[31merror",
+        );
+
+        assert!(rendered.contains(status), "{rendered:?}");
+        assert!(rendered.contains("dump]52;c;path.json"), "{rendered:?}");
+        assert!(rendered.contains("[savenext]"), "{rendered:?}");
+        assert!(rendered.contains("server[31merror"), "{rendered:?}");
+        assert_eq!(rendered.matches('\u{1b}').count(), 2, "{rendered:?}");
+        assert!(!rendered.contains('\n'), "{rendered:?}");
+        assert!(!rendered.contains('\u{7}'), "{rendered:?}");
+    }
 }

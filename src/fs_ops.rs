@@ -36,6 +36,16 @@ pub(crate) enum CreateExactOutcome {
     CreatedNamespaceDurabilityUnconfirmed(FileToken),
 }
 
+#[derive(Debug)]
+#[must_use = "a visible directory rename with unconfirmed durability must be handled explicitly"]
+pub(crate) enum DirectoryRenameOutcome {
+    DurablyRenamed,
+    #[cfg_attr(windows, allow(dead_code))]
+    VisibleDurabilityUnconfirmed {
+        cause: anyhow::Error,
+    },
+}
+
 impl CreateExactOutcome {
     pub(crate) fn token(&self) -> &FileToken {
         match self {
@@ -305,25 +315,54 @@ fn direct_parent(path: &Path) -> Result<(PathBuf, &OsStr)> {
 
 #[cfg(unix)]
 fn open_direct_directory(path: &Path) -> Result<File> {
-    let before = fs::symlink_metadata(path)
-        .with_context(|| format!("inspecting transaction directory {}", path.display()))?;
-    if !before.file_type().is_dir() || before.file_type().is_symlink() {
+    if !path.is_absolute() {
         anyhow::bail!(
-            "transaction parent is not a direct directory: {}",
+            "transaction directory path is not absolute: {}",
             path.display()
         );
     }
-    let directory = File::open(path)
-        .with_context(|| format!("opening transaction directory {}", path.display()))?;
-    let opened = directory
-        .metadata()
-        .with_context(|| format!("identifying transaction directory {}", path.display()))?;
-    if !opened.file_type().is_dir() || before.dev() != opened.dev() || before.ino() != opened.ino()
-    {
-        anyhow::bail!(
-            "transaction parent changed while it was opened: {}",
-            path.display()
-        );
+
+    let mut directory = File::open("/").context("opening filesystem root directory")?;
+    let mut walked = PathBuf::from("/");
+    for component in path.components() {
+        let name = match component {
+            std::path::Component::RootDir => continue,
+            std::path::Component::CurDir => continue,
+            std::path::Component::Normal(name) => name,
+            std::path::Component::ParentDir => {
+                anyhow::bail!("transaction directory contains '..': {}", path.display())
+            }
+            std::path::Component::Prefix(_) => {
+                anyhow::bail!(
+                    "unexpected platform prefix in Unix transaction directory: {}",
+                    path.display()
+                )
+            }
+        };
+        let name = component_c_string(name, path)?;
+        let descriptor = unsafe {
+            // SAFETY: `directory` is a live directory descriptor and `name`
+            // is NUL-terminated. O_NOFOLLOW and O_DIRECTORY bind this exact
+            // path component in one syscall instead of checking then following.
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        walked.push(OsStr::from_bytes(name.as_bytes()));
+        if descriptor == -1 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "opening direct transaction directory component {}",
+                    walked.display()
+                )
+            });
+        }
+        directory = unsafe {
+            // SAFETY: a successful openat returned a new uniquely owned fd.
+            File::from_raw_fd(descriptor)
+        };
     }
     Ok(directory)
 }
@@ -394,6 +433,232 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> 
             source_parent.display()
         )
     })
+}
+
+/// Atomically move one direct directory without replacing the destination and
+/// durably publish both sides of a cross-parent rename.
+#[cfg(unix)]
+fn rename_directory_entry_noreplace(
+    source_parent: &File,
+    source_name: &CString,
+    destination_parent: &File,
+    destination_name: &CString,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        // SAFETY: both descriptors and NUL-terminated component names remain
+        // live for the syscall. RENAME_NOREPLACE is one atomic boundary.
+        libc::renameat2(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        // SAFETY: as above; RENAME_EXCL supplies the no-replace contract.
+        libc::renameatx_np(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result: libc::c_int = return Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "durable directory rename is supported only on Linux and macOS",
+    ));
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn rename_directory_noreplace_durable(
+    source: &Path,
+    destination: &Path,
+) -> Result<DirectoryRenameOutcome> {
+    rename_directory_noreplace_durable_impl(source, destination, || {})
+}
+
+#[cfg(all(unix, test))]
+fn rename_directory_noreplace_durable_with_hook(
+    source: &Path,
+    destination: &Path,
+    before_rename: impl FnOnce(),
+) -> Result<DirectoryRenameOutcome> {
+    rename_directory_noreplace_durable_impl(source, destination, before_rename)
+}
+
+#[cfg(unix)]
+fn rename_directory_noreplace_durable_impl(
+    source: &Path,
+    destination: &Path,
+    before_rename: impl FnOnce(),
+) -> Result<DirectoryRenameOutcome> {
+    let (source_parent, source_name) = direct_parent(source)?;
+    let (destination_parent, destination_name) = direct_parent(destination)?;
+    let source_directory = open_direct_directory(&source_parent)?;
+    let destination_parent_directory = if source_parent == destination_parent {
+        None
+    } else {
+        Some(open_direct_directory(&destination_parent)?)
+    };
+    // Open the exact source before the namespace mutation so a final-component
+    // symlink can never be renamed as a profile directory.
+    let moved_directory = open_direct_directory(source)?;
+    let moved_metadata = moved_directory
+        .metadata()
+        .with_context(|| format!("binding source directory {}", source.display()))?;
+    let moved_identity = (moved_metadata.dev(), moved_metadata.ino());
+    let source_name = component_c_string(source_name, source)?;
+    let destination_name = component_c_string(destination_name, destination)?;
+    let destination_directory = destination_parent_directory
+        .as_ref()
+        .unwrap_or(&source_directory);
+
+    before_rename();
+
+    if let Err(error) = rename_directory_entry_noreplace(
+        &source_directory,
+        &source_name,
+        destination_directory,
+        &destination_name,
+    ) {
+        return Err(error).with_context(|| {
+            format!(
+                "atomically renaming directory without replacement {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        });
+    }
+
+    let published_directory = match open_direct_directory(destination).with_context(|| {
+        format!(
+            "opening the directory published by rename at {}",
+            destination.display()
+        )
+    }) {
+        Ok(directory) => directory,
+        Err(publication_error) => {
+            let rollback = rename_directory_entry_noreplace(
+                destination_directory,
+                &destination_name,
+                &source_directory,
+                &source_name,
+            );
+            match rollback {
+                Ok(()) => {
+                    let source_sync = source_directory.sync_all();
+                    let destination_sync = if std::ptr::eq(destination_directory, &source_directory)
+                    {
+                        Ok(())
+                    } else {
+                        destination_directory.sync_all()
+                    };
+                    anyhow::bail!(
+                        "source entry changed into a non-direct directory during exact rename ({publication_error:#}); the changed entry was restored without replacement to {} and profile metadata was not updated{}",
+                        source.display(),
+                        if source_sync.is_ok() && destination_sync.is_ok() {
+                            String::new()
+                        } else {
+                            "; restoration durability was not confirmed".to_string()
+                        }
+                    );
+                }
+                Err(rollback_error) => anyhow::bail!(
+                    "source entry changed into a non-direct directory during exact rename ({publication_error:#}) and exact restoration was not safe; profile metadata was not updated (source {}, destination {}, rollback: {rollback_error})",
+                    source.display(),
+                    destination.display()
+                ),
+            }
+        }
+    };
+    let published_metadata = published_directory
+        .metadata()
+        .with_context(|| format!("binding renamed directory {}", destination.display()))?;
+    let published_identity = (published_metadata.dev(), published_metadata.ino());
+    if published_identity != moved_identity {
+        let rollback = rename_directory_entry_noreplace(
+            destination_directory,
+            &destination_name,
+            &source_directory,
+            &source_name,
+        );
+        let restored_identity = open_direct_directory(source)
+            .and_then(|directory| {
+                let metadata = directory.metadata().with_context(|| {
+                    format!("identifying restored directory {}", source.display())
+                })?;
+                Ok((metadata.dev(), metadata.ino()))
+            })
+            .ok();
+        if rollback.is_ok() && restored_identity == Some(published_identity) {
+            let source_sync = source_directory.sync_all();
+            let destination_sync = if std::ptr::eq(destination_directory, &source_directory) {
+                Ok(())
+            } else {
+                destination_directory.sync_all()
+            };
+            let durability_note = match (source_sync, destination_sync) {
+                (Ok(()), Ok(())) => String::new(),
+                (source_result, destination_result) => format!(
+                    "; restoration durability was not confirmed (source parent: {}; destination parent: {})",
+                    source_result
+                        .err()
+                        .map_or_else(|| "ok".to_string(), |error| error.to_string()),
+                    destination_result
+                        .err()
+                        .map_or_else(|| "ok".to_string(), |error| error.to_string())
+                ),
+            };
+            anyhow::bail!(
+                "source directory changed during exact rename; the different directory was restored without replacement from {} to {}, profile metadata was not updated{durability_note}",
+                destination.display(),
+                source.display()
+            );
+        }
+        anyhow::bail!(
+            "source directory changed during exact rename and exact restoration was not safe; profile metadata was not updated (source {}, destination {}, rollback: {})",
+            source.display(),
+            destination.display(),
+            rollback.err().map_or_else(
+                || "postcondition mismatch".to_string(),
+                |error| error.to_string()
+            )
+        );
+    }
+
+    let mut sync_errors = Vec::new();
+    if let Err(error) = source_directory.sync_all() {
+        sync_errors.push(format!(
+            "source parent {}: {error}",
+            source_parent.display()
+        ));
+    }
+    if let Some(directory) = destination_parent_directory
+        && let Err(error) = directory.sync_all()
+    {
+        sync_errors.push(format!(
+            "destination parent {}: {error}",
+            destination_parent.display()
+        ));
+    }
+    if sync_errors.is_empty() {
+        Ok(DirectoryRenameOutcome::DurablyRenamed)
+    } else {
+        Ok(DirectoryRenameOutcome::VisibleDurabilityUnconfirmed {
+            cause: anyhow::anyhow!(sync_errors.join("; ")),
+        })
+    }
 }
 
 /// Atomically swaps two sibling names without creating a moment at which
@@ -558,15 +823,126 @@ fn direct_parent(path: &Path) -> Result<(PathBuf, &OsStr)> {
 
 #[cfg(windows)]
 fn validate_direct_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("inspecting transaction directory {}", path.display()))?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
         anyhow::bail!(
             "transaction parent is not a direct directory: {}",
             path.display()
         );
     }
     Ok(())
+}
+
+/// Handles that pin one direct Windows directory and all of its ancestors.
+#[cfg(windows)]
+struct PinnedWindowsDirectory {
+    /// Every component remains open so an intermediate directory cannot be
+    /// exchanged after its child has been validated.
+    handles: Vec<File>,
+}
+
+#[cfg(windows)]
+impl PinnedWindowsDirectory {
+    fn file(&self) -> &File {
+        self.handles
+            .last()
+            .expect("an absolute directory path has at least its root handle")
+    }
+}
+
+/// Open one exact directory while denying namespace replacement for the
+/// lifetime of the returned handles. `access` is explicit because a
+/// handle-bound rename needs `DELETE` on its source but only attribute access
+/// on its destination parent.
+#[cfg(windows)]
+fn open_pinned_direct_directory(path: &Path, access: u32) -> Result<PinnedWindowsDirectory> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "Windows transaction directory path is not absolute: {}",
+            path.display()
+        );
+    }
+
+    let mut walked = PathBuf::new();
+    let mut prefixes = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => walked.push(component.as_os_str()),
+            std::path::Component::RootDir => {
+                walked.push(component.as_os_str());
+                prefixes.push(walked.clone());
+            }
+            std::path::Component::Normal(_) => {
+                walked.push(component.as_os_str());
+                prefixes.push(walked.clone());
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                anyhow::bail!(
+                    "Windows transaction directory contains a relative component: {}",
+                    path.display()
+                )
+            }
+        }
+    }
+    if prefixes.is_empty() {
+        anyhow::bail!(
+            "Windows transaction directory has no openable component: {}",
+            path.display()
+        );
+    }
+
+    let mut handles = Vec::with_capacity(prefixes.len());
+    let last = prefixes.len() - 1;
+    for (index, component_path) in prefixes.into_iter().enumerate() {
+        let component_access = if index == last {
+            access
+        } else {
+            FILE_READ_ATTRIBUTES
+        };
+        let directory = OpenOptions::new()
+            .access_mode(component_access)
+            // Denying delete sharing pins this namespace component. Write
+            // sharing is unrelated to replacing the directory itself and
+            // permits normal mutation of entries below an app-owned parent.
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&component_path)
+            .with_context(|| {
+                format!(
+                    "opening and pinning Windows directory component {}",
+                    component_path.display()
+                )
+            })?;
+        let metadata = directory.metadata().with_context(|| {
+            format!(
+                "identifying pinned Windows directory component {}",
+                component_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            anyhow::bail!(
+                "pinned Windows path component is not a direct directory: {}",
+                component_path.display()
+            );
+        }
+        handles.push(directory);
+    }
+    Ok(PinnedWindowsDirectory { handles })
 }
 
 #[cfg(windows)]
@@ -659,6 +1035,100 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> 
             .context("atomically renaming a Windows transaction file without replacement");
     }
     Ok(())
+}
+
+/// Rename the exact opened Windows directory handle without replacing the
+/// destination. The source handle denies delete sharing until publication, so
+/// another writer cannot exchange the path between validation and the rename.
+#[cfg(windows)]
+pub(crate) fn rename_directory_noreplace_durable(
+    source: &Path,
+    destination: &Path,
+) -> Result<DirectoryRenameOutcome> {
+    rename_directory_noreplace_durable_impl(source, destination, || {})
+}
+
+#[cfg(all(windows, test))]
+fn rename_directory_noreplace_durable_with_hook(
+    source: &Path,
+    destination: &Path,
+    before_rename: impl FnOnce(),
+) -> Result<DirectoryRenameOutcome> {
+    rename_directory_noreplace_durable_impl(source, destination, before_rename)
+}
+
+#[cfg(windows)]
+fn rename_directory_noreplace_durable_impl(
+    source: &Path,
+    destination: &Path,
+    before_rename: impl FnOnce(),
+) -> Result<DirectoryRenameOutcome> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FileRenameInfo,
+        SetFileInformationByHandle,
+    };
+
+    let (_source_parent, _) = direct_parent(source)?;
+    let (destination_parent, _) = direct_parent(destination)?;
+    let source_directory = open_pinned_direct_directory(source, FILE_READ_ATTRIBUTES | DELETE)?;
+    let _destination_directory =
+        open_pinned_direct_directory(&destination_parent, FILE_GENERIC_READ)?;
+
+    before_rename();
+
+    // Keep every destination ancestor pinned, then use the documented common
+    // absolute-name form. RootDirectory-relative renames are not accepted by
+    // every local filesystem driver even though NTFS supports the structure.
+    let destination_wide: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if destination_wide.is_empty() || destination_wide.contains(&0) {
+        anyhow::bail!(
+            "Windows rename destination is empty or contains a NUL character: {}",
+            destination.display()
+        );
+    }
+    let name_bytes = destination_wide
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .context("Windows rename destination length overflow")?;
+    let name_bytes_u32 = u32::try_from(name_bytes)
+        .context("Windows rename destination exceeds the platform length limit")?;
+    let buffer_bytes = std::mem::size_of::<FILE_RENAME_INFO>()
+        .checked_add(name_bytes)
+        .context("Windows rename information length overflow")?;
+    let buffer_bytes_u32 = u32::try_from(buffer_bytes)
+        .context("Windows rename information exceeds the platform length limit")?;
+    let word_bytes = std::mem::size_of::<usize>();
+    let mut storage = vec![0_usize; buffer_bytes.div_ceil(word_bytes)];
+    let rename_info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        // SAFETY: `storage` is word-aligned and large enough for the fixed
+        // header plus every UTF-16 code unit copied into the flexible tail.
+        (*rename_info).Anonymous.ReplaceIfExists = false;
+        (*rename_info).RootDirectory = std::ptr::null_mut();
+        (*rename_info).FileNameLength = name_bytes_u32;
+        std::ptr::copy_nonoverlapping(
+            destination_wide.as_ptr(),
+            std::ptr::addr_of_mut!((*rename_info).FileName).cast::<u16>(),
+            destination_wide.len(),
+        );
+    }
+    let result = unsafe {
+        // SAFETY: `source_directory` owns the DELETE-capable pinned directory
+        // handle, and `rename_info` points into the live, correctly sized
+        // aligned buffer initialized above. ReplaceIfExists is false.
+        SetFileInformationByHandle(
+            source_directory.file().as_raw_handle(),
+            FileRenameInfo,
+            rename_info.cast(),
+            buffer_bytes_u32,
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("renaming the exact Windows directory handle without replacement");
+    }
+    Ok(DirectoryRenameOutcome::DurablyRenamed)
 }
 
 #[cfg(windows)]
@@ -1025,9 +1495,169 @@ pub(crate) fn remove_exact(source: &Path, expected: &FileToken) -> Result<Remove
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateExactOutcome, RemoveExactOutcome, create_exclusive_copy, remove_exact, token_for_path,
+        CreateExactOutcome, DirectoryRenameOutcome, RemoveExactOutcome, create_exclusive_copy,
+        remove_exact, rename_directory_noreplace_durable,
+        rename_directory_noreplace_durable_with_hook, token_for_path,
     };
     use std::fs;
+
+    #[test]
+    fn durable_directory_rename_supports_cross_parent_no_replace_moves() {
+        let root = tempfile::tempdir().unwrap();
+        let source_parent = root.path().join("source-parent");
+        let destination_parent = root.path().join("destination-parent");
+        fs::create_dir_all(source_parent.join("profile")).unwrap();
+        fs::create_dir(&destination_parent).unwrap();
+        fs::write(source_parent.join("profile/auth.json"), b"credential").unwrap();
+        let source = source_parent.join("profile");
+        let destination = destination_parent.join("archived");
+
+        let outcome = rename_directory_noreplace_durable(&source, &destination).unwrap();
+        assert!(matches!(
+            outcome,
+            DirectoryRenameOutcome::DurablyRenamed
+                | DirectoryRenameOutcome::VisibleDurabilityUnconfirmed { .. }
+        ));
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read(destination.join("auth.json")).unwrap(),
+            b"credential"
+        );
+
+        fs::create_dir_all(source.join("nested")).unwrap();
+        let error = rename_directory_noreplace_durable(&source, &destination)
+            .expect_err("a durable rename must never replace an existing directory");
+        assert!(!error.to_string().is_empty());
+        assert!(source.join("nested").exists());
+        assert_eq!(
+            fs::read(destination.join("auth.json")).unwrap(),
+            b"credential"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_rename_never_follows_a_source_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let source = root.path().join("source-link");
+        let destination = root.path().join("destination");
+        fs::create_dir(&original).unwrap();
+        fs::write(original.join("auth.json"), b"original").unwrap();
+        symlink(&original, &source).unwrap();
+
+        let error = rename_directory_noreplace_durable(&source, &destination)
+            .expect_err("the source bind must reject a final symlink atomically");
+
+        assert!(!destination.exists(), "the symlink itself was moved");
+        assert_eq!(fs::read(original.join("auth.json")).unwrap(), b"original");
+        assert!(
+            format!("{error:#}").contains("opening direct transaction directory component"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_rename_rejects_a_source_swapped_after_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let source_parent = root.path().join("source-parent");
+        let destination_parent = root.path().join("destination-parent");
+        let source = source_parent.join("profile");
+        let parked_source = source_parent.join("parked-profile");
+        let replacement = source_parent.join("replacement");
+        let destination = destination_parent.join("archived");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&replacement).unwrap();
+        fs::create_dir(&destination_parent).unwrap();
+        fs::write(source.join("auth.json"), b"original").unwrap();
+        fs::write(replacement.join("auth.json"), b"replacement").unwrap();
+
+        let error = rename_directory_noreplace_durable_with_hook(&source, &destination, || {
+            fs::rename(&source, &parked_source).unwrap();
+            fs::rename(&replacement, &source).unwrap();
+        })
+        .expect_err("a path-swapped source must never be reported as the bound directory");
+
+        assert!(
+            format!("{error:#}").contains("source directory changed during exact rename"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read(parked_source.join("auth.json")).unwrap(),
+            b"original"
+        );
+        assert_eq!(fs::read(source.join("auth.json")).unwrap(), b"replacement");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn durable_directory_rename_restores_a_symlink_swapped_after_binding() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let source_parent = root.path().join("source-parent");
+        let destination_parent = root.path().join("destination-parent");
+        let source = source_parent.join("profile");
+        let parked_source = source_parent.join("parked-profile");
+        let destination = destination_parent.join("archived");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&destination_parent).unwrap();
+        fs::write(source.join("auth.json"), b"original").unwrap();
+
+        let error = rename_directory_noreplace_durable_with_hook(&source, &destination, || {
+            fs::rename(&source, &parked_source).unwrap();
+            symlink(&parked_source, &source).unwrap();
+        })
+        .expect_err("a symlink swapped after binding must never be committed as the profile");
+
+        assert!(
+            format!("{error:#}").contains("changed into a non-direct directory"),
+            "{error:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(parked_source.join("auth.json")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_directory_rename_pins_the_source_namespace_until_handle_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let source_parent = root.path().join("source-parent");
+        let destination_parent = root.path().join("destination-parent");
+        let source = source_parent.join("profile");
+        let parked_source = source_parent.join("parked-profile");
+        let destination = destination_parent.join("archived");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir(&destination_parent).unwrap();
+        fs::write(source.join("auth.json"), b"original").unwrap();
+
+        let outcome = rename_directory_noreplace_durable_with_hook(&source, &destination, || {
+            fs::rename(&source, &parked_source)
+                .expect_err("the pinned source must reject a namespace swap");
+        })
+        .unwrap();
+
+        assert!(matches!(outcome, DirectoryRenameOutcome::DurablyRenamed));
+        assert!(!source.exists());
+        assert!(!parked_source.exists());
+        assert_eq!(
+            fs::read(destination.join("auth.json")).unwrap(),
+            b"original"
+        );
+    }
 
     #[test]
     fn exclusive_copy_and_exact_removal_preserve_the_bound_bytes() {

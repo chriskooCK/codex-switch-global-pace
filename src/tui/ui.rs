@@ -13,6 +13,7 @@ use crate::jwt::PlanKind;
 use crate::output::{
     format_local_time, format_reset_short, format_reset_time, reset_credits_count,
 };
+use crate::safe_text;
 use crate::usage::{GlobalWeeklySummary, QuotaPaceState, UsageInfo, quota_pace_state};
 
 // ── RGB-only color palette ───────────────────────────────
@@ -47,6 +48,10 @@ struct UsageBarAreas {
 
 fn base() -> Style {
     Style::default().bg(BG)
+}
+
+fn safe_display(value: &str) -> String {
+    safe_text::terminal_text(value).into_owned()
 }
 
 fn usage_bar_areas(area: Rect) -> UsageBarAreas {
@@ -249,6 +254,9 @@ enum AccountUsageState {
 }
 
 fn account_usage_state(usage: &UsageInfo) -> AccountUsageState {
+    if !usage.parse_issues.is_empty() {
+        return AccountUsageState::Unavailable;
+    }
     if usage.account_limited {
         return AccountUsageState::Limited;
     }
@@ -750,14 +758,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 base().fg(C_GRAY)
             };
 
-            let email = entry.info.email.as_deref().unwrap_or("--").to_string();
+            let alias = safe_display(&entry.alias);
+            let email = safe_display(entry.info.email.as_deref().unwrap_or("--"));
             let api_plan = if let UsageStatus::Loaded(u) = &entry.usage {
                 u.plan_type.as_deref()
             } else {
                 None
             };
             let effective_plan = api_plan.or(entry.info.plan_type.as_deref());
-            let plan_label = entry.info.plan_label_with(effective_plan);
+            let plan_label = safe_display(&entry.info.plan_label_with(effective_plan));
             let plan_style = plan_color(effective_plan, is_selected);
 
             let now = crate::auth::now_unix_secs();
@@ -886,7 +895,7 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
 
             Row::new(vec![
                 Cell::from(Span::styled(marker, marker_style)),
-                Cell::from(entry.alias.clone()).style(row_style),
+                Cell::from(alias).style(row_style),
                 Cell::from(email).style(row_style),
                 Cell::from(plan_label).style(plan_style),
                 Cell::from(status_text).style(base().fg(status_color).add_modifier(
@@ -917,13 +926,13 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
             " Accounts ({}/{}) [/{s}]",
             app.view_indices.len(),
             app.accounts.len(),
-            s = s.query
+            s = safe_text::terminal_text(&s.query)
         )
     } else {
         format!(" Accounts ({})", app.accounts.len())
     };
     if loading_count > 0 {
-        title.push_str(&format!(" -- fetching {}...", loading_count));
+        title.push_str(&format!(" -- fetching {loading_count}..."));
     }
     if !app.marked.is_empty() {
         title.push_str(&format!(" [{} marked]", app.marked.len()));
@@ -938,15 +947,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
 
     let mut table_state = TableState::default().with_selected(render_selected);
 
-    let aliases: Vec<&str> = app
+    let alias_labels: Vec<String> = app
         .view_indices
         .iter()
-        .map(|&idx| app.accounts[idx].alias.as_str())
+        .map(|&idx| safe_display(&app.accounts[idx].alias))
         .collect();
-    let emails: Vec<&str> = app
+    let email_labels: Vec<String> = app
         .view_indices
         .iter()
-        .map(|&idx| app.accounts[idx].info.email.as_deref().unwrap_or("--"))
+        .map(|&idx| safe_display(app.accounts[idx].info.email.as_deref().unwrap_or("--")))
         .collect();
     let plan_labels: Vec<String> = app
         .view_indices
@@ -957,11 +966,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 UsageStatus::Loaded(u) => u.plan_type.as_deref(),
                 _ => None,
             };
-            entry
-                .info
-                .plan_label_with(api_plan.or(entry.info.plan_type.as_deref()))
+            safe_display(
+                &entry
+                    .info
+                    .plan_label_with(api_plan.or(entry.info.plan_type.as_deref())),
+            )
         })
         .collect();
+    let aliases: Vec<&str> = alias_labels.iter().map(String::as_str).collect();
+    let emails: Vec<&str> = email_labels.iter().map(String::as_str).collect();
     let plans: Vec<&str> = plan_labels.iter().map(String::as_str).collect();
     let text_widths = table_text_widths(area.width, &aliases, &emails, &plans);
 
@@ -1045,9 +1058,9 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let title = if entry.is_current {
-        format!(" * {} (active) ", entry.alias)
+        format!(" * {} (active) ", safe_text::terminal_text(&entry.alias))
     } else {
-        format!(" {} ", entry.alias)
+        format!(" {} ", safe_text::terminal_text(&entry.alias))
     };
 
     let block = Block::default()
@@ -1076,7 +1089,8 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(p, layout[0]);
         }
         UsageStatus::Error(e) => {
-            let p = Paragraph::new(format!("Error: {}", e.detail)).style(base().fg(C_RED));
+            let p = Paragraph::new(format!("Error: {}", safe_text::terminal_text(&e.detail)))
+                .style(base().fg(C_RED));
             f.render_widget(p, layout[0]);
         }
         UsageStatus::Loaded(u) => {
@@ -1086,6 +1100,23 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
+    if !u.parse_issues.is_empty() {
+        let detail = u
+            .parse_issues
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        f.render_widget(
+            Paragraph::new(format!(
+                "Usage response rejected: {}",
+                safe_text::terminal_text(&detail)
+            ))
+            .style(base().fg(C_RED)),
+            area,
+        );
+        return;
+    }
     let now = crate::auth::now_unix_secs();
     let multi_pool = !u.additional_limits.is_empty();
     let mut y = area.y;
@@ -1099,9 +1130,9 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
         }
         if multi_pool && y < area.bottom() {
             let title = if unavailable {
-                format!("{name}  unavailable")
+                format!("{}  unavailable", safe_text::terminal_text(name))
             } else {
-                name.to_string()
+                safe_display(name)
             };
             f.render_widget(
                 Paragraph::new(title).style(base().fg(if unavailable { C_RED } else { C_CYAN })),
@@ -1226,7 +1257,8 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
                 alias, expires_at, ..
             } => {
                 format!(
-                    "Confirm reset card for '{alias}' expiring {expires_at}: y to use, any other key cancels"
+                    "Confirm reset card for '{alias}' expiring {}: y to use, any other key cancels",
+                    safe_text::terminal_text(expires_at)
                 )
             }
         };
@@ -1251,7 +1283,13 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             s.as_str(),
             base().fg(status_message_color(app.status_is_error)),
         ));
-        f.render_widget(Paragraph::new(msg).style(base()), area);
+        f.render_widget(
+            Paragraph::new(popup::wrap_line(&msg, area.width as usize)).style(base()),
+            area,
+        );
+        // Status messages own the complete footer. In particular, safety
+        // instructions must never be overwritten by the version indicator.
+        return;
     } else if !app.marked.is_empty() {
         let line = Line::from(vec![
             Span::styled(" ", base()),
@@ -1278,7 +1316,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         vec![
             Span::styled(" \u{2502} ", base().fg(DIM)),
             Span::styled(format!("v{version}"), base().fg(DIM)),
-            Span::styled(format!(" -> v{latest} "), base().fg(C_YELLOW)),
+            Span::styled(
+                format!(" -> v{} ", safe_text::terminal_text(latest)),
+                base().fg(C_YELLOW),
+            ),
         ]
     } else {
         vec![
@@ -1543,11 +1584,10 @@ fn format_auto_refresh_remaining(secs: u64) -> String {
 }
 
 fn status_bar_height(app: &App, width: u16) -> usize {
-    if app.status_msg.is_some()
-        || app.rename.is_some()
-        || app.confirm.is_some()
-        || app.search_active
-        || !app.marked.is_empty()
+    if let Some(status) = &app.status_msg {
+        return popup::wrap_line(&Line::from(status.as_str()), width as usize).len();
+    }
+    if app.rename.is_some() || app.confirm.is_some() || app.search_active || !app.marked.is_empty()
     {
         return 1;
     }
@@ -1562,13 +1602,14 @@ mod tests {
         PACE_LABEL, account_usage_state, editable_input_line, fitted_segment_suffix,
         global_weekly_panel_height, meter_fill_width, percent_marker_offset, plan_color,
         quota_pace_color, quota_table_value, render, render_detail_panel,
-        render_global_weekly_pace, render_usage_gauge, render_usage_gauges, status_message_color,
-        table_text_widths, usage_gauges_height,
+        render_global_weekly_pace, render_usage_gauge, render_usage_gauges, status_bar_height,
+        status_message_color, table_text_widths, usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
     use crate::tui::app::{AccountEntry, App, UsageStatus};
     use crate::usage::{
-        AdditionalRateLimit, GlobalPaceWeighting, GlobalWeeklySummary, UsageInfo, WindowUsage,
+        AdditionalRateLimit, GlobalPaceWeighting, GlobalWeeklySummary, UsageError, UsageInfo,
+        UsageParseIssue, WindowUsage,
     };
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
@@ -1669,6 +1710,40 @@ mod tests {
     }
 
     #[test]
+    fn safety_status_wraps_without_version_overdraw_at_supported_widths() {
+        let message =
+            "account: reset-card consumption may have occurred; verify before retry".to_string();
+        for width in [60, 80] {
+            let mut app = App::new();
+            app.status_msg = Some(message.clone());
+            app.status_is_error = true;
+            let status_height = status_bar_height(&app, width);
+            let backend = TestBackend::new(width, 18);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+            let rendered = ((18 - status_height as u16)..18)
+                .map(|y| row_text(terminal.backend(), y).trim_end().to_string())
+                .collect::<String>();
+            assert!(rendered.contains(&message), "width {width}: {rendered:?}");
+            assert!(
+                !rendered.contains(crate::update::current_version()),
+                "width {width}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_height_uses_display_width_for_cjk() {
+        let mut app = App::new();
+        app.status_msg = Some("한".repeat(40));
+
+        assert_eq!(status_bar_height(&app, 60), 2);
+        assert_eq!(status_bar_height(&app, 80), 1);
+    }
+
+    #[test]
     fn incomplete_quota_is_unavailable_while_explicit_limits_remain_limited() {
         let missing_windows = UsageInfo::default();
         let missing_percent = UsageInfo {
@@ -1693,6 +1768,12 @@ mod tests {
             account_limited: true,
             ..UsageInfo::default()
         };
+        let malformed = UsageInfo {
+            parse_issues: vec![UsageParseIssue::InvalidCodeReviewRateLimit {
+                detail: "expected an object".to_string(),
+            }],
+            ..UsageInfo::default()
+        };
 
         assert_eq!(
             account_usage_state(&missing_windows),
@@ -1710,6 +1791,10 @@ mod tests {
         assert_eq!(
             account_usage_state(&explicitly_limited),
             AccountUsageState::Limited
+        );
+        assert_eq!(
+            account_usage_state(&malformed),
+            AccountUsageState::Unavailable
         );
     }
 
@@ -1747,6 +1832,94 @@ mod tests {
                 .fg,
             DIM
         );
+    }
+
+    #[test]
+    fn dashboard_never_replays_controls_from_api_or_release_text() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo {
+                email: Some("user\u{1b}]52;mail\u{7}@example.com".into()),
+                plan_type: Some("future\nplan".into()),
+                ..AccountInfo::default()
+            },
+            usage: UsageStatus::Error(UsageError {
+                summary: "failed".into(),
+                detail: "server\u{1b}]52;detail\u{7}\nerror".into(),
+            }),
+            is_current: false,
+        });
+        app.update_available = Some("9.9\u{1b}]52;release\u{7}\nnext".into());
+        app.update_view();
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+
+        let rendered = (0..terminal.backend().buffer().area.height)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<String>();
+        assert!(
+            rendered.chars().all(|character| !character.is_control()),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("user]52;mail@example.com"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("server]52;detailerror"), "{rendered:?}");
+        assert!(rendered.contains("v9.9]52;releasenext"), "{rendered:?}");
+    }
+
+    #[test]
+    fn additional_pool_title_is_sanitized_at_the_render_boundary() {
+        let usage = UsageInfo {
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("Pool\u{1b}]52;name\u{7}\nNext".into()),
+                primary: Some(WindowUsage {
+                    used_percent: Some(20.0),
+                    resets_at: Some(crate::auth::now_unix_secs() + 3600),
+                    window_minutes: Some(300),
+                }),
+                ..AdditionalRateLimit::default()
+            }],
+            ..UsageInfo::default()
+        };
+        let backend = TestBackend::new(90, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .unwrap();
+
+        let rendered = (0..terminal.backend().buffer().area.height)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<String>();
+        assert!(rendered.chars().all(|character| !character.is_control()));
+        assert!(rendered.contains("Pool]52;nameNext"), "{rendered:?}");
+    }
+
+    #[test]
+    fn malformed_infallible_usage_is_visible_in_account_details() {
+        let usage = UsageInfo {
+            parse_issues: vec![UsageParseIssue::InvalidAdditionalRateLimits {
+                detail: "entry 0 has no rate_limit object".into(),
+            }],
+            ..UsageInfo::default()
+        };
+        let backend = TestBackend::new(90, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .unwrap();
+
+        let rendered = (0..terminal.backend().buffer().area.height)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<String>();
+        assert!(rendered.contains("Usage response rejected"), "{rendered:?}");
+        assert!(rendered.contains("additional_rate_limits"), "{rendered:?}");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{UsageInfo, WINDOW_7D_SECS, WindowUsage};
+use super::{UsageInfo, WINDOW_7D_SECS, WindowUsage, explicit_account_blocker};
 
 const WINDOW_7D_MINUTES: i64 = WINDOW_7D_SECS / 60;
 
@@ -32,7 +32,7 @@ impl GlobalPaceAccountInput {
     /// Build an equal-weight production input from a fetched usage response.
     pub fn from_usage(alias: impl Into<String>, usage: &UsageInfo) -> Self {
         let alias = alias.into();
-        if has_explicit_account_blocker(usage) {
+        if explicit_account_blocker(usage).is_some() {
             return Self::unavailable(alias);
         }
         let Some(window) = main_weekly_window(usage) else {
@@ -290,23 +290,6 @@ fn main_weekly_window(usage: &UsageInfo) -> Option<&WindowUsage> {
                     .is_some_and(|minutes| minutes == WINDOW_7D_MINUTES)
             })
         })
-}
-
-/// Workspace credit/spend-control failures can make an otherwise present quota
-/// window non-actionable. Generic `rate_limit_reached` and the bare
-/// `account_limited` flag are intentionally not blockers here: the parser also
-/// sets that flag for ordinary 100% exhaustion, which must stay in the pool.
-fn has_explicit_account_blocker(usage: &UsageInfo) -> bool {
-    usage.spend_control_reached
-        || matches!(
-            usage.rate_limit_reached_type.as_deref(),
-            Some(
-                "workspace_owner_credits_depleted"
-                    | "workspace_member_credits_depleted"
-                    | "workspace_owner_usage_limit_reached"
-                    | "workspace_member_usage_limit_reached"
-            )
-        )
 }
 
 #[cfg(test)]
@@ -612,6 +595,12 @@ mod tests {
             rate_limit_reached_type: Some("rate_limit_reached".to_string()),
             ..UsageInfo::default()
         };
+        let unknown = UsageInfo {
+            secondary: exhausted.secondary.clone(),
+            account_limited: true,
+            rate_limit_reached_type: Some("future_server_reason".to_string()),
+            ..UsageInfo::default()
+        };
 
         assert_eq!(
             GlobalPaceAccountInput::from_usage("blocked", &blocked).used_percent,
@@ -621,6 +610,55 @@ mod tests {
             GlobalPaceAccountInput::from_usage("exhausted", &exhausted).used_percent,
             Some(100.0)
         );
+        assert_eq!(
+            GlobalPaceAccountInput::from_usage("unknown", &unknown).used_percent,
+            None
+        );
+    }
+
+    #[test]
+    fn generic_weekly_exhaustion_still_contributes_zero_remaining_capacity() {
+        let usage = UsageInfo {
+            secondary: Some(WindowUsage {
+                used_percent: Some(100.0),
+                resets_at: Some(NOW + WINDOW_7D_SECS / 20),
+                window_minutes: Some(WINDOW_7D_MINUTES),
+            }),
+            account_limited: true,
+            rate_limit_reached_type: Some("rate_limit_reached".to_string()),
+            ..UsageInfo::default()
+        };
+        let input = GlobalPaceAccountInput::from_usage("exhausted", &usage);
+        let summary = calculate_global_weekly_summary(&[input], NOW);
+
+        assert_eq!(summary.included_accounts, 1);
+        assert_eq!(summary.excluded_accounts, 0);
+        assert_eq!(summary.aggregate_used_percent, Some(100.0));
+    }
+
+    #[test]
+    fn primary_exhaustion_does_not_remove_a_valid_weekly_window() {
+        let usage = UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(100.0),
+                resets_at: Some(NOW + 3_600),
+                window_minutes: Some(300),
+            }),
+            secondary: Some(WindowUsage {
+                used_percent: Some(40.0),
+                resets_at: Some(NOW + WINDOW_7D_SECS / 2),
+                window_minutes: Some(WINDOW_7D_MINUTES),
+            }),
+            account_limited: true,
+            rate_limit_reached_type: Some("rate_limit_reached".to_string()),
+            ..UsageInfo::default()
+        };
+        let input = GlobalPaceAccountInput::from_usage("primary-exhausted", &usage);
+        let summary = calculate_global_weekly_summary(&[input], NOW);
+
+        assert_eq!(summary.included_accounts, 1);
+        assert_eq!(summary.excluded_accounts, 0);
+        assert_eq!(summary.aggregate_used_percent, Some(40.0));
     }
 
     #[test]

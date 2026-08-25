@@ -171,6 +171,12 @@ fn usage_window_line(
 }
 
 pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
+    for issue in &u.parse_issues {
+        println!(
+            "  {}",
+            color::error(&format!("usage response issue: {issue}"))
+        );
+    }
     let width = term_width();
     // Each line: "  5h  bar  XXX% left  ~Xh" ≈ bar_width + 30
     let bar_width = if width >= 80 {

@@ -204,7 +204,7 @@ fn all_exhausted_prefers_soonest_reset() {
     let ranking = rank(candidates, 20.0, false, now);
 
     assert_eq!(
-        ranking[0], "exhausted_a",
+        ranking[0], "z_soon",
         "account resetting in 30min should rank first among all exhausted"
     );
 }

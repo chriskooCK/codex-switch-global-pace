@@ -8,7 +8,7 @@ use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
 
 use crate::auth;
-use crate::usage::{ResetCredit, UsageError, UsageInfo};
+use crate::usage::{ResetCredit, UsageError, UsageInfo, UsageParseIssue};
 
 /// How long a confirmed "this account has no workspace name" is trusted.
 ///
@@ -55,6 +55,8 @@ struct CacheEntry {
     individual_limit: Option<Box<crate::usage::SpendControlLimit>>,
     #[serde(default)]
     additional_limits: Vec<crate::usage::AdditionalRateLimit>,
+    #[serde(default)]
+    parse_issues: Vec<UsageParseIssue>,
 }
 
 /// A refusal the auth server will repeat for as long as the profile keeps the
@@ -170,10 +172,6 @@ fn ttl() -> Result<u64> {
     Ok(crate::config::try_get()?.cache.ttl)
 }
 
-fn load_cache() -> CacheFile {
-    load_cache_checked().unwrap_or_default()
-}
-
 fn load_cache_checked() -> Result<CacheFile> {
     let path = cache_path()?;
     load_cache_checked_at(&path)
@@ -231,6 +229,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         rate_limit_reached_type: u.rate_limit_reached_type.clone(),
         individual_limit: u.individual_limit.clone(),
         additional_limits: u.additional_limits.clone(),
+        parse_issues: u.parse_issues.clone(),
     }
 }
 
@@ -269,6 +268,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         rate_limit_reached_type: e.rate_limit_reached_type.clone(),
         individual_limit: e.individual_limit.clone(),
         additional_limits: e.additional_limits.clone(),
+        parse_issues: e.parse_issues.clone(),
     }
 }
 
@@ -332,10 +332,7 @@ const STORED_TEXT_MAX: usize = 512;
 /// the cache file forever. Control characters go, length is bounded, and
 /// everything readable — including non-ASCII — is preserved.
 fn sanitize_for_storage(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control())
-        .take(STORED_TEXT_MAX)
-        .collect()
+    crate::safe_text::bounded_terminal_text(text, STORED_TEXT_MAX)
 }
 
 fn record_auth_failure(
@@ -431,14 +428,13 @@ pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) ->
     })
 }
 
-pub fn get_workspace_name(account_id: &str) -> Option<String> {
-    match with_cache_lock(|| Ok(load_cache().workspace_names.get(account_id).cloned())) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!("Failed to read cached workspace name: {err}");
-            None
-        }
-    }
+pub fn get_workspace_name(account_id: &str) -> Result<Option<String>> {
+    with_cache_lock(|| {
+        Ok(load_cache_checked()?
+            .workspace_names
+            .get(account_id)
+            .cloned())
+    })
 }
 
 pub fn set_workspace_name(account_id: &str, name: Option<&str>) -> Result<()> {
@@ -484,7 +480,7 @@ fn update_workspace_name(cache: &mut CacheFile, account_id: &str, name: Option<&
 /// or to an absence still inside [`WORKSPACE_ABSENCE_TTL`].
 ///
 /// This is the question callers must ask before looking one up. Asking
-/// `get_workspace_name(..).is_none()` instead cannot tell "never looked up"
+/// `get_workspace_name(..)?.is_none()` instead cannot tell "never looked up"
 /// apart from "looked up, and there is none", so every personal plan answered
 /// the second as if it were the first.
 fn workspace_name_resolved(cache: &CacheFile, account_id: &str) -> bool {
@@ -498,14 +494,8 @@ fn workspace_name_resolved(cache: &CacheFile, account_id: &str) -> bool {
 }
 
 /// Public form of [`workspace_name_resolved`].
-pub fn workspace_name_is_known(account_id: &str) -> bool {
-    match with_cache_lock(|| Ok(workspace_name_resolved(&load_cache(), account_id))) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!("Failed to read cached workspace state: {err}");
-            false
-        }
-    }
+pub fn workspace_name_is_known(account_id: &str) -> Result<bool> {
+    with_cache_lock(|| Ok(workspace_name_resolved(&load_cache_checked()?, account_id)))
 }
 
 /// Both answers from one read: the outer `None` means "not resolved, look it
@@ -531,13 +521,14 @@ pub async fn resolved_workspace_name_async(account_id: &str) -> Result<Option<Op
     .context("workspace-cache read worker failed")?
 }
 
-pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
+pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) -> Result<()> {
     let Some(account_id) = info.account_id.as_deref() else {
-        return;
+        return Ok(());
     };
-    if let Some(name) = get_workspace_name(account_id) {
+    if let Some(name) = get_workspace_name(account_id)? {
         info.workspace_name = Some(name);
     }
+    Ok(())
 }
 
 /// Remove cached usage for an alias while preserving last-used metadata.
@@ -650,19 +641,17 @@ pub(crate) fn last_used_snapshot_checked() -> Result<HashMap<String, i64>> {
 
 /// Record a successful profile selection for scoring.
 ///
-/// This timestamp is auxiliary ranking data. The credential/current-profile
-/// transaction has already committed when callers reach this function, so a
-/// damaged cache must not turn that successful switch into a reported failure.
-pub fn set_last_used(alias: &str) {
-    if let Err(err) = with_cache_lock(|| {
+/// Callers retain the selected profile lease until this write finishes so a
+/// concurrent rename cannot move the old key and then let this function
+/// recreate it under a stale alias.
+pub fn set_last_used(alias: &str) -> Result<()> {
+    with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
         cache
             .last_used
             .insert(alias.to_string(), crate::auth::now_unix_secs());
         save_cache(&cache).context("writing last_used cache")
-    }) {
-        tracing::warn!(alias, "Failed to record last-used profile: {err}");
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -713,6 +702,7 @@ mod tests {
         assert_eq!(entry.reset_credits_error, None);
         assert!(!entry.account_limited);
         assert!(!entry.spend_control_reached);
+        assert!(entry.parse_issues.is_empty());
 
         let usage = from_entry(&entry);
         assert_eq!(usage.credits_balance, None);
@@ -737,6 +727,9 @@ mod tests {
                 primary: None,
                 secondary: None,
             }],
+            parse_issues: vec![UsageParseIssue::InvalidAdditionalRateLimits {
+                detail: "item 0 is malformed".to_string(),
+            }],
             ..Default::default()
         };
 
@@ -751,6 +744,7 @@ mod tests {
             Some("rate_limit_reached")
         );
         assert_eq!(restored.additional_limits.len(), 1);
+        assert_eq!(restored.parse_issues, usage.parse_issues);
         assert_eq!(
             restored.additional_limits[0].metered_feature.as_deref(),
             Some("codex_bengalfox")

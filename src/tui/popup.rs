@@ -10,6 +10,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::safe_text;
+
 const BG: Color = Color::Rgb(24, 24, 24);
 const C_WHITE: Color = Color::Rgb(240, 240, 240);
 const DIM: Color = Color::Rgb(120, 120, 120);
@@ -18,6 +20,10 @@ const C_CYAN: Color = Color::Rgb(100, 210, 255);
 /// Minimum terminal size below which we abort popup rendering.
 const MIN_TERM_W: u16 = 20;
 const MIN_TERM_H: u16 = 6;
+
+fn display_width(value: &str) -> u16 {
+    u16::try_from(Span::raw(value).width()).unwrap_or(u16::MAX)
+}
 
 pub struct PopupState {
     pub scroll: u16,
@@ -74,18 +80,32 @@ pub fn render_popup(
         return;
     }
 
-    // Measure content
-    let content_h = lines.len() as u16;
-    let content_w: u16 = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+    let title = safe_text::terminal_text(title);
+    let lines: Vec<Line<'static>> = lines.iter().map(sanitized_line).collect();
 
-    let title_w = (title.len() as u16).saturating_add(4); // "─ title ─" + corners
+    // Measure width first; height is calculated after wrapping to the popup's
+    // actual inner display width.
+    let content_w = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .map(|width| u16::try_from(width).unwrap_or(u16::MAX))
+        .unwrap_or(0);
+
+    let title_w = display_width(title.as_ref()).saturating_add(4); // "─ title ─" + corners
     let needed_w = content_w.saturating_add(4).max(title_w); // 2 border + 2 padding
-    let needed_h = content_h.saturating_add(2); // 2 border
-
     // Clamp to screen, leaving 2 cols / 1 row margin where possible
     let max_w = screen.width.saturating_sub(2).max(MIN_TERM_W);
     let max_h = screen.height.saturating_sub(2).max(MIN_TERM_H);
     let w = needed_w.min(max_w);
+    // 2 border cells and 2 explicit padding cells.
+    let usable_w = w.saturating_sub(4) as usize;
+    let wrapped: Vec<Line<'static>> = lines
+        .iter()
+        .flat_map(|line| wrap_line(line, usable_w))
+        .collect();
+    let content_h = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
+    let needed_h = content_h.saturating_add(2); // 2 border
     let h = needed_h.min(max_h);
 
     let x = screen.x + screen.width.saturating_sub(w) / 2;
@@ -113,24 +133,18 @@ pub fn render_popup(
     let usable_w = inner.width.saturating_sub(pad_left + pad_right);
     let visible_h = inner.height;
 
-    let total_lines = lines.len() as u16;
+    let total_lines = wrapped.len() as u16;
     let scrollable = total_lines > visible_h;
     let max_scroll = total_lines.saturating_sub(visible_h);
     let scroll = state.scroll.min(max_scroll);
     state.scroll = scroll; // clamp persisted scroll to actual content bounds
 
-    // Truncate lines that exceed usable_w (with ellipsis)
-    let truncated: Vec<Line<'static>> = lines
-        .iter()
-        .map(|l| truncate_line(l, usable_w as usize))
-        .collect();
-
     let visible_slice: &[Line<'static>] = if scrollable {
         let start = scroll as usize;
-        let end = (start + visible_h as usize).min(truncated.len());
-        &truncated[start..end]
+        let end = (start + visible_h as usize).min(wrapped.len());
+        &wrapped[start..end]
     } else {
-        &truncated[..]
+        &wrapped[..]
     };
 
     let content_area = Rect {
@@ -147,6 +161,23 @@ pub fn render_popup(
     // Scrollbar on right edge inside border
     if scrollable && inner.width >= 1 && visible_h > 0 {
         render_scrollbar(f, inner, scroll, max_scroll, visible_h, total_lines);
+    }
+}
+
+fn sanitized_line(line: &Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .iter()
+            .map(|span| {
+                Span::styled(
+                    safe_text::terminal_text(span.content.as_ref()).into_owned(),
+                    span.style,
+                )
+            })
+            .collect(),
     }
 }
 
@@ -215,51 +246,31 @@ fn render_too_small_fallback(f: &mut Frame, screen: Rect) {
     );
 }
 
-/// Truncate a Line so its display width <= max_width, appending "…" if cut.
-fn truncate_line(line: &Line<'_>, max_width: usize) -> Line<'static> {
-    if line.width() <= max_width {
-        // Clone owned
-        let spans: Vec<Span<'static>> = line
-            .spans
-            .iter()
-            .map(|s| Span::styled(s.content.to_string(), s.style))
-            .collect();
-        return Line::from(spans);
-    }
+/// Wrap a styled line by terminal display cells without splitting Unicode
+/// grapheme clusters or dropping content.
+pub(crate) fn wrap_line(line: &Line<'_>, max_width: usize) -> Vec<Line<'static>> {
     if max_width == 0 {
-        return Line::from(Span::raw(""));
+        return vec![Line::from(Span::raw(""))];
     }
 
-    let target = max_width.saturating_sub(1); // reserve 1 col for ellipsis
-    let mut acc: Vec<Span<'static>> = Vec::new();
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0usize;
     for span in &line.spans {
-        let span_w = span.width();
-        if used + span_w <= target {
-            acc.push(Span::styled(span.content.to_string(), span.style));
-            used += span_w;
-            continue;
-        }
-
-        let mut partial = String::new();
         for grapheme in span.styled_graphemes(Style::default()) {
             let grapheme_width = Span::raw(grapheme.symbol).width();
-            if used + grapheme_width > target {
-                break;
+            if used > 0 && used + grapheme_width > max_width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
             }
-            partial.push_str(grapheme.symbol);
+            current.push(Span::styled(grapheme.symbol.to_string(), grapheme.style));
             used += grapheme_width;
         }
-        if !partial.is_empty() {
-            acc.push(Span::styled(partial, span.style));
-        }
-        break;
     }
-    acc.push(Span::styled(
-        "\u{2026}".to_string(),
-        Style::default().fg(DIM),
-    ));
-    Line::from(acc)
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -274,44 +285,95 @@ mod tests {
     }
 
     #[test]
-    fn truncate_line_returns_original_when_shorter_or_exact_width() {
+    fn wrap_line_returns_one_line_when_shorter_or_exact_width() {
         let short = Line::from("abc");
         let exact = Line::from("abcd");
 
-        assert_eq!(content(&truncate_line(&short, 4)), "abc");
-        assert_eq!(content(&truncate_line(&exact, 4)), "abcd");
+        let short = wrap_line(&short, 4);
+        let exact = wrap_line(&exact, 4);
+        assert_eq!(short.len(), 1);
+        assert_eq!(exact.len(), 1);
+        assert_eq!(content(&short[0]), "abc");
+        assert_eq!(content(&exact[0]), "abcd");
     }
 
     #[test]
-    fn truncate_line_handles_cjk_and_emoji_by_display_width() {
-        let truncated = truncate_line(&Line::from("中🙂abc"), 4);
+    fn wrap_line_handles_cjk_and_emoji_by_display_width_without_loss() {
+        let wrapped = wrap_line(&Line::from("中🙂abc"), 4);
 
-        assert!(truncated.width() <= 4, "line was {truncated:?}");
-        assert!(content(&truncated).ends_with('…'));
+        assert!(wrapped.iter().all(|line| line.width() <= 4), "{wrapped:?}");
+        assert_eq!(wrapped.iter().map(content).collect::<String>(), "中🙂abc");
     }
 
     #[test]
-    fn truncate_line_keeps_unicode_grapheme_clusters_intact() {
-        let heart = truncate_line(&Line::from("❤️a"), 2);
-        let developer = truncate_line(&Line::from("👩‍💻ab"), 3);
+    fn wrap_line_keeps_unicode_grapheme_clusters_intact() {
+        let heart = wrap_line(&Line::from("❤️a"), 2);
+        let developer = wrap_line(&Line::from("👩‍💻ab"), 3);
 
-        assert!(heart.width() <= 2, "line was {heart:?}");
-        assert_eq!(content(&developer), "👩‍💻…");
-        assert_eq!(developer.width(), 3);
+        assert!(heart.iter().all(|line| line.width() <= 2), "{heart:?}");
+        assert_eq!(heart.iter().map(content).collect::<String>(), "❤️a");
+        assert_eq!(developer.iter().map(content).collect::<String>(), "👩‍💻ab");
+        assert!(developer.iter().all(|line| line.width() <= 3));
     }
 
     #[test]
-    fn truncate_line_preserves_partial_content_across_spans() {
+    fn wrap_line_preserves_content_and_style_across_spans() {
         let line = Line::from(vec![
             Span::styled("ab", Style::default().fg(Color::Red)),
             Span::styled("cdef", Style::default().fg(Color::Blue)),
         ]);
 
-        let truncated = truncate_line(&line, 5);
+        let wrapped = wrap_line(&line, 4);
 
-        assert_eq!(content(&truncated), "abcd…");
-        assert_eq!(truncated.width(), 5);
-        assert_eq!(truncated.spans[0].style.fg, Some(Color::Red));
-        assert_eq!(truncated.spans[1].style.fg, Some(Color::Blue));
+        assert_eq!(wrapped.iter().map(content).collect::<String>(), "abcdef");
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(wrapped[0].spans[2].style.fg, Some(Color::Blue));
+    }
+
+    #[test]
+    fn popup_sanitization_preserves_styles_and_unicode_display_width() {
+        let line = Line::from(vec![
+            Span::styled(
+                "계정\u{1b}]52;clipboard\u{7}",
+                Style::default().fg(Color::Red),
+            ),
+            Span::styled("🙂", Style::default().fg(Color::Blue)),
+        ]);
+
+        let sanitized = sanitized_line(&line);
+
+        assert_eq!(content(&sanitized), "계정]52;clipboard🙂");
+        assert_eq!(sanitized.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(sanitized.spans[1].style.fg, Some(Color::Blue));
+        assert_eq!(sanitized.width(), Line::from("계정]52;clipboard🙂").width());
+    }
+
+    #[test]
+    fn popup_title_width_uses_terminal_cells_instead_of_utf8_bytes() {
+        assert_eq!(display_width("계정🙂"), 6);
+        assert_eq!(display_width("ASCII"), 5);
+    }
+
+    #[test]
+    fn long_cjk_account_detail_wraps_instead_of_being_ellipsized() {
+        let title = "한".repeat(40);
+        let line = Line::from(vec![
+            Span::styled("organization  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{title} · Member"),
+                Style::default().fg(Color::White),
+            ),
+        ]);
+
+        // An 80-column screen leaves 74 display cells after popup margin,
+        // borders, and padding.
+        let wrapped = wrap_line(&line, 74);
+
+        assert!(wrapped.len() >= 2);
+        assert!(wrapped.iter().all(|line| line.width() <= 74));
+        let combined = wrapped.iter().map(content).collect::<String>();
+        assert!(combined.contains(&title));
+        assert!(combined.ends_with(" · Member"));
     }
 }

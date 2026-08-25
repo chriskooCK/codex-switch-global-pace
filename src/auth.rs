@@ -85,14 +85,27 @@ fn validate_home_path(name: &str, path: PathBuf) -> Result<PathBuf> {
     if path.parent().is_none() {
         anyhow::bail!("{name} cannot be a filesystem root: {}", path.display());
     }
-    validate_nearest_existing_directory(name, &path)?;
+    validate_existing_directory_components(name, &path)?;
     Ok(path)
 }
 
-fn validate_nearest_existing_directory(name: &str, path: &Path) -> Result<()> {
-    for component in path.ancestors() {
+/// Reject an existing link/reparse point anywhere in a private state path.
+///
+/// `symlink_metadata(path)` only avoids following the final component. It
+/// still follows links in every parent component, so checking the nearest
+/// existing descendant alone would let `link/existing-child` hide `link`.
+/// Walk from the filesystem root toward the leaf and inspect every component
+/// in its own right instead.
+fn validate_existing_directory_components(name: &str, path: &Path) -> Result<()> {
+    let mut found_existing = false;
+    #[cfg(unix)]
+    let mut parent: Option<(PathBuf, std::fs::Metadata)> = None;
+    #[cfg(unix)]
+    let mut encountered_missing = false;
+    for component in path.ancestors().collect::<Vec<_>>().into_iter().rev() {
         match std::fs::symlink_metadata(component) {
             Ok(metadata) => {
+                found_existing = true;
                 if metadata_is_link_or_reparse(&metadata) {
                     anyhow::bail!(
                         "{name} contains a symlink, junction, or reparse-point component: {}",
@@ -105,9 +118,18 @@ fn validate_nearest_existing_directory(name: &str, path: &Path) -> Result<()> {
                         component.display()
                     );
                 }
-                return Ok(());
+                #[cfg(unix)]
+                {
+                    validate_unix_directory_component(name, component, &metadata, parent.as_ref())?;
+                    parent = Some((component.to_path_buf(), metadata));
+                }
             }
-            Err(error) if metadata_lookup_requires_parent(&error) => continue,
+            Err(error) if metadata_lookup_requires_parent(&error) => {
+                #[cfg(unix)]
+                {
+                    encountered_missing = true;
+                }
+            }
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("inspecting {name} component {}", component.display())
@@ -115,10 +137,70 @@ fn validate_nearest_existing_directory(name: &str, path: &Path) -> Result<()> {
             }
         }
     }
-    anyhow::bail!(
-        "{name} has no existing directory ancestor: {}",
-        path.display()
-    )
+    if !found_existing {
+        anyhow::bail!(
+            "{name} has no existing directory ancestor: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    if encountered_missing && let Some((existing_parent, metadata)) = parent {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.mode() & 0o022 != 0 && metadata.mode() & libc::S_ISVTX == 0 {
+            anyhow::bail!(
+                "{name} would create a private entry in a group- or other-writable non-sticky directory: {}",
+                existing_parent.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_directory_component(
+    name: &str,
+    component: &Path,
+    metadata: &std::fs::Metadata,
+    parent: Option<&(PathBuf, std::fs::Metadata)>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let effective_uid = unsafe { libc::geteuid() };
+    let trusted_owner = metadata.uid() == 0 || metadata.uid() == effective_uid;
+
+    if let Some((parent_path, parent_metadata)) = parent {
+        let parent_mode = parent_metadata.mode();
+        if parent_mode & 0o022 != 0 {
+            if parent_mode & libc::S_ISVTX == 0 {
+                anyhow::bail!(
+                    "{name} crosses a group- or other-writable non-sticky directory that can replace private path entries: {}",
+                    parent_path.display()
+                );
+            }
+            // Sticky directories such as /tmp protect an entry only from users
+            // who own neither the directory nor that entry. A child owned by
+            // somebody else remains replaceable by its owner.
+            if !trusted_owner {
+                anyhow::bail!(
+                    "{name} contains an entry another user can replace in sticky directory {}: {}",
+                    parent_path.display(),
+                    component.display()
+                );
+            }
+        }
+    }
+
+    // A directory owner can make an apparently read-only directory writable
+    // after this check. Only root and this effective user are trusted to keep
+    // the path stable for the duration of a private write.
+    if !trusted_owner {
+        anyhow::bail!(
+            "{name} contains a directory owned by another user and cannot be used for private state: {} (uid {})",
+            component.display(),
+            metadata.uid()
+        );
+    }
+    Ok(())
 }
 
 fn metadata_lookup_requires_parent(error: &std::io::Error) -> bool {
@@ -388,7 +470,11 @@ pub(crate) fn fail_private_durability_confirmation_after(successful_publications
 }
 
 pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<PrivateWriteOutcome> {
-    let tmp = stage_private_file(path, contents)?;
+    let staged = stage_private_file(path, contents)?;
+    let StagedPrivateFile {
+        file: tmp,
+        _directory_guard,
+    } = staged;
     tmp.persist(path)
         .map_err(|err| err.error)
         .with_context(|| format!("atomically replacing {}", path.display()))?;
@@ -400,9 +486,14 @@ pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<Priva
     private_publication_outcome(path)
 }
 
-fn stage_private_file(path: &Path, contents: &[u8]) -> Result<tempfile::NamedTempFile> {
+struct StagedPrivateFile {
+    file: tempfile::NamedTempFile,
+    _directory_guard: PrivateDirectoryGuard,
+}
+
+fn stage_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile> {
     let parent = private_write_parent(path)?;
-    ensure_private_directory(parent)?;
+    let directory_guard = acquire_private_directory(parent)?;
 
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating temporary file in {}", parent.display()))?;
@@ -419,9 +510,70 @@ fn stage_private_file(path: &Path, contents: &[u8]) -> Result<tempfile::NamedTem
     tmp.as_file()
         .sync_all()
         .with_context(|| format!("syncing temporary file for {}", path.display()))?;
-    Ok(tmp)
+    Ok(StagedPrivateFile {
+        file: tmp,
+        _directory_guard: directory_guard,
+    })
 }
 
+/// Capability proving that `path` is a direct private directory for the
+/// lifetime of a path-based operation. On Windows the capability owns a handle
+/// for every component and denies delete sharing, so neither the directory nor
+/// an ancestor can be renamed after validation. Unix instead proves a durable
+/// ownership/mode invariant that an unrelated user cannot change.
+#[derive(Debug)]
+pub(crate) struct PrivateDirectoryGuard {
+    #[cfg(windows)]
+    _handles: Vec<std::fs::File>,
+    #[cfg(not(windows))]
+    _private: (),
+}
+
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
+    acquire_private_directory(path).map(drop)
+}
+
+pub(crate) fn acquire_private_directory(path: &Path) -> Result<PrivateDirectoryGuard> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "private directory path must be absolute: {}",
+            path.display()
+        );
+    }
+    if path.parent().is_none() {
+        anyhow::bail!(
+            "private directory path cannot be a filesystem root: {}",
+            path.display()
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!(
+            "private directory path contains '..' component: {}",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        acquire_windows_private_directory(path)
+    }
+    #[cfg(unix)]
+    {
+        prepare_unix_private_directory(path)?;
+        Ok(PrivateDirectoryGuard { _private: () })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!(
+            "private directory security is unsupported on this platform: {}",
+            path.display()
+        )
+    }
+}
+
+#[cfg(unix)]
 /// Create a private directory tree without leaving newly-created ancestor
 /// entries outside the durability contract used by private-file publication.
 ///
@@ -430,14 +582,8 @@ fn stage_private_file(path: &Path, contents: &[u8]) -> Result<tempfile::NamedTem
 /// its name in a newly-created parent does not. Create each missing component
 /// in order, sync that directory's inode, then sync the parent entry before
 /// proceeding to the next component.
-pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
-    if !path.is_absolute() {
-        anyhow::bail!(
-            "private directory path must be absolute for durable publication: {}",
-            path.display()
-        );
-    }
-    validate_nearest_existing_directory("private directory path", path)?;
+fn prepare_unix_private_directory(path: &Path) -> Result<()> {
+    validate_existing_directory_components("private directory path", path)?;
     let mut missing = Vec::new();
     let mut cursor = path;
     loop {
@@ -489,37 +635,230 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
                     .with_context(|| format!("creating directory {}", directory.display()));
             }
         }
+        // A successful mkdir in a protected parent creates a current-user
+        // entry. If another process won the name, the full chain validation
+        // rejects an untrusted owner before chmod follows that path.
+        validate_existing_directory_components("private directory path", directory)?;
         secure_private_directory(directory)?;
-        #[cfg(unix)]
-        {
-            std::fs::File::open(directory)
-                .with_context(|| format!("opening new directory {} for sync", directory.display()))?
-                .sync_all()
-                .with_context(|| format!("syncing new directory {}", directory.display()))?;
-            crate::fs_ops::sync_parent(directory).with_context(|| {
-                format!(
-                    "syncing parent after creating private directory {}",
-                    directory.display()
-                )
-            })?;
-        }
+        validate_existing_directory_components("private directory path", directory)?;
+        std::fs::File::open(directory)
+            .with_context(|| format!("opening new directory {} for sync", directory.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing new directory {}", directory.display()))?;
+        crate::fs_ops::sync_parent(directory).with_context(|| {
+            format!(
+                "syncing parent after creating private directory {}",
+                directory.display()
+            )
+        })?;
     }
 
     if missing.is_empty() {
         secure_private_directory(path)?;
     }
+    validate_private_directory_owner(path)?;
+    validate_existing_directory_components("private directory path", path)?;
     Ok(())
 }
 
-fn secure_private_directory(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    harden_windows_acl(path, true)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("setting permissions on {}", path.display()))?;
+#[cfg(unix)]
+fn validate_private_directory_owner(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("identifying private directory {}", path.display()))?;
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        anyhow::bail!(
+            "private directory must be owned by the effective user (uid {effective_uid}): {} is owned by uid {}",
+            path.display(),
+            metadata.uid()
+        );
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuard> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut walked = PathBuf::new();
+    let mut prefixes = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => walked.push(component.as_os_str()),
+            std::path::Component::RootDir => {
+                walked.push(component.as_os_str());
+                prefixes.push(walked.clone());
+            }
+            std::path::Component::Normal(_) => {
+                walked.push(component.as_os_str());
+                prefixes.push(walked.clone());
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {
+                anyhow::bail!(
+                    "private directory path contains a relative component: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if prefixes.is_empty() {
+        anyhow::bail!(
+            "private directory path has no openable component: {}",
+            path.display()
+        );
+    }
+
+    let final_index = prefixes.len() - 1;
+    let mut private_tree_started = false;
+    let mut handles = Vec::with_capacity(prefixes.len());
+    for (index, component_path) in prefixes.into_iter().enumerate() {
+        let open = || {
+            let mut options = std::fs::OpenOptions::new();
+            options
+                .access_mode(FILE_READ_ATTRIBUTES)
+                // Delete sharing is deliberately absent: every already-opened
+                // ancestor remains a stable namespace component while the next
+                // child is opened or securely created.
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            options.open(&component_path)
+        };
+        let directory = match open() {
+            Ok(directory) => directory,
+            Err(error)
+                if index != 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+            {
+                private_tree_started = true;
+                match create_windows_private_directory(&component_path) {
+                    Ok(()) => {}
+                    Err(create_error)
+                        if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(create_error) => {
+                        return Err(create_error).with_context(|| {
+                            format!(
+                                "securely creating private directory {}",
+                                component_path.display()
+                            )
+                        });
+                    }
+                }
+                open().with_context(|| {
+                    format!(
+                        "opening securely-created private directory {}",
+                        component_path.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "opening and pinning private Windows directory component {}",
+                        component_path.display()
+                    )
+                });
+            }
+        };
+        let metadata = directory.metadata().with_context(|| {
+            format!(
+                "identifying pinned private Windows directory component {}",
+                component_path.display()
+            )
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            anyhow::bail!(
+                "private Windows path component is not a direct directory: {}",
+                component_path.display()
+            );
+        }
+        handles.push(directory);
+
+        // Existing ancestors may be shared, but their pinned handles make them
+        // immutable for this operation. The final private directory and every
+        // component created for it must itself belong to this user before its
+        // protected ACL is installed; a hostile pre-creation therefore fails
+        // closed instead of being adopted.
+        if private_tree_started || index == final_index {
+            require_windows_path_owner(&component_path, "private directory")?;
+            harden_windows_acl(&component_path, true)?;
+        }
+    }
+
+    Ok(PrivateDirectoryGuard { _handles: handles })
+}
+
+#[cfg(windows)]
+fn create_windows_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    struct Descriptor(*mut core::ffi::c_void);
+    impl Drop for Descriptor {
+        fn drop(&mut self) {
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+
+    let current_user_sid = windows_current_user_sid_string(path)
+        .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+    let sddl = windows_private_acl_sddl(&current_user_sid, true);
+    let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut security_descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let _descriptor = Descriptor(security_descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security_descriptor,
+        bInheritHandle: 0,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("setting permissions on {}", path.display()))?;
     Ok(())
 }
 
@@ -610,6 +949,7 @@ struct ExactPrivateFile {
     path: PathBuf,
     token: crate::fs_ops::FileToken,
     cleanup_on_drop: bool,
+    _directory_guard: PrivateDirectoryGuard,
 }
 
 impl ExactPrivateFile {
@@ -657,9 +997,13 @@ enum ExpectedInodeObservation {
 }
 
 fn stage_exact_private_file(path: &Path, contents: &[u8]) -> Result<ExactPrivateFile> {
-    let mut staged = stage_private_file(path, contents)?;
-    let token = crate::fs_ops::token_for_file(staged.as_file_mut())?;
-    let (_file, staged_path) = staged
+    let staged = stage_private_file(path, contents)?;
+    let StagedPrivateFile {
+        mut file,
+        _directory_guard,
+    } = staged;
+    let token = crate::fs_ops::token_for_file(file.as_file_mut())?;
+    let (_file, staged_path) = file
         .keep()
         .map_err(|error| error.error)
         .with_context(|| format!("retaining private transaction file for {}", path.display()))?;
@@ -667,6 +1011,7 @@ fn stage_exact_private_file(path: &Path, contents: &[u8]) -> Result<ExactPrivate
         path: staged_path,
         token,
         cleanup_on_drop: true,
+        _directory_guard,
     })
 }
 
@@ -1369,6 +1714,7 @@ fn settle_auth_publication(
 /// live-auth transaction. Exact known states are completed or rolled back;
 /// unknown namespace occupants are never overwritten or deleted.
 pub(crate) fn recover_interrupted_auth_publication(live_path: &Path) -> Result<()> {
+    let _directory_guard = acquire_private_directory(private_write_parent(live_path)?)?;
     let Some((record, record_token)) = read_publication_record(live_path)? else {
         return Ok(());
     };
@@ -1440,6 +1786,7 @@ fn create_independent_backup_stage(
     destination: &Path,
     expected: &crate::fs_ops::FileToken,
 ) -> Result<ExactPrivateFile> {
+    let directory_guard = acquire_private_directory(private_write_parent(destination)?)?;
     let creation = crate::fs_ops::create_exclusive_copy(source, destination, expected)
         .with_context(|| {
             format!(
@@ -1453,6 +1800,7 @@ fn create_independent_backup_stage(
         path: destination.to_path_buf(),
         token,
         cleanup_on_drop: true,
+        _directory_guard: directory_guard,
     };
     if matches!(
         creation,
@@ -1745,6 +2093,158 @@ pub(crate) fn atomic_write_private_if_unchanged(
     conditional_write_from_settlement(path, settlement, Some(boundary))
 }
 
+#[cfg(windows)]
+fn windows_current_user_sid_string(path: &Path) -> Result<String> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct OwnedHandle(HANDLE);
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+    struct LocalAllocation(*mut core::ffi::c_void);
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+    let last_error = |api: &str| {
+        anyhow::anyhow!(
+            "{api} failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )
+    };
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(last_error("OpenProcessToken"));
+    }
+    let _token = OwnedHandle(token);
+    let mut token_user_bytes = 0;
+    let probe_ok =
+        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut token_user_bytes) };
+    let probe_error = std::io::Error::last_os_error();
+    if probe_ok != 0
+        || token_user_bytes == 0
+        || probe_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+    {
+        anyhow::bail!(
+            "GetTokenInformation(TokenUser size) failed for {}: {probe_error}",
+            path.display()
+        );
+    }
+    let words = (token_user_bytes as usize).div_ceil(std::mem::size_of::<usize>());
+    let mut token_user = vec![0usize; words];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            token_user.as_mut_ptr().cast(),
+            token_user_bytes,
+            &mut token_user_bytes,
+        )
+    } == 0
+    {
+        return Err(last_error("GetTokenInformation(TokenUser)"));
+    }
+    let user_sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+    let mut string_sid = null_mut();
+    if unsafe { ConvertSidToStringSidW(user_sid, &mut string_sid) } == 0 {
+        return Err(last_error("ConvertSidToStringSidW"));
+    }
+    let _string_sid = LocalAllocation(string_sid.cast());
+    let mut sid_len = 0;
+    while unsafe { *string_sid.add(sid_len) } != 0 {
+        sid_len += 1;
+    }
+    String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, sid_len) }).with_context(
+        || {
+            format!(
+                "decoding ConvertSidToStringSidW output for {}",
+                path.display()
+            )
+        },
+    )
+}
+
+#[cfg(windows)]
+fn require_windows_path_owner(path: &Path, description: &str) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    struct LocalAllocation(*mut core::ffi::c_void);
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!(
+            "reading owner for {description} {} failed: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(status as i32)
+        );
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    let mut owner_string = null_mut();
+    if unsafe { ConvertSidToStringSidW(owner, &mut owner_string) } == 0 {
+        anyhow::bail!(
+            "converting owner SID for {description} {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    let _owner_string = LocalAllocation(owner_string.cast());
+    let mut owner_len = 0;
+    while unsafe { *owner_string.add(owner_len) } != 0 {
+        owner_len += 1;
+    }
+    let owner_sid =
+        String::from_utf16(unsafe { std::slice::from_raw_parts(owner_string, owner_len) })?;
+    let current_sid = windows_current_user_sid_string(path)?;
+    if owner_sid != current_sid {
+        anyhow::bail!(
+            "{description} must be owned by the current Windows user: {} is owned by SID {}",
+            path.display(),
+            owner_sid
+        );
+    }
+    Ok(())
+}
+
 #[cfg(any(windows, test))]
 fn windows_private_acl_sddl(current_user_sid: &str, directory: bool) -> String {
     let inheritance = if directory { "OICI" } else { "" };
@@ -1760,31 +2260,15 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::{null, null_mut};
 
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HANDLE, LocalFree,
-    };
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    struct OwnedHandle(HANDLE);
-
-    impl Drop for OwnedHandle {
-        fn drop(&mut self) {
-            // SAFETY: this wrapper is only constructed from a successful
-            // OpenProcessToken call and owns that handle exactly once.
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
 
     struct LocalAllocation(*mut core::ffi::c_void);
 
@@ -1806,73 +2290,7 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
         )
     }
 
-    let mut token = null_mut();
-    // SAFETY: GetCurrentProcess returns a valid pseudo-handle, and `token`
-    // points to writable storage for the owned token handle.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(last_error(path, "OpenProcessToken"));
-    }
-    let _token = OwnedHandle(token);
-
-    let mut token_user_bytes = 0;
-    // SAFETY: the null-buffer probe is the documented way to obtain the
-    // TOKEN_USER size; no output buffer is dereferenced.
-    let probe_ok =
-        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut token_user_bytes) };
-    let probe_error = std::io::Error::last_os_error();
-    if probe_ok != 0
-        || token_user_bytes == 0
-        || probe_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-    {
-        return Err(anyhow::anyhow!(
-            "GetTokenInformation(TokenUser size) failed for {}: {probe_error}",
-            path.display()
-        ));
-    }
-
-    let words = (token_user_bytes as usize).div_ceil(std::mem::size_of::<usize>());
-    let mut token_user = vec![0usize; words];
-    // SAFETY: the usize-backed buffer is suitably aligned for TOKEN_USER and
-    // has the exact byte capacity requested by the preceding size probe.
-    if unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            token_user.as_mut_ptr().cast(),
-            token_user_bytes,
-            &mut token_user_bytes,
-        )
-    } == 0
-    {
-        return Err(last_error(path, "GetTokenInformation(TokenUser)"));
-    }
-    // SAFETY: GetTokenInformation initialized the aligned buffer as TOKEN_USER,
-    // and the SID remains valid while `token_user` is alive.
-    let user_sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-
-    let mut string_sid = null_mut();
-    // SAFETY: `user_sid` comes from the live TOKEN_USER buffer and the API
-    // writes one LocalAlloc-owned, NUL-terminated UTF-16 pointer.
-    if unsafe { ConvertSidToStringSidW(user_sid, &mut string_sid) } == 0 {
-        return Err(last_error(path, "ConvertSidToStringSidW"));
-    }
-    let _string_sid = LocalAllocation(string_sid.cast());
-    let mut sid_len = 0;
-    // SAFETY: ConvertSidToStringSidW guarantees a NUL-terminated UTF-16
-    // string, and `_string_sid` keeps that allocation alive for this scan.
-    while unsafe { *string_sid.add(sid_len) } != 0 {
-        sid_len += 1;
-    }
-    // SAFETY: `sid_len` was found within the API-provided NUL-terminated
-    // allocation and excludes the terminator.
-    let current_user_sid =
-        String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, sid_len) })
-            .with_context(|| {
-                format!(
-                    "decoding ConvertSidToStringSidW output for {}",
-                    path.display()
-                )
-            })?;
+    let current_user_sid = windows_current_user_sid_string(path)?;
 
     let sddl = windows_private_acl_sddl(&current_user_sid, directory);
     let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
@@ -1953,6 +2371,7 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn harden_windows_private_file(path: &Path) -> Result<()> {
+    require_windows_path_owner(path, "private file")?;
     harden_windows_acl(path, false)
 }
 
@@ -1999,7 +2418,7 @@ pub(crate) fn redact_sensitive_log_body(body: &serde_json::Value) -> String {
 
     let mut value = body.clone();
     redact(&mut value);
-    serde_json::to_string(&value).unwrap_or_default()
+    serde_json::to_string(&value).expect("serde_json::Value always serializes to JSON")
 }
 
 fn io_error_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
@@ -2015,6 +2434,7 @@ pub fn apply_tokens(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<()> {
+    validate_complete_oauth_tokens(id_token, access_token, refresh_token)?;
     let tokens = val
         .get_mut("tokens")
         .and_then(|t| t.as_object_mut())
@@ -2030,6 +2450,27 @@ pub fn apply_tokens(
             "last_refresh".into(),
             serde_json::json!(crate::output::format_iso8601(now_unix_secs())),
         );
+    }
+    Ok(())
+}
+
+/// Validate a complete OAuth token set before it can cross a credential-write
+/// boundary. OAuth responses distinguish an omitted optional field from an
+/// explicitly present but empty value; the latter must never erase a usable
+/// credential.
+pub(crate) fn validate_complete_oauth_tokens(
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<()> {
+    for (field, value) in [
+        ("id_token", id_token),
+        ("access_token", access_token),
+        ("refresh_token", refresh_token),
+    ] {
+        if value.trim().is_empty() {
+            anyhow::bail!("OAuth {field} must not be empty");
+        }
     }
     Ok(())
 }
@@ -2064,16 +2505,17 @@ pub fn now_unix_secs() -> i64 {
 /// Read auth.json and parse AccountInfo without collapsing path, read, or JSON
 /// errors into an empty account model.
 pub(crate) fn read_account_info_checked(path: &Path) -> Result<crate::jwt::AccountInfo> {
-    read_auth(path).map(|value| account_info_from_auth_value(&value))
+    let value = read_auth(path)?;
+    let mut info = account_info_from_auth_value(&value);
+    crate::cache::apply_workspace_name(&mut info)?;
+    Ok(info)
 }
 
 /// Derive request-routing and display metadata from the exact auth snapshot
 /// that supplied the request's bearer token. Callers that already loaded an
 /// auth value must not reopen the path and accidentally mix two generations.
 pub(crate) fn account_info_from_auth_value(value: &serde_json::Value) -> crate::jwt::AccountInfo {
-    let mut info = crate::jwt::parse_account_info(value);
-    crate::cache::apply_workspace_name(&mut info);
-    info
+    crate::jwt::parse_account_info(value)
 }
 
 pub fn validate_auth_value(val: &serde_json::Value) -> Result<crate::jwt::AccountInfo> {
@@ -2622,7 +3064,8 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            format!("{error:#}").contains("creating independent auth recovery copy"),
+            format!("{error:#}").contains("private")
+                && format!("{error:#}").contains(&blocked_parent.display().to_string()),
             "{error:#}"
         );
         assert_eq!(std::fs::read(&blocked_parent).unwrap(), b"x");
@@ -2817,6 +3260,115 @@ mod tests {
         let derived = codex_home_from_values(None, Some(user_home))
             .expect_err("the derived credential directory must not be a symlink");
         assert!(derived.to_string().contains("symlink"), "{derived:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_homes_reject_existing_descendants_below_an_intermediate_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("existing-child")).unwrap();
+        let linked = root.path().join("linked");
+        symlink(&real, &linked).unwrap();
+
+        let error = configured_home_path(
+            "CODEX_SWITCH_HOME",
+            linked.join("existing-child").into_os_string(),
+        )
+        .expect_err("every existing path component must be inspected without following links");
+
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        assert!(error.to_string().contains("linked"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_rejects_a_nonsticky_world_writable_ancestor() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let error = ensure_private_directory(&shared.join("private"))
+            .expect_err("another user could replace a child in a non-sticky writable directory");
+
+        assert!(error.to_string().contains("non-sticky"), "{error:#}");
+        assert!(!shared.join("private").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_allows_a_current_user_entry_in_a_sticky_parent() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let private = shared.join("private");
+
+        let _guard = acquire_private_directory(&private)
+            .expect("sticky ownership protects the newly-created private entry");
+        let metadata = std::fs::metadata(&private).unwrap();
+
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_homes_reject_existing_descendants_below_an_intermediate_reparse_point() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("existing-child")).unwrap();
+        let linked = root.path().join("linked");
+        if let Err(error) = symlink_dir(&real, &linked) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("creating directory symlink for path validation test: {error}");
+        }
+
+        let error = configured_home_path(
+            "CODEX_SWITCH_HOME",
+            linked.join("existing-child").into_os_string(),
+        )
+        .expect_err("every existing path component must reject reparse points");
+
+        assert!(error.to_string().contains("reparse-point"), "{error:#}");
+        assert!(error.to_string().contains("linked"), "{error:#}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_guard_pins_the_full_windows_path_until_drop() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let private = parent.join("private");
+        let moved = root.path().join("moved-parent");
+        let guard = acquire_private_directory(&private).expect("acquire private path capability");
+
+        let error = std::fs::rename(&parent, &moved)
+            .expect_err("an ancestor must not be renameable while the capability is live");
+        assert!(
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other
+            ),
+            "unexpected Windows sharing error: {error}"
+        );
+        assert!(private.is_dir());
+
+        drop(guard);
+        std::fs::rename(&parent, &moved)
+            .expect("dropping the capability must release its namespace pins");
+        assert!(moved.join("private").is_dir());
     }
 
     #[test]

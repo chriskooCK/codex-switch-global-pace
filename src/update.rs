@@ -10,6 +10,9 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
+mod cleanup_worker;
+
 const REPO_OWNER: &str = "chriskooCK";
 const REPO_NAME: &str = "codex-switch-global-pace";
 const BIN_NAME: &str = "codex-switch-global-pace";
@@ -27,6 +30,67 @@ const WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT: usize = 16;
 const WINDOWS_DISPLACED_RECOVERY_PREFIX: &str = ".self-update-displaced-";
 #[cfg(windows)]
 const WINDOWS_FAILED_RECOVERY_PREFIX: &str = ".self-update-failed-";
+
+#[cfg(windows)]
+pub(crate) fn run_self_update_cleanup_worker(
+    parent_pid: u32,
+    displaced_previous: &Path,
+    expected_token: &str,
+    expected_executable_token: &str,
+    journal_path: &Path,
+    expected_journal_token: &str,
+    ready_nonce: &str,
+) -> Result<()> {
+    cleanup_worker::run(
+        parent_pid,
+        displaced_previous,
+        expected_token,
+        expected_executable_token,
+        journal_path,
+        expected_journal_token,
+        ready_nonce,
+    )
+}
+
+#[cfg(not(windows))]
+pub(crate) fn run_self_update_cleanup_worker(
+    _parent_pid: u32,
+    _displaced_previous: &Path,
+    _expected_token: &str,
+    _expected_executable_token: &str,
+    _journal_path: &Path,
+    _expected_journal_token: &str,
+    _ready_nonce: &str,
+) -> Result<()> {
+    anyhow::bail!("the self-update cleanup worker is only available on Windows")
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("previous executable cleanup remains pending: {source:#}")]
+pub(crate) struct PendingSelfUpdateCleanup {
+    #[source]
+    source: anyhow::Error,
+}
+
+pub(crate) fn recover_pending_self_update_cleanup_on_startup()
+-> std::result::Result<bool, PendingSelfUpdateCleanup> {
+    #[cfg(windows)]
+    {
+        (|| -> Result<bool> {
+            let executable = fs::canonicalize(
+                std::env::current_exe()
+                    .context("locating current executable for cleanup recovery")?,
+            )
+            .context("resolving current executable for cleanup recovery")?;
+            cleanup_worker::recover_pending(&executable)
+        })()
+        .map_err(|source| PendingSelfUpdateCleanup { source })
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -276,9 +340,11 @@ impl SelfUpdateResult {
 
     /// Finish a successful update after every dependent process has restarted.
     ///
-    /// Commit revalidates the published executable token before removing either
-    /// exact recovery copy. A concurrent writer or incomplete cleanup is
-    /// reported and all unclassified recovery entries are preserved.
+    /// Commit revalidates the published executable token before consuming its
+    /// exact recovery copies. On Windows, an exact cleanup journal is made
+    /// durable before the independent backup is removed; a token-bound worker
+    /// from the new public image then waits for this updater to exit before
+    /// removing the mapped previous image and journal.
     pub(crate) fn commit_replacement(&mut self) -> Result<()> {
         if let Some(replacement) = self.replacement.as_mut() {
             let commit = replacement.commit();
@@ -456,6 +522,41 @@ thread_local! {
     };
 }
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static USE_EXTERNAL_WINDOWS_CLEANUP_WORKER: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(all(test, windows))]
+const WINDOWS_COMMIT_EXIT_AFTER_BACKUP_ENV: &str = "CSGP_WINDOWS_COMMIT_EXIT_AFTER_BACKUP_CLEANUP";
+#[cfg(all(test, windows))]
+const WINDOWS_COMMIT_EXIT_AFTER_BACKUP_CODE: i32 = 86;
+
+#[cfg(all(test, windows))]
+fn use_external_windows_cleanup_worker_once() {
+    USE_EXTERNAL_WINDOWS_CLEANUP_WORKER.with(|enabled| {
+        assert!(!enabled.replace(true));
+    });
+}
+
+#[cfg(all(test, windows))]
+fn take_external_windows_cleanup_worker() -> bool {
+    USE_EXTERNAL_WINDOWS_CLEANUP_WORKER.with(|enabled| enabled.replace(false))
+}
+
+#[cfg(windows)]
+fn terminate_after_backup_cleanup_if_requested() {
+    #[cfg(test)]
+    if std::env::var_os(WINDOWS_COMMIT_EXIT_AFTER_BACKUP_ENV).is_some() {
+        // This is deliberately a process boundary rather than a panic. It
+        // proves the pre-mutation journal survives when no stack guard or
+        // cleanup worker gets a chance to run after the fixed backup is gone.
+        std::process::exit(WINDOWS_COMMIT_EXIT_AFTER_BACKUP_CODE);
+    }
+}
+
 fn inject_commit_fault(point: CommitFaultPoint) {
     #[cfg(test)]
     if COMMIT_FAULT.with(|fault| {
@@ -555,34 +656,115 @@ impl PendingReplacement {
                 &self.published_token,
                 "published self-update candidate at commit",
             )?;
+            #[cfg(windows)]
+            let (external_cleanup, prepared_cleanup) = {
+                #[cfg(not(test))]
+                let external_cleanup = true;
+                #[cfg(test)]
+                let external_cleanup = take_external_windows_cleanup_worker();
+                let prepared_cleanup = if external_cleanup {
+                    Some(
+                        cleanup_worker::prepare(
+                            &self.executable,
+                            &self.published_token,
+                            &self.backup,
+                            &self.backup_token,
+                            &self.displaced_previous,
+                            &self.previous_token,
+                        )
+                        .context(
+                            "durably recording exact executable cleanup before commit mutation",
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                (external_cleanup, prepared_cleanup)
+            };
             // From the first recovery deletion onward automatic rollback is
             // no longer sound. Publish that fact before any mutation so an
             // unwind can never interpret a reduced recovery set as Pending.
             self.completion = Some(SelfUpdateReplacementState::Committed);
             self.state = ReplacementState::Preserved;
-            let displaced_cleanup = remove_exact_transaction_path(
-                &self.displaced_previous,
-                &self.previous_token,
-                "displaced previous executable",
-            )?;
-            inject_commit_fault(CommitFaultPoint::BeforeFinalRecoveryCleanup);
-            let backup_cleanup = remove_exact_transaction_path(
-                &self.backup,
-                &self.backup_token,
-                "old executable backup",
-            )?;
-            // Both recovery names are gone. Set the live state immediately,
-            // before formatting or allocating cleanup diagnostics.
-            self.state = ReplacementState::Finished;
-            inject_commit_fault(CommitFaultPoint::AfterFinalRecoveryCleanup);
-            let mut unconfirmed = Vec::new();
-            if let Some(note) = displaced_cleanup.unconfirmed_note() {
-                unconfirmed.push(note.to_string());
+            #[cfg(windows)]
+            {
+                // The fixed-name backup is not mapped. Remove it first so a
+                // successful update never leaves a name that blocks the next
+                // update while this old updater image is still shutting down.
+                let backup_cleanup = remove_exact_transaction_path(
+                    &self.backup,
+                    &self.backup_token,
+                    "old executable backup",
+                )?;
+                terminate_after_backup_cleanup_if_requested();
+                inject_commit_fault(CommitFaultPoint::BeforeFinalRecoveryCleanup);
+                let displaced_cleanup = if external_cleanup {
+                    cleanup_worker::spawn(
+                        &self.executable,
+                        &self.published_token,
+                        &self.displaced_previous,
+                        &self.previous_token,
+                        prepared_cleanup.context(
+                            "self-update cleanup journal was not retained through commit mutation",
+                        )?,
+                    )
+                    .context("starting exact previous-image cleanup after updater exit")?;
+                    None
+                } else {
+                    // Unit fixtures are inert files in this process. Keep them
+                    // synchronous; the copied-running-EXE regression opts into
+                    // the production worker through the one-shot hook above.
+                    Some(remove_exact_transaction_path(
+                        &self.displaced_previous,
+                        &self.previous_token,
+                        "displaced previous executable",
+                    )?)
+                };
+                // Readiness means the new public executable has opened this
+                // updater's process object and verified both exact file tokens.
+                // It removes the mapped old image only after updater exit.
+                self.state = ReplacementState::Finished;
+                inject_commit_fault(CommitFaultPoint::AfterFinalRecoveryCleanup);
+                let unconfirmed = backup_cleanup
+                    .unconfirmed_note()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                let mut unconfirmed = unconfirmed;
+                if let Some(note) = displaced_cleanup
+                    .as_ref()
+                    .and_then(ExactRemovalOutcome::unconfirmed_note)
+                {
+                    unconfirmed.push(note.to_string());
+                }
+                Ok(unconfirmed)
             }
-            if let Some(note) = backup_cleanup.unconfirmed_note() {
-                unconfirmed.push(note.to_string());
+            #[cfg(not(windows))]
+            {
+                let displaced_cleanup = remove_exact_transaction_path(
+                    &self.displaced_previous,
+                    &self.previous_token,
+                    "displaced previous executable",
+                )?;
+                inject_commit_fault(CommitFaultPoint::BeforeFinalRecoveryCleanup);
+                let backup_cleanup = remove_exact_transaction_path(
+                    &self.backup,
+                    &self.backup_token,
+                    "old executable backup",
+                )?;
+                // Both recovery names are gone. Set the live state immediately,
+                // before formatting or allocating cleanup diagnostics.
+                self.state = ReplacementState::Finished;
+                inject_commit_fault(CommitFaultPoint::AfterFinalRecoveryCleanup);
+                let mut unconfirmed = Vec::new();
+                if let Some(note) = displaced_cleanup.unconfirmed_note() {
+                    unconfirmed.push(note.to_string());
+                }
+                if let Some(note) = backup_cleanup.unconfirmed_note() {
+                    unconfirmed.push(note.to_string());
+                }
+                Ok(unconfirmed)
             }
-            Ok(unconfirmed)
         })();
         let result = match result {
             Ok(unconfirmed) => {
@@ -3057,6 +3239,22 @@ mod tests {
     }
 
     #[cfg(windows)]
+    const RUNNING_IMAGE_TEST_ROLE: &str = "CSGP_RUNNING_IMAGE_TEST_ROLE";
+    #[cfg(windows)]
+    const RUNNING_IMAGE_TEST_TARGET: &str = "CSGP_RUNNING_IMAGE_TEST_TARGET";
+    #[cfg(windows)]
+    const RUNNING_IMAGE_TEST_CANDIDATE: &str = "CSGP_RUNNING_IMAGE_TEST_CANDIDATE";
+    #[cfg(windows)]
+    const RUNNING_IMAGE_TEST_FAIL_CLEANUP_SENTINEL: &str =
+        "CSGP_RUNNING_IMAGE_TEST_FAIL_CLEANUP_SENTINEL";
+    #[cfg(windows)]
+    const RUNNING_IMAGE_TEST_HOLDER_EXIT_SENTINEL: &str =
+        "CSGP_RUNNING_IMAGE_TEST_HOLDER_EXIT_SENTINEL";
+    #[cfg(windows)]
+    const RUNNING_IMAGE_TEST_NAME: &str =
+        "update::tests::windows_commit_cleans_a_running_old_image_after_process_exit";
+
+    #[cfg(windows)]
     fn typed_result_fixture() -> (
         tempfile::TempDir,
         PathBuf,
@@ -3344,11 +3542,22 @@ mod tests {
             SelfUpdateReplacementState::Preserved
         );
         assert_eq!(fs::read(&executable).unwrap(), b"new executable");
-        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
-        assert!(
-            !displaced.exists(),
-            "the first exact recovery entry was already removed, so automatic rollback must not be claimed"
-        );
+        #[cfg(not(windows))]
+        {
+            assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+            assert!(
+                !displaced.exists(),
+                "the first exact recovery entry was already removed, so automatic rollback must not be claimed"
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                !backup.exists(),
+                "the fixed backup is consumed before mapped-image cleanup"
+            );
+            assert_eq!(fs::read(&displaced).unwrap(), b"old executable");
+        }
         let recovery = result
             .preserve_replacement_for_recovery()
             .expect("classify the remaining recovery entries");
@@ -3357,16 +3566,25 @@ mod tests {
             .iter()
             .find(|entry| entry.path == backup)
             .expect("backup observation");
+        #[cfg(not(windows))]
         assert_eq!(
             backup_entry.state,
             ReplacementRecoveryEntryState::ExactPresent
         );
+        #[cfg(windows)]
+        assert_eq!(backup_entry.state, ReplacementRecoveryEntryState::Absent);
         let displaced_entry = recovery
             .entries
             .iter()
             .find(|entry| entry.path == displaced)
             .expect("displaced observation");
+        #[cfg(not(windows))]
         assert_eq!(displaced_entry.state, ReplacementRecoveryEntryState::Absent);
+        #[cfg(windows)]
+        assert_eq!(
+            displaced_entry.state,
+            ReplacementRecoveryEntryState::ExactPresent
+        );
         let description = recovery.describe();
         assert!(description.contains("independent previous-executable backup"));
         assert!(description.contains("exact entry is present"));
@@ -4176,12 +4394,330 @@ mod tests {
         )
         .expect("publish candidate");
         let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let displaced = replacement.displaced_previous.clone();
         assert!(backup.exists());
 
         replacement.commit().expect("commit replacement");
 
         assert_eq!(fs::read(&executable).unwrap(), b"new executable");
         assert!(!backup.exists());
+        assert!(!displaced.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_self_update_cleanup_worker_process_entry() {
+        if cleanup_worker::run_from_test_env()
+            .expect("run exact self-update cleanup worker fixture")
+        {
+            std::process::exit(0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commit_cleans_a_running_old_image_after_process_exit() {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        use std::process::Stdio;
+
+        match std::env::var(RUNNING_IMAGE_TEST_ROLE).as_deref() {
+            Ok("holder") => {
+                println!("running image holder ready");
+                std::io::stdout().flush().expect("flush holder readiness");
+                let mut input = Vec::new();
+                std::io::stdin()
+                    .read_to_end(&mut input)
+                    .expect("wait for updater release");
+                if let Some(sentinel) = std::env::var_os(RUNNING_IMAGE_TEST_HOLDER_EXIT_SENTINEL) {
+                    fs::write(sentinel, b"mapped-image holder exited")
+                        .expect("publish holder-exit sentinel");
+                }
+                return;
+            }
+            Ok("updater") => {
+                let target = fs::canonicalize(PathBuf::from(
+                    std::env::var_os(RUNNING_IMAGE_TEST_TARGET).expect("running image target"),
+                ))
+                .expect("resolve running image target");
+                let candidate = fs::canonicalize(PathBuf::from(
+                    std::env::var_os(RUNNING_IMAGE_TEST_CANDIDATE)
+                        .expect("running image candidate"),
+                ))
+                .expect("resolve running image candidate");
+                if let Some(sentinel) = std::env::var_os(RUNNING_IMAGE_TEST_FAIL_CLEANUP_SENTINEL) {
+                    cleanup_worker::fail_after_parent_exit_once(PathBuf::from(sentinel));
+                }
+                let mut holder_command = std::process::Command::new(&target);
+                holder_command
+                    .arg(RUNNING_IMAGE_TEST_NAME)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(RUNNING_IMAGE_TEST_ROLE, "holder")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit());
+                let mut holder = holder_command.spawn().expect("spawn mapped-image holder");
+                let holder_input = holder.stdin.take().expect("holder stdin");
+                let mut holder_output =
+                    std::io::BufReader::new(holder.stdout.take().expect("holder readiness output"));
+                let mut marker = String::new();
+                loop {
+                    marker.clear();
+                    let read = holder_output
+                        .read_line(&mut marker)
+                        .expect("read holder readiness");
+                    assert_ne!(read, 0, "holder exited before readiness");
+                    if marker.contains("running image holder ready") {
+                        break;
+                    }
+                }
+
+                let lease = acquire_update_lease(&target).expect("acquire updater lease");
+                let mut replacement = replace_candidate(
+                    &target,
+                    &candidate,
+                    lease,
+                    UpdatePlatform::Windows,
+                    "v-running-image-test",
+                )
+                .expect("publish over the running copied executable");
+                let backup = replacement.backup.clone();
+                use_external_windows_cleanup_worker_once();
+                replacement
+                    .commit()
+                    .expect("commit running-image replacement");
+                assert!(
+                    !backup.exists(),
+                    "the fixed backup must not survive a successful commit"
+                );
+
+                drop(holder_input);
+                assert!(
+                    holder
+                        .wait()
+                        .expect("wait for mapped-image holder")
+                        .success(),
+                    "mapped-image holder did not exit cleanly"
+                );
+                return;
+            }
+            Ok("recover") => {
+                assert!(
+                    recover_pending_self_update_cleanup_on_startup()
+                        .expect("recover journaled self-update cleanup"),
+                    "the next execution did not observe its pending cleanup journal"
+                );
+                return;
+            }
+            Ok(other) => panic!("unexpected running-image helper role {other}"),
+            Err(_) => {}
+        }
+
+        let temp = tempfile::tempdir().expect("create running-image replacement fixture");
+        let source = std::env::current_exe().expect("locate test executable");
+        let target = temp.path().join("running-self-updater.exe");
+        let candidate = temp.path().join("replacement-candidate.exe");
+        fs::copy(&source, &target).expect("copy running updater image");
+        fs::hard_link(&source, &candidate).expect("link replacement candidate fixture");
+        let target = fs::canonicalize(target).expect("resolve copied updater image");
+        let candidate = fs::canonicalize(candidate).expect("resolve first update candidate");
+        let crash_holder_exit_sentinel = temp.path().join("crash-holder-exited");
+
+        let wait_for_fixture = |mut child: std::process::Child, purpose: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+            loop {
+                if let Some(status) = child.try_wait().expect("poll copied executable fixture") {
+                    return status;
+                }
+                if std::time::Instant::now() >= deadline {
+                    child
+                        .kill()
+                        .expect("terminate hung copied executable fixture");
+                    child.wait().expect("reap hung copied executable fixture");
+                    panic!("{purpose} did not exit within 240 seconds");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let run_updater =
+            |candidate: &Path, failure_sentinel: Option<&Path>, exit_after_backup: bool| {
+                let mut updater_command = std::process::Command::new(&target);
+                updater_command
+                    .arg(RUNNING_IMAGE_TEST_NAME)
+                    .arg("--exact")
+                    .arg("--nocapture")
+                    .env(RUNNING_IMAGE_TEST_ROLE, "updater")
+                    .env(RUNNING_IMAGE_TEST_TARGET, &target)
+                    .env(RUNNING_IMAGE_TEST_CANDIDATE, candidate)
+                    .env_remove(RUNNING_IMAGE_TEST_FAIL_CLEANUP_SENTINEL)
+                    .env_remove(RUNNING_IMAGE_TEST_HOLDER_EXIT_SENTINEL)
+                    .env_remove(WINDOWS_COMMIT_EXIT_AFTER_BACKUP_ENV)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit());
+                if let Some(sentinel) = failure_sentinel {
+                    updater_command.env(RUNNING_IMAGE_TEST_FAIL_CLEANUP_SENTINEL, sentinel);
+                }
+                if exit_after_backup {
+                    updater_command
+                        .env(WINDOWS_COMMIT_EXIT_AFTER_BACKUP_ENV, "1")
+                        .env(
+                            RUNNING_IMAGE_TEST_HOLDER_EXIT_SENTINEL,
+                            &crash_holder_exit_sentinel,
+                        );
+                }
+                let updater = updater_command.spawn().expect("run copied self-updater");
+                wait_for_fixture(updater, "copied self-updater")
+            };
+
+        let pending_journal = cleanup_worker::journal_path(&target)
+            .expect("derive pending self-update cleanup journal");
+        let fixed_backup = transaction_sibling_path(&target, ".self-update-backup").unwrap();
+        let run_recovery = || {
+            let mut recovery_command = std::process::Command::new(&target);
+            recovery_command
+                .arg(RUNNING_IMAGE_TEST_NAME)
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(RUNNING_IMAGE_TEST_ROLE, "recover")
+                .env_remove(RUNNING_IMAGE_TEST_FAIL_CLEANUP_SENTINEL)
+                .env_remove(RUNNING_IMAGE_TEST_HOLDER_EXIT_SENTINEL)
+                .env_remove(WINDOWS_COMMIT_EXIT_AFTER_BACKUP_ENV)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            let recovery = recovery_command
+                .spawn()
+                .expect("run the next executable for journal recovery");
+            let recovery_status = wait_for_fixture(recovery, "cleanup recovery execution");
+            assert!(
+                recovery_status.success(),
+                "the next executable did not recover pending cleanup: {recovery_status}"
+            );
+        };
+
+        // The durable journal must exist before the first cleanup mutation.
+        // Terminate the actual updater immediately after it deletes the fixed
+        // backup, before it can spawn a worker, then prove the next public
+        // execution has enough exact authority to finish and unblock another
+        // independent ReplaceFileW transaction.
+        let crash_status = run_updater(&candidate, None, true);
+        assert_eq!(
+            crash_status.code(),
+            Some(WINDOWS_COMMIT_EXIT_AFTER_BACKUP_CODE),
+            "copied updater did not terminate at the post-backup crash boundary: {crash_status}"
+        );
+        let holder_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !crash_holder_exit_sentinel.exists() {
+            assert!(
+                std::time::Instant::now() < holder_deadline,
+                "mapped-image holder did not finalize after its updater died"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            pending_journal.exists(),
+            "post-backup process death lost its pre-mutation cleanup journal"
+        );
+        assert!(
+            !fixed_backup.exists(),
+            "crash fixture did not cross the fixed-backup deletion boundary"
+        );
+        assert_eq!(
+            windows_recovery_entries(&target, WINDOWS_DISPLACED_RECOVERY_PREFIX).len(),
+            1,
+            "post-backup process death did not retain exactly one displaced image"
+        );
+        run_recovery();
+        assert!(
+            !pending_journal.exists(),
+            "crash recovery left its journal behind"
+        );
+        assert!(
+            windows_recovery_entries(&target, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty(),
+            "crash recovery left the exact displaced executable behind"
+        );
+
+        // A worker can acknowledge readiness and then encounter an AV or
+        // permissions failure only after this updater exits. The successful
+        // publication remains committed, while its exact durable journal must
+        // make that cleanup recoverable by the next execution.
+        let failure_candidate = temp.path().join("post-readiness-failure-candidate.exe");
+        fs::copy(&source, &failure_candidate)
+            .expect("copy a distinct post-readiness failure candidate");
+        let failure_candidate =
+            fs::canonicalize(failure_candidate).expect("resolve post-readiness failure candidate");
+        let failure_sentinel = temp.path().join("post-readiness-cleanup-failed");
+        let failure_status = run_updater(&failure_candidate, Some(&failure_sentinel), false);
+        assert!(
+            failure_status.success(),
+            "copied self-updater failed before its deferred cleanup: {failure_status}"
+        );
+
+        let failure_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !failure_sentinel.exists() {
+            assert!(
+                std::time::Instant::now() < failure_deadline,
+                "cleanup worker did not reach the injected post-parent-exit failure"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(pending_journal.exists(), "cleanup failure lost its journal");
+        assert_eq!(
+            windows_recovery_entries(&target, WINDOWS_DISPLACED_RECOVERY_PREFIX).len(),
+            1,
+            "cleanup failure did not retain exactly one displaced image"
+        );
+        assert!(
+            !fixed_backup.exists(),
+            "fixed backup residue must not return when deferred cleanup fails"
+        );
+        run_recovery();
+        assert!(
+            !pending_journal.exists(),
+            "recovery left its journal behind"
+        );
+        assert!(
+            windows_recovery_entries(&target, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty(),
+            "recovery left the exact displaced executable behind"
+        );
+
+        // Exercise the actual next running-image publication boundary. The
+        // candidate is a copy, not a hard link to the original test image, so
+        // this proves a distinct second ReplaceFileW transaction enters and
+        // its normal post-exit worker consumes both exact recovery entries.
+        let second_candidate = temp.path().join("second-candidate.exe");
+        fs::copy(&source, &second_candidate)
+            .expect("copy a distinct second update candidate fixture");
+        let second_candidate =
+            fs::canonicalize(second_candidate).expect("resolve second update candidate");
+        let second_status = run_updater(&second_candidate, None, false);
+        assert!(
+            second_status.success(),
+            "second copied self-updater failed: {second_status}"
+        );
+
+        let completed_journal =
+            cleanup_worker::journal_path(&target).expect("derive completed cleanup journal");
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            if windows_recovery_entries(&target, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty()
+                && !completed_journal.exists()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "mapped previous image or its cleanup journal remained after updater and holder exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !transaction_sibling_path(&target, ".self-update-backup")
+                .unwrap()
+                .exists(),
+            "fixed backup residue would block the next update"
+        );
     }
 
     #[cfg(windows)]

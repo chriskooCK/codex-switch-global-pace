@@ -40,7 +40,7 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
                     ok: true,
                     alias: a,
                     action: "created".into(),
-                });
+                })?;
             }
         }
         profile::SaveAction::Updated(a) => {
@@ -55,7 +55,7 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
                     ok: true,
                     alias: a,
                     action: "updated".into(),
-                });
+                })?;
             }
         }
     }
@@ -74,7 +74,7 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
         println!(
             "Re-authorizing profile '{}' ({})...",
             color::bold(alias),
-            old_info.email.as_deref().unwrap_or("unknown email")
+            crate::safe_text::terminal_text(old_info.email.as_deref().unwrap_or("unknown email"))
         );
     }
 
@@ -95,7 +95,7 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
             ok: true,
             alias: alias.to_string(),
             action: "reauthed".into(),
-        });
+        })?;
     } else {
         println!(
             "{}",

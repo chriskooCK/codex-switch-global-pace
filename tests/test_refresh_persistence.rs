@@ -85,7 +85,6 @@ fn rotation(n: u32) -> Reply {
     reply(
         StatusCode::OK,
         json!({
-            "id_token": format!("id_{n}"),
             "access_token": format!("access_{n}"),
             "refresh_token": format!("refresh_{n}"),
         }),
@@ -422,6 +421,19 @@ fn expired_jwt() -> String {
     jwt_expiring_in(-3600)
 }
 
+fn account_id_token() -> String {
+    let payload = URL_SAFE_NO_PAD.encode(
+        json!({
+            "email": "refresh-test@example.com",
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct_refresh_test"
+            }
+        })
+        .to_string(),
+    );
+    format!("header.{payload}.signature")
+}
+
 fn write_auth_file(path: &Path, id: &str, access: &str, refresh: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
@@ -475,7 +487,13 @@ fn env_guards(server: &MockServer, home: &Path) -> Vec<EnvVarGuard> {
 fn fixture(server: &MockServer, alias: &str, access_token: &str) -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let guards = env_guards(server, home.path());
-    let profile_path = write_profile(home.path(), alias, "old_id", access_token, "refresh_old");
+    let profile_path = write_profile(
+        home.path(),
+        alias,
+        &account_id_token(),
+        access_token,
+        "refresh_old",
+    );
     Fixture {
         profile_path,
         _guards: guards,
@@ -939,7 +957,7 @@ fn opportunistic_fixture(server: &MockServer) -> OpportunisticFixture {
     let keeper_profile = write_profile(
         home.path(),
         "keeper",
-        "old_id",
+        &account_id_token(),
         &keeper_access,
         "refresh_keeper",
     );
@@ -947,7 +965,7 @@ fn opportunistic_fixture(server: &MockServer) -> OpportunisticFixture {
     let blocked_profile = write_profile(
         home.path(),
         "blocked",
-        "old_id",
+        &account_id_token(),
         &blocked_access,
         "refresh_blocked",
     );
@@ -955,7 +973,7 @@ fn opportunistic_fixture(server: &MockServer) -> OpportunisticFixture {
     let live_auth_path = home.path().join("codex").join("auth.json");
     write_auth_file(
         &live_auth_path,
-        "old_id",
+        &account_id_token(),
         &blocked_access,
         "refresh_blocked",
     );
@@ -975,7 +993,6 @@ fn opportunistic_server_replies() -> Vec<(String, Reply)> {
             reply(
                 StatusCode::OK,
                 json!({
-                    "id_token": "id_keeper_new",
                     "access_token": "access_keeper_new",
                     "refresh_token": "refresh_keeper_new",
                 }),
@@ -986,7 +1003,6 @@ fn opportunistic_server_replies() -> Vec<(String, Reply)> {
             reply(
                 StatusCode::OK,
                 json!({
-                    "id_token": "id_blocked_new",
                     "access_token": "access_blocked_new",
                     "refresh_token": "refresh_blocked_new",
                 }),
@@ -1096,7 +1112,7 @@ fn expiring_profiles_fixture(server: &MockServer, aliases: &[&str]) -> ExpiringF
             write_profile(
                 home.path(),
                 alias,
-                "old_id",
+                &account_id_token(),
                 &jwt_expiring_in(-300 + index as i64 * 100),
                 &format!("refresh_{alias}"),
             )
@@ -1116,7 +1132,6 @@ fn rotation_for(alias: &str) -> (String, Reply) {
         reply(
             StatusCode::OK,
             json!({
-                "id_token": format!("id_{alias}_new"),
                 "access_token": format!("access_{alias}_new"),
                 "refresh_token": format!("refresh_{alias}_new"),
             }),
@@ -1574,7 +1589,7 @@ async fn refresh_rejected_by_a_concurrent_winner_recovers_from_the_stored_token(
         "refresh_old",
         ConcurrentWinner {
             profile_path: fx.profile_path.clone(),
-            id_token: "id_winner".to_string(),
+            id_token: account_id_token(),
             access_token: "access_winner".to_string(),
             refresh_token: "refresh_winner".to_string(),
         },
@@ -1698,7 +1713,7 @@ async fn concurrent_rotation_recovery_is_granted_at_most_once() {
             presented,
             ConcurrentWinner {
                 profile_path: fx.profile_path.clone(),
-                id_token: "id_winner".to_string(),
+                id_token: account_id_token(),
                 access_token: stale_access.clone(),
                 refresh_token: next.to_string(),
             },
