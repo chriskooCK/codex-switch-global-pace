@@ -1620,7 +1620,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "terminal-refresh-test";
@@ -1669,7 +1669,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
             let alias = "unknown-refresh-test";
             crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
@@ -1737,7 +1737,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "fetch-models-refresh-log-test";
@@ -1948,7 +1948,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-pre-warmup";
@@ -1975,7 +1975,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-401-retry";
@@ -2008,7 +2008,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-fetch-models";
@@ -2036,7 +2036,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
             let _codex_home = EnvVarGuard::set(
                 "CODEX_HOME",
@@ -2144,7 +2144,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             // Unique alias: MODEL_CACHE is process-global and outlives one test.
@@ -2178,7 +2178,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "models-fetch-count-with-pool";
@@ -2285,7 +2285,7 @@ mod tests {
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let home = tempfile::tempdir().unwrap();
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "models-cache-pool-set-changed";

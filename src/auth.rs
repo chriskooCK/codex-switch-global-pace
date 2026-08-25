@@ -205,7 +205,7 @@ fn validate_unix_directory_component(
 
 #[cfg(unix)]
 fn unix_mode_is_sticky(mode: u32) -> bool {
-    mode & u32::from(libc::S_ISVTX) != 0
+    u64::from(mode) & u64::from(libc::S_ISVTX) != 0
 }
 
 fn metadata_lookup_requires_parent(error: &std::io::Error) -> bool {
@@ -2869,7 +2869,7 @@ mod tests {
     fn test_write_auth_sets_private_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("auth.json");
 
         write_auth(&path, &json!({ "tokens": {} }))
@@ -2905,7 +2905,7 @@ mod tests {
     /// points than it claims.
     #[test]
     fn two_conditional_publications_within_the_same_second_retain_both_backups() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("auth.json");
 
         write_auth(&path, &json!({ "tokens": { "refresh_token": "first" } }))
@@ -2939,7 +2939,7 @@ mod tests {
     /// retention order.
     #[test]
     fn cleanup_keeps_the_newest_backups_across_both_timestamp_widths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("auth.json");
         write_auth(&path, &json!({ "tokens": {} }))
             .unwrap()
@@ -2969,7 +2969,7 @@ mod tests {
 
     #[test]
     fn cleanup_preserves_manual_legacy_and_malformed_backup_names() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("auth.json");
         write_auth(&path, &json!({ "tokens": {} }))
             .unwrap()
@@ -3021,7 +3021,7 @@ mod tests {
 
     #[test]
     fn cleanup_does_not_delete_a_backup_replaced_after_eligibility_scan() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("auth.json");
         write_auth(&path, &json!({ "tokens": {} }))
             .unwrap()
@@ -3055,7 +3055,7 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let source = dir.path().join("auth.json");
         let destination = dir.path().join(".auth.json.codex-switch-backup-test");
 
@@ -3080,7 +3080,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn metadata_errors_are_not_treated_as_missing_auth_or_managed_config() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let blocked_parent = dir.path().join("not-a-directory");
         std::fs::write(&blocked_parent, b"x").unwrap();
 
@@ -3114,7 +3114,7 @@ mod tests {
 
     #[test]
     fn backup_stage_parent_errors_are_not_treated_as_available_slots() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let source = dir.path().join("auth.json");
         write_auth(&source, &json!({ "tokens": {} }))
             .unwrap()
@@ -3139,7 +3139,7 @@ mod tests {
     #[test]
     fn test_explicit_non_file_credentials_stores_are_rejected() {
         for mode in ["keyring", "auto", "ephemeral"] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::fs_ops::create_direct_tempdir().unwrap();
             std::fs::write(
                 dir.path().join("config.toml"),
                 format!("cli_auth_credentials_store = \"{mode}\"\n"),
@@ -3157,7 +3157,7 @@ mod tests {
 
     #[test]
     fn test_missing_credentials_store_defaults_to_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
 
         validate_cli_auth_credentials_store(dir.path()).unwrap();
@@ -3165,7 +3165,7 @@ mod tests {
 
     #[test]
     fn test_explicit_file_credentials_store_is_allowed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
             "cli_auth_credentials_store = \"file\"\n",
@@ -3290,7 +3290,7 @@ mod tests {
 
     #[test]
     fn configured_state_homes_reject_existing_file_components() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let file = root.path().join("not-a-directory");
         std::fs::write(&file, b"occupied").unwrap();
 
@@ -3308,7 +3308,7 @@ mod tests {
     fn state_homes_reject_symlinked_nearest_ancestors_and_default_directories() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let real = root.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let linked = root.path().join("linked");
@@ -3332,7 +3332,7 @@ mod tests {
     fn state_homes_reject_existing_descendants_below_an_intermediate_symlink() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let real = root.path().join("real");
         std::fs::create_dir_all(real.join("existing-child")).unwrap();
         let linked = root.path().join("linked");
@@ -3353,7 +3353,7 @@ mod tests {
     fn private_directory_rejects_a_nonsticky_world_writable_ancestor() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let shared = root.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -3370,7 +3370,7 @@ mod tests {
     fn private_directory_allows_a_current_user_entry_in_a_sticky_parent() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let shared = root.path().join("shared");
         std::fs::create_dir(&shared).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
@@ -3389,7 +3389,7 @@ mod tests {
     fn state_homes_reject_existing_descendants_below_an_intermediate_reparse_point() {
         use std::os::windows::fs::symlink_dir;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let real = root.path().join("real");
         std::fs::create_dir_all(real.join("existing-child")).unwrap();
         let linked = root.path().join("linked");
@@ -3413,7 +3413,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn private_directory_guard_pins_the_full_windows_path_until_drop() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let parent = root.path().join("parent");
         let private = parent.join("private");
         let moved = root.path().join("moved-parent");
@@ -3568,7 +3568,7 @@ mod tests {
 
     #[test]
     fn conditional_private_write_never_publishes_after_a_detected_change() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let existing = dir.path().join("auth.json");
         std::fs::write(&existing, b"original").unwrap();
 
@@ -3600,7 +3600,7 @@ mod tests {
 
     #[test]
     fn conditional_publication_preserves_a_writer_that_wins_before_exchange() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         std::fs::write(&live, b"original").unwrap();
         std::fs::write(dir.path().join("auth.json.bak.1"), b"retained").unwrap();
@@ -3637,7 +3637,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_foreign_restore_never_overwrites_a_late_candidate_path_occupant() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         let candidate = dir.path().join(".auth.json.codex-switch-candidate-test");
         let displaced = dir.path().join(".auth.json.codex-switch-displaced-test");
@@ -3679,7 +3679,7 @@ mod tests {
     fn an_old_live_handle_cannot_mutate_the_independent_backup() {
         use std::io::{Seek as _, SeekFrom};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         std::fs::write(&live, b"original").unwrap();
         let mut old_live = std::fs::OpenOptions::new()
@@ -3720,7 +3720,7 @@ mod tests {
 
     #[test]
     fn publication_record_cannot_redirect_transaction_paths() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         let unrelated = dir.path().join("unrelated.json");
         std::fs::write(&live, b"original").unwrap();
@@ -3754,7 +3754,7 @@ mod tests {
 
     #[test]
     fn oversized_publication_record_is_bounded_and_preserved() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         std::fs::write(&live, b"original").unwrap();
         let record_path = super::auth_publication_record_path(&live).unwrap();
@@ -3770,7 +3770,7 @@ mod tests {
 
     #[test]
     fn successful_exchange_retains_an_independent_original_backup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         std::fs::write(&live, b"original").unwrap();
 
@@ -3790,7 +3790,7 @@ mod tests {
 
     #[test]
     fn exclusive_backup_stage_never_adopts_or_overwrites_a_collision() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let live = dir.path().join("auth.json");
         let collision = dir.path().join(".auth.json.codex-switch-backup-collision");
         std::fs::write(&live, b"original").unwrap();
@@ -3803,7 +3803,7 @@ mod tests {
 
     #[test]
     fn private_write_durability_contract_includes_new_directory_ancestors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("new/app/profiles/alice/auth.json");
 
         super::atomic_write_private(&path, b"credential")
@@ -3816,7 +3816,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn atomic_private_write_removes_unknown_explicit_windows_aces() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let status = std::process::Command::new("icacls")
             .arg(dir.path())
             .args(["/grant", "*S-1-1-0:(OI)(CI)F"])

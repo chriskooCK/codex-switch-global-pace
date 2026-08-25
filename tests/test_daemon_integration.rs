@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 mod mock;
+mod support;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -11,7 +12,7 @@ use mock::scenarios;
 use serde_json::{Value, json};
 
 struct TestEnv {
-    _tmp: tempfile::TempDir,
+    _tmp: support::TempDir,
     home: PathBuf,
     codex_home: PathBuf,
     usage_url: String,
@@ -67,7 +68,7 @@ fn setup_env(
     usage_url: String,
     token_url: String,
 ) -> TestEnv {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = support::tempdir();
     let home = tmp.path().join("home");
     let codex_home = tmp.path().join("codex-home");
     let profiles_dir = home.join(".codex-switch").join("profiles");

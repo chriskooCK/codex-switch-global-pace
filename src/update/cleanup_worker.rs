@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn journal_is_a_stable_executable_transaction_sibling() {
-        let temp = tempfile::tempdir().expect("create stable journal fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create stable journal fixture");
         let public = temp.path().join("public.exe");
 
         assert_eq!(
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn public_executable_pin_blocks_a_to_b_to_a_spawn_race() {
-        let temp = tempfile::tempdir().expect("create pin fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create pin fixture");
         let public = temp.path().join("public.exe");
         let candidate = temp.path().join("candidate.exe");
         let held = temp.path().join("held-a.exe");
@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn public_executable_pin_blocks_in_place_rewrite_spawn_restore_race() {
-        let temp = tempfile::tempdir().expect("create in-place pin fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create in-place pin fixture");
         let public = temp.path().join("public.exe");
         std::fs::write(&public, b"verified image A").expect("write image A");
         let expected = crate::fs_ops::token_for_path(&public).expect("bind image A");
@@ -842,7 +842,7 @@ mod tests {
     fn an_undeletable_journal_remains_exactly_retryable() {
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-        let temp = tempfile::tempdir().expect("create cleanup retry fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create cleanup retry fixture");
         let public = temp.path().join("public.exe");
         let backup = temp.path().join(".public.exe.self-update-backup");
         let displaced = temp
@@ -901,7 +901,8 @@ mod tests {
 
     #[test]
     fn malformed_journal_is_preserved_without_deleting_the_displaced_image() {
-        let temp = tempfile::tempdir().expect("create malformed journal fixture");
+        let temp =
+            crate::fs_ops::create_direct_tempdir().expect("create malformed journal fixture");
         let public = temp.path().join("public.exe");
         let displaced = temp
             .path()

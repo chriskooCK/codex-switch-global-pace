@@ -5,6 +5,8 @@
 //! persist it — or that replays a consumed token — permanently bricks the
 //! profile, so these behaviours are covered end-to-end against a local mock.
 
+mod support;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -62,7 +64,7 @@ impl Drop for EnvVarGuard {
 
 fn init_test_config() {
     CONFIG_INIT.call_once(|| {
-        let home = tempfile::tempdir().expect("test config home must be created");
+        let home = support::tempdir();
         let _home = EnvVarGuard::set(
             "CODEX_SWITCH_HOME",
             home.path().to_string_lossy().into_owned(),
@@ -470,7 +472,7 @@ fn stored_refresh_token(path: &Path) -> String {
 struct Fixture {
     profile_path: PathBuf,
     _guards: Vec<EnvVarGuard>,
-    _home: tempfile::TempDir,
+    _home: support::TempDir,
 }
 
 fn env_guards(server: &MockServer, home: &Path) -> Vec<EnvVarGuard> {
@@ -485,7 +487,7 @@ fn env_guards(server: &MockServer, home: &Path) -> Vec<EnvVarGuard> {
 }
 
 fn fixture(server: &MockServer, alias: &str, access_token: &str) -> Fixture {
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let guards = env_guards(server, home.path());
     let profile_path = write_profile(
         home.path(),
@@ -947,11 +949,11 @@ struct OpportunisticFixture {
     blocked_profile: PathBuf,
     live_auth_path: PathBuf,
     _guards: Vec<EnvVarGuard>,
-    _home: tempfile::TempDir,
+    _home: support::TempDir,
 }
 
 fn opportunistic_fixture(server: &MockServer) -> OpportunisticFixture {
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let guards = env_guards(server, home.path());
     let keeper_access = expired_jwt();
     let keeper_profile = write_profile(
@@ -1099,11 +1101,11 @@ async fn opportunistic_refresh_keeps_going_after_active_profile_sync_fails() {
 struct ExpiringFixture {
     profiles: Vec<PathBuf>,
     _guards: Vec<EnvVarGuard>,
-    _home: tempfile::TempDir,
+    _home: support::TempDir,
 }
 
 fn expiring_profiles_fixture(server: &MockServer, aliases: &[&str]) -> ExpiringFixture {
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let guards = env_guards(server, home.path());
     let profiles = aliases
         .iter()
@@ -1333,7 +1335,7 @@ async fn import_validation_hands_back_rotated_tokens_when_usage_fails() {
         vec![rotation(1)],
     )
     .await;
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let _guards = env_guards(&server, home.path());
 
     let mut val = json!({
@@ -1395,7 +1397,7 @@ async fn import_rotation_is_staged_before_the_follow_up_usage_get() {
     )
     .await;
     let mut held_usage = server.hold_usage_request("access_1");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let _guards = env_guards(&server, home.path());
     let stage_path = home
         .path()
@@ -1448,7 +1450,7 @@ async fn import_stage_failure_prevents_the_follow_up_usage_get() {
         vec![rotation(1)],
     )
     .await;
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let _guards = env_guards(&server, home.path());
     let mut val = json!({
         "OPENAI_API_KEY": null,
@@ -1508,7 +1510,7 @@ async fn second_import_rotation_stage_failure_prevents_the_second_follow_up_get(
         vec![rotation(1), rotation(2)],
     )
     .await;
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let _guards = env_guards(&server, home.path());
     let stage_path = home
         .path()

@@ -254,7 +254,7 @@ mod tests {
         let _env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _home = EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
         let _url = EnvVarGuard::set("CS_ACCOUNTS_CHECK_URL", UNREACHABLE_ACCOUNTS_CHECK);
 
@@ -280,7 +280,7 @@ mod tests {
         let _env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _home = EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
         let _url = EnvVarGuard::set("CS_ACCOUNTS_CHECK_URL", UNREACHABLE_ACCOUNTS_CHECK);
 

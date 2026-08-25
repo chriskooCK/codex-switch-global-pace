@@ -3682,7 +3682,7 @@ mod installer_state_tests {
 
     #[test]
     fn initially_stopped_transaction_keeps_the_exact_executable_identity() {
-        let home = tempfile::tempdir().expect("temp stopped executable state");
+        let home = crate::fs_ops::create_direct_tempdir().expect("temp stopped executable state");
         let executable = home.path().join(if cfg!(windows) {
             "codex-switch-global-pace.exe"
         } else {
@@ -3882,7 +3882,7 @@ mod installer_state_tests {
 
     #[test]
     fn installer_capture_rejects_a_daemon_from_another_public_copy() {
-        let home = tempfile::tempdir().expect("temp executable identities");
+        let home = crate::fs_ops::create_direct_tempdir().expect("temp executable identities");
         let expected = home.path().join(if cfg!(windows) {
             "expected.exe"
         } else {
@@ -4037,7 +4037,7 @@ mod tests {
             Err(_) => {}
         }
 
-        let temp = tempfile::tempdir().expect("signal isolation temp directory");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("signal isolation temp directory");
         let ready = temp.path().join("coordinator-ready");
         let finalized = temp.path().join("holder-finalized");
         let executable = std::env::current_exe().expect("locate test executable");
@@ -4101,7 +4101,7 @@ mod tests {
     fn installer_capture_rejects_the_same_file_through_a_symlinked_ancestor() {
         use std::os::unix::fs::symlink;
 
-        let home = tempfile::tempdir().expect("temp identity root");
+        let home = crate::fs_ops::create_direct_tempdir().expect("temp identity root");
         let real_root = home.path().join("real");
         let real_bin = real_root.join("bin");
         std::fs::create_dir_all(&real_bin).expect("create real bin");
@@ -4126,7 +4126,7 @@ mod tests {
 
     #[test]
     fn user_path_migration_rejects_a_legacy_foreground_winner_with_identical_bytes() {
-        let home = tempfile::tempdir().expect("temp migration identities");
+        let home = crate::fs_ops::create_direct_tempdir().expect("temp migration identities");
         let legacy = home.path().join("legacy/codex-switch-global-pace");
         let user = home.path().join("user/codex-switch-global-pace");
         std::fs::create_dir_all(legacy.parent().unwrap()).expect("create legacy parent");
@@ -4148,7 +4148,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().expect("temp home");
+        let home = crate::fs_ops::create_direct_tempdir().expect("temp home");
         let previous = std::env::var_os("CODEX_SWITCH_HOME");
         // SAFETY: the process-wide env lock above is held for the whole test.
         unsafe { std::env::set_var("CODEX_SWITCH_HOME", home.path()) };

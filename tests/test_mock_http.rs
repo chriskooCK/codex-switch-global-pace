@@ -5,6 +5,7 @@
 //! the HTTP → parse → score pipeline.
 
 mod mock;
+mod support;
 
 use codex_switch::jwt::AccountInfo;
 use codex_switch::usage::{self, ResetCredit, ScoredCandidate};
@@ -53,7 +54,7 @@ impl Drop for EnvVarGuard {
 
 fn init_test_config() {
     CONFIG_INIT.call_once(|| {
-        let home = tempfile::tempdir().expect("test config home must be created");
+        let home = support::tempdir();
         let _home = EnvVarGuard::set(
             "CODEX_SWITCH_HOME",
             home.path().to_string_lossy().into_owned(),
@@ -67,10 +68,10 @@ fn init_test_config() {
 fn setup_profiles(
     entries: &[(String, Vec<serde_json::Value>)],
 ) -> (
-    tempfile::TempDir,
+    support::TempDir,
     Vec<(String, PathBuf, String, AccountInfo)>,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::tempdir();
     let mut profiles = Vec::new();
 
     for (token, _responses) in entries {
@@ -322,7 +323,7 @@ async fn usage_retry_exhaustion_returns_last_error_after_three_attempts() {
     )])
     .await;
     let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::tempdir();
     let auth_path = dir.path().join("auth.json");
     std::fs::write(
         &auth_path,
@@ -598,24 +599,14 @@ mod revival {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::mock;
     use serde_json::{Value, json};
 
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_home(name: &str) -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("codex-switch-global-pace-revival-{name}-{ts}-{id}"));
-        fs::create_dir_all(&path).unwrap();
-        path
+    fn temp_home() -> crate::support::TempDir {
+        crate::support::tempdir()
     }
 
     fn jwt(payload: &Value) -> String {
@@ -839,7 +830,7 @@ mod revival {
     /// another account in the pool holds a reset card.
     #[test]
     fn contract5_eligible_top_skips_card_logic_and_never_hits_consume() {
-        let home = temp_home("contract5");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(&home, "eligible_top", "tok_eligible_top", 5.0, &[]);
         write_cached_profile(
@@ -871,8 +862,6 @@ mod revival {
             json.get("hint").is_none(),
             "no hint expected when top candidate is eligible: {json}"
         );
-
-        let _ = fs::remove_dir_all(home);
     }
 
     /// Contract 6: pool exhausted, one account holds a card, PreApproved
@@ -882,7 +871,7 @@ mod revival {
     /// call must not starve the MockServer's own async task on the same thread.
     #[tokio::test(flavor = "multi_thread")]
     async fn contract6_consume_card_revives_exhausted_pool() {
-        let home = temp_home("contract6");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -934,12 +923,11 @@ mod revival {
         );
 
         server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn card_is_not_consumed_before_untracked_live_auth_is_authorized() {
-        let home = temp_home("authorize-before-consume");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -982,12 +970,11 @@ mod revival {
         assert_eq!(live, untracked);
 
         server.abort();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cached_spend_blocker_is_rejected_before_preflight_or_consume() {
-        let home = temp_home("cached-spend-blocker");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1037,12 +1024,11 @@ mod revival {
         assert_eq!(current_live, live);
 
         consume_server.abort();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn forced_preflight_workspace_blocker_is_rejected_before_consume() {
-        let home = temp_home("preflight-workspace-blocker");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1093,12 +1079,11 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn changed_card_metadata_is_refused_before_the_consume_request() {
-        let home = temp_home("changed-card-binding");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1141,12 +1126,11 @@ mod revival {
         consume_server.abort();
         credits_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn consumed_card_activation_failure_reports_the_irreversible_side_effect() {
-        let home = temp_home("consumed-activation-race");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1194,7 +1178,6 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     /// Contract 7: consuming the card doesn't actually free quota (still
@@ -1204,7 +1187,7 @@ mod revival {
     /// Multi-thread runtime: see `contract6_consume_card_revives_exhausted_pool`.
     #[tokio::test(flavor = "multi_thread")]
     async fn contract7_does_not_switch_when_still_exhausted_after_consume() {
-        let home = temp_home("contract7");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1248,12 +1231,11 @@ mod revival {
         );
 
         server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn consumed_card_does_not_switch_when_post_consume_refresh_fails() {
-        let home = temp_home("post-consume-refresh-failure");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1304,12 +1286,11 @@ mod revival {
         );
 
         server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn contract7_human_output_reports_consumed_but_unconfirmed_card() {
-        let home = temp_home("contract7-human");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1347,12 +1328,11 @@ mod revival {
         assert!(!home.join(".codex/auth.json").exists());
 
         server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn consume_unknown_json_output_warns_to_verify_before_retry() {
-        let home = temp_home("consume-unknown-json");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1394,12 +1374,11 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn consume_unknown_human_output_warns_to_verify_before_retry() {
-        let home = temp_home("consume-unknown-human");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1437,12 +1416,11 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn explicit_reset_card_unknown_json_warns_to_verify_before_retry() {
-        let home = temp_home("explicit-reset-unknown-json");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1482,12 +1460,11 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn explicit_reset_card_rechecks_hard_blocker_under_lease_before_consume() {
-        let home = temp_home("explicit-reset-preflight-blocker");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1537,12 +1514,11 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn explicit_reset_card_unknown_human_warns_to_verify_before_retry() {
-        let home = temp_home("explicit-reset-unknown-human");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1578,7 +1554,6 @@ mod revival {
 
         consume_server.abort();
         usage_server.shutdown();
-        let _ = fs::remove_dir_all(home);
     }
 
     /// Contract 8: pool exhausted, a card is available, but no
@@ -1586,7 +1561,7 @@ mod revival {
     /// JSON and human output carry the revival hint.
     #[test]
     fn contract8_deny_without_flag_emits_hint_and_consumes_nothing() {
-        let home = temp_home("contract8-json");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1619,13 +1594,11 @@ mod revival {
         let hint = json["hint"].as_str().expect("hint field should be set");
         assert!(hint.contains("card_holder"), "{hint}");
         assert!(hint.contains("--consume-card"), "{hint}");
-
-        let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     fn contract8_deny_without_flag_prints_human_hint() {
-        let home = temp_home("contract8-human");
+        let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
             &home,
@@ -1653,8 +1626,6 @@ mod revival {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("card_holder"), "{stdout}");
         assert!(stdout.contains("--consume-card"), "{stdout}");
-
-        let _ = fs::remove_dir_all(home);
     }
 }
 

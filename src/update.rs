@@ -1171,7 +1171,8 @@ async fn download_and_replace(
             format!("release does not contain provenance asset '{PROVENANCE_ASSET_NAME}'")
         })?;
 
-    let temp_dir = tempfile::tempdir().context("creating temporary update directory")?;
+    let temp_dir = crate::fs_ops::create_direct_tempdir()
+        .context("creating direct temporary update directory")?;
     let archive_path = temp_dir.path().join(&archive_asset.name);
     let provenance_path = temp_dir.path().join(PROVENANCE_ASSET_NAME);
     if show_progress {
@@ -3191,7 +3192,8 @@ mod tests {
 
     #[test]
     fn update_lock_target_canonicalizes_existing_and_missing_destinations() {
-        let temp = tempfile::tempdir().expect("create update-lock target fixture");
+        let temp =
+            crate::fs_ops::create_direct_tempdir().expect("create update-lock target fixture");
         let install_dir = temp.path().join("install");
         fs::create_dir(&install_dir).expect("create install directory");
 
@@ -3230,7 +3232,7 @@ mod tests {
 
     #[cfg(windows)]
     fn windows_replacement_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let temp = tempfile::tempdir().expect("create replacement fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create replacement fixture");
         let executable = temp.path().join("codex-switch-global-pace.exe");
         let candidate = temp.path().join("candidate.exe");
         fs::write(&executable, b"old executable").expect("write old executable");
@@ -3391,7 +3393,7 @@ mod tests {
 
     #[test]
     fn self_update_lease_serializes_concurrent_replacements() {
-        let temp = tempfile::tempdir().expect("create lease fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create lease fixture");
         let executable = temp.path().join(extracted_binary_name());
         fs::write(&executable, b"current executable").expect("write executable fixture");
         let first = acquire_update_lease(&executable).expect("acquire first update lease");
@@ -3429,7 +3431,7 @@ mod tests {
     #[cfg(not(windows))]
     fn unix_pending_replacement_fixture()
     -> (tempfile::TempDir, PathBuf, PathBuf, PendingReplacement) {
-        let temp = tempfile::tempdir().expect("create Unix replacement fixture");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create Unix replacement fixture");
         let executable = temp.path().join("codex-switch-global-pace");
         let candidate = temp.path().join("candidate");
         let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
@@ -3696,7 +3698,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unix_publication_refuses_to_overwrite_an_executable_changed_during_staging() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let executable = temp.path().join("codex-switch-global-pace");
         let candidate = temp.path().join("candidate");
         fs::write(&executable, b"old executable").unwrap();
@@ -3727,7 +3729,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unix_publication_preserves_a_writer_that_claims_the_atomic_boundary() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let executable = temp.path().join("codex-switch-global-pace");
         let candidate = temp.path().join("candidate");
         fs::write(&executable, b"old executable").unwrap();
@@ -3761,7 +3763,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unix_unwind_immediately_after_exchange_restores_the_old_executable() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let executable = temp.path().join("codex-switch-global-pace");
         let candidate = temp.path().join("candidate");
         fs::write(&executable, b"old executable").unwrap();
@@ -3795,7 +3797,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unix_error_immediately_after_exchange_reports_exact_restoration() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let executable = temp.path().join("codex-switch-global-pace");
         let candidate = temp.path().join("candidate");
         fs::write(&executable, b"old executable").unwrap();
@@ -3831,7 +3833,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn nested_unwind_during_unix_publication_rollback_preserves_exact_paths() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let executable = temp.path().join("codex-switch-global-pace");
         let candidate = temp.path().join("candidate");
         fs::write(&executable, b"old executable").unwrap();
@@ -3915,7 +3917,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unix_no_replace_rename_never_overwrites_the_destination() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let source = temp.path().join("source");
         let destination = temp.path().join("destination");
         fs::write(&source, b"source").unwrap();
@@ -4513,7 +4515,8 @@ mod tests {
             Err(_) => {}
         }
 
-        let temp = tempfile::tempdir().expect("create running-image replacement fixture");
+        let temp = crate::fs_ops::create_direct_tempdir()
+            .expect("create running-image replacement fixture");
         let source = std::env::current_exe().expect("locate test executable");
         let target = temp.path().join("running-self-updater.exe");
         let candidate = temp.path().join("replacement-candidate.exe");
@@ -4997,7 +5000,7 @@ mod tests {
     fn replacement_preflight_rejects_a_read_only_install_directory() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let install_dir = temp.path().join("bin");
         fs::create_dir(&install_dir).unwrap();
         let executable = install_dir.join("codex-switch-global-pace");
@@ -5163,7 +5166,7 @@ mod tests {
     fn homebrew_symlink_is_resolved_before_legacy_migration_check() {
         use std::os::unix::fs::symlink;
 
-        let temp = tempfile::tempdir().expect("create temp directory");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create temp directory");
         let cellar_dir = temp
             .path()
             .join("Cellar/codex-switch-global-pace/20260713.4.0/bin");
@@ -5193,7 +5196,7 @@ mod tests {
 
     #[test]
     fn executable_resolution_and_system_marker_checks_fail_closed() {
-        let temp = tempfile::tempdir().expect("create temp directory");
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create temp directory");
         let missing_executable = temp.path().join("missing-executable");
         let error = canonical_executable_path(missing_executable).unwrap_err();
         assert!(

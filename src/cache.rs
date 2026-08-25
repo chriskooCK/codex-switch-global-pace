@@ -873,7 +873,7 @@ mod tests {
 
     #[test]
     fn cache_mutation_load_rejects_malformed_state() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("cache.json");
         std::fs::write(&path, "not-json").unwrap();
 
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn automatic_ranking_history_rejects_malformed_cache_state() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("cache.json");
         std::fs::write(&path, "not-json").unwrap();
 
@@ -903,7 +903,7 @@ mod tests {
 
     #[test]
     fn cache_mutation_load_treats_only_a_missing_file_as_empty() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("missing-cache.json");
 
         let cache = load_cache_checked_at(&path).unwrap();
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn cache_mutation_waits_for_cross_process_lock() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let lock_path = dir.path().join("cache.lock");
         let holder = open_cache_lock_file(&lock_path).unwrap();
         FileExt::lock(&holder).unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn cache_atomic_write_replaces_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("cache.json");
         let mut first = CacheFile::default();
         first.last_used.insert("alice".into(), 1);
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[test]
     fn cache_lock_timeout_preserves_live_lock_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let lock_path = dir.path().join("cache.lock");
         let holder = open_cache_lock_file(&lock_path).unwrap();
         std::fs::write(&lock_path, "holder-marker").unwrap();

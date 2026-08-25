@@ -1083,7 +1083,7 @@ mod revival_target_tests {
     #[test]
     fn automatic_ranking_rejects_malformed_selection_history() {
         let _lock = lock_profile_test_environment();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let profile_dir = home.path().join("profiles/alice");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -1104,7 +1104,7 @@ mod revival_target_tests {
     #[test]
     fn automatic_ranking_rejects_unreadable_profile_metadata() {
         let _lock = lock_profile_test_environment();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let profile_dir = home.path().join("profiles/alice");
         std::fs::create_dir_all(&profile_dir).unwrap();
@@ -1409,7 +1409,7 @@ mod revival_target_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn usage_worker_failures_are_reported_only_after_other_workers_persist() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let persisted_path = temp.path().join("rotated-auth.json");
         let path_in_worker = persisted_path.clone();
         let workers_started = std::sync::Arc::new(tokio::sync::Barrier::new(3));

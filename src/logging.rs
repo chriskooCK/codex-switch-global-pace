@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn retains_only_the_latest_three_calendar_days() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         for day in 8..=12 {
             create_log(
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn removes_oldest_logs_to_keep_total_at_ten_mebibytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         for day in 10..=12 {
             create_log(
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn appending_never_exceeds_ten_mebibytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         create_log(dir.path(), today, MAX_LOG_BYTES);
         let directory_guard = create_private_log_dir(dir.path()).unwrap();
@@ -493,7 +493,7 @@ mod tests {
     /// out-of-retention files alone, and a due one must still collect them.
     #[test]
     fn a_skipped_maintenance_write_does_not_scan_the_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         let expired = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
         create_log(dir.path(), expired, 1);
@@ -517,7 +517,7 @@ mod tests {
     fn append_log_tightens_directory_lock_and_log_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         let lock_path = dir.path().join(".lock");
         let current_log = log_path(dir.path(), today);
@@ -549,7 +549,7 @@ mod tests {
     fn append_log_never_follows_preexisting_file_links() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let dir = root.path().join("logs");
         fs::create_dir(&dir).unwrap();
         let target = root.path().join("unrelated");
@@ -573,7 +573,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn append_log_hardens_directory_lock_and_log_acls() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let dir = root.path().join("logs");
         let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
         let lock_path = dir.join(".lock");
@@ -594,7 +594,7 @@ mod tests {
     fn append_log_never_follows_preexisting_file_reparse_points() {
         use std::os::windows::fs::symlink_file;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
         let dir = root.path().join("logs");
         fs::create_dir(&dir).unwrap();
         let target = root.path().join("unrelated");

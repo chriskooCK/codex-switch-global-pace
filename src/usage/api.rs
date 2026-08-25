@@ -1595,7 +1595,7 @@ mod tests {
         status: StatusCode,
         body: Value,
     ) -> (UsageError, usize, usize) {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[test]
     fn terminal_verdict_guard_rejects_a_superseded_refresh_token() {
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = home.path().join("auth.json");
         write_auth_durable(
             &path,
@@ -1763,7 +1763,7 @@ mod tests {
         let _env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
         let app = Router::new().route(
@@ -1832,7 +1832,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::config::init_defaults_for_tests();
 
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
@@ -2022,7 +2022,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         crate::config::init_defaults_for_tests();
 
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
@@ -2235,7 +2235,7 @@ mod tests {
         let _env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();
         let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());

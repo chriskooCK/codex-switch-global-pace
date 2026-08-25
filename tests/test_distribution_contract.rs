@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1853,7 +1855,7 @@ fn unix_binary_transaction_never_removes_a_foreign_replacement() {
 
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let install_dir = temp.path().join("bin");
     fs::create_dir(&install_dir).unwrap();
     let candidate = temp.path().join("candidate");
@@ -2008,7 +2010,7 @@ fn unix_legacy_migration_acquires_system_then_user_target_locks() {
     let start = script.find("cleanup_update_locks_on_exit() {").unwrap();
     let end = script[start..].find("prepare_daemon_upgrade() {").unwrap() + start;
     let helpers = &script[start..end];
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::tempdir();
     let binary = dir.path().join("lock-helper");
     let log = dir.path().join("lock-order");
     fs::write(
@@ -2058,7 +2060,7 @@ fn unix_uninstall_keeps_its_lock_holder_alive_through_daemon_and_binary_removal(
     use std::os::unix::fs::PermissionsExt;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let install_dir = home.path().join(".local/bin");
     fs::create_dir_all(&install_dir).unwrap();
     let binary = install_dir.join("codex-switch-global-pace");
@@ -2178,7 +2180,7 @@ fn unix_uninstall_restores_binary_and_path_when_service_commit_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let install_dir = home.path().join(".local/bin");
     fs::create_dir_all(&install_dir).unwrap();
     let binary = install_dir.join("codex-switch-global-pace");
@@ -2285,7 +2287,7 @@ fn unix_raw_repository_uninstaller_refuses_to_mutate_an_existing_install() {
     use std::process::Command;
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let install_dir = home.path().join(".local/bin");
     fs::create_dir_all(&install_dir).unwrap();
     let binary = install_dir.join("codex-switch-global-pace");
@@ -2325,7 +2327,7 @@ fn unix_installer_rejects_non_executable_direct_binaries_before_network_or_mutat
     use std::process::Command;
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let install_dir = home.path().join(".local/bin");
     fs::create_dir_all(&install_dir).unwrap();
     let binary = install_dir.join("codex-switch-global-pace");
@@ -2359,7 +2361,7 @@ fn unix_uninstall_true_noop_does_not_create_a_lock_parent() {
     use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let candidate = home.path().join("verified-candidate");
     fs::write(
         &candidate,
@@ -2405,7 +2407,7 @@ fn unix_uninstall_preserves_a_service_when_the_lock_holder_binary_is_missing() {
     use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let target = home.path().join(".local/bin/codex-switch-global-pace");
     let service = if cfg!(target_os = "macos") {
         home.path()
@@ -2471,7 +2473,7 @@ fn unix_uninstall_preserves_a_stale_path_block_without_a_lock_holder_binary() {
     use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let profile = home.path().join(".profile");
     let contents = concat!(
         "before\n",
@@ -2513,7 +2515,7 @@ fn unix_release_candidate_cleans_stale_marker_and_path_when_the_lock_parent_exis
     use std::os::unix::fs::PermissionsExt;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let system_dir = home.path().join("system-bin");
     fs::create_dir_all(&system_dir).unwrap();
     let system_marker = system_dir.join(".codex-switch-global-pace-system-install-v1");
@@ -2617,7 +2619,7 @@ fn unix_release_candidate_stops_a_detached_daemon_without_an_installed_binary() 
     use std::os::unix::fs::PermissionsExt;
 
     let script = repo_file("scripts/install.sh");
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let install_dir = home.path().join(".local/bin");
     fs::create_dir_all(&install_dir).unwrap();
     let data_dir = home.path().join(".codex-switch");
@@ -2729,7 +2731,7 @@ fn unix_daemon_upgrade_boundary_restores_a_running_service() {
 
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::tempdir();
     let binary = dir.path().join("daemon-fixture");
     let state = dir.path().join("state");
     fs::write(&state, "true").unwrap();
@@ -2764,6 +2766,7 @@ esac
         .args(["-c", &harness])
         .env("BIN", &binary)
         .env("DAEMON_FIXTURE_STATE", &state)
+        .env("TMPDIR", dir.path())
         .output()
         .unwrap();
     assert!(
@@ -2840,7 +2843,7 @@ fn unix_installer_rejects_a_repository_escape_version_before_network_access() {
     use std::process::Command;
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let output = Command::new("bash")
         .arg(root.join("scripts/install.sh"))
         .env("HOME", home.path())
@@ -3129,7 +3132,7 @@ fn unix_symlink_cycle_and_temp_identity_checks_execute_fail_closed() {
 
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
-    let directory = tempfile::tempdir().unwrap();
+    let directory = support::tempdir();
 
     let first = directory.path().join("first-link");
     let second = directory.path().join("second-link");
@@ -3209,7 +3212,7 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
         .split("\nmanaged_path_block_exists() {")
         .next()
         .expect("installer must define managed_path_block_exists");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let real_profile = temp.path().join("real-profile");
     let middle_link = temp.path().join("middle-profile");
     let profile_link = temp.path().join(".zprofile");
@@ -3232,6 +3235,7 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile_link)
+        .env("TMPDIR", temp.path())
         .output()
         .unwrap();
 
@@ -3263,7 +3267,7 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
 fn unix_path_addition_uses_the_shared_transaction_and_rolls_back_exactly() {
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let profile = home.path().join(".profile");
     fs::write(&profile, "export KEEP=1\n").unwrap();
     let harness = format!(
@@ -3283,6 +3287,7 @@ rollback_managed_path_changes
     let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
+        .env("TMPDIR", home.path())
         .env("SHELL", "/bin/bash")
         .env("PATH", "/usr/bin:/bin")
         .output()
@@ -3301,7 +3306,7 @@ rollback_managed_path_changes
 fn unix_path_rollback_preserves_a_fixed_original_when_the_profile_is_replaced() {
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = support::tempdir();
     let profile = home.path().join(".profile");
     let recovery = home
         .path()
@@ -3329,6 +3334,7 @@ fi
     let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
+        .env("TMPDIR", home.path())
         .env("SHELL", "/bin/bash")
         .env("PATH", "/usr/bin:/bin")
         .output()
@@ -3353,7 +3359,7 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
         .split("\nmanaged_path_block_exists() {")
         .next()
         .expect("installer must define managed_path_block_exists");
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let original_profile = temp.path().join("original-profile");
     let replacement_profile = temp.path().join("replacement-profile");
     let profile_link = temp.path().join(".zprofile");
@@ -3386,6 +3392,7 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile_link)
+        .env("TMPDIR", temp.path())
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("PROFILE_LINK", &profile_link)
         .env("REPLACEMENT_PROFILE", &replacement_profile)
@@ -3418,7 +3425,7 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
         .split("\nmanaged_path_block_exists() {")
         .next()
         .unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let dir_a = temp.path().join("dir-a");
     let dir_b = temp.path().join("dir-b");
     let current = temp.path().join("current");
@@ -3453,6 +3460,7 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(current.join("profile"))
+        .env("TMPDIR", temp.path())
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("CURRENT_LINK", &current)
         .env("NEW_DIR", &dir_b)
@@ -3482,7 +3490,7 @@ fn unix_installer_aborts_if_profile_inode_changes() {
         .split("\nmanaged_path_block_exists() {")
         .next()
         .unwrap();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = support::tempdir();
     let profile = temp.path().join("profile");
     let replacement = temp.path().join("replacement");
     let managed = "# >>> codex-switch-global-pace PATH >>>\nexport PATH=/tmp/cs:$PATH\n# <<< codex-switch-global-pace PATH <<<\n";
@@ -3511,6 +3519,7 @@ fn unix_installer_aborts_if_profile_inode_changes() {
     let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile)
+        .env("TMPDIR", temp.path())
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("PROFILE_FILE", &profile)
         .env("REPLACEMENT_PROFILE", &replacement)
@@ -3826,7 +3835,7 @@ fn windows_installer_transaction_helpers_execute_fail_closed() {
     }
 
     let candidate = Path::new(env!("CARGO_BIN_EXE_codex-switch-global-pace"));
-    let directory = tempfile::tempdir().unwrap();
+    let directory = support::tempdir();
 
     let source = directory.path().join("source.exe");
     let staged = directory.path().join("staged.exe");

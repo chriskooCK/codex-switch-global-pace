@@ -4687,7 +4687,7 @@ mod tests {
 
     #[test]
     fn exact_service_snapshot_compares_definition_bytes_and_runtime_not_recreated_file_ids() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let first_path = temp.path().join("first-definition");
         let second_path = temp.path().join("second-definition");
         std::fs::write(&first_path, b"exact owned definition").unwrap();
@@ -4917,7 +4917,8 @@ mod tests {
 
     #[test]
     fn service_readiness_rejects_a_foreground_winner_from_another_file() {
-        let home = tempfile::tempdir().expect("temp service executable identities");
+        let home =
+            crate::fs_ops::create_direct_tempdir().expect("temp service executable identities");
         let expected = home.path().join(if cfg!(windows) {
             "expected.exe"
         } else {
@@ -4972,7 +4973,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn service_definition_publication_rolls_back_and_commits_exact_files() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = temp.path().join("daemon.service");
         std::fs::write(&path, b"old definition").unwrap();
         let previous = optional_service_file_snapshot(&path).unwrap().unwrap();
@@ -5007,7 +5008,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn service_definition_removal_is_token_bound_and_reversible() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = temp.path().join("daemon.service");
         std::fs::write(&path, b"owned definition").unwrap();
         let previous = optional_service_file_snapshot(&path).unwrap().unwrap();
@@ -5034,7 +5035,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn applied_service_removal_cleanup_failure_is_not_rolled_back() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = temp.path().join("daemon.service");
         std::fs::write(&path, b"owned definition").unwrap();
         let previous = optional_service_file_snapshot(&path).unwrap().unwrap();
@@ -5061,7 +5062,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn service_definition_commit_never_deletes_a_concurrent_writer() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = temp.path().join("daemon.service");
         let external = temp.path().join("external.service");
         std::fs::write(&path, b"old definition").unwrap();
@@ -5116,7 +5117,7 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn unix_service_operation_lease_rejects_a_concurrent_lifecycle_entry() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = temp.path().join("daemon-service-operation.lock");
         let first = acquire_service_operation_lease_at(&path).unwrap();
         let contender_path = path.clone();
@@ -5411,7 +5412,7 @@ mod tests {
     fn windows_task_scheduler_command_runs_with_the_stored_argument_shape() {
         use std::os::windows::process::CommandExt;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let probe = PathBuf::from("daemon probe.cmd");
         // `!PATH!` proves TaskRun explicitly disables registry-configured
         // delayed expansion instead of relying on the machine default.
