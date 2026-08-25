@@ -3320,7 +3320,7 @@ mv -f "$HOME/replacement-profile" "$HOME/.profile"
 if rollback_managed_path_changes; then
   exit 1
 fi
-[ "$PATH_TRANSACTION_ERROR" = "could not safely restore $HOME/.profile; the exact pre-transaction profile is preserved at $HOME/.profile.$BINARY_NAME.install for manual recovery" ]
+[ "$PATH_TRANSACTION_ERROR" = "exact displaced profile remains at $HOME/.profile.$BINARY_NAME.install" ]
 [ "$(cat "$HOME/.profile")" = 'foreign profile' ]
 [ "$(cat "$HOME/.profile.$BINARY_NAME.install")" = 'export KEEP=1' ]
 "#
