@@ -11,8 +11,8 @@ use crate::auth::{self, CLIENT_ID, format_reqwest_error};
 use super::parse::parse_usage_checked;
 use super::reset_credits::enrich_reset_credits;
 use super::{
-    ImportValidation, MAX_RETRIES, RETRY_DELAY, Refresh, RefreshedTokens, TerminalAuthError,
-    TokenPersistFailure, UsageError, UsageInfo,
+    ImportValidation, MAX_RETRIES, RETRY_DELAY, Refresh, RefreshOutcomeUnknown, RefreshedTokens,
+    TerminalAuthError, TokenPersistFailure, UsageError, UsageInfo,
 };
 
 pub(crate) fn apply_account_routing_headers(
@@ -55,23 +55,46 @@ struct RefreshResponse {
     error_description: Option<String>,
 }
 
+#[derive(Debug)]
+pub(crate) enum RefreshTokenResolution {
+    Validated(RefreshedTokens),
+    RotatedButInvalid {
+        recovery: Value,
+        cause: anyhow::Error,
+    },
+}
+
 impl RefreshResponse {
     /// Normalize both wire shapes to `(code, message)`.
     fn error_parts(&self) -> Option<(String, Option<String>)> {
         match self.error.as_ref()? {
-            RefreshError::Code(code) => Some((code.clone(), self.error_description.clone())),
+            RefreshError::Code(code) => nonempty_error_code(code)
+                .map(|code| (code.to_string(), self.error_description.clone())),
             RefreshError::Detail {
                 code,
                 message,
                 kind,
-            } => Some((
-                code.clone()
-                    .or_else(|| kind.clone())
-                    .unwrap_or_else(|| "unknown_error".to_string()),
-                message.clone().or_else(|| self.error_description.clone()),
-            )),
+            } => code
+                .as_deref()
+                .and_then(nonempty_error_code)
+                .or_else(|| kind.as_deref().and_then(nonempty_error_code))
+                .map(|code| {
+                    (
+                        code.to_string(),
+                        message.clone().or_else(|| self.error_description.clone()),
+                    )
+                }),
         }
     }
+}
+
+fn nonempty_error_code(code: &str) -> Option<&str> {
+    let code = code.trim();
+    (!code.is_empty()).then_some(code)
+}
+
+fn refresh_outcome_unknown(cause: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RefreshOutcomeUnknown::new(cause))
 }
 
 /// Auth-server verdicts no retry can change, independent of HTTP status.
@@ -265,6 +288,80 @@ fn persist_refreshed_tokens(
         crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } => {
             Err(UsageError::live_activation_incomplete(alias, &cause))
         }
+        crate::profile::RefreshTokenUpdate::Quarantined { path, cause } => Err(
+            UsageError::refreshed_credentials_quarantined(alias, &path, &cause),
+        ),
+    }
+}
+
+/// Complete the local side of a refresh-token rotation before any follow-up
+/// network request. Invalid responses with a non-empty successor are never
+/// installed; their raw token fields are durably quarantined instead.
+pub(crate) fn persist_refresh_resolution(
+    lease: &crate::profile::ProfileLease,
+    authorization: crate::profile::FreshCredentialsActivationAuthorization,
+    presented_refresh_token: &str,
+    resolution: RefreshTokenResolution,
+) -> std::result::Result<RefreshedTokens, UsageError> {
+    let alias = lease.alias();
+    match resolution {
+        RefreshTokenResolution::Validated(tokens) => {
+            persist_refreshed_tokens(lease, authorization, presented_refresh_token, &tokens)?;
+            Ok(tokens)
+        }
+        RefreshTokenResolution::RotatedButInvalid { recovery, cause } => {
+            let update = crate::profile::quarantine_invalid_refresh_response_leased(
+                lease,
+                authorization,
+                presented_refresh_token,
+                &recovery,
+                cause,
+            )
+            .map_err(|error| UsageError::invalid_refresh_recovery_failed(alias, &error))?;
+            match update {
+                crate::profile::RefreshTokenUpdate::Quarantined { path, cause } => Err(
+                    UsageError::refreshed_credentials_quarantined(alias, &path, &cause),
+                ),
+                crate::profile::RefreshTokenUpdate::Saved
+                | crate::profile::RefreshTokenUpdate::Superseded
+                | crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { .. } => {
+                    Err(UsageError::invalid_refresh_recovery_failed(
+                        alias,
+                        &anyhow::anyhow!(
+                            "invalid refresh response did not produce a quarantine outcome"
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+}
+
+fn persist_unbound_refresh_resolution<F>(
+    alias: &str,
+    presented_refresh_token: &str,
+    resolution: RefreshTokenResolution,
+    persist_rotation: &mut F,
+) -> Result<RefreshedTokens>
+where
+    F: FnMut(&str, RefreshedTokens) -> Result<()>,
+{
+    match resolution {
+        RefreshTokenResolution::Validated(tokens) => {
+            persist_rotation(presented_refresh_token, tokens.clone())?;
+            Ok(tokens)
+        }
+        RefreshTokenResolution::RotatedButInvalid { recovery, cause } => {
+            match crate::profile::stage_import_rotation(&recovery) {
+                Ok(stage) => Err(cause.context(format!(
+                    "[{alias}] token refresh returned an invalid token set; its non-empty successor refresh token was preserved privately at {} and was not installed",
+                    stage.path().display()
+                ))),
+                Err(recovery_error) => anyhow::bail!(
+                    "[{alias}] token refresh returned an invalid token set ({cause:#}) after issuing a non-empty successor refresh token, and its private recovery copy failed ({recovery_error:#}); the previous refresh token may already be invalid"
+                ),
+            }
+        }
     }
 }
 
@@ -272,9 +369,8 @@ fn resolve_refreshed_tokens(
     response: RefreshResponse,
     status: reqwest::StatusCode,
     current_id_token: Option<&str>,
-    current_access_token: Option<&str>,
     current_refresh_token: &str,
-) -> Result<RefreshedTokens> {
+) -> Result<RefreshTokenResolution> {
     if let Some((code, message)) = response.error_parts() {
         if is_terminal_auth_failure(&code, status) {
             return Err(TerminalAuthError { code, message }.into());
@@ -285,41 +381,63 @@ fn resolve_refreshed_tokens(
         );
     }
 
-    // A non-2xx without a recognizable error body still means no tokens were
-    // issued; falling through would "succeed" by echoing the current tokens.
+    // Only a structured OAuth error proves that the server rejected the
+    // rotation. A proxy error, empty body, or otherwise unrecognized non-2xx
+    // response can arrive after the endpoint consumed the single-use token.
     if !status.is_success() {
-        let code = format!("http_{}", status.as_u16());
-        if is_terminal_auth_failure(&code, status) {
-            return Err(TerminalAuthError {
-                code,
-                message: None,
-            }
-            .into());
-        }
-        anyhow::bail!("token refresh failed: HTTP {status}");
+        return Err(refresh_outcome_unknown(anyhow::anyhow!(
+            "token refresh returned HTTP {status} without a recognizable OAuth error"
+        )));
     }
 
-    let id_token = response
-        .id_token
-        .or_else(|| current_id_token.map(str::to_string))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "token refresh response omitted id_token and no existing id_token is available"
-            )
-        })?;
-    let access_token = response
-        .access_token
-        .or_else(|| current_access_token.map(str::to_string))
-        .ok_or_else(|| anyhow::anyhow!("token refresh response omitted access_token and no existing access_token is available"))?;
-    let refresh_token = response
+    let returned_nonempty_refresh = response
         .refresh_token
-        .unwrap_or_else(|| current_refresh_token.to_string());
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+    let recovery = serde_json::json!({
+        "id_token": response.id_token.clone(),
+        "access_token": response.access_token.clone(),
+        "refresh_token": response.refresh_token.clone(),
+        "recovery_kind": "invalid_token_refresh_response"
+    });
+    let resolved = (|| -> Result<RefreshedTokens> {
+        let id_token = response
+            .id_token
+            .or_else(|| current_id_token.map(str::to_string))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "token refresh response omitted id_token and no existing id_token is available"
+                )
+            })?;
+        // OAuth success responses must explicitly issue an access token. Using
+        // the existing value here would turn an empty HTTP 2xx body into a
+        // false success even though the server may already have rotated the
+        // refresh token.
+        let access_token = response.access_token.ok_or_else(|| {
+            anyhow::anyhow!("token refresh success response omitted access_token")
+        })?;
+        let refresh_token = response
+            .refresh_token
+            .unwrap_or_else(|| current_refresh_token.to_string());
+        auth::validate_complete_oauth_tokens(&id_token, &access_token, &refresh_token)
+            .context("invalid token refresh response")?;
 
-    Ok(RefreshedTokens {
-        id_token,
-        access_token,
-        refresh_token,
-    })
+        Ok(RefreshedTokens {
+            id_token,
+            access_token,
+            refresh_token,
+        })
+    })();
+
+    match resolved {
+        Ok(tokens) => Ok(RefreshTokenResolution::Validated(tokens)),
+        Err(cause) if returned_nonempty_refresh => {
+            Ok(RefreshTokenResolution::RotatedButInvalid { recovery, cause })
+        }
+        Err(cause) => Err(refresh_outcome_unknown(
+            cause.context("invalid token refresh success response"),
+        )),
+    }
 }
 
 /// Credentials re-read from a profile after a refresh was rejected.
@@ -528,17 +646,17 @@ async fn fetch_usage_retried_with_lease(
             let mut persist_before_follow_up =
                 |activation_authorization: crate::profile::FreshCredentialsActivationAuthorization,
                  presented: &str,
-                 tokens: RefreshedTokens|
-                 -> Result<()> {
-                    match persist_refreshed_tokens(
+                 resolution: RefreshTokenResolution|
+                 -> Result<RefreshedTokens> {
+                    match persist_refresh_resolution(
                         lease,
                         activation_authorization,
                         presented,
-                        &tokens,
+                        resolution,
                     ) {
-                        Ok(()) => {
-                            rotated_tokens = Some(tokens);
-                            Ok(())
+                        Ok(tokens) => {
+                            rotated_tokens = Some(tokens.clone());
+                            Ok(tokens)
                         }
                         Err(error) => {
                             let detail = error.detail.clone();
@@ -612,6 +730,9 @@ async fn fetch_usage_retried_with_lease(
                     attempt += 1;
                     continue;
                 }
+                if e.downcast_ref::<RefreshOutcomeUnknown>().is_some() {
+                    return Err(UsageError::refresh_outcome_unknown(alias, &e));
+                }
                 last_summary = extract_error_summary(&msg);
                 last_err = msg;
             }
@@ -646,8 +767,8 @@ where
     F: FnMut(&str, RefreshedTokens) -> Result<()>,
 {
     let mut authorize_rotation = || Ok(());
-    let mut persist_authorized = |(): (), presented: &str, tokens: RefreshedTokens| -> Result<()> {
-        persist_rotation(presented, tokens)
+    let mut persist_authorized = |(): (), presented: &str, resolution: RefreshTokenResolution| {
+        persist_unbound_refresh_resolution(alias, presented, resolution, persist_rotation)
     };
     fetch_usage_with_refresh_transactional(
         alias,
@@ -680,7 +801,7 @@ async fn fetch_usage_with_refresh_transactional<A, F, T>(
 ) -> Result<UsageInfo>
 where
     A: FnMut() -> Result<T>,
-    F: FnMut(T, &str, RefreshedTokens) -> Result<()>,
+    F: FnMut(T, &str, RefreshTokenResolution) -> Result<RefreshedTokens>,
 {
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
@@ -694,10 +815,10 @@ where
         info!("[{alias}] token expiring soon, proactively refreshing");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
-            Ok(new_tokens) => {
+        match do_refresh_token(alias, &client, id_token, rt).await {
+            Ok(resolution) => {
+                let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
-                persist_rotation(authorization, rt, new_tokens)?;
 
                 let resp = apply_account_routing_headers(
                     client
@@ -730,6 +851,9 @@ where
                 anyhow::bail!("Usage API failed (HTTP {status}) after proactive token refresh");
             }
             Err(e) => {
+                if e.downcast_ref::<RefreshOutcomeUnknown>().is_some() {
+                    return Err(e);
+                }
                 if e.downcast_ref::<TerminalAuthError>().is_some() {
                     info!("[{alias}] proactive token refresh rejected permanently: {e:#}");
                     rejected_refresh = Some(e);
@@ -790,10 +914,10 @@ where
         info!("[{alias}] got HTTP {status}, attempting token refresh");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
-            Ok(new_tokens) => {
+        match do_refresh_token(alias, &client, id_token, rt).await {
+            Ok(resolution) => {
+                let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
-                persist_rotation(authorization, rt, new_tokens)?;
 
                 let resp2 = apply_account_routing_headers(
                     client
@@ -934,7 +1058,15 @@ where
         }
         (None, Some(rt)) => {
             let client = auth::build_http_client()?;
-            let first = do_refresh_token(alias, &client, id_token.as_deref(), None, &rt).await?;
+            let first_resolution =
+                do_refresh_token(alias, &client, id_token.as_deref(), &rt).await?;
+            let mut defer_persistence = |_: &str, _: RefreshedTokens| Ok(());
+            let first = persist_unbound_refresh_resolution(
+                alias,
+                &rt,
+                first_resolution,
+                &mut defer_persistence,
+            )?;
             let (access_token, id_token, refresh_token) = (
                 first.access_token.clone(),
                 first.id_token.clone(),
@@ -990,45 +1122,52 @@ pub(crate) async fn do_refresh_token(
     alias: &str,
     client: &reqwest::Client,
     current_id_token: Option<&str>,
-    current_access_token: Option<&str>,
     refresh_token: &str,
-) -> Result<RefreshedTokens> {
+) -> Result<RefreshTokenResolution> {
     let token_url = auth::token_url();
     debug!("[{alias}] sending token refresh request to {token_url}");
 
     let resp = build_refresh_request(client, &token_url, refresh_token)
         .send()
         .await
-        .map_err(|e| format_reqwest_error("token refresh request failed", &e))?;
+        .map_err(|error| {
+            let detail = format_reqwest_error("token refresh request failed", &error).to_string();
+            refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
+                "token refresh request transport failed after submission began: {detail}"
+            )))
+        })?;
 
     let status = resp.status();
     debug!("[{alias}] token refresh response: HTTP {status}");
 
     // Read raw body first so we can log it on parse failure
-    let body_text = resp.text().await.map_err(|e| {
-        anyhow::anyhow!("failed to read token refresh response body (HTTP {status}): {e}")
+    let body_text = resp.text().await.map_err(|error| {
+        refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
+            "failed to read token refresh response body (HTTP {status})"
+        )))
     })?;
 
-    let r: RefreshResponse = serde_json::from_str(&body_text).map_err(|e| {
+    let r: RefreshResponse = serde_json::from_str(&body_text).map_err(|error| {
         // A token refresh body may contain access/refresh/id tokens; redact them
         // before logging so `--debug` output is safe to share in bug reports.
         let redacted = serde_json::from_str::<Value>(&body_text)
             .map(|v| crate::auth::redact_sensitive_log_body(&v))
             .unwrap_or_else(|_| format!("<non-JSON body, {} bytes>", body_text.len()));
         debug!("[{alias}] token refresh parse failure, raw body: {redacted}");
-        anyhow::anyhow!("Failed to parse token refresh response (HTTP {status}): {e}")
+        refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
+            "failed to parse token refresh response (HTTP {status})"
+        )))
     })?;
 
-    let refreshed = resolve_refreshed_tokens(
-        r,
-        status,
-        current_id_token,
-        current_access_token,
-        refresh_token,
-    )
-    .with_context(|| format!("[{alias}] token refresh HTTP {status}"))?;
-    info!("[{alias}] token refresh succeeded");
-    Ok(refreshed)
+    let resolution = resolve_refreshed_tokens(r, status, current_id_token, refresh_token)
+        .with_context(|| format!("[{alias}] token refresh HTTP {status}"))?;
+    match &resolution {
+        RefreshTokenResolution::Validated(_) => info!("[{alias}] token refresh succeeded"),
+        RefreshTokenResolution::RotatedButInvalid { .. } => warn!(
+            "[{alias}] token refresh returned a successor refresh token in an invalid response; preserving it for recovery"
+        ),
+    }
+    Ok(resolution)
 }
 
 /// Max number of tokens to refresh opportunistically per CLI invocation.
@@ -1293,8 +1432,7 @@ pub async fn refresh_expiring_tokens_within(
                         return None;
                     }
                 };
-                let (access_token, current_refresh_token) = auth::extract_tokens(&value);
-                let access_token = access_token?;
+                let (_, current_refresh_token) = auth::extract_tokens(&value);
                 let current_refresh_token = current_refresh_token?;
                 if current_refresh_token != rt {
                     debug!(
@@ -1328,18 +1466,17 @@ pub async fn refresh_expiring_tokens_within(
                     &alias,
                     &client,
                     id_token.as_deref(),
-                    Some(&access_token),
                     &rt,
                 )
                 .await
                 {
-                    Ok(new_tokens) => match persist_refreshed_tokens(
+                    Ok(resolution) => match persist_refresh_resolution(
                         &lease,
                         activation_authorization,
                         &rt,
-                        &new_tokens,
+                        resolution,
                     ) {
-                        Ok(()) => {
+                        Ok(_) => {
                             info!("[{alias}] opportunistic token refresh succeeded");
                             None
                         }
@@ -1350,6 +1487,9 @@ pub async fn refresh_expiring_tokens_within(
                     },
                     Err(e) => {
                         let detail = format!("{e:#}");
+                        if e.downcast_ref::<RefreshOutcomeUnknown>().is_some() {
+                            return Some(UsageError::refresh_outcome_unknown(&alias, &e));
+                        }
                         if let Some(terminal) = e.downcast_ref::<TerminalAuthError>() {
                             let error = UsageError {
                                 summary: terminal.summary(),
@@ -1395,7 +1535,8 @@ pub async fn refresh_expiring_tokens_within(
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::routing::post;
+    use axum::http::StatusCode;
+    use axum::routing::{get, post};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
     use std::sync::Arc;
@@ -1434,6 +1575,87 @@ mod tests {
     fn jwt_with_exp(exp: i64) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
         format!("header.{payload}.signature")
+    }
+
+    fn jwt_with_exp_and_identity(exp: i64) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "exp": exp,
+                "email": "budget-test@example.com",
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct-budget-test"
+                }
+            })
+            .to_string(),
+        );
+        format!("header.{payload}.signature")
+    }
+
+    async fn run_ambiguous_refresh_response(
+        status: StatusCode,
+        body: Value,
+    ) -> (UsageError, usize, usize) {
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let usage_server_calls = Arc::clone(&usage_calls);
+        let token_server_calls = Arc::clone(&token_calls);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let calls = Arc::clone(&usage_server_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&token_server_calls);
+                    let body = body.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (status, axum::Json(body))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let now = crate::auth::now_unix_secs();
+        let profile_path = crate::profile::profile_auth_path("alice").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400),
+                    "refresh_token": "old-refresh"
+                }
+            }),
+        );
+
+        let error = fetch_usage_retried_force("alice", &profile_path)
+            .await
+            .expect_err("an ambiguous refresh response must stop the request");
+        server.abort();
+        (
+            error,
+            usage_calls.load(Ordering::SeqCst),
+            token_calls.load(Ordering::SeqCst),
+        )
     }
 
     #[test]
@@ -1567,13 +1789,14 @@ mod tests {
         let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
         let profile_path = home.path().join("profiles/late/auth.json");
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
-        let expiring = jwt_with_exp(crate::auth::now_unix_secs() - 60);
+        let expiring_id = jwt_with_exp_and_identity(crate::auth::now_unix_secs() - 60);
+        let expiring_access = jwt_with_exp(crate::auth::now_unix_secs() - 60);
         write_auth_durable(
             &profile_path,
             &json!({
                 "tokens": {
-                    "id_token": expiring.clone(),
-                    "access_token": expiring,
+                    "id_token": expiring_id,
+                    "access_token": expiring_access,
                     "refresh_token": "old-refresh"
                 }
             }),
@@ -1596,6 +1819,280 @@ mod tests {
                 .and_then(Value::as_str),
             Some("old-refresh")
         );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_rotated_response_is_quarantined_without_retry_or_publication() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let usage_server_calls = Arc::clone(&usage_calls);
+        let token_server_calls = Arc::clone(&token_calls);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let calls = Arc::clone(&usage_server_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&token_server_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({
+                            "id_token": "",
+                            "access_token": "new-access",
+                            "refresh_token": "new-refresh"
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let now = crate::auth::now_unix_secs();
+        let profile = json!({
+            "tokens": {
+                "id_token": jwt_with_exp_and_identity(now + 86_400),
+                "access_token": jwt_with_exp(now + 86_400),
+                "refresh_token": "old-refresh"
+            }
+        });
+        let profile_path = crate::profile::profile_auth_path("alice").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(&profile_path, &profile);
+        let live_path = crate::auth::codex_auth_path().unwrap();
+        write_auth_durable(&live_path, &profile);
+        let profile_before = std::fs::read(&profile_path).unwrap();
+        let live_before = std::fs::read(&live_path).unwrap();
+
+        let error = fetch_usage_retried_force("alice", &profile_path)
+            .await
+            .expect_err("an invalid rotated response must not be installed");
+        server.abort();
+
+        assert_eq!(error.summary, "refreshed credentials quarantined");
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_before);
+        assert_eq!(std::fs::read(&live_path).unwrap(), live_before);
+        let recovery_dir = home.path().join("recovery");
+        let recovery_files = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_files.len(), 1);
+        let recovery: Value =
+            serde_json::from_slice(&std::fs::read(&recovery_files[0]).unwrap()).unwrap();
+        assert_eq!(
+            recovery.get("refresh_token").and_then(Value::as_str),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            recovery.get("recovery_kind").and_then(Value::as_str),
+            Some("invalid_token_refresh_response")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_successor_refresh_token_stops_after_one_irreversible_request() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let usage_server_calls = Arc::clone(&usage_calls);
+        let token_server_calls = Arc::clone(&token_calls);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let calls = Arc::clone(&usage_server_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::UNAUTHORIZED
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&token_server_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({
+                            "id_token": "new-id",
+                            "access_token": "new-access",
+                            "refresh_token": ""
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let mut authorize = || Ok(());
+        let mut persist = |(): (), _: &str, _: RefreshTokenResolution| -> Result<RefreshedTokens> {
+            panic!("an unusable successor must never reach persistence");
+        };
+        let error = fetch_usage_with_refresh_transactional(
+            "alice",
+            "old-access",
+            Some("old-id"),
+            Some("old-refresh"),
+            None,
+            false,
+            &mut authorize,
+            &mut persist,
+        )
+        .await
+        .expect_err("a blank successor makes the refresh outcome unknown");
+        server.abort();
+
+        assert!(
+            error.downcast_ref::<RefreshOutcomeUnknown>().is_some(),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguous_http_responses_never_replay_the_single_use_refresh_token() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        for (status, body, case) in [
+            (StatusCode::OK, json!({}), "empty success"),
+            (
+                StatusCode::BAD_GATEWAY,
+                json!({"message": "upstream unavailable"}),
+                "unstructured non-success",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": {}}),
+                "unrecognizable error object",
+            ),
+        ] {
+            let (error, usage_calls, token_calls) =
+                run_ambiguous_refresh_response(status, body).await;
+            assert_eq!(error.summary, "token refresh outcome unknown", "{case}");
+            assert!(error.detail.contains("do not retry"), "{case}: {error:?}");
+            assert_eq!(usage_calls, 1, "{case}");
+            assert_eq!(token_calls, 1, "{case}");
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_loss_after_refresh_submission_stops_after_one_request() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let usage_server_calls = Arc::clone(&usage_calls);
+        let usage_app = Router::new().route(
+            "/usage",
+            get(move || {
+                let calls = Arc::clone(&usage_server_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+        let usage_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let usage_address = usage_listener.local_addr().unwrap();
+        let usage_server =
+            tokio::spawn(async move { axum::serve(usage_listener, usage_app).await.unwrap() });
+
+        let token_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_address = token_listener.local_addr().unwrap();
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let token_server_calls = Arc::clone(&token_calls);
+        let token_server = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+
+            loop {
+                let Ok((mut stream, _)) = token_listener.accept().await else {
+                    return;
+                };
+                token_server_calls.fetch_add(1, Ordering::SeqCst);
+                let mut request = vec![0_u8; 4096];
+                let _ = stream.read(&mut request).await;
+                // Drop the connection without an HTTP response after observing
+                // the submitted POST. The client cannot know whether a token
+                // endpoint behind this connection already rotated the token.
+            }
+        });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{usage_address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{token_address}/token"));
+
+        let now = crate::auth::now_unix_secs();
+        let profile_path = crate::profile::profile_auth_path("alice").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400),
+                    "refresh_token": "old-refresh"
+                }
+            }),
+        );
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_usage_retried_force("alice", &profile_path),
+        )
+        .await
+        .expect("transport-loss fixture must complete")
+        .expect_err("transport loss must make refresh outcome unknown");
+        usage_server.abort();
+        token_server.abort();
+
+        assert_eq!(error.summary, "token refresh outcome unknown");
+        assert!(error.detail.contains("do not retry"), "{error:?}");
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1655,7 +2152,7 @@ mod tests {
 
     #[test]
     fn test_refresh_without_id_token_preserves_existing_id_token() {
-        let refreshed = resolve_refreshed_tokens(
+        let RefreshTokenResolution::Validated(refreshed) = resolve_refreshed_tokens(
             RefreshResponse {
                 id_token: None,
                 access_token: Some("new-access".to_string()),
@@ -1665,13 +2162,139 @@ mod tests {
             },
             reqwest::StatusCode::OK,
             Some("existing-id"),
-            Some("existing-access"),
             "existing-refresh",
         )
-        .unwrap();
+        .unwrap() else {
+            panic!("a valid refresh response must resolve to validated tokens");
+        };
 
         assert_eq!(refreshed.id_token, "existing-id");
         assert_eq!(refreshed.access_token, "new-access");
         assert_eq!(refreshed.refresh_token, "existing-refresh");
+    }
+
+    #[test]
+    fn rotated_refresh_response_quarantines_explicitly_empty_identity_or_access_token() {
+        for field in ["id_token", "access_token"] {
+            let mut response = RefreshResponse {
+                id_token: Some("new-id".to_string()),
+                access_token: Some("new-access".to_string()),
+                refresh_token: Some("new-refresh".to_string()),
+                error: None,
+                error_description: None,
+            };
+            match field {
+                "id_token" => response.id_token = Some(" \t".to_string()),
+                "access_token" => response.access_token = Some(String::new()),
+                "refresh_token" => response.refresh_token = Some("\n".to_string()),
+                _ => unreachable!(),
+            }
+
+            let resolution = resolve_refreshed_tokens(
+                response,
+                reqwest::StatusCode::OK,
+                Some("existing-id"),
+                "existing-refresh",
+            )
+            .expect("a returned successor must be preserved for recovery");
+            let RefreshTokenResolution::RotatedButInvalid { recovery, cause } = resolution else {
+                panic!("an invalid rotated response must not be accepted");
+            };
+            assert_eq!(
+                recovery.get("refresh_token").and_then(Value::as_str),
+                Some("new-refresh")
+            );
+            assert!(format!("{cause:#}").contains(field), "{field}: {cause:#}");
+        }
+    }
+
+    #[test]
+    fn explicitly_blank_refresh_token_is_outcome_unknown() {
+        let error = resolve_refreshed_tokens(
+            RefreshResponse {
+                id_token: Some("new-id".to_string()),
+                access_token: Some("new-access".to_string()),
+                refresh_token: Some("\n".to_string()),
+                error: None,
+                error_description: None,
+            },
+            reqwest::StatusCode::OK,
+            Some("existing-id"),
+            "existing-refresh",
+        )
+        .expect_err("a blank returned refresh token makes rotation outcome unknown");
+
+        assert!(error.downcast_ref::<RefreshOutcomeUnknown>().is_some());
+        assert!(format!("{error:#}").contains("refresh_token"));
+    }
+
+    #[test]
+    fn invalid_rotation_recovery_failure_is_terminal_and_leaves_auth_unchanged() {
+        let _env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+        let now = crate::auth::now_unix_secs();
+        let profile = json!({
+            "tokens": {
+                "id_token": jwt_with_exp_and_identity(now + 86_400),
+                "access_token": jwt_with_exp(now + 86_400),
+                "refresh_token": "old-refresh"
+            }
+        });
+        let profile_path = crate::profile::profile_auth_path("alice").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(&profile_path, &profile);
+        let live_path = crate::auth::codex_auth_path().unwrap();
+        write_auth_durable(&live_path, &profile);
+        let profile_before = std::fs::read(&profile_path).unwrap();
+        let live_before = std::fs::read(&live_path).unwrap();
+        std::fs::write(home.path().join("recovery"), b"blocks recovery directory").unwrap();
+
+        let lease = crate::profile::acquire_profile_lease("alice").unwrap();
+        let authorization = crate::profile::authorize_fresh_credentials_activation(&lease).unwrap();
+        let error = persist_refresh_resolution(
+            &lease,
+            authorization,
+            "old-refresh",
+            RefreshTokenResolution::RotatedButInvalid {
+                recovery: json!({
+                    "id_token": "",
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh"
+                }),
+                cause: anyhow::anyhow!("invalid id_token"),
+            },
+        )
+        .expect_err("failure to preserve the successor must be terminal");
+
+        assert_eq!(error.summary, "rotated credential recovery failed");
+        assert!(error.detail.contains("do not retry"));
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_before);
+        assert_eq!(std::fs::read(&live_path).unwrap(), live_before);
+    }
+
+    #[test]
+    fn refresh_success_requires_an_explicit_access_token() {
+        let error = resolve_refreshed_tokens(
+            RefreshResponse {
+                id_token: None,
+                access_token: None,
+                refresh_token: None,
+                error: None,
+                error_description: None,
+            },
+            reqwest::StatusCode::OK,
+            Some("existing-id"),
+            "existing-refresh",
+        )
+        .expect_err("a success response must not reuse the stored access token");
+
+        assert!(error.downcast_ref::<RefreshOutcomeUnknown>().is_some());
+        assert!(format!("{error:#}").contains("access_token"), "{error:#}");
     }
 }

@@ -16,11 +16,14 @@ use crate::profile::{
     self, cmd_delete, list_profiles, profile_auth_path, rename_profile, sync_current_from_live,
     validate_alias,
 };
+use crate::safe_text;
 use crate::usage::{
     ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary, Refresh, ResetCredit,
     UsageError, UsageInfo, calculate_global_weekly_summary, reset_credit_expiry_sort_key,
 };
 use crate::warmup::ModelEntry;
+
+const STATUS_MESSAGE_MAX_CHARS: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct AccountEntry {
@@ -91,43 +94,48 @@ fn reset_card_failure_from_outcome(
     }
 }
 
+#[derive(Debug, Default)]
+struct BatchDeleteReport {
+    committed: usize,
+    durability_warnings: Vec<String>,
+    failures: Vec<String>,
+}
+
+impl BatchDeleteReport {
+    fn record(&mut self, alias: &str, result: Result<profile::ProfileMutationOutcome>) {
+        match result {
+            Ok(outcome) => {
+                self.committed += 1;
+                if let Some(warning) = outcome.durability_warning() {
+                    self.durability_warnings
+                        .push(format!("{alias}: {warning:#}"));
+                }
+            }
+            Err(error) => self.failures.push(format!("{alias}: {error:#}")),
+        }
+    }
+
+    fn message(&self) -> String {
+        let mut message = format!("Deleted {} account(s) (recoverable)", self.committed);
+        if !self.durability_warnings.is_empty() {
+            message.push_str(&format!(
+                "; durability unconfirmed for {}: {}",
+                self.durability_warnings.len(),
+                self.durability_warnings.join("; ")
+            ));
+        }
+        if !self.failures.is_empty() {
+            message.push_str(&format!("; {} failed", self.failures.len()));
+        }
+        message
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ModelStatus {
     Loading,
     Loaded(Vec<ModelEntry>),
     Error(String),
-}
-
-fn wrap_account_detail_line(line: String) -> Vec<String> {
-    const MAX_WIDTH: usize = 68;
-    if line.chars().count() <= MAX_WIDTH {
-        return vec![line];
-    }
-    let indent = "    ";
-    let mut remaining = line.as_str();
-    let mut wrapped = Vec::new();
-    while remaining.chars().count() > MAX_WIDTH {
-        let split = remaining
-            .char_indices()
-            .take(MAX_WIDTH + 1)
-            .filter(|(_, ch)| ch.is_whitespace() || matches!(ch, '·' | ','))
-            .map(|(index, _)| index)
-            .last()
-            .unwrap_or_else(|| {
-                remaining
-                    .char_indices()
-                    .nth(MAX_WIDTH)
-                    .map(|(index, _)| index)
-                    .unwrap_or(remaining.len())
-            });
-        let (head, tail) = remaining.split_at(split);
-        wrapped.push(head.trim_end().to_string());
-        remaining = tail.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '·');
-    }
-    if !remaining.is_empty() {
-        wrapped.push(format!("{indent}{remaining}"));
-    }
-    wrapped
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +243,13 @@ enum AccountTaskKind {
     Usage { request_id: u64 },
     Model { request_id: u64 },
     ResetCard,
+    SwitchPrepare,
+    SwitchCommit,
+}
+
+enum ProfileSwitchTaskResult {
+    Prepared(Result<profile::PreparedProfileSwitch>),
+    Committed(Result<profile::ProfileSwitchOutcome>),
 }
 
 #[derive(Debug)]
@@ -269,6 +284,8 @@ pub struct App {
         tokio::sync::mpsc::Receiver<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
     pub reset_card_sender:
         tokio::sync::mpsc::Sender<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
+    pending_profile_switches: tokio::sync::mpsc::Receiver<(String, ProfileSwitchTaskResult)>,
+    profile_switch_sender: tokio::sync::mpsc::Sender<(String, ProfileSwitchTaskResult)>,
     pub reset_cards_in_flight: BTreeSet<String>,
     /// Tracks each warmup until its task has observably completed. The slow-task
     /// notice never cancels work because a refresh-token rotation or submitted
@@ -312,6 +329,7 @@ impl App {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let (workspace_tx, workspace_rx) = tokio::sync::mpsc::channel(128);
         let (reset_card_tx, reset_card_rx) = tokio::sync::mpsc::channel(16);
+        let (profile_switch_tx, profile_switch_rx) = tokio::sync::mpsc::channel(16);
         let (model_tx, model_rx) = tokio::sync::mpsc::channel(32);
         let cfg = crate::config::get();
         App {
@@ -334,6 +352,8 @@ impl App {
             workspace_sender: workspace_tx,
             pending_reset_cards: reset_card_rx,
             reset_card_sender: reset_card_tx,
+            pending_profile_switches: profile_switch_rx,
+            profile_switch_sender: profile_switch_tx,
             reset_cards_in_flight: BTreeSet::new(),
             warmup_tasks: HashMap::new(),
             warmup_next_id: 0,
@@ -389,6 +409,19 @@ impl App {
             || self.reset_cards_in_flight.contains(alias)
     }
 
+    fn profile_switch_in_flight(&self) -> bool {
+        self.account_tasks.values().any(|task| {
+            matches!(
+                task.kind,
+                AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit
+            )
+        })
+    }
+
+    fn interactive_operation_in_flight(&self) -> bool {
+        self.confirm.is_some() || self.rename.is_some() || self.profile_switch_in_flight()
+    }
+
     pub fn has_pending_credential_tasks(&self) -> bool {
         !self.account_tasks.is_empty() || !self.warmup_tasks.is_empty()
     }
@@ -437,6 +470,7 @@ impl App {
                     AccountTaskKind::ResetCard => {
                         self.reset_cards_in_flight.remove(&alias);
                     }
+                    AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit => {}
                 }
                 continue;
             }
@@ -477,6 +511,44 @@ impl App {
                 }
                 AccountTaskKind::ResetCard => {
                     self.reset_cards_in_flight.remove(&alias);
+                    let mut unknown = format!(
+                        "reset-card consumption may have occurred because its worker stopped ({detail}); verify before retry"
+                    );
+                    if let Err(cache_error) = cache::invalidate(&alias) {
+                        unknown.push_str(&format!(
+                            "; usage cache invalidation also failed: {cache_error:#}; do not retry until usage is refreshed and card ownership is verified"
+                        ));
+                    }
+                    if let Some(entry) = self.accounts.iter_mut().find(|entry| entry.alias == alias)
+                    {
+                        entry.usage = UsageStatus::Error(UsageError {
+                            summary: "reset-card outcome unknown".to_string(),
+                            detail: unknown.clone(),
+                        });
+                        self.update_view();
+                    }
+                    failures.push((alias, unknown));
+                    continue;
+                }
+                AccountTaskKind::SwitchPrepare => {}
+                AccountTaskKind::SwitchCommit => {
+                    let switch_error = anyhow::anyhow!(
+                        "profile switch task stopped before reporting its outcome: {detail}"
+                    );
+                    if let Err(reconcile_error) =
+                        self.reconcile_displayed_current_after_switch_error(&switch_error)
+                    {
+                        for account in &mut self.accounts {
+                            account.is_current = false;
+                        }
+                        failures.push((
+                            alias.clone(),
+                            format!(
+                                "{detail}; active account could not be verified: {reconcile_error:#}"
+                            ),
+                        ));
+                        continue;
+                    }
                 }
             }
             failures.push((alias, detail));
@@ -520,6 +592,7 @@ impl App {
             self.poll_results();
             self.poll_reset_card_results();
             self.poll_model_results();
+            self.poll_profile_switch_results();
             self.poll_warmup_results().await;
             self.poll_account_tasks().await;
             if self.has_pending_credential_tasks() {
@@ -531,6 +604,7 @@ impl App {
         self.poll_results();
         self.poll_reset_card_results();
         self.poll_model_results();
+        self.poll_profile_switch_results();
     }
 
     /// Kick off a model-list fetch for `alias` if the detail panel needs it
@@ -701,6 +775,9 @@ impl App {
         let can_consume_reset_card = loaded_usage
             .and_then(|u| crate::usage::earliest_reset_credit(&u.reset_credits))
             .is_some()
+            && loaded_usage
+                .is_some_and(|usage| crate::usage::explicit_account_blocker(usage).is_none())
+            && loaded_usage.is_some_and(|usage| usage.reset_credits_error.is_none())
             && !self.reset_cards_in_flight.contains(&entry.alias);
         let usage_meta: Vec<String> = loaded_usage
             .map(|usage| {
@@ -746,7 +823,6 @@ impl App {
             })
             .unwrap_or_default()
             .into_iter()
-            .flat_map(wrap_account_detail_line)
             .collect();
         let models: Vec<String> = match self.model_cache.get(&entry.alias) {
             Some(ModelStatus::Loaded(models)) => crate::warmup::sorted_models_for_display(models)
@@ -837,7 +913,6 @@ impl App {
                             }
                         )
                     })
-                    .flat_map(wrap_account_detail_line)
                     .collect(),
                 auth_expiries,
                 usage: loaded_usage.cloned().map(Box::new),
@@ -896,6 +971,14 @@ impl App {
     }
 
     pub fn request_consume_reset_card(&mut self, alias: &str) {
+        if self.interactive_operation_in_flight() {
+            self.set_status(
+                "Finish the active confirmation or profile switch before using a reset card"
+                    .to_string(),
+                5,
+            );
+            return;
+        }
         if self.reset_cards_in_flight.contains(alias) {
             self.set_status(format!("{alias}: reset card use is already in progress"), 4);
             return;
@@ -907,6 +990,22 @@ impl App {
             self.set_status(format!("{alias}: refresh usage before using reset card"), 4);
             return;
         };
+        if let Some(blocker) = crate::usage::explicit_account_blocker(u) {
+            self.set_status(
+                format!(
+                    "{alias}: reset card cannot clear the account/workspace restriction ({blocker})"
+                ),
+                6,
+            );
+            return;
+        }
+        if let Some(error) = u.reset_credits_error.as_deref() {
+            self.set_status_error(
+                format!("{alias}: reset-card details could not be verified ({error})"),
+                6,
+            );
+            return;
+        }
         let Some(credit) = crate::usage::earliest_reset_credit(&u.reset_credits) else {
             self.set_status(format!("{alias}: no available reset cards"), 4);
             return;
@@ -924,6 +1023,13 @@ impl App {
 
     /// Request delete confirmation for a specific alias (called from menu).
     pub fn request_delete_alias(&mut self, alias: &str) {
+        if self.interactive_operation_in_flight() {
+            self.set_status(
+                "Finish the active confirmation or profile switch before deleting".to_string(),
+                5,
+            );
+            return;
+        }
         if self.account_operation_in_flight(alias) {
             self.set_status(
                 format!("{alias}: wait for the account operation to finish before deleting"),
@@ -943,6 +1049,14 @@ impl App {
 
     /// Begin rename for a specific alias (called from menu).
     pub fn start_rename_alias(&mut self, alias: &str) {
+        if self.interactive_operation_in_flight() {
+            self.set_status(
+                "Finish the active confirmation, rename, or profile switch before renaming"
+                    .to_string(),
+                5,
+            );
+            return;
+        }
         if self.account_operation_in_flight(alias) {
             self.set_status(
                 format!("{alias}: wait for the account operation to finish before renaming"),
@@ -1684,17 +1798,29 @@ impl App {
         let needs_usage =
             refresh_fetches_loaded_usage(refresh) || !matches!(entry.usage, UsageStatus::Loaded(_));
         let force_negative_caches = refresh_forces_negative_caches(refresh);
-        let needs_workspace = force_negative_caches
-            || entry
-                .info
-                .account_id
-                .as_deref()
-                .is_some_and(|id| !crate::cache::workspace_name_is_known(id));
+        let alias = entry.alias.clone();
+        let needs_workspace = if force_negative_caches {
+            true
+        } else if let Some(account_id) = entry.info.account_id.as_deref() {
+            match crate::cache::workspace_name_is_known(account_id) {
+                Ok(known) => !known,
+                Err(error) => {
+                    self.set_status_error(
+                        format!(
+                            "Could not inspect workspace metadata cache for {alias}: {error:#}"
+                        ),
+                        6,
+                    );
+                    return;
+                }
+            }
+        } else {
+            false
+        };
         if !needs_usage && !needs_workspace {
             return;
         }
 
-        let alias = entry.alias.clone();
         let path = match profile_auth_path(&alias) {
             Ok(p) => p,
             Err(e) => {
@@ -1845,6 +1971,7 @@ impl App {
 
     pub fn poll_results(&mut self) {
         let mut changed = false;
+        let mut workspace_cache_errors = Vec::new();
         let open_account_alias = match self.menu.as_ref() {
             Some(super::menu::MenuState::Account { info, .. }) => Some(info.alias.clone()),
             _ => None,
@@ -1866,7 +1993,9 @@ impl App {
                 Ok(u) => UsageStatus::Loaded(Box::new(u)),
                 Err(e) => UsageStatus::Error(e),
             };
-            crate::cache::apply_workspace_name(&mut self.accounts[idx].info);
+            if let Err(error) = crate::cache::apply_workspace_name(&mut self.accounts[idx].info) {
+                workspace_cache_errors.push((alias.clone(), error));
+            }
             refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
             changed = true;
             if let Some(refresh) = self.pending_usage_refreshes.remove(&alias)
@@ -1877,9 +2006,14 @@ impl App {
         }
         while let Ok(alias) = self.pending_workspace.try_recv() {
             if let Some(entry) = self.accounts.iter_mut().find(|entry| entry.alias == alias) {
-                crate::cache::apply_workspace_name(&mut entry.info);
-                refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
-                changed = true;
+                match crate::cache::apply_workspace_name(&mut entry.info) {
+                    Ok(()) => {
+                        refresh_open_account |=
+                            open_account_alias.as_deref() == Some(alias.as_str());
+                        changed = true;
+                    }
+                    Err(error) => workspace_cache_errors.push((alias, error)),
+                }
             }
         }
         if changed {
@@ -1888,51 +2022,194 @@ impl App {
         if refresh_open_account {
             self.rebuild_open_account_menu();
         }
+        if !workspace_cache_errors.is_empty() {
+            workspace_cache_errors.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let detail = workspace_cache_errors
+                .into_iter()
+                .map(|(alias, error)| format!("[{alias}] {error:#}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.set_status_error(format!("Could not apply workspace metadata: {detail}"), 6);
+        }
     }
 
     pub fn switch_selected(&mut self) {
-        if let Some(entry) = self
+        let Some(entry) = self
             .selected_account_idx()
             .and_then(|idx| self.accounts.get(idx))
-        {
-            let alias = entry.alias.clone();
-            match profile::prepare_profile_switch(&alias) {
-                Ok(prepared) if prepared.requires_confirmation() => {
-                    self.confirm = Some(ConfirmAction::Switch(prepared));
+        else {
+            return;
+        };
+        let alias = entry.alias.clone();
+        if self.interactive_operation_in_flight() {
+            self.set_status(
+                "Finish the active confirmation or profile switch before switching again"
+                    .to_string(),
+                5,
+            );
+            return;
+        }
+        if self.account_operation_in_flight(&alias) {
+            self.set_status(
+                format!("{alias}: wait for the account operation to finish before switching"),
+                5,
+            );
+            return;
+        }
+        self.start_profile_switch_prepare(alias);
+    }
+
+    fn start_profile_switch_prepare(&mut self, alias: String) {
+        if self.shutting_down {
+            return;
+        }
+        let tx = self.profile_switch_sender.clone();
+        let tracked_alias = alias.clone();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_lease_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let result = match profile::acquire_profile_lease_async_cancellable(
+                alias.clone(),
+                &task_lease_control,
+            )
+            .await
+            {
+                Ok(Some(lease)) => {
+                    match tokio::task::spawn_blocking(move || {
+                        profile::prepare_profile_switch_with_lease(&lease)
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => Err(anyhow::anyhow!(
+                            "profile switch preparation worker stopped: {}",
+                            crate::task_batch::join_failure_detail(&error)
+                        )),
+                    }
                 }
-                Ok(prepared) => {
+                Ok(None) => return,
+                Err(error) => Err(error.context(format!(
+                    "acquiring profile lease before preparing switch to '{alias}'"
+                ))),
+            };
+            let _ = tx
+                .send((alias, ProfileSwitchTaskResult::Prepared(result)))
+                .await;
+        });
+        self.track_account_task(
+            tracked_alias.clone(),
+            AccountTaskKind::SwitchPrepare,
+            lease_control,
+            handle,
+        );
+        self.set_status(format!("Preparing switch to {tracked_alias}..."), 60);
+    }
+
+    fn start_profile_switch_commit(&mut self, confirmed: profile::ConfirmedProfileSwitch) {
+        let alias = confirmed.alias().to_string();
+        if self.shutting_down {
+            return;
+        }
+        let tx = self.profile_switch_sender.clone();
+        let tracked_alias = alias.clone();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_lease_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let result = match profile::acquire_profile_lease_async_cancellable(
+                alias.clone(),
+                &task_lease_control,
+            )
+            .await
+            {
+                Ok(Some(lease)) => match tokio::task::spawn_blocking(move || {
+                    profile::commit_confirmed_profile_switch_with_lease(confirmed, &lease)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "profile switch commit worker stopped: {}",
+                        crate::task_batch::join_failure_detail(&error)
+                    )),
+                },
+                Ok(None) => return,
+                Err(error) => Err(error.context(format!(
+                    "acquiring profile lease before committing switch to '{alias}'"
+                ))),
+            };
+            let _ = tx
+                .send((alias, ProfileSwitchTaskResult::Committed(result)))
+                .await;
+        });
+        self.track_account_task(
+            tracked_alias.clone(),
+            AccountTaskKind::SwitchCommit,
+            lease_control,
+            handle,
+        );
+        self.set_status(format!("Switching to {tracked_alias}..."), 60);
+    }
+
+    pub fn poll_profile_switch_results(&mut self) {
+        while let Ok((alias, result)) = self.pending_profile_switches.try_recv() {
+            match result {
+                ProfileSwitchTaskResult::Prepared(_) if self.shutting_down => {}
+                ProfileSwitchTaskResult::Prepared(Ok(prepared))
+                    if prepared.requires_confirmation() =>
+                {
+                    if self.confirm.is_some() {
+                        self.set_status(
+                            format!(
+                                "Switch to {alias} was cancelled because another confirmation is active"
+                            ),
+                            5,
+                        );
+                    } else {
+                        self.set_status(format!("Switch to {alias} requires confirmation"), 60);
+                        self.confirm = Some(ConfirmAction::Switch(prepared));
+                    }
+                }
+                ProfileSwitchTaskResult::Prepared(Ok(prepared)) => {
                     match profile::confirm_prepared_profile_switch_without_overwrite(prepared) {
-                        Ok(confirmed) => self.commit_profile_switch(confirmed),
+                        Ok(confirmed) => self.start_profile_switch_commit(confirmed),
                         Err(error) => {
-                            self.set_status_error(format!("Switch failed: {error}"), 5);
+                            self.set_status_error(format!("Switch failed: {error:#}"), 5);
                         }
                     }
                 }
-                Err(error) => {
-                    self.set_status_error(format!("Switch failed: {error}"), 5);
+                ProfileSwitchTaskResult::Prepared(Err(error)) => {
+                    self.set_status_error(format!("Switch failed: {error:#}"), 5);
+                }
+                ProfileSwitchTaskResult::Committed(result) => {
+                    self.finish_profile_switch(alias, result);
                 }
             }
         }
     }
 
-    fn commit_profile_switch(&mut self, confirmed: profile::ConfirmedProfileSwitch) {
-        let alias = confirmed.alias().to_string();
-        match profile::commit_confirmed_profile_switch(confirmed) {
-            Ok(()) => {
-                cache::set_last_used(&alias);
+    fn finish_profile_switch(
+        &mut self,
+        alias: String,
+        result: Result<profile::ProfileSwitchOutcome>,
+    ) {
+        match result {
+            Ok(outcome) => {
                 for account in &mut self.accounts {
                     account.is_current = account.alias == alias;
                 }
-                self.set_status(format!("Switched to {alias}"), 3);
+                if let Some(warning) = outcome.selection_history_warning() {
+                    self.set_status(
+                        format!(
+                            "Switched to {alias}; warning: selection history was not updated: {warning:#}"
+                        ),
+                        8,
+                    );
+                } else {
+                    self.set_status(format!("Switched to {alias}"), 3);
+                }
             }
             Err(error) => {
                 let reconciliation = self.reconcile_displayed_current_after_switch_error(&error);
-                if matches!(
-                    reconciliation.as_ref(),
-                    Ok(Some(active)) if active == &alias
-                ) {
-                    cache::set_last_used(&alias);
-                }
                 let mut message = format!("Switch failed: {error:#}");
                 if let Err(reconcile_error) = reconciliation {
                     for account in &mut self.accounts {
@@ -1975,7 +2252,7 @@ impl App {
             ConfirmAction::Switch(prepared) => {
                 let confirmed =
                     profile::confirm_prepared_profile_switch_after_ui_approval(prepared);
-                self.commit_profile_switch(confirmed);
+                self.start_profile_switch_commit(confirmed);
             }
             ConfirmAction::Delete(alias) => {
                 if self.account_operation_in_flight(&alias) {
@@ -2001,16 +2278,8 @@ impl App {
                         return;
                     }
                 }
-                match cmd_delete(&alias) {
-                    Ok(()) => {
-                        self.model_cache.remove(&alias);
-                        self.model_requests.remove(&alias);
-                        self.set_status(format!("Deleted {alias} (recoverable)"), 3);
-                        self.load_profiles();
-                        self.refresh(Refresh::Forced);
-                    }
-                    Err(e) => self.set_status_error(format!("Delete failed: {e}"), 5),
-                }
+                let delete_result = cmd_delete(&alias);
+                self.reconcile_delete_result(&alias, delete_result);
             }
             ConfirmAction::BatchDelete(aliases) => {
                 if let Some(alias) = aliases
@@ -2025,8 +2294,7 @@ impl App {
                     );
                     return;
                 }
-                let mut ok = 0usize;
-                let mut errors: Vec<String> = Vec::new();
+                let mut report = BatchDeleteReport::default();
                 let current = match crate::profile::active_profile_from_live() {
                     Ok(current) => current,
                     Err(error) => {
@@ -2039,23 +2307,16 @@ impl App {
                 };
                 for alias in &aliases {
                     if current.as_deref() == Some(alias.as_str()) {
-                        errors.push(format!("{alias}: active, skipped"));
+                        report.failures.push(format!("{alias}: active, skipped"));
                         continue;
                     }
-                    match cmd_delete(alias) {
-                        Ok(()) => ok += 1,
-                        Err(e) => errors.push(format!("{alias}: {e}")),
-                    }
+                    report.record(alias, cmd_delete(alias));
                 }
                 self.marked.clear();
                 self.load_profiles();
                 self.refresh(Refresh::Forced);
-                let msg = if errors.is_empty() {
-                    format!("Deleted {ok} account(s) (recoverable)")
-                } else {
-                    format!("Deleted {ok} ok, {} failed", errors.len())
-                };
-                if errors.is_empty() {
+                let msg = report.message();
+                if report.failures.is_empty() {
                     self.set_status(msg, 6);
                 } else {
                     self.set_status_error(msg, 6);
@@ -2064,6 +2325,124 @@ impl App {
             ConfirmAction::ConsumeResetCard { alias, credit, .. } => {
                 self.consume_reset_card(&alias, credit);
             }
+        }
+    }
+
+    fn reconcile_delete_result(
+        &mut self,
+        alias: &str,
+        delete_result: Result<profile::ProfileMutationOutcome>,
+    ) {
+        let reload_result = self.try_load_profiles();
+        let visibly_deleted =
+            reload_result.is_ok() && self.accounts.iter().all(|entry| entry.alias != alias);
+        if reload_result.is_ok() {
+            self.refresh(Refresh::Forced);
+        }
+        match (delete_result, reload_result) {
+            (Ok(outcome), Ok(())) if visibly_deleted => {
+                if let Some(warning) = outcome.durability_warning() {
+                    self.set_status(
+                        format!(
+                            "Deleted {alias} (recoverable), but durability could not be confirmed: {warning:#}"
+                        ),
+                        8,
+                    );
+                } else {
+                    self.set_status(format!("Deleted {alias} (recoverable)"), 3);
+                }
+            }
+            (Ok(_), Ok(())) => self.set_status_error(
+                format!(
+                    "Delete reported a committed archive, but the reloaded profile list still contains {alias}"
+                ),
+                6,
+            ),
+            (Ok(outcome), Err(reload)) => self.set_status_error(
+                format!(
+                    "Deleted {alias}, but the profile list could not be reloaded: {reload:#}{}",
+                    outcome
+                        .durability_warning()
+                        .map(|warning| format!("; durability warning: {warning:#}"))
+                        .unwrap_or_default()
+                ),
+                6,
+            ),
+            (Err(error), Ok(())) => {
+                self.set_status_error(format!("Delete failed: {error:#}"), 5)
+            }
+            (Err(error), Err(reload)) => self.set_status_error(
+                format!(
+                    "Delete failed ({error:#}); the profile list also could not be reloaded: {reload:#}"
+                ),
+                7,
+            ),
+        }
+    }
+
+    fn reconcile_rename_result(
+        &mut self,
+        old: &str,
+        new: &str,
+        rename_result: Result<profile::ProfileMutationOutcome>,
+    ) {
+        let was_marked = self.marked.contains(old);
+        let reload_result = self.try_load_profiles();
+        let visibly_renamed = reload_result.is_ok()
+            && self.accounts.iter().all(|entry| entry.alias != old)
+            && self.accounts.iter().any(|entry| entry.alias == new);
+        if reload_result.is_ok() {
+            if was_marked && visibly_renamed {
+                self.marked.insert(new.to_string());
+            }
+            if let Some(account_idx) = self.accounts.iter().position(|entry| entry.alias == new)
+                && let Some(view_idx) = self
+                    .view_indices
+                    .iter()
+                    .position(|&index| index == account_idx)
+            {
+                self.selected = view_idx;
+            }
+            self.refresh(Refresh::Forced);
+        }
+        match (rename_result, reload_result) {
+            (Ok(outcome), Ok(())) if visibly_renamed => {
+                if let Some(warning) = outcome.durability_warning() {
+                    self.set_status(
+                        format!(
+                            "Renamed {old} -> {new}, but durability could not be confirmed: {warning:#}"
+                        ),
+                        8,
+                    );
+                } else {
+                    self.set_status(format!("Renamed {old} -> {new}"), 3);
+                }
+            }
+            (Ok(_), Ok(())) => self.set_status_error(
+                format!(
+                    "Rename reported success, but the reloaded profile list does not contain {new}"
+                ),
+                6,
+            ),
+            (Ok(outcome), Err(reload)) => self.set_status_error(
+                format!(
+                    "Renamed {old} -> {new}, but the profile list could not be reloaded: {reload:#}{}",
+                    outcome
+                        .durability_warning()
+                        .map(|warning| format!("; durability warning: {warning:#}"))
+                        .unwrap_or_default()
+                ),
+                6,
+            ),
+            (Err(error), Ok(())) => {
+                self.set_status_error(format!("Rename failed: {error:#}"), 5)
+            }
+            (Err(error), Err(reload)) => self.set_status_error(
+                format!(
+                    "Rename failed ({error:#}); the profile list also could not be reloaded: {reload:#}"
+                ),
+                7,
+            ),
         }
     }
 
@@ -2107,21 +2486,49 @@ impl App {
                     return;
                 }
             };
-            let result = crate::usage::consume_reset_credit_by_id_leased(
+            let preflight = crate::usage::fetch_usage_retried_with_existing_lease(
                 &alias_owned,
                 &path,
-                credit,
+                Refresh::Forced,
                 &lease,
             )
-            .await
-            .map_err(|error| {
-                let unknown = error.outcome_unknown_after_request();
-                reset_card_failure_from_outcome(
-                    unknown,
-                    error.user_facing_unknown_message(&alias_owned),
-                    format!("Reset card failed ({alias_owned}): {error}"),
-                )
-            });
+            .await;
+            let result = match preflight {
+                Ok(preflight) => {
+                    match crate::usage::validate_reset_credit_preflight(
+                        &alias_owned,
+                        &preflight,
+                        &credit,
+                    ) {
+                        Ok(()) => crate::usage::consume_reset_credit_by_id_leased(
+                            &alias_owned,
+                            &path,
+                            credit,
+                            &lease,
+                        )
+                        .await
+                        .map_err(|error| {
+                            let unknown = error.outcome_unknown_after_request();
+                            reset_card_failure_from_outcome(
+                                unknown,
+                                error.user_facing_unknown_message(&alias_owned),
+                                format!("Reset card failed ({alias_owned}): {error}"),
+                            )
+                        }),
+                        Err(error) => Err(map_reset_card_failure(
+                            format!("Reset card blocked ({alias_owned}): {error:#}"),
+                            false,
+                        )),
+                    }
+                }
+                Err(error) => Err(map_reset_card_failure(
+                    format!(
+                        "Reset card preflight failed ({alias_owned}): {}; no reset card was requested",
+                        error.detail
+                    ),
+                    false,
+                )),
+            };
             let _ = tx.send((alias_owned, result)).await;
         });
         self.track_account_task(
@@ -2134,6 +2541,13 @@ impl App {
 
     pub fn request_batch_delete(&mut self) {
         if self.marked.is_empty() {
+            return;
+        }
+        if self.interactive_operation_in_flight() {
+            self.set_status(
+                "Finish the active confirmation or profile switch before deleting".to_string(),
+                5,
+            );
             return;
         }
         if let Some(alias) = self
@@ -2226,28 +2640,8 @@ impl App {
                     return true;
                 }
                 self.rename = None;
-                match rename_profile(&old, &new) {
-                    Ok(()) => {
-                        let was_marked = self.marked.remove(&old);
-                        if was_marked {
-                            self.marked.insert(new.clone());
-                        }
-                        self.model_cache.remove(&old);
-                        self.model_cache.remove(&new);
-                        self.model_requests.remove(&old);
-                        self.model_requests.remove(&new);
-                        self.set_status(format!("Renamed {old} -> {new}"), 3);
-                        self.load_profiles();
-                        if let Some(account_idx) = self.accounts.iter().position(|a| a.alias == new)
-                            && let Some(view_idx) =
-                                self.view_indices.iter().position(|&idx| idx == account_idx)
-                        {
-                            self.selected = view_idx;
-                        }
-                        self.refresh(Refresh::Forced);
-                    }
-                    Err(e) => self.set_status_error(format!("Rename failed: {e}"), 5),
-                }
+                let rename_result = rename_profile(&old, &new);
+                self.reconcile_rename_result(&old, &new, rename_result);
                 return false;
             }
             _ => {
@@ -2308,13 +2702,19 @@ impl App {
     }
 
     fn set_status(&mut self, msg: String, secs: u64) {
-        self.status_msg = Some(msg);
+        self.status_msg = Some(safe_text::bounded_terminal_text(
+            &msg,
+            STATUS_MESSAGE_MAX_CHARS,
+        ));
         self.status_is_error = false;
         self.status_expiry = Some(Instant::now() + Duration::from_secs(secs));
     }
 
     fn set_status_error(&mut self, msg: String, secs: u64) {
-        self.status_msg = Some(msg);
+        self.status_msg = Some(safe_text::bounded_terminal_text(
+            &msg,
+            STATUS_MESSAGE_MAX_CHARS,
+        ));
         self.status_is_error = true;
         self.status_expiry = Some(Instant::now() + Duration::from_secs(secs));
     }
@@ -2471,6 +2871,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.poll_reset_card_results();
         app.poll_model_results();
         app.poll_account_tasks().await;
+        app.poll_profile_switch_results();
         app.poll_update();
         app.tick();
         app.run_due_auto_refresh();
@@ -2727,7 +3128,9 @@ async fn perform_oauth(
 
     let mode_name = match &mode {
         OAuthMode::Add => "Add new account".to_string(),
-        OAuthMode::Relogin(alias) => format!("Re-login: {alias}"),
+        OAuthMode::Relogin(alias) => {
+            format!("Re-login: {}", safe_text::terminal_text(alias))
+        }
     };
     println!("\n=== {mode_name} ===");
     if device {
@@ -2746,7 +3149,7 @@ async fn perform_oauth(
         println!("\nReturning to TUI...");
     } else {
         if let Err(ref e) = result {
-            eprintln!("\nError: {e}");
+            eprintln!("\nError: {}", safe_text::terminal_text(&e.to_string()));
         }
         println!("\nReturning to TUI...");
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -2848,7 +3251,12 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     tokio::pin!(stop_signal);
 
     for (i, alias) in aliases.iter().enumerate() {
-        println!("\n--- [{}/{}] {alias} ---", i + 1, total);
+        println!(
+            "\n--- [{}/{}] {} ---",
+            i + 1,
+            total,
+            safe_text::terminal_text(alias)
+        );
         let mode = OAuthMode::Relogin(alias.clone());
         let lease_control = profile::ProfileLeaseAcquireControl::new();
         let (result, stop_after_round, listener_error) = finish_login_or_stop_after_round(
@@ -2864,12 +3272,19 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
                 cancelled_accounts = 1;
             }
             Err(e) => {
-                eprintln!("[err] {alias}: {e}");
+                eprintln!(
+                    "[err] {}: {}",
+                    safe_text::terminal_text(alias),
+                    safe_text::terminal_text(&e.to_string())
+                );
                 failed.push((alias.clone(), e.to_string()));
             }
         }
         if let Some(error) = listener_error {
-            eprintln!("[err] Ctrl+C listener failed: {error}");
+            eprintln!(
+                "[err] Ctrl+C listener failed: {}",
+                safe_text::terminal_text(&error.to_string())
+            );
             stop_listener_error = Some(error);
         }
         if cancelled_accounts > 0 || stop_after_round || stop_listener_error.is_some() {
@@ -2892,7 +3307,11 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
     if !failed.is_empty() {
         for (a, e) in &failed {
-            println!("  - {a}: {e}");
+            println!(
+                "  - {}: {}",
+                safe_text::terminal_text(a),
+                safe_text::terminal_text(e)
+            );
         }
     }
     println!("\nReturning to TUI...");
@@ -2948,7 +3367,11 @@ async fn run_oauth_inner(
             let alias = action.alias().to_string();
             let verb = action.action(); // "created" / "updated"
             let email_disp = info.email.as_deref().unwrap_or("unknown");
-            println!("[ok] Account {verb}: {alias} ({email_disp})");
+            println!(
+                "[ok] Account {verb}: {} ({})",
+                safe_text::terminal_text(&alias),
+                safe_text::terminal_text(email_disp)
+            );
             if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
                 tracing::debug!("workspace metadata unavailable after TUI login save: {err}");
             }
@@ -2978,7 +3401,11 @@ async fn run_oauth_inner(
             profile::replace_profile_auth_and_live_if_current_leased(&lease, &auth_val)?;
             drop(lease);
             let email_disp = info.email.as_deref().unwrap_or("unknown");
-            println!("[ok] Re-logged in: {alias} ({email_disp})");
+            println!(
+                "[ok] Re-logged in: {} ({})",
+                safe_text::terminal_text(&alias),
+                safe_text::terminal_text(email_disp)
+            );
             if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
                 tracing::debug!("workspace metadata unavailable after TUI re-login save: {err}");
             }
@@ -3052,7 +3479,7 @@ fn edit_grapheme_input(input: &mut String, cursor: &mut usize, code: KeyCode) {
         KeyCode::Right if *cursor < grapheme_count(input) => *cursor += 1,
         KeyCode::Home => *cursor = 0,
         KeyCode::End => *cursor = grapheme_count(input),
-        KeyCode::Char(character) => {
+        KeyCode::Char(character) if !character.is_control() => {
             let byte = grapheme_to_byte(input, *cursor);
             input.insert(byte, character);
             *cursor = grapheme_cursor_after_byte(input, byte + character.len_utf8());
@@ -3064,8 +3491,9 @@ fn edit_grapheme_input(input: &mut String, cursor: &mut usize, code: KeyCode) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountEntry, AccountTaskKind, App, ConfirmAction, ModelStatus, SearchState, UsageStatus,
-        WarmupTask, batch_relogin_not_attempted, drain_credential_tasks_on_error,
+        AccountEntry, AccountTaskKind, App, BatchDeleteReport, ConfirmAction, ModelStatus,
+        STATUS_MESSAGE_MAX_CHARS, SearchState, UsageStatus, WarmupTask,
+        batch_relogin_not_attempted, drain_credential_tasks_on_error,
         finish_login_or_stop_after_round, refresh_fetches_loaded_usage,
         refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
     };
@@ -3085,6 +3513,12 @@ mod tests {
 
     impl EnvVarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn set_text(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
@@ -3150,6 +3584,27 @@ mod tests {
         })
         .await
         .expect("warmup preflight must finish");
+    }
+
+    async fn settle_profile_switch(app: &mut App) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                app.poll_account_tasks().await;
+                app.poll_profile_switch_results();
+                let switch_task_pending = app.account_tasks.values().any(|task| {
+                    matches!(
+                        task.kind,
+                        AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit
+                    )
+                });
+                if !switch_task_pending {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("profile switch task must settle");
     }
 
     #[test]
@@ -3363,8 +3818,14 @@ mod tests {
         assert!(app.shutting_down);
     }
 
-    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
     async fn account_task_panics_are_redacted_and_reported_deterministically() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let mut app = App::new();
         for (alias, secret) in [
             ("z-account", "SECRET_Z_ACCOUNT_TOKEN"),
@@ -3407,6 +3868,80 @@ mod tests {
         );
         assert!(app.account_tasks.is_empty());
         assert!(app.reset_cards_in_flight.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_card_task_panic_after_lease_invalidates_cache_and_warns_before_retry() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        crate::cache::put(
+            "account",
+            &UsageInfo {
+                fetched_at: Some(crate::auth::now_unix_secs()),
+                reset_credits: vec![ResetCredit {
+                    id: "possibly-consumed".into(),
+                    granted_at: None,
+                    expires_at: None,
+                }],
+                ..UsageInfo::default()
+            },
+        )
+        .unwrap();
+        assert!(crate::cache::get("account").unwrap().is_some());
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::default()),
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.reset_cards_in_flight.insert("account".into());
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let _lease = profile::acquire_profile_lease_async_cancellable(
+                "account".to_string(),
+                &task_control,
+            )
+            .await
+            .unwrap()
+            .expect("test task acquires the lease before the simulated post-request panic");
+            panic!("panic after reset-card POST");
+        });
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::ResetCard,
+            lease_control,
+            handle,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while app
+                .account_tasks
+                .values()
+                .any(|task| !task.handle.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("simulated reset-card worker must stop");
+        app.poll_account_tasks().await;
+
+        assert!(crate::cache::get("account").unwrap().is_none());
+        assert!(!app.reset_cards_in_flight.contains("account"));
+        assert!(matches!(&app.accounts[0].usage, UsageStatus::Error(_)));
+        assert!(app.status_is_error);
+        let status = app.status_msg.as_deref().unwrap();
+        assert!(status.contains("consumption may have occurred"), "{status}");
+        assert!(status.contains("verify before retry"), "{status}");
+        assert!(!status.contains("panic after reset-card POST"), "{status}");
     }
 
     #[tokio::test]
@@ -3484,6 +4019,337 @@ mod tests {
         assert!(app.account_tasks.is_empty());
         assert!(app.reset_cards_in_flight.is_empty());
         drop(held_lease);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_switch_is_tracked_and_shutdown_cancels_a_prelease_commit() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth(
+                "account@example.com",
+                "acct_account",
+                "saved-access",
+                "saved-refresh",
+            ),
+        );
+        let untracked = serde_json::json!({
+            "tokens": {
+                "access_token": "untracked-access",
+                "refresh_token": "untracked-refresh"
+            }
+        });
+        let live_path = codex_home.join("auth.json");
+        write_auth_durable(&live_path, &untracked);
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        app.switch_selected();
+        assert!(
+            app.account_tasks
+                .values()
+                .any(|task| matches!(task.kind, AccountTaskKind::SwitchPrepare))
+        );
+        settle_profile_switch(&mut app).await;
+        assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
+
+        let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
+        app.confirm_action();
+        assert!(
+            app.account_tasks
+                .values()
+                .any(|task| matches!(task.kind, AccountTaskKind::SwitchCommit))
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.drain_credential_tasks(),
+        )
+        .await
+        .expect("shutdown must cancel a switch commit still waiting for its profile lease");
+
+        assert!(app.account_tasks.is_empty());
+        assert_eq!(crate::auth::read_auth(&live_path).unwrap(), untracked);
+        assert!(!app.accounts[0].is_current);
+        drop(held_lease);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_switch_gate_rejects_a_second_alias_while_prepare_is_in_flight() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+        for alias in ["first", "second"] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(
+                &path,
+                &managed_auth(
+                    &format!("{alias}@example.com"),
+                    &format!("acct_{alias}"),
+                    &format!("{alias}-access"),
+                    &format!("{alias}-refresh"),
+                ),
+            );
+        }
+
+        let mut app = App::new();
+        for alias in ["first", "second"] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Idle,
+                is_current: false,
+            });
+        }
+        app.view_indices.extend([0, 1]);
+
+        app.switch_selected();
+        app.selected = 1;
+        app.switch_selected();
+
+        let switch_tasks = app
+            .account_tasks
+            .values()
+            .filter(|task| {
+                matches!(
+                    task.kind,
+                    AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(switch_tasks.len(), 1);
+        assert_eq!(switch_tasks[0].alias, "first");
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("before switching again"))
+        );
+
+        app.drain_credential_tasks().await;
+        assert!(app.confirm.is_none());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_switch_never_replaces_an_existing_confirmation() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+        for alias in ["switch-target", "delete-target"] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(
+                &path,
+                &managed_auth(
+                    &format!("{alias}@example.com"),
+                    &format!("acct_{alias}"),
+                    &format!("{alias}-access"),
+                    &format!("{alias}-refresh"),
+                ),
+            );
+        }
+        write_auth_durable(
+            &codex_home.join("auth.json"),
+            &serde_json::json!({
+                "tokens": {
+                    "access_token": "untracked-access",
+                    "refresh_token": "untracked-refresh"
+                }
+            }),
+        );
+
+        let mut app = App::new();
+        for alias in ["switch-target", "delete-target"] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Idle,
+                is_current: false,
+            });
+        }
+        app.view_indices.extend([0, 1]);
+
+        app.request_delete_alias("delete-target");
+        app.switch_selected();
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmAction::Delete(ref alias)) if alias == "delete-target"
+        ));
+        assert!(!app.profile_switch_in_flight());
+
+        app.confirm = None;
+        app.switch_selected();
+        assert!(app.profile_switch_in_flight());
+        app.confirm = Some(ConfirmAction::Delete("delete-target".into()));
+        settle_profile_switch(&mut app).await;
+
+        assert!(matches!(
+            app.confirm,
+            Some(ConfirmAction::Delete(ref alias)) if alias == "delete-target"
+        ));
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("another confirmation is active"))
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_switch_prepare_keeps_event_loop_responsive_during_auth_lock_contention() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth(
+                "account@example.com",
+                "acct_account",
+                "saved-access",
+                "saved-refresh",
+            ),
+        );
+
+        let auth_lock = crate::profile::lock_live_auth().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(auth_lock);
+        });
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        app.switch_selected();
+        let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        })
+        .await;
+        assert!(
+            responsive.is_ok(),
+            "auth-lock contention must stay on the blocking pool"
+        );
+
+        release.join().unwrap();
+        settle_profile_switch(&mut app).await;
+        assert!(app.accounts[0].is_current);
+        assert!(!app.status_is_error);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_switch_commit_keeps_event_loop_responsive_during_cache_lock_contention() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth(
+                "account@example.com",
+                "acct_account",
+                "saved-access",
+                "saved-refresh",
+            ),
+        );
+        write_auth_durable(
+            &codex_home.join("auth.json"),
+            &serde_json::json!({
+                "tokens": {
+                    "access_token": "untracked-access",
+                    "refresh_token": "untracked-refresh"
+                }
+            }),
+        );
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.switch_selected();
+        settle_profile_switch(&mut app).await;
+        assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
+
+        let cache_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(home.path().join("cache.lock"))
+            .unwrap();
+        fs4::FileExt::lock(&cache_lock).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(cache_lock);
+        });
+
+        app.confirm_action();
+        let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        })
+        .await;
+        assert!(
+            responsive.is_ok(),
+            "cache-lock contention must stay on the blocking pool"
+        );
+
+        release.join().unwrap();
+        settle_profile_switch(&mut app).await;
+        assert!(app.accounts[0].is_current);
+        assert!(!app.status_is_error);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -3633,7 +4499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_and_delete_do_not_block_on_in_flight_account_work() {
+    async fn switch_rename_and_delete_do_not_block_on_in_flight_account_work() {
         let mut app = App::new();
         app.accounts.push(AccountEntry {
             alias: "account".into(),
@@ -3665,6 +4531,15 @@ mod tests {
             app.status_msg
                 .as_deref()
                 .is_some_and(|message| message.contains("before deleting"))
+        );
+
+        app.status_msg = None;
+        app.switch_selected();
+        assert_eq!(app.account_tasks.len(), 1, "no switch task may be queued");
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("before switching"))
         );
 
         let task = app.account_tasks.remove(&0).expect("tracked task");
@@ -3740,6 +4615,23 @@ mod tests {
     }
 
     #[test]
+    fn search_input_ignores_terminal_control_characters() {
+        let mut app = App::new();
+        app.search = Some(SearchState {
+            query: "safe".to_string(),
+            cursor: 4,
+        });
+        app.search_active = true;
+
+        app.handle_search_key(KeyCode::Char('\u{1b}'));
+        app.handle_search_key(KeyCode::Char('\n'));
+
+        let state = app.search.as_ref().expect("search remains active");
+        assert_eq!(state.query, "safe");
+        assert_eq!(state.cursor, 4);
+    }
+
+    #[test]
     fn model_results_from_before_credential_reload_are_ignored() {
         let mut app = App::new();
         app.model_cache
@@ -3756,8 +4648,9 @@ mod tests {
         assert!(!app.model_requests.contains_key("account"));
     }
 
-    #[test]
-    fn untracked_live_auth_does_not_leave_stale_profile_active() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn untracked_live_auth_does_not_leave_stale_profile_active() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let codex_home = home.path().join("codex");
@@ -3790,6 +4683,7 @@ mod tests {
         assert!(!app.accounts[0].is_current);
 
         app.switch_selected();
+        settle_profile_switch(&mut app).await;
         assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
         write_auth_durable(
             &codex_home.join("auth.json"),
@@ -3798,6 +4692,7 @@ mod tests {
             }),
         );
         app.confirm_action();
+        settle_profile_switch(&mut app).await;
 
         assert!(app.status_is_error);
         assert!(
@@ -3814,8 +4709,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_switch_publication_updates_the_tui_to_the_actual_live_account() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn partial_switch_publication_updates_the_tui_to_the_actual_live_account() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let codex_home = home.path().join("codex");
@@ -3853,6 +4749,7 @@ mod tests {
 
         crate::profile::fail_next_activation_marker_write();
         app.switch_selected();
+        settle_profile_switch(&mut app).await;
 
         assert!(app.status_is_error);
         assert!(
@@ -3884,8 +4781,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_switch_rechecks_live_auth_before_updating_the_tui() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn partial_switch_rechecks_live_auth_before_updating_the_tui() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let codex_home = home.path().join("codex");
@@ -3929,6 +4827,7 @@ mod tests {
             write_auth_durable(&replacement_path, &replacement);
         });
         app.switch_selected();
+        settle_profile_switch(&mut app).await;
 
         assert!(app.status_is_error);
         assert_eq!(crate::auth::read_auth(&live_path).unwrap(), alice);
@@ -3946,8 +4845,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_switch_reconciliation_failure_clears_every_active_highlight() {
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn partial_switch_reconciliation_failure_clears_every_active_highlight() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
         let codex_home = home.path().join("codex");
@@ -3991,6 +4891,7 @@ mod tests {
             std::fs::create_dir(&unreadable_live).unwrap();
         });
         app.switch_selected();
+        settle_profile_switch(&mut app).await;
 
         assert!(app.status_is_error);
         assert!(
@@ -4003,6 +4904,54 @@ mod tests {
         assert!(
             app.accounts.iter().all(|account| !account.is_current),
             "an unverifiable live binding must not leave a stale active highlight"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn successful_switch_surfaces_selection_history_failure_as_a_warning() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let saved = managed_auth(
+            "account@example.com",
+            "acct_account",
+            "saved-access",
+            "saved-refresh",
+        );
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_auth_durable(&profile_path, &saved);
+        std::fs::write(home.path().join("cache.json"), b"{invalid cache").unwrap();
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        app.switch_selected();
+        settle_profile_switch(&mut app).await;
+
+        assert!(app.accounts[0].is_current);
+        assert!(!app.status_is_error, "the activation itself succeeded");
+        assert!(
+            app.status_msg.as_deref().is_some_and(|message| {
+                message.contains("Switched to account")
+                    && message.contains("selection history was not updated")
+            }),
+            "unexpected switch warning: {:?}",
+            app.status_msg
+        );
+        assert_eq!(
+            crate::auth::read_auth(&codex_home.join("auth.json")).unwrap(),
+            saved
         );
     }
 
@@ -4580,6 +5529,292 @@ mod tests {
     }
 
     #[test]
+    fn hard_blocker_disables_reset_card_menu_and_confirmation() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "blocked".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits: vec![ResetCredit {
+                    id: "cannot-help".into(),
+                    granted_at: None,
+                    expires_at: None,
+                }],
+                account_limited: true,
+                spend_control_reached: true,
+                ..UsageInfo::default()
+            })),
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        app.request_consume_reset_card("blocked");
+
+        assert!(app.confirm.is_none());
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("spend_control_reached"))
+        );
+        app.model_cache
+            .insert("blocked".into(), ModelStatus::Loaded(Vec::new()));
+        app.open_account_menu();
+        let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
+            panic!("account detail should open");
+        };
+        assert!(!info.can_consume_reset_card);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_card_forced_preflight_blocker_sends_no_consume_request() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth(
+                "account@example.com",
+                "acct_account",
+                "access-token",
+                "refresh-token",
+            ),
+        );
+        let confirmed = ResetCredit {
+            id: "confirmed-credit".into(),
+            granted_at: Some("2026-08-01T00:00:00Z".into()),
+            expires_at: Some("2026-09-01T00:00:00Z".into()),
+        };
+        let usage_body = serde_json::json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "limit_reached": true,
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "reset_at": 2_000_000_000_i64,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": {
+                    "used_percent": 50.0,
+                    "reset_at": 2_000_600_000_i64,
+                    "limit_window_seconds": 604_800
+                }
+            },
+            "rate_limit_reached_type": {
+                "type": "workspace_owner_credits_depleted"
+            }
+        });
+        let credit_body = serde_json::json!({
+            "available_count": 1,
+            "credits": [{
+                "id": "confirmed-credit",
+                "reset_type": "codex_rate_limits",
+                "status": "available",
+                "granted_at": "2026-08-01T00:00:00Z",
+                "expires_at": "2026-09-01T00:00:00Z"
+            }]
+        });
+        let consume_requests = Arc::new(AtomicUsize::new(0));
+        let consume_requests_for_route = Arc::clone(&consume_requests);
+        let server = axum::Router::new()
+            .route(
+                "/usage",
+                axum::routing::get(move || {
+                    let body = usage_body.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/credits",
+                axum::routing::get(move || {
+                    let body = credit_body.clone();
+                    async move { axum::Json(body) }
+                }),
+            )
+            .route(
+                "/consume",
+                axum::routing::post(move || {
+                    let requests = Arc::clone(&consume_requests_for_route);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({"code": "reset"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let _usage_url = EnvVarGuard::set_text("CS_USAGE_URL", &format!("http://{address}/usage"));
+        let _credits_url =
+            EnvVarGuard::set_text("CS_RESET_CREDITS_URL", &format!("http://{address}/credits"));
+        let _consume_url = EnvVarGuard::set_text(
+            "CS_RESET_CREDITS_CONSUME_URL",
+            &format!("http://{address}/consume"),
+        );
+
+        let mut app = App::new();
+        app.consume_reset_card("account", confirmed);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                app.poll_account_tasks().await;
+                app.poll_reset_card_results();
+                if app.account_tasks.is_empty() && app.reset_cards_in_flight.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reset-card preflight must settle");
+
+        assert_eq!(consume_requests.load(Ordering::SeqCst), 0);
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg.as_deref().is_some_and(|message| {
+                message.contains("workspace_owner_credits_depleted")
+                    && message.contains("no reset card was requested")
+            }),
+            "unexpected status: {:?}",
+            app.status_msg
+        );
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn visible_rename_error_reloads_committed_alias_and_reports_warning() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let new_path = home.path().join("profiles/new/auth.json");
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &new_path,
+            &managed_auth("account@example.com", "acct_account", "access", "refresh"),
+        );
+
+        let mut app = App::new();
+        app.shutting_down = true;
+        app.accounts.push(AccountEntry {
+            alias: "old".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.marked.insert("old".into());
+
+        app.reconcile_rename_result(
+            "old",
+            "new",
+            Ok(
+                profile::ProfileMutationOutcome::test_committed_with_durability_warning(
+                    anyhow::anyhow!("directory durability was not confirmed"),
+                ),
+            ),
+        );
+
+        assert_eq!(
+            app.accounts
+                .iter()
+                .map(|entry| entry.alias.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new"]
+        );
+        assert!(app.marked.contains("new"));
+        assert!(!app.marked.contains("old"));
+        assert!(!app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("durability could not be confirmed"))
+        );
+        app.drain_credential_tasks().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn visible_delete_error_removes_stale_row_and_reports_warning() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let mut app = App::new();
+        app.shutting_down = true;
+        app.accounts.push(AccountEntry {
+            alias: "deleted".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        app.reconcile_delete_result(
+            "deleted",
+            Ok(
+                profile::ProfileMutationOutcome::test_committed_with_durability_warning(
+                    anyhow::anyhow!("directory durability was not confirmed"),
+                ),
+            ),
+        );
+
+        assert!(app.accounts.is_empty());
+        assert!(!app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("durability could not be confirmed"))
+        );
+    }
+
+    #[test]
+    fn mixed_batch_delete_counts_committed_warning_and_true_failure_truthfully() {
+        let mut report = BatchDeleteReport::default();
+        report.record(
+            "durable",
+            Ok(profile::ProfileMutationOutcome::test_committed()),
+        );
+        report.record(
+            "warning",
+            Ok(
+                profile::ProfileMutationOutcome::test_committed_with_durability_warning(
+                    anyhow::anyhow!("directory sync failed"),
+                ),
+            ),
+        );
+        report.record("failed", Err(anyhow::anyhow!("permission denied")));
+
+        assert_eq!(report.committed, 2);
+        assert_eq!(report.durability_warnings.len(), 1);
+        assert_eq!(report.failures.len(), 1);
+        let message = report.message();
+        assert!(message.contains("Deleted 2 account(s)"), "{message}");
+        assert!(
+            message.contains("durability unconfirmed for 1"),
+            "{message}"
+        );
+        assert!(message.contains("warning"), "{message}");
+        assert!(message.contains("1 failed"), "{message}");
+    }
+
+    #[test]
     fn reset_card_result_always_clears_in_flight_state() {
         let mut app = App::new();
         app.reset_cards_in_flight.insert("account".into());
@@ -4625,5 +5860,21 @@ mod tests {
         // the accurate error rather than the unknown-outcome safe message.
         assert!(!failure.invalidate_cache);
         assert_eq!(failure.message, "Reset card failed (account): HTTP 400");
+    }
+
+    #[test]
+    fn status_storage_removes_terminal_controls_and_bounds_untrusted_errors() {
+        let mut app = App::new();
+        let hostile = format!(
+            "server\u{1b}]52;clipboard\u{7}\n{}",
+            "한".repeat(STATUS_MESSAGE_MAX_CHARS + 50)
+        );
+
+        app.set_status_error(hostile, 5);
+
+        let stored = app.status_msg.as_deref().expect("stored status");
+        assert!(stored.chars().all(|character| !character.is_control()));
+        assert_eq!(stored.chars().count(), STATUS_MESSAGE_MAX_CHARS);
+        assert!(app.status_is_error);
     }
 }

@@ -105,6 +105,10 @@ pub enum Commands {
         initial_executable: std::path::PathBuf,
         #[arg(long, value_name = "ABSOLUTE_PATH")]
         replacement_executable: std::path::PathBuf,
+        #[arg(long)]
+        expected_executable_token: Option<String>,
+        #[arg(long)]
+        ready_nonce: Option<String>,
     },
     #[command(name = "__installer-file-op", hide = true)]
     InstallerFileOp {
@@ -120,6 +124,23 @@ pub enum Commands {
         expected_token: Option<String>,
         #[arg(long)]
         expected_destination_token: Option<String>,
+    },
+    #[command(name = "__cleanup-self-update", hide = true)]
+    CleanupSelfUpdate {
+        #[arg(long)]
+        parent_pid: u32,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        displaced: std::path::PathBuf,
+        #[arg(long)]
+        expected_token: String,
+        #[arg(long)]
+        expected_executable_token: String,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        journal: std::path::PathBuf,
+        #[arg(long)]
+        expected_journal_token: String,
+        #[arg(long)]
+        ready_nonce: String,
     },
     /// Switch to a profile; omit alias to auto-select using the unified scoring algorithm
     Use {
@@ -364,6 +385,94 @@ mod tests {
                 }))
             ));
         }
+    }
+
+    #[test]
+    fn hidden_self_update_cleanup_keeps_every_exact_attestation() {
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "__cleanup-self-update",
+            "--parent-pid",
+            "42",
+            "--displaced",
+            r"C:\Program Files\.codex-switch-global-pace.exe.self-update-displaced-00112233445566778899aabbccddeeff",
+            "--expected-token",
+            "1:2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-executable-token",
+            "3:4|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--journal",
+            r"C:\Program Files\.codex-switch-global-pace.exe.self-update-cleanup-journal",
+            "--expected-journal-token",
+            "5:6|cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--ready-nonce",
+            "00112233445566778899aabbccddeeff",
+        ])
+        .unwrap();
+
+        let Some(Commands::CleanupSelfUpdate {
+            parent_pid,
+            displaced,
+            expected_token,
+            expected_executable_token,
+            journal,
+            expected_journal_token,
+            ready_nonce,
+        }) = cli.command
+        else {
+            panic!("expected self-update cleanup command");
+        };
+        assert_eq!(parent_pid, 42);
+        assert!(displaced.ends_with(
+            ".codex-switch-global-pace.exe.self-update-displaced-00112233445566778899aabbccddeeff"
+        ));
+        assert_eq!(
+            expected_token,
+            "1:2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            expected_executable_token,
+            "3:4|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(journal.ends_with(".codex-switch-global-pace.exe.self-update-cleanup-journal"));
+        assert_eq!(
+            expected_journal_token,
+            "5:6|cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        );
+        assert_eq!(ready_nonce, "00112233445566778899aabbccddeeff");
+    }
+
+    #[test]
+    fn hidden_lifecycle_holder_accepts_the_bound_image_attestation_pair() {
+        let cli = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "__hold-daemon-update-boundary",
+            "--initial-executable",
+            r"C:\Program Files\codex-switch-global-pace.exe",
+            "--replacement-executable",
+            r"C:\Program Files\codex-switch-global-pace.exe",
+            "--expected-executable-token",
+            "3:4|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--ready-nonce",
+            "00112233445566778899aabbccddeeff",
+        ])
+        .unwrap();
+
+        let Some(Commands::HoldDaemonUpdateBoundary {
+            expected_executable_token,
+            ready_nonce,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected daemon lifecycle holder command");
+        };
+        assert_eq!(
+            expected_executable_token.as_deref(),
+            Some("3:4|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            ready_nonce.as_deref(),
+            Some("00112233445566778899aabbccddeeff")
+        );
     }
 
     #[test]

@@ -449,7 +449,7 @@ async fn http_all_exhausted() {
     let scored = score_from_responses(&responses, &profiles, false, 20.0, now);
 
     assert_eq!(
-        scored[0].0, "exhausted_a",
+        scored[0].0, "z_soon",
         "soonest reset (30min) should rank first"
     );
     assert!(
@@ -986,6 +986,117 @@ mod revival {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn cached_spend_blocker_is_rejected_before_preflight_or_consume() {
+        let home = temp_home("cached-spend-blocker");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let cache_path = home.join(".codex-switch/cache.json");
+        let mut cache: Value =
+            serde_json::from_str(&fs::read_to_string(&cache_path).unwrap()).unwrap();
+        cache["entries"]["card_holder"]["account_limited"] = json!(true);
+        cache["entries"]["card_holder"]["spend_control_reached"] = json!(true);
+        write_json(&cache_path, &cache);
+        let live = auth_json_with_access("live@mock.test", "acct_live", "tok_live");
+        let live_path = home.join(".codex/auth.json");
+        write_json(&live_path, &live);
+        let (consume_url, consume_requests, consume_server) = counting_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(
+            consume_requests.load(Ordering::SeqCst),
+            0,
+            "a cached hard blocker must not reach reset-card redemption"
+        );
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"].as_str().is_some_and(|message| {
+                message.contains("spend_control_reached")
+                    && message.contains("no reset card was requested")
+                    && message.contains("no profile was switched")
+            }),
+            "{error}"
+        );
+        let current_live: Value =
+            serde_json::from_str(&fs::read_to_string(&live_path).unwrap()).unwrap();
+        assert_eq!(current_live, live);
+
+        consume_server.abort();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forced_preflight_workspace_blocker_is_rejected_before_consume() {
+        let home = temp_home("preflight-workspace-blocker");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let profile_path = home.join(".codex-switch/profiles/card_holder/auth.json");
+        let live_path = home.join(".codex/auth.json");
+        fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+        fs::copy(&profile_path, &live_path).unwrap();
+        let live_before = fs::read(&live_path).unwrap();
+
+        let mut blocked = mock::transformer::base_response("plus", 100.0, 1800, 10.0, 604800);
+        blocked["rate_limit_reached_type"] = json!({"type": "workspace_owner_credits_depleted"});
+        let usage_server =
+            mock::MockServer::start(vec![("tok_card_holder".to_string(), vec![blocked])]).await;
+        let (consume_url, consume_requests, consume_server) = counting_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(usage_server.request_count("tok_card_holder"), 1);
+        assert_eq!(
+            consume_requests.load(Ordering::SeqCst),
+            0,
+            "a hard blocker found by forced preflight must stop before POST"
+        );
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"].as_str().is_some_and(|message| {
+                message.contains("workspace_owner_credits_depleted")
+                    && message.contains("no reset card was requested")
+                    && message.contains("no profile was switched")
+            }),
+            "{error}"
+        );
+        assert_eq!(fs::read(&live_path).unwrap(), live_before);
+
+        consume_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn changed_card_metadata_is_refused_before_the_consume_request() {
         let home = temp_home("changed-card-binding");
         write_long_ttl_config(&home);
@@ -1087,12 +1198,12 @@ mod revival {
     }
 
     /// Contract 7: consuming the card doesn't actually free quota (still
-    /// exhausted on recheck) -> keeps the already-authorized card holder and
-    /// reports the unconfirmed revival without trying a second card.
+    /// exhausted on recheck) -> reports the consumed-but-unconfirmed outcome
+    /// without committing the already-authorized profile switch.
     ///
     /// Multi-thread runtime: see `contract6_consume_card_revives_exhausted_pool`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn contract7_keeps_authorized_target_when_still_exhausted_after_consume() {
+    async fn contract7_does_not_switch_when_still_exhausted_after_consume() {
         let home = temp_home("contract7");
         write_long_ttl_config(&home);
         write_cached_profile(
@@ -1121,21 +1232,76 @@ mod revival {
             ],
         );
 
-        assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(!output.status.success());
         let json = parse_stdout_json(&output);
-        // Still exhausted -> retains the exact target authorized before the
-        // irreversible card redemption rather than silently choosing another.
-        assert_eq!(json["switched_to"], "card_holder");
-        let hint = json["hint"]
-            .as_str()
-            .expect("consumed card must be reported");
-        assert!(hint.contains("card_holder"), "{hint}");
-        assert!(hint.contains("card was consumed"), "{hint}");
-        assert!(hint.contains("could not be confirmed revived"), "{hint}");
+        let message = json["error"].as_str().expect("JSON error must be present");
+        assert!(message.contains("card_holder"), "{message}");
+        assert!(message.contains("was consumed"), "{message}");
+        assert!(
+            message.contains("could not be confirmed eligible"),
+            "{message}"
+        );
+        assert!(message.contains("no profile was switched"), "{message}");
+        assert!(
+            !home.join(".codex/auth.json").exists(),
+            "post-consume ineligibility must leave the absent live auth unchanged"
+        );
+
+        server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consumed_card_does_not_switch_when_post_consume_refresh_fails() {
+        let home = temp_home("post-consume-refresh-failure");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let server = mock::MockServer::start_programmed(vec![(
+            "tok_card_holder".to_string(),
+            vec![
+                mock::MockResponse::json(
+                    StatusCode::OK,
+                    mock::transformer::base_response("plus", 100.0, 1800, 50.0, 604800),
+                ),
+                mock::MockResponse::text(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "post-consume usage unavailable",
+                ),
+            ],
+        )])
+        .await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+            ],
+        );
+
+        assert!(!output.status.success());
+        let json = parse_stdout_json(&output);
+        let message = json["error"].as_str().expect("JSON error must be present");
+        assert!(message.contains("card_holder"), "{message}");
+        assert!(message.contains("was consumed"), "{message}");
+        assert!(message.contains("usage refresh failed"), "{message}");
+        assert!(message.contains("no profile was switched"), "{message}");
+        assert!(
+            !home.join(".codex/auth.json").exists(),
+            "post-consume refresh failure must leave the absent live auth unchanged"
+        );
+        assert_eq!(
+            server.request_count("tok_card_holder"),
+            4,
+            "one preflight plus three post-consume refresh attempts are expected"
+        );
 
         server.shutdown();
         let _ = fs::remove_dir_all(home);
@@ -1169,18 +1335,16 @@ mod revival {
             ],
         );
 
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("card_holder"), "{stderr}");
+        assert!(stderr.contains("was consumed"), "{stderr}");
         assert!(
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains("could not be confirmed eligible"),
+            "{stderr}"
         );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("card_holder"), "{stdout}");
-        assert!(stdout.contains("card was consumed"), "{stdout}");
-        assert!(
-            stdout.contains("could not be confirmed revived"),
-            "{stdout}"
-        );
+        assert!(stderr.contains("no profile was switched"), "{stderr}");
+        assert!(!home.join(".codex/auth.json").exists());
 
         server.shutdown();
         let _ = fs::remove_dir_all(home);
@@ -1216,14 +1380,17 @@ mod revival {
             ],
         );
 
-        assert!(output.status.success());
+        assert!(!output.status.success());
         let json = parse_stdout_json(&output);
-        let hint = json["hint"]
-            .as_str()
-            .expect("unknown outcome must be visible");
-        assert!(hint.contains("card_holder"), "{hint}");
-        assert!(hint.contains("consumption may have occurred"), "{hint}");
-        assert!(hint.contains("verify before retry"), "{hint}");
+        let message = json["error"].as_str().expect("JSON error must be present");
+        assert!(message.contains("card_holder"), "{message}");
+        assert!(
+            message.contains("consumption may have occurred"),
+            "{message}"
+        );
+        assert!(message.contains("verify before retry"), "{message}");
+        assert!(message.contains("no profile was switched"), "{message}");
+        assert!(!home.join(".codex/auth.json").exists());
 
         consume_server.abort();
         usage_server.shutdown();
@@ -1260,11 +1427,13 @@ mod revival {
             ],
         );
 
-        assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("card_holder"), "{stdout}");
-        assert!(stdout.contains("consumption may have occurred"), "{stdout}");
-        assert!(stdout.contains("verify before retry"), "{stdout}");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("card_holder"), "{stderr}");
+        assert!(stderr.contains("consumption may have occurred"), "{stderr}");
+        assert!(stderr.contains("verify before retry"), "{stderr}");
+        assert!(stderr.contains("no profile was switched"), "{stderr}");
+        assert!(!home.join(".codex/auth.json").exists());
 
         consume_server.abort();
         usage_server.shutdown();
@@ -1310,6 +1479,61 @@ mod revival {
             "{message}"
         );
         assert!(message.contains("verify before retry"), "{message}");
+
+        consume_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_reset_card_rechecks_hard_blocker_under_lease_before_consume() {
+        let home = temp_home("explicit-reset-preflight-blocker");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let initial = mock::transformer::base_response("plus", 100.0, 1800, 50.0, 604800);
+        let mut blocked = initial.clone();
+        blocked["rate_limit_reached_type"] = json!({"type": "workspace_owner_credits_depleted"});
+        let usage_server = mock::MockServer::start(vec![(
+            "tok_card_holder".to_string(),
+            vec![initial, blocked],
+        )])
+        .await;
+        let (consume_url, consume_requests, consume_server) = counting_consume_url().await;
+        let profile_path = home.join(".codex-switch/profiles/card_holder/auth.json");
+        let profile_before = fs::read(&profile_path).unwrap();
+
+        let output = run_with_env(
+            &home,
+            &["--json", "reset-card", "card_holder", "--yes"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(usage_server.request_count("tok_card_holder"), 2);
+        assert_eq!(
+            consume_requests.load(Ordering::SeqCst),
+            0,
+            "a hard blocker found by the lease-held forced preflight must stop before POST"
+        );
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"].as_str().is_some_and(|message| {
+                message.contains("workspace_owner_credits_depleted")
+                    && message.contains("no reset card was requested")
+            }),
+            "{error}"
+        );
+        assert_eq!(fs::read(&profile_path).unwrap(), profile_before);
 
         consume_server.abort();
         usage_server.shutdown();

@@ -17,6 +17,16 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
     let usage = usage::fetch_usage_retried_force(alias, &path)
         .await
         .map_err(|e| anyhow::anyhow!("{alias}: {}", e.detail))?;
+    if let Some(blocker) = usage::explicit_account_blocker(&usage) {
+        anyhow::bail!(
+            "{alias}: reset card cannot clear the account/workspace restriction ({blocker}); no reset card was requested"
+        );
+    }
+    if let Some(error) = usage.reset_credits_error.as_deref() {
+        anyhow::bail!(
+            "{alias}: reset-card details could not be verified ({error}); no reset card was requested"
+        );
+    }
     let credit = usage::earliest_reset_credit(&usage.reset_credits)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{alias}: no available reset cards"))?;
@@ -34,7 +44,27 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
         }
     }
 
-    let result = match usage::consume_reset_credit_by_id(alias, &path, credit).await {
+    // Revalidate both the restriction and the exact approved card while the
+    // profile lease is held. This closes the confirmation-time race before the
+    // irreversible consume request.
+    let lease = profile::acquire_profile_lease_async(alias.to_string())
+        .await
+        .with_context(|| format!("{alias}: acquiring profile lease for reset-card preflight"))?;
+    let preflight = usage::fetch_usage_retried_with_existing_lease(
+        alias,
+        &path,
+        usage::Refresh::Forced,
+        &lease,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.detail))
+    .with_context(|| {
+        format!("{alias}: reset-card preflight failed; no reset card was requested")
+    })?;
+    usage::validate_reset_credit_preflight(alias, &preflight, &credit)?;
+
+    let result = match usage::consume_reset_credit_by_id_leased(alias, &path, credit, &lease).await
+    {
         Ok(result) => result,
         Err(error) if error.outcome_unknown_after_request() => {
             if let Err(err) = cache::invalidate(alias) {
@@ -57,7 +87,7 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
             "code": result.code,
             "windows_reset": result.windows_reset,
             "redeemed_at": result.redeemed_at,
-        }));
+        }))?;
     } else {
         println!(
             "{}",
@@ -93,7 +123,10 @@ pub(crate) fn open_cmd() -> Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let result = std::process::Command::new("xdg-open").arg(&dir).spawn();
     result.with_context(|| format!("opening file manager for {}", dir.display()))?;
-    println!("Opened: {}", dir.display());
+    println!(
+        "Opened: {}",
+        crate::safe_text::terminal_text(&dir.display().to_string())
+    );
     Ok(())
 }
 
@@ -107,12 +140,12 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
     if let Some(a) = alias
         && !profile::profile_exists(a)?
     {
-        anyhow::bail!("profile '{}' not found", a);
+        anyhow::bail!("profile '{a}' not found");
     }
 
     if aliases.is_empty() {
         if json {
-            print_json(&serde_json::json!({"ok": true, "results": []}));
+            print_json(&serde_json::json!({"ok": true, "results": []}))?;
         } else {
             user_println("(no saved profiles)");
         }
@@ -153,7 +186,7 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                     .unwrap_or("")
                     .cmp(b["alias"].as_str().unwrap_or(""))
             });
-            print_json(&serde_json::json!({"ok": true, "results": results}));
+            print_json(&serde_json::json!({"ok": true, "results": results}))?;
         }
         return Ok(());
     }
@@ -170,12 +203,17 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
             Ok(path) => pending.push((alias, path)),
             Err(error) => {
                 let detail = format!("{error:#}");
-                tracing::warn!("[{alias}] failed to resolve profile path: {detail}");
+                let terminal_detail = crate::safe_text::terminal_text(&detail).into_owned();
+                tracing::warn!("[{alias}] failed to resolve profile path: {terminal_detail}");
                 if json {
                     results
                         .push(serde_json::json!({"alias": &alias, "ok": false, "error": &detail}));
                 } else {
-                    user_println(&format!("  {} failed: {}", color::error(&alias), detail));
+                    user_println(&format!(
+                        "  {} failed: {}",
+                        color::error(&alias),
+                        terminal_detail
+                    ));
                 }
                 failures.push((alias, detail));
                 had_error = true;
@@ -216,12 +254,17 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
             }
             Err(error) => {
                 let detail = format!("{error:#}");
-                tracing::error!(alias = %alias, error = %detail, "warmup failed");
+                let terminal_detail = crate::safe_text::terminal_text(&detail).into_owned();
+                tracing::error!(alias = %alias, error = %terminal_detail, "warmup failed");
                 if json {
                     results
                         .push(serde_json::json!({"alias": &alias, "ok": false, "error": &detail}));
                 } else {
-                    user_println(&format!("  {} failed: {}", color::error(&alias), detail));
+                    user_println(&format!(
+                        "  {} failed: {}",
+                        color::error(&alias),
+                        terminal_detail
+                    ));
                 }
                 failures.push((alias, detail));
                 had_error = true;
@@ -237,7 +280,7 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                 .cmp(b["alias"].as_str().unwrap_or(""))
         });
         // Embed overall status in JSON so callers get a single valid object.
-        print_json(&serde_json::json!({"ok": !had_error, "results": results}));
+        print_json(&serde_json::json!({"ok": !had_error, "results": results}))?;
         if had_error {
             return Err(crate::OutputAlreadyReported.into());
         }

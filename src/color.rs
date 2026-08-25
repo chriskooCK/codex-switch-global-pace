@@ -39,64 +39,71 @@ pub fn enabled() -> bool {
 
 /// Green text for success
 pub fn success(s: &str) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if enabled() {
-        format!("{}", s.green())
+        format!("{}", s.as_ref().green())
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
 /// Red text for errors
 pub fn error(s: &str) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if enabled() {
-        format!("{}", s.red())
+        format!("{}", s.as_ref().red())
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
 /// Yellow text for warnings
 pub fn warn(s: &str) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if enabled() {
-        format!("{}", s.yellow())
+        format!("{}", s.as_ref().yellow())
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
 /// Dim/gray text
 pub fn dim(s: &str) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if enabled() {
-        format!("{}", s.dimmed())
+        format!("{}", s.as_ref().dimmed())
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
 /// Bold text
 pub fn bold(s: &str) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if enabled() {
-        format!("{}", s.bold())
+        format!("{}", s.as_ref().bold())
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
 /// Green bold for active marker
 pub fn active(s: &str) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if enabled() {
-        format!("{}", s.green().bold())
+        format!("{}", s.as_ref().green().bold())
     } else {
-        s.to_string()
+        s.into_owned()
     }
 }
 
 /// Color quota usage by its position relative to pace.
 pub fn usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f64>) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if !enabled() {
-        return s.to_string();
+        return s.into_owned();
     }
-    colored_usage_pace(s, used_percent, pace_percent)
+    colored_usage_pace(s.as_ref(), used_percent, pace_percent)
 }
 
 fn colored_usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f64>) -> String {
@@ -109,36 +116,39 @@ fn colored_usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f
 
 /// Color a credits balance: green >= $10, yellow >= $2, red < $2
 pub fn credits(s: &str, balance: f64, unlimited: bool) -> String {
+    let s = crate::safe_text::terminal_text(s);
     if !enabled() {
-        return s.to_string();
+        return s.into_owned();
     }
     if unlimited || balance >= 10.0 {
-        format!("{}", s.green())
+        format!("{}", s.as_ref().green())
     } else if balance >= 2.0 {
-        format!("{}", s.yellow())
+        format!("{}", s.as_ref().yellow())
     } else {
-        format!("{}", s.red())
+        format!("{}", s.as_ref().red())
     }
 }
 
 /// Color a status tag: OK = green, Limited = red, Error = red
 pub fn status_tag(tag: &str) -> String {
+    let tag = crate::safe_text::terminal_text(tag);
     if !enabled() {
         return format!("[{tag}]");
     }
-    match tag {
-        "OK" => format!("[{}]", tag.green()),
-        "Limited" | "Error" => format!("[{}]", tag.red()),
+    match tag.as_ref() {
+        "OK" => format!("[{}]", tag.as_ref().green()),
+        "Limited" | "Error" => format!("[{}]", tag.as_ref().red()),
         _ => format!("[{tag}]"),
     }
 }
 
 /// Color a plan label by type
 pub fn plan(label: &str, plan_type: Option<&str>) -> String {
+    let label = crate::safe_text::terminal_text(label);
     if !enabled() {
         return format!("[{label}]");
     }
-    colored_plan(label, plan_type)
+    colored_plan(label.as_ref(), plan_type)
 }
 
 fn colored_plan(label: &str, plan_type: Option<&str>) -> String {
@@ -157,7 +167,15 @@ fn colored_plan(label: &str, plan_type: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{colored_plan, colored_usage_pace};
+    use super::{colored_plan, colored_usage_pace, error};
+
+    #[test]
+    fn cli_styling_never_replays_untrusted_terminal_controls() {
+        let rendered = error("bad\u{1b}]52;clipboard\u{7}\nnext");
+        assert!(!rendered.contains("]52;clipboard\u{7}"));
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("bad]52;clipboardnext"));
+    }
 
     #[test]
     fn plan_colors_distinguish_go_and_both_pro_tiers() {

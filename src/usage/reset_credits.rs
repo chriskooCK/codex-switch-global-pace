@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rand::Rng;
 use serde_json::Value;
 use tracing::debug;
@@ -99,13 +99,8 @@ pub(super) async fn enrich_reset_credits(
     usage: &mut UsageInfo,
 ) {
     match fetch_reset_credits(client, access_token, account_id, is_fedramp).await {
-        Ok((available_count, credits)) => {
-            if available_count.is_some() {
-                usage.reset_credits_available_count = available_count;
-            }
-            if !credits.is_empty() {
-                usage.reset_credits = credits;
-            }
+        Ok(summary) => {
+            merge_reset_credits(usage, summary);
             usage.reset_credits_error = None;
         }
         Err(err) => {
@@ -121,7 +116,7 @@ async fn fetch_reset_credits(
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
-) -> Result<(Option<u64>, Vec<ResetCredit>)> {
+) -> Result<ResetCreditsSummary> {
     fetch_reset_credits_at_url(
         client,
         access_token,
@@ -138,7 +133,7 @@ async fn fetch_reset_credits_at_url(
     account_id: Option<&str>,
     is_fedramp: bool,
     url: &str,
-) -> Result<(Option<u64>, Vec<ResetCredit>)> {
+) -> Result<ResetCreditsSummary> {
     let req = client
         .get(url)
         .bearer_auth(access_token)
@@ -160,11 +155,8 @@ async fn fetch_reset_credits_at_url(
         .json()
         .await
         .map_err(|e| anyhow::anyhow!("failed to parse reset credits response: {e}"))?;
-    let (available_count, credits, valid_shape) = parse_reset_credits_summary(&body);
-    if !valid_shape {
-        anyhow::bail!("reset credits response missing expected fields");
-    }
-    Ok((available_count, credits))
+    parse_reset_credits_summary(&body)
+        .context("reset credits response does not match the expected summary shape")
 }
 
 pub(crate) fn reset_credit_expiry_sort_key(credit: &ResetCredit) -> i64 {
@@ -405,75 +397,170 @@ fn redeem_request_id() -> String {
     )
 }
 
-fn parse_reset_credit(value: &Value) -> Option<ResetCredit> {
-    let obj = value.as_object()?;
+fn optional_reset_credit_string(
+    obj: &serde_json::Map<String, Value>,
+    snake_case: &str,
+    camel_case: &str,
+) -> Result<Option<String>> {
+    let value = match (obj.get(snake_case), obj.get(camel_case)) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("reset credit must not contain both {snake_case} and {camel_case}")
+        }
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.trim().to_string())),
+        Some(_) => anyhow::bail!("reset credit {snake_case} must be a string or null"),
+    }
+}
 
-    let reset_type = obj
-        .get("reset_type")
-        .or_else(|| obj.get("resetType"))
-        .and_then(|v| v.as_str())
-        .map(str::trim);
-    if let Some(reset_type) = reset_type
+fn parse_reset_credit(value: &Value) -> Result<Option<ResetCredit>> {
+    let obj = value
+        .as_object()
+        .context("each reset credit must be a JSON object")?;
+
+    let reset_type = optional_reset_credit_string(obj, "reset_type", "resetType")?;
+    if let Some(reset_type) = reset_type.as_deref()
         && reset_type != "codex_rate_limits"
     {
-        return None;
+        return Ok(None);
     }
 
-    let status = obj.get("status").and_then(|v| v.as_str()).map(str::trim);
+    let status = match obj.get("status") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(status)) => Some(status.trim()),
+        Some(_) => anyhow::bail!("reset credit status must be a string or null"),
+    };
     if let Some(status) = status
         && status != "available"
     {
-        return None;
+        return Ok(None);
     }
-
-    let expires_at = obj
-        .get("expires_at")
-        .or_else(|| obj.get("expiresAt"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
 
     let id = obj
         .get("id")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .map(str::to_string)?;
-    let granted_at = obj
-        .get("granted_at")
-        .or_else(|| obj.get("grantedAt"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(str::to_string)
+        .context("available reset credit id must be a non-empty string")?;
+    let granted_at = optional_reset_credit_string(obj, "granted_at", "grantedAt")?
+        .filter(|value| !value.is_empty());
+    let expires_at = optional_reset_credit_string(obj, "expires_at", "expiresAt")?
+        .filter(|value| !value.is_empty());
 
-    Some(ResetCredit {
+    Ok(Some(ResetCredit {
         id,
         granted_at,
         expires_at,
+    }))
+}
+
+#[derive(Debug)]
+pub(super) struct ResetCreditsSummary {
+    pub(super) available_count: Option<u64>,
+    /// `None` means the response omitted a list and supplied only summary data;
+    /// `Some(vec![])` is an authoritative explicit empty list.
+    pub(super) credits: Option<Vec<ResetCredit>>,
+}
+
+fn merge_reset_credits(usage: &mut UsageInfo, summary: ResetCreditsSummary) {
+    if summary.available_count.is_some() {
+        usage.reset_credits_available_count = summary.available_count;
+    }
+    match summary.credits {
+        Some(credits) => usage.reset_credits = credits,
+        None if summary.available_count == Some(0) => usage.reset_credits.clear(),
+        None => {}
+    }
+}
+
+pub(super) fn parse_reset_credits_summary(body: &Value) -> Result<ResetCreditsSummary> {
+    let obj = body
+        .as_object()
+        .context("reset credits summary must be a JSON object")?;
+    let count_value = match (obj.get("available_count"), obj.get("availableCount")) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "reset credits summary must not contain both available_count and availableCount"
+            )
+        }
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    let mut available_count = count_value
+        .map(|value| {
+            parse_optional_u64(Some(value)).context(
+                "reset credits available_count must be a non-negative integer or numeric string",
+            )
+        })
+        .transpose()?;
+    let credits = match obj.get("credits") {
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    parse_reset_credit(item)
+                        .with_context(|| format!("invalid reset credit at index {index}"))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => anyhow::bail!("reset credits credits field must be an array"),
+        None => None,
+    };
+    if count_value.is_none() && credits.is_none() {
+        anyhow::bail!("reset credits response missing expected fields");
+    }
+    if available_count.is_none() && credits.as_ref().is_some_and(Vec::is_empty) {
+        available_count = Some(0);
+    }
+
+    Ok(ResetCreditsSummary {
+        available_count,
+        credits,
     })
 }
 
-pub(super) fn parse_reset_credits_summary(body: &Value) -> (Option<u64>, Vec<ResetCredit>, bool) {
-    let Some(obj) = body.as_object() else {
-        return (None, vec![], false);
-    };
-
-    let available_count = parse_optional_u64(
-        obj.get("available_count")
-            .or_else(|| obj.get("availableCount")),
-    );
-    let credits = obj
-        .get("credits")
-        .and_then(|v| v.as_array())
-        .map(|items| items.iter().filter_map(parse_reset_credit).collect())
-        .unwrap_or_default();
-    let valid_shape = obj.contains_key("credits")
-        || obj.contains_key("available_count")
-        || obj.contains_key("availableCount");
-
-    (available_count, credits, valid_shape)
+/// Revalidate the exact card the user approved against a forced usage fetch
+/// made while the caller owns the profile lease. Account/workspace blockers
+/// cannot be repaired by a quota reset, and an ambiguous/missing card list must
+/// never be treated as permission to issue the irreversible POST.
+pub(crate) fn validate_reset_credit_preflight(
+    alias: &str,
+    usage: &UsageInfo,
+    confirmed: &ResetCredit,
+) -> Result<()> {
+    if let Some(blocker) = super::explicit_account_blocker(usage) {
+        anyhow::bail!(
+            "{alias}: reset card cannot clear the account/workspace restriction ({blocker}); no reset card was requested"
+        );
+    }
+    if let Some(error) = usage.reset_credits_error.as_deref() {
+        anyhow::bail!(
+            "{alias}: reset-card ownership could not be revalidated ({error}); no reset card was requested"
+        );
+    }
+    let matches = usage
+        .reset_credits
+        .iter()
+        .filter(|current| {
+            current.id == confirmed.id
+                && current.granted_at == confirmed.granted_at
+                && current.expires_at == confirmed.expires_at
+        })
+        .count();
+    if matches != 1 {
+        anyhow::bail!(
+            "{alias}: the exact reset card approved by the user changed or disappeared; no reset card was requested"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -556,6 +643,46 @@ mod tests {
         assert_eq!(*observed.lock().unwrap(), vec![(true, true), (true, true)]);
     }
 
+    #[tokio::test]
+    async fn dedicated_fetch_rejects_explicit_malformed_summary_fields() {
+        let app = axum::Router::new()
+            .route(
+                "/bad-credits",
+                get(|| async { Json(json!({"credits": {"id": "not-an-array"}})) }),
+            )
+            .route(
+                "/bad-count",
+                get(|| async { Json(json!({"available_count": "many"})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+
+        let bad_credits = fetch_reset_credits_at_url(
+            &client,
+            "access-token",
+            None,
+            false,
+            &format!("http://{address}/bad-credits"),
+        )
+        .await
+        .unwrap_err();
+        let bad_count = fetch_reset_credits_at_url(
+            &client,
+            "access-token",
+            None,
+            false,
+            &format!("http://{address}/bad-count"),
+        )
+        .await
+        .unwrap_err();
+        server.abort();
+
+        assert!(format!("{bad_credits:#}").contains("credits field must be an array"));
+        assert!(format!("{bad_count:#}").contains("available_count must be"));
+    }
+
     #[test]
     fn test_reset_credit_without_expiry_is_preserved_and_sorted_last() {
         let expiring = parse_reset_credit(&json!({
@@ -563,12 +690,14 @@ mod tests {
             "status": "available",
             "expires_at": "2026-07-08T00:00:00Z"
         }))
+        .unwrap()
         .unwrap();
         let no_expiry = parse_reset_credit(&json!({
             "id": "no-expiry",
             "status": "available",
             "expires_at": null
         }))
+        .unwrap()
         .unwrap();
         let credits = vec![no_expiry, expiring];
 
@@ -577,8 +706,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_credit_id_is_filtered_before_earliest_credit_is_selected() {
-        let (_, credits, valid_shape) = parse_reset_credits_summary(&json!({
+    fn empty_credit_id_rejects_the_summary_before_selection() {
+        let error = parse_reset_credits_summary(&json!({
             "credits": [
                 {
                     "id": "  ",
@@ -591,10 +720,142 @@ mod tests {
                     "expires_at": "2026-08-01T00:00:00Z"
                 }
             ]
-        }));
+        }))
+        .expect_err("an explicit empty card id must not be silently discarded");
 
-        assert!(valid_shape);
-        assert_eq!(earliest_reset_credit(&credits).unwrap().id, "valid-credit");
+        assert!(
+            format!("{error:#}").contains("available reset credit id must be a non-empty string")
+        );
+    }
+
+    #[test]
+    fn explicit_empty_credit_list_without_count_clears_stale_count_and_cards() {
+        let mut usage = UsageInfo {
+            reset_credits_available_count: Some(1),
+            reset_credits: vec![ResetCredit {
+                id: "stale-credit".to_string(),
+                granted_at: None,
+                expires_at: None,
+            }],
+            ..UsageInfo::default()
+        };
+
+        merge_reset_credits(
+            &mut usage,
+            parse_reset_credits_summary(&json!({"credits": []})).unwrap(),
+        );
+
+        assert_eq!(usage.reset_credits_available_count, Some(0));
+        assert!(usage.reset_credits.is_empty());
+    }
+
+    #[test]
+    fn explicit_malformed_summary_fields_are_not_treated_as_omitted() {
+        for malformed in [
+            json!({"credits": null}),
+            json!({"credits": {}}),
+            json!({"available_count": -1}),
+            json!({"available_count": "many"}),
+            json!({"available_count": null}),
+        ] {
+            assert!(
+                parse_reset_credits_summary(&malformed).is_err(),
+                "explicit malformed shape must fail: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_malformed_credit_item_rejects_the_whole_summary() {
+        for malformed in [
+            json!({"credits": [7]}),
+            json!({"credits": [{}]}),
+            json!({"credits": [{"id": "  ", "status": "available"}]}),
+            json!({"credits": [{"id": "credit-1", "status": 1}]}),
+            json!({"credits": [{"id": "credit-1", "expires_at": 123}]}),
+        ] {
+            let error = parse_reset_credits_summary(&malformed)
+                .expect_err("a malformed explicit card must reject the summary");
+            assert!(
+                format!("{error:#}").contains("invalid reset credit at index 0"),
+                "unexpected error for {malformed}: {error:#}"
+            );
+        }
+
+        let summary = parse_reset_credits_summary(&json!({
+            "credits": [
+                {"reset_type": "other_product"},
+                {"status": "redeemed"},
+                {"id": "available-with-optional-fields-omitted"}
+            ]
+        }))
+        .unwrap();
+        let credits = summary.credits.unwrap();
+        assert_eq!(credits.len(), 1);
+        assert_eq!(credits[0].id, "available-with-optional-fields-omitted");
+    }
+
+    #[test]
+    fn reset_credit_preflight_rejects_hard_blocker_and_changed_card() {
+        let confirmed = ResetCredit {
+            id: "confirmed".into(),
+            granted_at: Some("2026-08-01T00:00:00Z".into()),
+            expires_at: Some("2026-09-01T00:00:00Z".into()),
+        };
+        let blocked = UsageInfo {
+            reset_credits: vec![confirmed.clone()],
+            spend_control_reached: true,
+            ..UsageInfo::default()
+        };
+        let blocker = validate_reset_credit_preflight("account", &blocked, &confirmed)
+            .expect_err("a reset card cannot repair a hard blocker");
+        assert!(format!("{blocker:#}").contains("spend_control_reached"));
+
+        let unknown_reason = UsageInfo {
+            reset_credits: vec![confirmed.clone()],
+            rate_limit_reached_type: Some("future_server_reason".into()),
+            ..UsageInfo::default()
+        };
+        let blocker = validate_reset_credit_preflight("account", &unknown_reason, &confirmed)
+            .expect_err("an unknown non-empty limit reason must fail closed");
+        assert!(format!("{blocker:#}").contains("future_server_reason"));
+
+        let changed = UsageInfo {
+            reset_credits: vec![ResetCredit {
+                expires_at: Some("2026-10-01T00:00:00Z".into()),
+                ..confirmed.clone()
+            }],
+            ..UsageInfo::default()
+        };
+        let changed = validate_reset_credit_preflight("account", &changed, &confirmed)
+            .expect_err("changed metadata must invalidate the user's consent");
+        assert!(format!("{changed:#}").contains("changed or disappeared"));
+    }
+
+    #[test]
+    fn count_only_credit_summary_preserves_details_unless_count_is_zero() {
+        let stale = ResetCredit {
+            id: "embedded-credit".to_string(),
+            granted_at: None,
+            expires_at: None,
+        };
+        let mut usage = UsageInfo {
+            reset_credits: vec![stale.clone()],
+            ..UsageInfo::default()
+        };
+
+        merge_reset_credits(
+            &mut usage,
+            parse_reset_credits_summary(&json!({"available_count": 1})).unwrap(),
+        );
+        assert_eq!(usage.reset_credits.len(), 1);
+        assert_eq!(usage.reset_credits[0].id, stale.id);
+
+        merge_reset_credits(
+            &mut usage,
+            parse_reset_credits_summary(&json!({"available_count": 0})).unwrap(),
+        );
+        assert!(usage.reset_credits.is_empty());
     }
 
     #[tokio::test]

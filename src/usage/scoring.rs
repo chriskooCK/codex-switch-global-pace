@@ -123,7 +123,10 @@ pub fn visible_pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
 
 /// Whether an account is currently usable (both windows have remaining quota).
 pub fn is_available(u: &UsageInfo) -> bool {
-    if u.account_limited || (u.primary.is_none() && u.secondary.is_none()) {
+    if super::explicit_account_blocker(u).is_some()
+        || u.account_limited
+        || (u.primary.is_none() && u.secondary.is_none())
+    {
         return false;
     }
     if let Some(w) = &u.secondary
@@ -141,7 +144,7 @@ pub fn is_available(u: &UsageInfo) -> bool {
 
 /// Eligibility check on a Candidate (reset-aware).
 pub fn is_candidate_eligible(c: &Candidate, safety_margin_7d: f64) -> bool {
-    if !c.has_5h_data && !c.has_7d_data {
+    if c.account_limit_active() || (!c.has_5h_data && !c.has_7d_data) {
         return false;
     }
     let used_5h = c.effective_used_5h();
@@ -394,7 +397,9 @@ pub fn score_candidates(
 
     let pool_exhausted = candidates
         .iter()
-        .filter(|(candidate, _)| candidate.effective_used_5h() >= 100.0)
+        .filter(|(candidate, _)| {
+            candidate.account_limit_active() || candidate.effective_used_5h() >= 100.0
+        })
         .count();
     for (candidate, _) in &mut candidates {
         candidate.pool_exhausted = pool_exhausted;
@@ -424,11 +429,15 @@ pub fn pick_switch_target<'a>(
     safety_7d: f64,
 ) -> Option<(&'a str, f64)> {
     let current_eligible = is_candidate_eligible(&current.candidate, safety_7d);
+    let current_blocked = current.candidate.explicit_account_blocker.is_some();
     let mut best_eligible: Option<(&'a str, f64)> = None;
     let mut best_ineligible: Option<(&'a str, f64)> = None;
     let mut any_eligible = false;
 
     for s in others {
+        if s.candidate.explicit_account_blocker.is_some() {
+            continue;
+        }
         let eligible = is_candidate_eligible(&s.candidate, safety_7d);
         if eligible {
             any_eligible = true;
@@ -437,7 +446,9 @@ pub fn pick_switch_target<'a>(
             {
                 best_eligible = Some((s.candidate.alias.as_str(), s.score));
             }
-        } else if s.score > current.score && best_ineligible.is_none_or(|(_, bs)| s.score > bs) {
+        } else if (current_blocked || s.score > current.score)
+            && best_ineligible.is_none_or(|(_, bs)| s.score > bs)
+        {
             best_ineligible = Some((s.candidate.alias.as_str(), s.score));
         }
     }
@@ -469,6 +480,7 @@ mod tests {
             rate_limit_reached_type: None,
             individual_limit: None,
             additional_limits: vec![],
+            parse_issues: vec![],
         }
     }
 
@@ -529,6 +541,138 @@ mod tests {
         assert!(!is_available(&UsageInfo::default()));
     }
 
+    #[test]
+    fn ordinary_window_exhaustion_preserves_reset_data_for_ranking() {
+        let usage = UsageInfo {
+            primary: Some(window(100.0, Some(1_001_800))),
+            secondary: Some(window(80.0, Some(1_604_800))),
+            account_limited: true,
+            rate_limit_reached_type: Some("rate_limit_reached".to_string()),
+            ..UsageInfo::default()
+        };
+
+        let candidate =
+            Candidate::from_usage("ordinary".to_string(), &usage, false, false, 0, 1_000_000);
+
+        assert_eq!(candidate.used_5h, 100.0);
+        assert_eq!(candidate.resets_at_5h, Some(1_001_800));
+        assert_eq!(candidate.used_7d, 80.0);
+        assert_eq!(candidate.resets_at_7d, Some(1_604_800));
+        assert_eq!(candidate.explicit_account_blocker, None);
+        assert_eq!(
+            candidate.ordinary_account_limit,
+            Some(super::super::OrdinaryAccountLimit::UntilReset(1_001_800))
+        );
+    }
+
+    #[test]
+    fn broad_limit_verdict_blocks_inconsistent_percentages_until_reset() {
+        for used in [10.0, 99.0] {
+            let usage = UsageInfo {
+                primary: Some(window(used, Some(1_003_600))),
+                account_limited: true,
+                ..UsageInfo::default()
+            };
+            let mut candidate = Candidate::from_usage(
+                format!("limited-{used}"),
+                &usage,
+                false,
+                false,
+                0,
+                1_000_000,
+            );
+
+            assert_eq!(candidate.used_5h, used);
+            assert_eq!(
+                candidate.ordinary_account_limit,
+                Some(super::super::OrdinaryAccountLimit::UntilReset(1_003_600))
+            );
+            assert!(!is_candidate_eligible(&candidate, 20.0));
+
+            candidate.now = 1_003_600;
+            assert!(
+                is_candidate_eligible(&candidate, 20.0),
+                "the stale broad verdict may be ignored once its reported window reset"
+            );
+        }
+    }
+
+    #[test]
+    fn broad_limit_without_window_metadata_fails_closed() {
+        let usage = UsageInfo {
+            account_limited: true,
+            ..UsageInfo::default()
+        };
+        let candidate = Candidate::from_usage(
+            "missing-window".to_string(),
+            &usage,
+            false,
+            false,
+            0,
+            1_000_000,
+        );
+
+        assert_eq!(
+            candidate.ordinary_account_limit,
+            Some(super::super::OrdinaryAccountLimit::ResetUnknown)
+        );
+        assert!(!is_candidate_eligible(&candidate, 20.0));
+    }
+
+    #[test]
+    fn unrecognized_limit_reason_is_hard_blocked_regardless_of_window_shape_or_reset() {
+        for primary in [
+            Some(window(10.0, Some(999_000))),
+            Some(window(99.0, Some(1_003_600))),
+            None,
+        ] {
+            let usage = UsageInfo {
+                primary,
+                account_limited: true,
+                rate_limit_reached_type: Some("future_server_reason".to_string()),
+                ..UsageInfo::default()
+            };
+            let candidate = Candidate::from_usage(
+                "unknown-reason".to_string(),
+                &usage,
+                false,
+                false,
+                0,
+                1_000_000,
+            );
+
+            assert!(matches!(
+                candidate.explicit_account_blocker,
+                Some(super::super::ExplicitAccountBlocker::UnrecognizedRateLimitReason(ref reason))
+                    if reason == "future_server_reason"
+            ));
+            assert_eq!(candidate.ordinary_account_limit, None);
+            assert!(!is_candidate_eligible(&candidate, 20.0));
+            assert!(!is_available(&usage));
+        }
+    }
+
+    #[test]
+    fn explicit_spend_blocker_is_typed_and_never_eligible() {
+        let usage = UsageInfo {
+            primary: Some(window(10.0, Some(1_003_600))),
+            secondary: Some(window(10.0, Some(1_604_800))),
+            account_limited: true,
+            spend_control_reached: true,
+            ..UsageInfo::default()
+        };
+
+        let candidate =
+            Candidate::from_usage("blocked".to_string(), &usage, false, false, 0, 1_000_000);
+
+        assert_eq!(
+            candidate.explicit_account_blocker,
+            Some(super::super::ExplicitAccountBlocker::SpendControlReached)
+        );
+        assert!(!is_candidate_eligible(&candidate, 20.0));
+        assert!(!is_available(&usage));
+    }
+
     // ── adaptive scoring tests ──
 
     fn make_candidate(
@@ -546,6 +690,8 @@ mod tests {
             resets_at_7d: reset_7d,
             has_5h_data: true,
             has_7d_data: true,
+            explicit_account_blocker: None,
+            ordinary_account_limit: None,
             is_team: false,
             is_free: false,
             last_used: 0,
@@ -917,6 +1063,8 @@ mod tests {
             resets_at_7d: None,
             has_5h_data: false,
             has_7d_data: false,
+            explicit_account_blocker: None,
+            ordinary_account_limit: None,
             is_team: false,
             is_free: false,
             last_used: 0,
@@ -959,6 +1107,8 @@ mod tests {
             resets_at_7d: None,
             has_5h_data: true,
             has_7d_data: true,
+            explicit_account_blocker: None,
+            ordinary_account_limit: None,
             is_team: false,
             is_free: false,
             last_used: 0,

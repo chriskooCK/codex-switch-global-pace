@@ -261,6 +261,12 @@ pub(crate) async fn self_update_cmd(
     // Preserve the migration-specific guidance before any network or lock error.
     ensure_system_install_migrated(use_dev, version, json)?;
 
+    if !check {
+        update::recover_pending_self_update_cleanup_on_startup().context(
+            "a previous Windows self-update cleanup remains pending; exact recovery must succeed before another executable publication",
+        )?;
+    }
+
     if check {
         let current_version = update::current_version().to_string();
         let result = if use_dev {
@@ -290,7 +296,7 @@ pub(crate) async fn self_update_cmd(
                 updated: false,
                 install_source,
                 action: "checked".into(),
-            });
+            })?;
             return Ok(());
         }
 
@@ -421,7 +427,7 @@ pub(crate) async fn self_update_cmd(
             } else {
                 "up_to_date".into()
             },
-        });
+        })?;
         return Ok(());
     }
 
@@ -434,6 +440,10 @@ pub(crate) async fn self_update_cmd(
                 result.current_version, result.latest_version
             ))
         );
+        #[cfg(windows)]
+        output::user_println(&color::dim(
+            "Previous executable cleanup is journaled and will finish after this updater exits; a later startup retries it if needed.",
+        ));
         if dev && !update::is_dev_version(&result.current_version) {
             output::user_println(&color::dim(
                 "Switched to dev channel. Run `codex-switch-global-pace self-update --stable` to return.",

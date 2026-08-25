@@ -39,10 +39,28 @@ Accounts are added by logging in with `codex-switch-global-pace login` or by imp
 | `$CODEX_SWITCH_HOME/*.lock` | Cross-process coordination files. |
 
 Unset variables default to `~/.codex` and `~/.codex-switch` respectively (`%USERPROFILE%\.codex-switch` on Windows).
-Each resolved state directory, or its nearest existing parent when the state
-directory has not been created yet, must be an ordinary directory rather than a
-symbolic link, Windows junction, or other reparse point. The same rule is
-checked at startup and at the private-write boundary.
+Overrides may point anywhere on an absolute path, but a private state
+path is accepted only when its full ancestry can be kept private and stable:
+
+- Every existing component must be an ordinary directory, never a symbolic
+  link, Windows junction, or other reparse point.
+- On Unix, existing components must be owned by the effective user or root. A
+  group- or other-writable ancestor is rejected unless it is sticky (for
+  example `/tmp`) and the protected child entry belongs to the effective user
+  or root. The final state directory must belong to the effective user and is
+  kept at mode `0700`.
+- On Windows, a private directory must belong to the current user and receives
+  a protected ACL for that user, Local System, and Administrators. Credential
+  publication and the log writer keep direct handles to every path component,
+  without delete sharing, for the entire path-based operation. A writable
+  shared parent is therefore never trusted merely because an earlier path
+  check succeeded.
+
+These checks run whenever a private state directory is prepared. Operations
+that hold a private-directory guard — including live-auth temporary-file
+publication, rotated-credential recovery staging, and the log writer — keep it
+for the complete path-based operation. An override whose ancestry cannot meet
+the rules fails explicitly instead of falling back to a different directory.
 
 ## Settings
 
@@ -92,8 +110,8 @@ The removed `[launch]` table is also ignored with a startup warning and can be d
 
 | Variable | Effect |
 |---|---|
-| `CODEX_HOME` | Codex's own home; `auth.json` and Codex's `config.toml` live here (default `~/.codex`). A non-empty override must be absolute, contain no `..`, must not be a filesystem root, and its nearest existing directory must not be a link or reparse point. |
-| `CODEX_SWITCH_HOME` | Relocates codex-switch-global-pace state (default `~/.codex-switch`); an empty value is ignored, and a non-empty override must be absolute, contain no `..`, must not be a filesystem root, and its nearest existing directory must not be a link or reparse point. |
+| `CODEX_HOME` | Codex's own home; `auth.json` and Codex's `config.toml` live here (default `~/.codex`). A non-empty override must be absolute, contain no `..`, must not be a filesystem root, and must satisfy the full private-path ownership, permission, and direct-component rules above. |
+| `CODEX_SWITCH_HOME` | Relocates codex-switch-global-pace state (default `~/.codex-switch`); an empty value is ignored, and a non-empty override must be absolute, contain no `..`, must not be a filesystem root, and must satisfy the same private-path rules. |
 | `CS_PROXY` | Proxy URL; same as `--proxy`. |
 | `CS_COLOR` | Color mode; same as `--color`. |
 | `NO_COLOR` | Disables color output regardless of other settings. |

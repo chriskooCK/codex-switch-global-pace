@@ -10,7 +10,7 @@ mod scoring;
 
 pub(crate) use api::{
     apply_account_routing_headers, do_refresh_token, fetch_usage_retried_unattended_leased,
-    fetch_usage_retried_with_existing_lease,
+    fetch_usage_retried_with_existing_lease, persist_refresh_resolution,
 };
 pub use api::{
     fetch_usage_retried, fetch_usage_retried_force, fetch_usage_retried_unattended,
@@ -31,7 +31,10 @@ pub use global_pace::{
 #[allow(unused_imports)]
 pub use parse::parse_usage;
 pub use reset_credits::{consume_reset_credit_by_id, earliest_reset_credit};
-pub(crate) use reset_credits::{consume_reset_credit_by_id_leased, reset_credit_expiry_sort_key};
+pub(crate) use reset_credits::{
+    consume_reset_credit_by_id_leased, reset_credit_expiry_sort_key,
+    validate_reset_credit_preflight,
+};
 #[allow(unused_imports)]
 pub use scoring::visible_pace_percent;
 pub(crate) use scoring::{
@@ -99,6 +102,41 @@ pub struct ResetCredit {
     pub expires_at: Option<String>,
 }
 
+/// A schema problem retained by the public infallible parser. Network fetches
+/// use the checked parser and reject these responses outright; retaining the
+/// typed issue keeps direct library callers from receiving a silent fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "field", rename_all = "snake_case")]
+pub enum UsageParseIssue {
+    InvalidPrimaryWindow { detail: String },
+    InvalidSecondaryWindow { detail: String },
+    InvalidRateLimitReachedType { raw: String, detail: String },
+    InvalidAdditionalRateLimits { detail: String },
+    InvalidCodeReviewRateLimit { detail: String },
+}
+
+impl std::fmt::Display for UsageParseIssue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPrimaryWindow { detail } => {
+                write!(formatter, "primary_window: {detail}")
+            }
+            Self::InvalidSecondaryWindow { detail } => {
+                write!(formatter, "secondary_window: {detail}")
+            }
+            Self::InvalidRateLimitReachedType { detail, .. } => {
+                write!(formatter, "rate_limit_reached_type: {detail}")
+            }
+            Self::InvalidAdditionalRateLimits { detail } => {
+                write!(formatter, "additional_rate_limits: {detail}")
+            }
+            Self::InvalidCodeReviewRateLimit { detail } => {
+                write!(formatter, "code_review_rate_limit: {detail}")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ConsumedResetCredit {
     pub credit: ResetCredit,
@@ -131,6 +169,134 @@ pub struct UsageInfo {
     pub individual_limit: Option<Box<SpendControlLimit>>,
     /// Per-feature rate limits from `additional_rate_limits[]` (e.g. codex_other).
     pub additional_limits: Vec<AdditionalRateLimit>,
+    /// Explicit schema problems retained by [`parse_usage`]. Checked network
+    /// parsing rejects the same issues before a `UsageInfo` is returned.
+    pub parse_issues: Vec<UsageParseIssue>,
+}
+
+/// A non-window account restriction that a Codex rate-limit reset card cannot
+/// repair. Keep this distinct from the broad `account_limited` compatibility
+/// flag: the usage API also sets that flag for an ordinary exhausted window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExplicitAccountBlocker {
+    SpendControlReached,
+    WorkspaceOwnerCreditsDepleted,
+    WorkspaceMemberCreditsDepleted,
+    WorkspaceOwnerUsageLimitReached,
+    WorkspaceMemberUsageLimitReached,
+    UnrecognizedRateLimitReason(String),
+    MalformedUsageResponse(String),
+}
+
+impl ExplicitAccountBlocker {
+    pub fn wire_reason(&self) -> &str {
+        match self {
+            Self::SpendControlReached => "spend_control_reached",
+            Self::WorkspaceOwnerCreditsDepleted => "workspace_owner_credits_depleted",
+            Self::WorkspaceMemberCreditsDepleted => "workspace_member_credits_depleted",
+            Self::WorkspaceOwnerUsageLimitReached => "workspace_owner_usage_limit_reached",
+            Self::WorkspaceMemberUsageLimitReached => "workspace_member_usage_limit_reached",
+            Self::UnrecognizedRateLimitReason(reason) => reason,
+            Self::MalformedUsageResponse(issue) => issue,
+        }
+    }
+}
+
+impl std::fmt::Display for ExplicitAccountBlocker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.wire_reason())
+    }
+}
+
+/// Classify only account/workspace restrictions that remain in force even if
+/// the ordinary quota windows are reset.
+pub fn explicit_account_blocker(usage: &UsageInfo) -> Option<ExplicitAccountBlocker> {
+    if usage.spend_control_reached {
+        return Some(ExplicitAccountBlocker::SpendControlReached);
+    }
+    let reason_blocker = match usage.rate_limit_reached_type.as_deref() {
+        Some("workspace_owner_credits_depleted") => {
+            Some(ExplicitAccountBlocker::WorkspaceOwnerCreditsDepleted)
+        }
+        Some("workspace_member_credits_depleted") => {
+            Some(ExplicitAccountBlocker::WorkspaceMemberCreditsDepleted)
+        }
+        Some("workspace_owner_usage_limit_reached") => {
+            Some(ExplicitAccountBlocker::WorkspaceOwnerUsageLimitReached)
+        }
+        Some("workspace_member_usage_limit_reached") => {
+            Some(ExplicitAccountBlocker::WorkspaceMemberUsageLimitReached)
+        }
+        Some("rate_limit_reached") | None => None,
+        Some(reason) => Some(ExplicitAccountBlocker::UnrecognizedRateLimitReason(
+            reason.to_string(),
+        )),
+    };
+    if reason_blocker.is_some() {
+        return reason_blocker;
+    }
+    usage
+        .parse_issues
+        .first()
+        .map(|issue| ExplicitAccountBlocker::MalformedUsageResponse(issue.to_string()))
+}
+
+/// A broad `limit_reached` verdict that is not one of the explicit
+/// account/workspace restrictions above. The API normally pairs this with an
+/// exhausted quota window, but partial or slightly inconsistent snapshots must
+/// still fail closed until the reported windows have reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdinaryAccountLimit {
+    UntilReset(i64),
+    ResetUnknown,
+}
+
+impl OrdinaryAccountLimit {
+    pub const fn is_active(self, now: i64) -> bool {
+        match self {
+            Self::UntilReset(resets_at) => resets_at > now,
+            Self::ResetUnknown => true,
+        }
+    }
+}
+
+/// Classify the broad account-limited verdict separately from explicit
+/// blockers. A quota reset can repair this state, so its reset timestamp is
+/// retained instead of erasing the underlying usage windows.
+pub fn ordinary_account_limit(usage: &UsageInfo) -> Option<OrdinaryAccountLimit> {
+    if !usage.account_limited || explicit_account_blocker(usage).is_some() {
+        return None;
+    }
+
+    let windows = [usage.primary.as_ref(), usage.secondary.as_ref()];
+    let present = windows.into_iter().flatten().collect::<Vec<_>>();
+    if present.is_empty() {
+        return Some(OrdinaryAccountLimit::ResetUnknown);
+    }
+
+    let exhausted = present
+        .iter()
+        .copied()
+        .filter(|window| window.used_percent.is_some_and(|used| used >= 100.0))
+        .collect::<Vec<_>>();
+    let relevant = if exhausted.is_empty() {
+        present
+    } else {
+        exhausted
+    };
+    if relevant.iter().any(|window| window.resets_at.is_none()) {
+        return Some(OrdinaryAccountLimit::ResetUnknown);
+    }
+
+    // When the broad verdict and percentages disagree, the response does not
+    // identify which window caused it. Waiting for the latest reported reset
+    // is conservative and a normal refresh will clear the stale verdict sooner.
+    let resets_at = relevant
+        .into_iter()
+        .filter_map(|window| window.resets_at)
+        .max()
+        .expect("present windows with reset timestamps were checked above");
+    Some(OrdinaryAccountLimit::UntilReset(resets_at))
 }
 
 /// One assembled display row for an additional-limit pool. Pure data,
@@ -169,6 +335,8 @@ pub struct Candidate {
     pub resets_at_7d: Option<i64>,
     pub has_5h_data: bool,
     pub has_7d_data: bool,
+    pub explicit_account_blocker: Option<ExplicitAccountBlocker>,
+    pub ordinary_account_limit: Option<OrdinaryAccountLimit>,
     pub is_team: bool,
     pub is_free: bool,
     pub last_used: i64,
@@ -189,33 +357,24 @@ impl Candidate {
         last_used: i64,
         now: i64,
     ) -> Self {
-        let force_exhausted = u.account_limited;
         Self {
             alias,
-            used_5h: if force_exhausted {
-                100.0
-            } else {
-                u.primary
-                    .as_ref()
-                    .and_then(|w| w.used_percent)
-                    .unwrap_or(0.0)
-            },
-            resets_at_5h: (!force_exhausted)
-                .then(|| u.primary.as_ref().and_then(|w| w.resets_at))
-                .flatten(),
-            used_7d: if force_exhausted {
-                100.0
-            } else {
-                u.secondary
-                    .as_ref()
-                    .and_then(|w| w.used_percent)
-                    .unwrap_or(0.0)
-            },
-            resets_at_7d: (!force_exhausted)
-                .then(|| u.secondary.as_ref().and_then(|w| w.resets_at))
-                .flatten(),
-            has_5h_data: u.primary.is_some() || force_exhausted,
-            has_7d_data: u.secondary.is_some() || force_exhausted,
+            used_5h: u
+                .primary
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .unwrap_or(0.0),
+            resets_at_5h: u.primary.as_ref().and_then(|w| w.resets_at),
+            used_7d: u
+                .secondary
+                .as_ref()
+                .and_then(|w| w.used_percent)
+                .unwrap_or(0.0),
+            resets_at_7d: u.secondary.as_ref().and_then(|w| w.resets_at),
+            has_5h_data: u.primary.is_some(),
+            has_7d_data: u.secondary.is_some(),
+            explicit_account_blocker: explicit_account_blocker(u),
+            ordinary_account_limit: ordinary_account_limit(u),
             is_team,
             is_free,
             last_used,
@@ -242,6 +401,13 @@ impl Candidate {
         } else {
             self.used_7d
         }
+    }
+
+    pub fn account_limit_active(&self) -> bool {
+        self.explicit_account_blocker.is_some()
+            || self
+                .ordinary_account_limit
+                .is_some_and(|limit| limit.is_active(self.now))
     }
 }
 
@@ -287,6 +453,7 @@ impl Refresh {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct RefreshedTokens {
     pub id_token: String,
     pub access_token: String,
@@ -325,6 +492,34 @@ impl std::fmt::Display for TerminalAuthError {
 }
 
 impl std::error::Error for TerminalAuthError {}
+
+/// A refresh request whose server-side token-rotation result cannot be proven.
+/// Replaying the presented single-use token could consume or reject it again,
+/// so retry loops must stop immediately.
+#[derive(Debug)]
+pub(crate) struct RefreshOutcomeUnknown {
+    cause: anyhow::Error,
+}
+
+impl RefreshOutcomeUnknown {
+    pub(crate) fn new(cause: anyhow::Error) -> Self {
+        Self { cause }
+    }
+}
+
+impl std::fmt::Display for RefreshOutcomeUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "token refresh outcome is unknown after the request may have reached the server; do not retry this credential before inspecting the profile",
+        )
+    }
+}
+
+impl std::error::Error for RefreshOutcomeUnknown {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
 
 /// Outcome of validating an auth.json on the `import` path.
 ///
@@ -393,6 +588,49 @@ impl UsageError {
                  commit or live Codex auth synchronization could not be confirmed safely: \
                  {cause:#}. The refresh was stopped without spending another token. Fix the \
                  reported local path problem, then inspect the profile before retrying."
+            ),
+        }
+    }
+
+    /// A rotation completed server-side, but installing its response would
+    /// have rebound the profile to a different account or violated managed
+    /// account policy. The response is retained as a private recovery file
+    /// rather than overwriting either saved or live credentials.
+    pub fn refreshed_credentials_quarantined(
+        alias: &str,
+        path: &std::path::Path,
+        cause: &anyhow::Error,
+    ) -> Self {
+        Self {
+            summary: "refreshed credentials quarantined".to_string(),
+            detail: format!(
+                "[{alias}] token refresh succeeded, but its credentials were not installed: \
+                 {cause:#}. The exact rotated credentials were preserved privately at {}. \
+                 The existing profile and live Codex auth were left unchanged; inspect the \
+                 account mismatch before recovering or retrying.",
+                path.display()
+            ),
+        }
+    }
+
+    /// The endpoint returned a non-empty successor refresh token together with
+    /// an invalid token set, and even the private recovery copy could not be
+    /// committed durably. The old profile remains visible but its presented
+    /// refresh token may already be dead server-side.
+    pub fn invalid_refresh_recovery_failed(alias: &str, cause: &anyhow::Error) -> Self {
+        Self {
+            summary: "rotated credential recovery failed".to_string(),
+            detail: format!(
+                "[{alias}] token refresh issued a non-empty successor refresh token, but the response was invalid and its private recovery copy could not be committed: {cause:#}. The existing profile and live Codex auth were left unchanged, but the previous refresh token may already be invalid; do not retry it and sign in again if the recovery artifact cannot be located."
+            ),
+        }
+    }
+
+    pub fn refresh_outcome_unknown(alias: &str, cause: &anyhow::Error) -> Self {
+        Self {
+            summary: "token refresh outcome unknown".to_string(),
+            detail: format!(
+                "[{alias}] {cause:#}. The refresh request may have reached the server, so whether its single-use token was consumed or rotated cannot be confirmed. The existing profile and live Codex auth were left unchanged; do not retry this credential before inspecting it, and sign in again if necessary."
             ),
         }
     }

@@ -1524,7 +1524,7 @@ fn unix_installer_preserves_daemon_state_for_every_direct_upgrade() {
 fn unix_installer_lifecycle_holder_covers_fresh_publish_and_exit_cleanup_order() {
     let script = repo_file("scripts/install.sh");
     let cli = repo_file("src/cli.rs");
-    let main = repo_file("src/main.rs");
+    let main = repo_file("src/app.rs");
     let daemon = repo_file("src/daemon/mod.rs");
     let service = repo_file("src/daemon/service.rs");
     assert!(cli.contains("name = \"__hold-daemon-update-boundary\""));
@@ -4468,7 +4468,7 @@ fn daemon_service_installations_stage_validate_and_rollback() {
 
 #[test]
 fn installer_only_daemon_checks_run_before_normal_initialization() {
-    let main = repo_file("src/main.rs");
+    let main = repo_file("src/app.rs");
     let cli = repo_file("src/cli.rs");
     assert_before(
         &main,
@@ -4589,17 +4589,18 @@ fn self_update_daemon_restart_holds_both_lifecycle_authorities_through_commit() 
         "self.input.take();",
         "child.wait()",
         "pub(crate) fn stop_replacement_for_rollback",
-        "isolate_lifecycle_holder_from_terminal_interrupt(&mut command)",
+        "isolate_background_child_from_terminal_interrupt(&mut command)",
     ] {
         assert!(
             client.contains(required),
             "the async self-update client must retain an independent phase-aware holder: `{required}`"
         );
     }
-    assert!(daemon.contains("command.process_group(0)"));
+    assert!(daemon.contains("libc::setsid()"));
     assert!(daemon.contains("CREATE_NEW_PROCESS_GROUP"));
     assert!(daemon.contains("CREATE_NO_WINDOW"));
-    assert!(daemon.contains("lifecycle_holder_survives_parent_process_group_interrupt"));
+    assert!(daemon.contains("detached_background_child_survives_parent_process_group_interrupt"));
+    assert!(daemon.contains("detached_background_child_survives_parent_session_hangup"));
     assert_before(
         &command,
         "SelfUpdateDaemonBoundaryClient::start()",
@@ -4662,6 +4663,14 @@ fn self_update_daemon_restart_holds_both_lifecycle_authorities_through_commit() 
         "pidfile::running_pid_checked()?",
     );
     assert!(detached_start.contains("start_detached_executable_locked("));
+    let detached_spawn = daemon
+        .split("fn start_detached_executable_locked(")
+        .nth(1)
+        .and_then(|tail| tail.split("fn start_windows_installer_owned").next())
+        .expect("detached daemon spawn implementation");
+    assert!(
+        detached_spawn.contains("isolate_background_child_from_terminal_interrupt(&mut command)")
+    );
 
     let normal_stop = daemon
         .split("fn stop(expected_service_executable:")
@@ -4715,6 +4724,133 @@ fn windows_self_update_recovery_names_are_random_and_transaction_owned() {
     );
     assert!(
         windows_replace.contains("replace_file_windows(executable, &staged, &displaced_previous)")
+    );
+}
+
+#[test]
+fn windows_self_update_cleanup_is_attested_journaled_and_retryable() {
+    let update = repo_file("src/update.rs");
+    let cleanup = repo_file("src/update/cleanup_worker.rs");
+    let daemon = repo_file("src/daemon/mod.rs");
+    let cli = repo_file("src/cli.rs");
+    let app = repo_file("src/app.rs");
+    let command = repo_file("src/commands/update.rs");
+
+    for field in [
+        "parent_pid: u32",
+        "displaced: std::path::PathBuf",
+        "expected_token: String",
+        "expected_executable_token: String",
+        "journal: std::path::PathBuf",
+        "expected_journal_token: String",
+        "ready_nonce: String",
+    ] {
+        assert!(
+            cli.contains(field),
+            "hidden cleanup command lost exact field {field}"
+        );
+    }
+    assert!(cli.contains("name = \"__cleanup-self-update\""));
+    assert_before(
+        &app,
+        "if let Some(Commands::CleanupSelfUpdate",
+        "let use_json = cli.json || cli.json_pretty;",
+    );
+
+    assert!(cleanup.contains("const JOURNAL_SUFFIX: &str = \".self-update-cleanup-journal\""));
+    assert!(cleanup.contains("backup_file_name: Vec<u16>"));
+    assert!(cleanup.contains("backup_token: String"));
+    assert!(
+        !cleanup.contains("CODEX_SWITCH_HOME") && !cleanup.contains("crate::auth::app_home"),
+        "cleanup authority must stay at the stable executable transaction boundary"
+    );
+    assert_before(
+        &cleanup,
+        "let (journal_path, journal_token) = create_journal(",
+        "let mut command = std::process::Command::new(public_executable);",
+    );
+    assert_before(
+        &cleanup,
+        "let parent = open_parent(parent_pid)?;",
+        "println!(\"{READY_PREFIX} {ready_nonce}\");",
+    );
+    assert!(cleanup.contains("OpenProcess(PROCESS_SYNCHRONIZE"));
+    assert!(cleanup.contains("WaitForSingleObject(parent.0, INFINITE)"));
+    assert!(cleanup.contains("complete_after_revalidation(&cleanup)"));
+    assert!(cleanup.contains("super::acquire_update_lease(public_executable)"));
+    assert!(cleanup.contains("super::recover_pending(&public)"));
+    assert!(cleanup.contains("remove_exact(&cleanup.backup, &cleanup.backup_token)"));
+    assert!(cleanup.contains("journaled backup executable changed before exact removal"));
+    assert!(cleanup.contains("an_undeletable_journal_remains_exactly_retryable"));
+    assert!(
+        cleanup.contains("malformed_journal_is_preserved_without_deleting_the_displaced_image")
+    );
+
+    let verified_spawn = daemon
+        .split("pub(crate) fn prepare_verified_background_spawn(")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("pub(crate) fn validate_background_ready_nonce")
+                .next()
+        })
+        .expect("verified background spawn primitive");
+    assert!(verified_spawn.contains(".share_mode(FILE_SHARE_READ)"));
+    assert!(!verified_spawn.contains("FILE_SHARE_WRITE"));
+    assert!(!verified_spawn.contains("FILE_SHARE_DELETE"));
+    assert!(daemon.contains("--expected-executable-token"));
+    assert!(daemon.contains("--ready-nonce"));
+    assert!(daemon.contains("read_marker_with_timeout(Some(LIFECYCLE_READY_TIMEOUT))"));
+    assert!(daemon.contains("self.read_marker_with_timeout(None)"));
+    assert!(daemon.contains("BACKGROUND_MARKER_LINE_MAX_BYTES"));
+    assert!(daemon.contains("total marker output limit"));
+    assert!(daemon.contains("inherited stdout handle defeated the marker deadline"));
+
+    let commit = update
+        .split("fn commit(&mut self) -> Result<()>")
+        .nth(1)
+        .and_then(|tail| tail.split("fn rollback(&mut self)").next())
+        .expect("self-update commit boundary");
+    assert_before(
+        commit,
+        "cleanup_worker::prepare(",
+        "\"old executable backup\"",
+    );
+    assert_before(
+        commit,
+        "\"old executable backup\"",
+        "cleanup_worker::spawn(",
+    );
+    assert!(update.contains("windows_commit_cleans_a_running_old_image_after_process_exit"));
+    assert!(update.contains("WINDOWS_COMMIT_EXIT_AFTER_BACKUP_ENV"));
+    assert!(update.contains("post-backup process death lost its pre-mutation cleanup journal"));
+    assert!(update.contains("fail_after_parent_exit_once"));
+    assert!(update.contains("fs::copy(&source, &second_candidate)"));
+    assert!(update.contains("pub(crate) struct PendingSelfUpdateCleanup"));
+    assert!(app.contains("format_pending_self_update_cleanup_warning"));
+    assert!(command.contains("exact recovery must succeed before another executable publication"));
+    assert!(command.contains(
+        "Previous executable cleanup is journaled and will finish after this updater exits"
+    ));
+}
+
+#[test]
+fn daemon_state_errors_and_untrusted_status_text_remain_observable() {
+    let state = repo_file("src/daemon/state.rs");
+    let daemon = repo_file("src/daemon/mod.rs");
+
+    assert!(state.contains("pub fn read() -> anyhow::Result<Option<DaemonState>>"));
+    assert!(state.contains("error.kind() == std::io::ErrorKind::NotFound"));
+    assert!(state.contains("fn write_snapshot(state: &DaemonState) -> anyhow::Result<()>"));
+    assert!(state.contains("pub fn write(state: &mut DaemonState)"));
+    assert!(state.contains("tracing::warn!"));
+    assert!(state.contains("malformed_snapshot_is_reported_instead_of_treated_as_missing"));
+    assert!(state.contains("snapshot_write_error_is_returned_to_the_best_effort_logging_boundary"));
+
+    assert!(daemon.contains("let snapshot = if running { state::read()? } else { None };"));
+    assert!(daemon.contains("bounded_status_last_error"));
+    assert!(daemon.contains("STATUS_LAST_ERROR_MAX_CHARS"));
+    assert!(
+        daemon.contains("persisted_last_error_is_control_free_and_bounded_at_terminal_boundary")
     );
 }
 
@@ -5052,4 +5188,21 @@ fn changelog_tracks_the_calendar_version_development_cycle() {
         changelog.contains("## v20260713.2.0 — 2026-07-13"),
         "the final dev candidate must carry the stable release heading before zero-drift acceptance"
     );
+}
+
+#[test]
+fn binary_entrypoint_delegates_to_one_library_module_graph() {
+    let main = repo_file("src/main.rs");
+    let lib = repo_file("src/lib.rs");
+
+    assert!(main.contains("codex_switch::run().await"));
+    assert!(
+        !main
+            .lines()
+            .any(|line| line.trim_start().starts_with("mod ")),
+        "the binary must not compile a second copy of the application modules"
+    );
+    assert!(lib.contains("mod app;"));
+    assert!(lib.contains("mod commands;"));
+    assert!(lib.contains("pub use app::run;"));
 }

@@ -399,20 +399,25 @@ async fn check_and_switch() -> Result<PollOutcome> {
             best_alias,
             best_score,
         );
-        if !profile::switch_profile_if_current(&current, &best_alias)? {
+        let Some(switch_outcome) = profile::switch_profile_if_current(&current, &best_alias)?
+        else {
             tracing::info!(
                 "Skipping stale daemon switch '{}' -> '{}': the active profile changed during the poll",
                 current,
                 best_alias,
             );
             return Ok(PollOutcome::NoAction);
+        };
+        if let Some(error) = switch_outcome.selection_history_warning() {
+            tracing::warn!(
+                alias = best_alias,
+                "profile switched but selection history was not recorded: {error:#}"
+            );
         }
-        cache::set_last_used(&best_alias);
 
         if cfg.daemon.notify {
             super::notify::send_notification(&format!(
-                "Switched to '{}' (score: {:.0})",
-                best_alias, best_score
+                "Switched to '{best_alias}' (score: {best_score:.0})"
             ));
         }
         return Ok(PollOutcome::Switched {

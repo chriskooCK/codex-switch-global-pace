@@ -29,13 +29,12 @@ pub(crate) async fn use_cmd(alias: Option<&str>, json: bool, consume_card: bool)
     match alias {
         Some(a) => {
             profile::cmd_use(a, !json && std::io::stdin().is_terminal())?;
-            cache::set_last_used(a);
             if json {
                 print_json(&output::JsonOk {
                     ok: true,
                     alias: a.to_string(),
                     action: "switched".into(),
-                });
+                })?;
             }
         }
         None => best_cmd(json, consume_card).await?,
@@ -57,7 +56,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
             print_json(&output::JsonUsageResult {
                 profiles: vec![],
                 global_weekly: global_weekly_to_json(&summary),
-            });
+            })?;
         } else {
             println!("{}", color::dim("(no saved profiles)"));
         }
@@ -116,12 +115,10 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
         .collect();
     for (idx, row) in rows.iter().enumerate() {
         let needs_usage = row.usage_result.is_none();
-        let needs_workspace = force
-            || row
-                .info
-                .account_id
-                .as_deref()
-                .is_some_and(|id| !cache::workspace_name_is_known(id));
+        let needs_workspace = match row.info.account_id.as_deref() {
+            Some(id) => force || !cache::workspace_name_is_known(id)?,
+            None => false,
+        };
         if !needs_usage && !needs_workspace {
             continue;
         }
@@ -187,7 +184,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
                 if let Some(usage_result) = usage_result {
                     rows[idx].usage_result = Some(usage_result);
                 }
-                cache::apply_workspace_name(&mut rows[idx].info);
+                cache::apply_workspace_name(&mut rows[idx].info)?;
             }
             NamedTaskOutcome::Failed { alias, detail } => {
                 worker_failures.push((alias, detail));
@@ -281,7 +278,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
         print_json(&output::JsonUsageResult {
             profiles: json_items,
             global_weekly: global_weekly_to_json(&global_weekly),
-        });
+        })?;
     }
 
     // Opportunistically refresh tokens about to expire (background, bounded)
@@ -293,13 +290,32 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
 // ── rename ───────────────────────────────────────────────
 
 pub(crate) fn rename_cmd(old: &str, new: &str, json: bool) -> Result<()> {
-    profile::rename_profile(old, new)?;
+    let outcome = profile::rename_profile(old, new)?;
+    let durability_warning = outcome
+        .durability_warning()
+        .map(|warning| format!("{warning:#}"));
     if json {
-        print_json(&output::JsonOk {
-            ok: true,
-            alias: new.to_string(),
-            action: "renamed".into(),
-        });
+        if let Some(warning) = durability_warning {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "alias": new,
+                "action": "renamed",
+                "durability_warning": warning,
+            }))?;
+        } else {
+            print_json(&output::JsonOk {
+                ok: true,
+                alias: new.to_string(),
+                action: "renamed".into(),
+            })?;
+        }
+    } else {
+        user_println(&format!("Renamed profile: {old} -> {new}"));
+        if let Some(warning) = durability_warning {
+            user_println(&color::warn(&format!(
+                "Warning: rename committed, but durability could not be confirmed: {warning}"
+            )));
+        }
     }
     Ok(())
 }
@@ -326,13 +342,32 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
             return Ok(());
         }
     }
-    profile::cmd_delete(alias)?;
+    let outcome = profile::cmd_delete(alias)?;
+    let durability_warning = outcome
+        .durability_warning()
+        .map(|warning| format!("{warning:#}"));
     if json {
-        print_json(&output::JsonOk {
-            ok: true,
-            alias: alias.to_string(),
-            action: "deleted".into(),
-        });
+        if let Some(warning) = durability_warning {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "alias": alias,
+                "action": "deleted",
+                "durability_warning": warning,
+            }))?;
+        } else {
+            print_json(&output::JsonOk {
+                ok: true,
+                alias: alias.to_string(),
+                action: "deleted".into(),
+            })?;
+        }
+    } else {
+        user_println(&format!("Deleted profile: {alias} (recoverable)"));
+        if let Some(warning) = durability_warning {
+            user_println(&color::warn(&format!(
+                "Warning: deletion committed, but durability could not be confirmed: {warning}"
+            )));
+        }
     }
     Ok(())
 }
@@ -370,8 +405,11 @@ fn score_profile_candidates(
     scored.sort_by(|a, b| {
         let eligible_a = usage::is_candidate_eligible(&a.0, safety_7d);
         let eligible_b = usage::is_candidate_eligible(&b.0, safety_7d);
+        let blocked_a = a.0.explicit_account_blocker.is_some();
+        let blocked_b = b.0.explicit_account_blocker.is_some();
         eligible_b
             .cmp(&eligible_a)
+            .then(blocked_a.cmp(&blocked_b))
             .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
             .then(a.0.last_used.cmp(&b.0.last_used))
             .then(a.0.alias.cmp(&b.0.alias))
@@ -399,8 +437,6 @@ pub(crate) enum CardPolicy {
 pub(crate) struct RevivalHint {
     pub(crate) alias: String,
     pub(crate) card_count: u64,
-    pub(crate) consumed_unconfirmed: Option<&'static str>,
-    pub(crate) consumption_unknown_message: Option<String>,
 }
 
 pub(crate) struct SelectOutcome {
@@ -413,7 +449,6 @@ pub(crate) struct SelectOutcome {
 struct PendingRevival {
     target_candidate: usage::Candidate,
     target_credit: usage::ResetCredit,
-    now: i64,
     safety_7d: f64,
 }
 
@@ -425,7 +460,6 @@ enum SelectionPlan {
 enum RevivalSideEffect {
     None,
     Consumed { alias: String },
-    OutcomeUnknown { alias: String, warning: String },
 }
 
 struct RevivalExecution {
@@ -443,21 +477,25 @@ enum ResetCardActivationError {
         #[source]
         source: anyhow::Error,
     },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ResetCardRevivalError {
     #[error(
-        "{warning}; activating profile '{alias}' also failed, so verify the card before any retry and retry only the profile switch when appropriate: {source:#}"
+        "reset card for '{alias}' was consumed, but the account could not be confirmed eligible ({reason}); live auth was left unchanged and no profile was switched; do not consume another card before verifying quota"
     )]
-    OutcomeUnknown {
-        alias: String,
-        warning: String,
-        #[source]
-        source: anyhow::Error,
-    },
+    ConsumedUnconfirmed { alias: String, reason: &'static str },
+    #[error(
+        "reset-card outcome for '{alias}' is unknown: {warning}; live auth was left unchanged and no profile was switched; verify the card and quota before any retry"
+    )]
+    OutcomeUnknown { alias: String, warning: String },
 }
 
 impl RevivalSideEffect {
-    fn commit_result(self, result: Result<()>) -> Result<()> {
-        let Err(source) = result else {
-            return Ok(());
+    fn commit_result<T>(self, result: Result<T>) -> Result<T> {
+        let source = match result {
+            Ok(value) => return Ok(value),
+            Err(source) => source,
         };
         match self {
             Self::None => Err(source),
@@ -467,27 +505,11 @@ impl RevivalSideEffect {
                     source,
                 }))
             }
-            Self::OutcomeUnknown { alias, warning } => Err(anyhow::Error::new(
-                ResetCardActivationError::OutcomeUnknown {
-                    alias,
-                    warning,
-                    source,
-                },
-            )),
         }
     }
 }
 
 pub(crate) fn revival_hint_message(hint: &RevivalHint) -> String {
-    if let Some(message) = &hint.consumption_unknown_message {
-        return message.clone();
-    }
-    if let Some(summary) = hint.consumed_unconfirmed {
-        return format!(
-            "{}: card was consumed, but account could not be confirmed revived ({summary})",
-            hint.alias
-        );
-    }
     format!(
         "{} holds {} reset card(s); rerun with --consume-card to revive",
         hint.alias, hint.card_count
@@ -687,6 +709,7 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
     // Pool exhausted: see if a card-holding account can be revived.
     let revival_candidates: Vec<RevivalCandidate> = scored
         .iter()
+        .filter(|(_, usage, _)| usage::explicit_account_blocker(usage).is_none())
         .map(|(c, u, s)| RevivalCandidate {
             alias: &c.alias,
             eligible: usage::is_candidate_eligible(c, safety_7d),
@@ -697,6 +720,11 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
     let revival_target = pick_revival_target(&revival_candidates);
 
     let Some(target_alias) = revival_target else {
+        if let Some(blocker) = usage::explicit_account_blocker(&top_usage) {
+            anyhow::bail!(
+                "all selectable profiles are blocked by account/workspace restrictions ({blocker}); no reset card was requested and no profile was switched"
+            );
+        }
         return Ok(SelectionPlan::Ready(SelectOutcome {
             alias: top_candidate.alias,
             usage: top_usage,
@@ -740,15 +768,12 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
         return Ok(SelectionPlan::Ready(top_outcome(Some(RevivalHint {
             alias: target_alias,
             card_count,
-            consumed_unconfirmed: None,
-            consumption_unknown_message: None,
         }))));
     }
 
     Ok(SelectionPlan::Revive(PendingRevival {
         target_candidate,
         target_credit,
-        now,
         safety_7d,
     }))
 }
@@ -790,7 +815,6 @@ async fn execute_revival(
     let PendingRevival {
         target_candidate,
         target_credit,
-        now,
         safety_7d,
     } = plan;
     let target_alias = target_candidate.alias.clone();
@@ -814,9 +838,18 @@ async fn execute_revival(
     .await
     .map_err(|error| anyhow::anyhow!(error.detail))
     .context("reset-card preflight failed; no card was requested and no profile was switched")?;
-    let preflight_candidate =
-        candidate_from_revival_usage(&target_candidate, &preflight_usage, now, false);
+    let preflight_candidate = candidate_from_revival_usage(
+        &target_candidate,
+        &preflight_usage,
+        auth::now_unix_secs(),
+        false,
+    );
     let preflight_score = usage::score_unified(&preflight_candidate, safety_7d);
+    if let Some(blocker) = usage::explicit_account_blocker(&preflight_usage) {
+        anyhow::bail!(
+            "'{target_alias}' became blocked by an account/workspace restriction ({blocker}); no reset card was requested and no profile was switched"
+        );
+    }
     if usage::is_candidate_eligible(&preflight_candidate, safety_7d) {
         return Ok(RevivalExecution {
             outcome: SelectOutcome {
@@ -849,7 +882,6 @@ async fn execute_revival(
         )
     })?;
 
-    let card_count = preflight_usage.reset_credits.len() as u64;
     match usage::consume_reset_credit_by_id_leased(
         &target_alias,
         &target_path,
@@ -862,68 +894,53 @@ async fn execute_revival(
             if let Err(err) = cache::invalidate(&target_alias) {
                 tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
             }
-            let (usage_after_attempt, score_after_attempt, failure_summary) =
-                match usage::fetch_usage_retried_with_existing_lease(
-                    &target_alias,
-                    &target_path,
-                    usage::Refresh::Forced,
-                    authorized.lease(),
-                )
-                .await
-                {
-                    Ok(revived_usage) => {
-                        let revived_candidate = candidate_from_revival_usage(
-                            &target_candidate,
-                            &revived_usage,
-                            now,
-                            true,
-                        );
-                        let score = usage::score_unified(&revived_candidate, safety_7d);
-                        if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
-                            return Ok(RevivalExecution {
-                                outcome: SelectOutcome {
-                                    alias: target_alias.clone(),
-                                    usage: revived_usage,
-                                    score,
-                                    revival_hint: None,
-                                },
-                                side_effect: RevivalSideEffect::Consumed {
-                                    alias: target_alias,
-                                },
-                            });
-                        }
-                        tracing::warn!(
-                            "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
-                        );
-                        (
-                            revived_usage,
-                            score,
-                            "quota remained exhausted after refresh",
-                        )
+            let failure_summary = match usage::fetch_usage_retried_with_existing_lease(
+                &target_alias,
+                &target_path,
+                usage::Refresh::Forced,
+                authorized.lease(),
+            )
+            .await
+            {
+                Ok(revived_usage) => {
+                    let revived_candidate = candidate_from_revival_usage(
+                        &target_candidate,
+                        &revived_usage,
+                        auth::now_unix_secs(),
+                        true,
+                    );
+                    let score = usage::score_unified(&revived_candidate, safety_7d);
+                    if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
+                        return Ok(RevivalExecution {
+                            outcome: SelectOutcome {
+                                alias: target_alias.clone(),
+                                usage: revived_usage,
+                                score,
+                                revival_hint: None,
+                            },
+                            side_effect: RevivalSideEffect::Consumed {
+                                alias: target_alias,
+                            },
+                        });
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
-                        );
-                        (preflight_usage, preflight_score, "usage refresh failed")
-                    }
-                };
-            Ok(RevivalExecution {
-                outcome: SelectOutcome {
-                    alias: target_alias.clone(),
-                    usage: usage_after_attempt,
-                    score: score_after_attempt,
-                    revival_hint: Some(RevivalHint {
-                        alias: target_candidate.alias,
-                        card_count,
-                        consumed_unconfirmed: Some(failure_summary),
-                        consumption_unknown_message: None,
-                    }),
-                },
-                side_effect: RevivalSideEffect::Consumed {
+                    tracing::warn!(
+                        "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
+                    );
+                    "quota remained exhausted after refresh"
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
+                    );
+                    "usage refresh failed"
+                }
+            };
+            Err(anyhow::Error::new(
+                ResetCardRevivalError::ConsumedUnconfirmed {
                     alias: target_alias,
+                    reason: failure_summary,
                 },
-            })
+            ))
         }
         Err(e) => {
             tracing::warn!("[{target_alias}] failed to consume reset card: {e}");
@@ -932,23 +949,10 @@ async fn execute_revival(
                     tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
                 }
                 let message = e.user_facing_unknown_message(&target_alias);
-                Ok(RevivalExecution {
-                    outcome: SelectOutcome {
-                        alias: target_alias.clone(),
-                        usage: preflight_usage,
-                        score: preflight_score,
-                        revival_hint: Some(RevivalHint {
-                            alias: target_candidate.alias,
-                            card_count,
-                            consumed_unconfirmed: None,
-                            consumption_unknown_message: Some(message.clone()),
-                        }),
-                    },
-                    side_effect: RevivalSideEffect::OutcomeUnknown {
-                        alias: target_alias,
-                        warning: message,
-                    },
-                })
+                Err(anyhow::Error::new(ResetCardRevivalError::OutcomeUnknown {
+                    alias: target_alias,
+                    warning: message,
+                }))
             } else {
                 debug_assert!(e.definitely_not_consumed());
                 Err(anyhow::Error::new(e).context(format!(
@@ -971,10 +975,10 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
     };
 
     let allow_prompt = !json && std::io::stdin().is_terminal();
-    let outcome = match plan_best_profile(json, card_policy).await? {
+    let (outcome, switch_outcome) = match plan_best_profile(json, card_policy).await? {
         SelectionPlan::Ready(outcome) => {
-            profile::switch_profile_with_prompt(&outcome.alias, allow_prompt)?;
-            outcome
+            let switch_outcome = profile::switch_profile_with_prompt(&outcome.alias, allow_prompt)?;
+            (outcome, switch_outcome)
         }
         SelectionPlan::Revive(plan) => {
             // The overwrite authorization must precede card redemption. In
@@ -988,8 +992,9 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
                 outcome,
                 side_effect,
             } = execute_revival(plan, &authorized).await?;
-            side_effect.commit_result(profile::commit_authorized_profile_switch(authorized))?;
-            outcome
+            let switch_outcome =
+                side_effect.commit_result(profile::commit_authorized_profile_switch(authorized))?;
+            (outcome, switch_outcome)
         }
     };
     let SelectOutcome {
@@ -999,7 +1004,14 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
         revival_hint,
     } = outcome;
 
-    cache::set_last_used(&best_alias);
+    if let Some(error) = switch_outcome.selection_history_warning() {
+        eprintln!(
+            "{}",
+            color::warn(&format!(
+                "Warning: switched to '{best_alias}', but its selection history could not be recorded: {error:#}"
+            ))
+        );
+    }
 
     let path = profile::profile_auth_path(&best_alias)?;
     let info = auth::read_account_info_checked(&path)
@@ -1013,7 +1025,7 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
             score: best_score,
             mode: "unified".to_string(),
             hint: revival_hint.as_ref().map(revival_hint_message),
-        });
+        })?;
     } else {
         println!("{}", color::success(&format!("Switched to: {best_alias}")));
         print_usage_line(&best_usage);
@@ -1240,8 +1252,6 @@ mod revival_target_tests {
         let hint = RevivalHint {
             alias: "acct-b".to_string(),
             card_count: 3,
-            consumed_unconfirmed: None,
-            consumption_unknown_message: None,
         };
         let msg = revival_hint_message(&hint);
         assert!(msg.contains("acct-b"));
@@ -1276,11 +1286,40 @@ mod revival_target_tests {
     }
 
     #[test]
+    fn revival_recheck_uses_response_time_across_a_reset_boundary() {
+        let usage = usage::UsageInfo {
+            primary: Some(usage::WindowUsage {
+                used_percent: Some(100.0),
+                resets_at: Some(1_001),
+                window_minutes: Some(300),
+            }),
+            secondary: Some(usage::WindowUsage {
+                used_percent: Some(10.0),
+                resets_at: Some(2_000),
+                window_minutes: Some(10_080),
+            }),
+            account_limited: true,
+            ..usage::UsageInfo::default()
+        };
+        let base =
+            usage::Candidate::from_usage("boundary".to_string(), &usage, false, false, 0, 1_000);
+        assert!(!usage::is_candidate_eligible(&base, 20.0));
+
+        let rechecked = candidate_from_revival_usage(&base, &usage, 1_002, true);
+
+        assert_eq!(rechecked.now, 1_002);
+        assert!(
+            usage::is_candidate_eligible(&rechecked, 20.0),
+            "a reset crossed while the request was in flight must be evaluated at response time"
+        );
+    }
+
+    #[test]
     fn post_card_activation_errors_preserve_side_effect_status() {
         let consumed = RevivalSideEffect::Consumed {
             alias: "acct-a".to_string(),
         }
-        .commit_result(Err(anyhow::anyhow!("live auth changed")))
+        .commit_result::<()>(Err(anyhow::anyhow!("live auth changed")))
         .unwrap_err();
         let consumed = format!("{consumed:#}");
         assert!(consumed.contains("was consumed"), "{consumed}");
@@ -1290,22 +1329,20 @@ mod revival_target_tests {
             "{consumed}"
         );
 
-        let unknown = RevivalSideEffect::OutcomeUnknown {
+        let unknown = anyhow::Error::new(ResetCardRevivalError::OutcomeUnknown {
             alias: "acct-b".to_string(),
             warning: "consumption may have occurred; verify before retry".to_string(),
-        }
-        .commit_result(Err(anyhow::anyhow!("live auth changed")))
-        .unwrap_err();
+        });
         let unknown = format!("{unknown:#}");
         assert!(
             unknown.contains("consumption may have occurred"),
             "{unknown}"
         );
-        assert!(unknown.contains("verify the card"), "{unknown}");
         assert!(
-            unknown.contains("retry only the profile switch"),
+            unknown.contains("live auth was left unchanged"),
             "{unknown}"
         );
+        assert!(unknown.contains("no profile was switched"), "{unknown}");
     }
 
     #[tokio::test]

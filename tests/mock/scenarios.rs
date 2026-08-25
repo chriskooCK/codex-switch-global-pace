@@ -90,20 +90,21 @@ pub fn seven_day_crisis() -> Vec<(String, Vec<Value>)> {
     ]
 }
 
-/// 3 accounts 100% used, reset in 30min/2h/4h.
+/// 3 accounts 100% used, deliberately ordered by latest-to-soonest reset and
+/// named so alphabetical order also opposes the desired reset-time ranking.
 pub fn all_exhausted() -> Vec<(String, Vec<Value>)> {
     vec![
         entry(
-            "tok_exhausted_a",
-            vec![base_response("plus", 100.0, 1800, 80.0, 604800)],
+            "tok_a_late",
+            vec![base_response("plus", 100.0, 14400, 60.0, 604800)],
         ),
         entry(
-            "tok_exhausted_b",
+            "tok_m_middle",
             vec![base_response("plus", 100.0, 7200, 70.0, 604800)],
         ),
         entry(
-            "tok_exhausted_c",
-            vec![base_response("plus", 100.0, 14400, 60.0, 604800)],
+            "tok_z_soon",
+            vec![base_response("plus", 100.0, 1800, 80.0, 604800)],
         ),
     ]
 }

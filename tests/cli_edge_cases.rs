@@ -180,7 +180,7 @@ fn run_with_timeout(home: &Path, args: &[&str], timeout: Duration) -> Output {
         if start.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("command timed out: {:?}", args);
+            panic!("command timed out: {args:?}");
         }
 
         thread::sleep(Duration::from_millis(20));

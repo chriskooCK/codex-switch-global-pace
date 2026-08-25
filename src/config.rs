@@ -92,7 +92,7 @@ impl AppConfig {
         if log_level.is_empty() {
             anyhow::bail!("config.daemon.log_level cannot be empty");
         }
-        tracing_subscriber::EnvFilter::try_new(format!("codex_switch_global_pace={log_level}"))
+        tracing_subscriber::EnvFilter::try_new(crate::logging::application_filter(log_level))
             .context("config.daemon.log_level is not a valid tracing filter level")?;
         Ok(())
     }

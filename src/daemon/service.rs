@@ -434,8 +434,7 @@ fn optional_task_definition(path: &Path) -> Result<Option<Vec<u8>>> {
         (false, None) => Ok(None),
         (true, Some(definition)) => Ok(Some(definition)),
         (true, None) => anyhow::bail!(
-            "Task Scheduler reports {}, but its trusted on-disk definition is missing; ownership cannot be proven",
-            WINDOWS_TASK_NAME
+            "Task Scheduler reports {WINDOWS_TASK_NAME}, but its trusted on-disk definition is missing; ownership cannot be proven"
         ),
         (false, Some(_)) => anyhow::bail!(
             "trusted on-disk definition {} exists, but Task Scheduler does not report the task; refusing an inconsistent service state",
@@ -504,8 +503,7 @@ fn require_task_definition_snapshot(path: &Path, expected: Option<&[u8]>) -> Res
 fn query_scheduled_task_xml(action: &str) -> Result<Vec<u8>> {
     optional_scheduled_task_xml(action)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "Task Scheduler no longer reports {} while its XML was required",
-            WINDOWS_TASK_NAME
+            "Task Scheduler no longer reports {WINDOWS_TASK_NAME} while its XML was required"
         )
     })
 }
@@ -2384,6 +2382,7 @@ fn launchd_plist(exe: &str, home: &str, codex_home: &str, app_home: &str) -> Str
     let home = xml_escape(home);
     let codex_home = xml_escape(codex_home);
     let app_home = xml_escape(app_home);
+    let label = LAUNCHD_LABEL;
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -2413,12 +2412,7 @@ fn launchd_plist(exe: &str, home: &str, codex_home: &str, app_home: &str) -> Str
         <string>{app_home}</string>
     </dict>
 </dict>
-</plist>"#,
-        exe = exe,
-        home = home,
-        codex_home = codex_home,
-        app_home = app_home,
-        label = LAUNCHD_LABEL,
+</plist>"#
     )
 }
 
@@ -2971,11 +2965,7 @@ Environment={app_home}
 
 [Install]
 WantedBy=default.target
-"#,
-        exe = exe,
-        home = home,
-        codex_home = codex_home,
-        app_home = app_home,
+"#
     )
 }
 
@@ -4014,8 +4004,7 @@ fn install_task_scheduler(expected_existing_executable: Option<&Path>) -> Result
         );
     }
     user_println(&format!(
-        "Installed Windows scheduled task {}",
-        WINDOWS_TASK_NAME
+        "Installed Windows scheduled task {WINDOWS_TASK_NAME}"
     ));
     Ok(())
 }

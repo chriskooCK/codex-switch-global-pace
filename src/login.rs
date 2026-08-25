@@ -504,27 +504,41 @@ async fn exchange_code_with_redirect(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to parse token response (HTTP {status}): {e}"))?;
 
-    if let Some(err) = token_resp.error {
+    let tokens = resolve_login_token_response(token_resp, status)?;
+    info!("Token exchange succeeded");
+    Ok(tokens)
+}
+
+fn resolve_login_token_response(
+    token_resp: TokenResponse,
+    status: reqwest::StatusCode,
+) -> Result<LoginTokens> {
+    if let Some(err) = token_resp.error.as_ref() {
         let (code, detail) = err.describe(token_resp.error_description.as_deref());
         bail!("Token exchange failed (HTTP {status}): {code} -- {detail}");
     }
-
-    match (
-        token_resp.id_token,
-        token_resp.access_token,
-        token_resp.refresh_token,
-    ) {
-        (Some(id), Some(access), Some(refresh)) => {
-            info!("Token exchange succeeded");
-            Ok(LoginTokens {
-                id_token: id,
-                access_token: access,
-                refresh_token: refresh,
-                api_key: None,
-            })
-        }
-        _ => bail!("Token response missing required fields (HTTP {status})"),
+    if !status.is_success() {
+        bail!("Token exchange failed (HTTP {status})");
     }
+
+    let id_token = token_resp
+        .id_token
+        .ok_or_else(|| anyhow::anyhow!("Token response missing id_token (HTTP {status})"))?;
+    let access_token = token_resp
+        .access_token
+        .ok_or_else(|| anyhow::anyhow!("Token response missing access_token (HTTP {status})"))?;
+    let refresh_token = token_resp
+        .refresh_token
+        .ok_or_else(|| anyhow::anyhow!("Token response missing refresh_token (HTTP {status})"))?;
+    crate::auth::validate_complete_oauth_tokens(&id_token, &access_token, &refresh_token)
+        .with_context(|| format!("invalid token exchange response (HTTP {status})"))?;
+
+    Ok(LoginTokens {
+        id_token,
+        access_token,
+        refresh_token,
+        api_key: None,
+    })
 }
 
 // ── Device Code Flow (RFC 8628) ──────────────────────────
@@ -556,7 +570,7 @@ struct DeviceCodeResponse {
     device_auth_id: Option<String>,
     user_code: Option<String>,
     #[serde(default)]
-    interval: Option<String>,
+    interval: Option<serde_json::Value>,
     error: Option<serde_json::Value>,
 }
 
@@ -638,12 +652,62 @@ fn is_device_poll_retryable_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
+fn parse_device_poll_interval(interval: Option<&serde_json::Value>) -> Result<u64> {
+    let Some(interval) = interval else {
+        return Ok(DEVICE_POLL_INTERVAL_SECS);
+    };
+    let seconds = match interval {
+        serde_json::Value::String(value) => value.parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "Device code response interval must be a positive integer number of seconds"
+            )
+        })?,
+        serde_json::Value::Number(value) => value.as_u64().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Device code response interval must be a positive integer number of seconds"
+            )
+        })?,
+        _ => {
+            bail!("Device code response interval must be a positive integer number of seconds")
+        }
+    };
+    if seconds == 0 {
+        bail!("Device code response interval must be greater than zero");
+    }
+    Ok(seconds)
+}
+
+fn device_authorization_deadline(
+    now: tokio::time::Instant,
+    timeout_secs: u64,
+) -> Result<tokio::time::Instant> {
+    now.checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Device authorization timeout exceeds the platform clock range")
+        })
+}
+
+fn device_user_code_line(user_code: &str) -> String {
+    format!(
+        "  Enter code:         {}",
+        crate::safe_text::terminal_text(user_code)
+    )
+}
+
+fn device_poll_retry_line(failure_count: u32, detail: &str) -> String {
+    format!(
+        "  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {}",
+        crate::safe_text::terminal_text(detail)
+    )
+}
+
 fn device_poll_next_wake(
     now: tokio::time::Instant,
     deadline: tokio::time::Instant,
     interval_secs: u64,
 ) -> tokio::time::Instant {
-    (now + Duration::from_secs(interval_secs)).min(deadline)
+    now.checked_add(Duration::from_secs(interval_secs))
+        .map_or(deadline, |wake| wake.min(deadline))
 }
 
 /// Run Device Code Flow: request code → display to user → poll for token
@@ -687,16 +751,19 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
     let user_code = dc
         .user_code
         .ok_or_else(|| anyhow::anyhow!("No user_code in response"))?;
-    let mut interval_secs: u64 = dc
-        .interval
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEVICE_POLL_INTERVAL_SECS);
+    if device_auth_id.trim().is_empty() {
+        bail!("Device code response device_auth_id must not be empty");
+    }
+    if user_code.trim().is_empty() {
+        bail!("Device code response user_code must not be empty");
+    }
+    let mut interval_secs = parse_device_poll_interval(dc.interval.as_ref())?;
     let timeout = DEVICE_TIMEOUT_SECS;
 
     // Step 2: Display instructions
     user_println("");
     user_println(&format!("  To sign in, visit:  {DEVICE_VERIFICATION_URI}"));
-    user_println(&format!("  Enter code:         {user_code}"));
+    user_println(&device_user_code_line(&user_code));
     user_println("");
     user_println(&format!(
         "  Waiting for authorization (polling every {interval_secs}s)..."
@@ -704,7 +771,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
     let _ = std::io::stdout().flush();
 
     // Step 3: Poll for token (Ctrl+C safe)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+    let deadline = device_authorization_deadline(tokio::time::Instant::now(), timeout)?;
     let mut poll_count = 0u32;
     let mut poll_failures = DevicePollFailureTracker::default();
 
@@ -746,9 +813,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                 info!("Device poll network error (retrying): {e}");
                 let detail = format!("network error: {e}");
                 let failure_count = poll_failures.record();
-                eprintln!(
-                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
-                );
+                eprintln!("\n{}", device_poll_retry_line(failure_count, &detail));
                 continue;
             }
             Err(_) => bail!("Device authorization timed out. Please try again."),
@@ -774,9 +839,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                 info!("Device poll parse error (retrying): {e}");
                 let detail = format!("invalid response: {e}");
                 let failure_count = poll_failures.record();
-                eprintln!(
-                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
-                );
+                eprintln!("\n{}", device_poll_retry_line(failure_count, &detail));
                 continue;
             }
             Ok(Err(e)) => {
@@ -815,9 +878,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
                         bail!("Device authorization failed (HTTP {poll_status}): {detail}");
                     }
                     let failure_count = poll_failures.record();
-                    eprintln!(
-                        "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
-                    );
+                    eprintln!("\n{}", device_poll_retry_line(failure_count, &detail));
                     continue;
                 }
             }
@@ -845,9 +906,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
             Err(error) => {
                 let detail = error.to_string();
                 let failure_count = poll_failures.record();
-                eprintln!(
-                    "\n  Device polling failed ({failure_count}); retrying until the 15-minute timeout: {detail}"
-                );
+                eprintln!("\n{}", device_poll_retry_line(failure_count, &detail));
                 continue;
             }
         };
@@ -1078,6 +1137,44 @@ mod tests {
         );
     }
 
+    fn successful_token_response() -> TokenResponse {
+        TokenResponse {
+            id_token: Some("id-token".to_string()),
+            access_token: Some("access-token".to_string()),
+            refresh_token: Some("refresh-token".to_string()),
+            error: None,
+            error_description: None,
+        }
+    }
+
+    #[test]
+    fn token_exchange_rejects_token_bearing_non_success_status() {
+        let error = resolve_login_token_response(
+            successful_token_response(),
+            reqwest::StatusCode::BAD_REQUEST,
+        )
+        .expect_err("an HTTP error cannot become a successful login");
+
+        assert!(error.to_string().contains("HTTP 400"), "{error:#}");
+    }
+
+    #[test]
+    fn token_exchange_rejects_every_empty_required_token() {
+        for field in ["id_token", "access_token", "refresh_token"] {
+            let mut response = successful_token_response();
+            match field {
+                "id_token" => response.id_token = Some(" \t".to_string()),
+                "access_token" => response.access_token = Some(String::new()),
+                "refresh_token" => response.refresh_token = Some("\n".to_string()),
+                _ => unreachable!(),
+            }
+
+            let error = resolve_login_token_response(response, reqwest::StatusCode::OK)
+                .expect_err("blank OAuth fields must not reach the credential store");
+            assert!(format!("{error:#}").contains(field), "{field}: {error:#}");
+        }
+    }
+
     #[test]
     fn test_build_auth_json_persists_api_key_when_present() {
         let tokens = LoginTokens {
@@ -1260,6 +1357,64 @@ mod tests {
         let deadline = now + Duration::from_secs(3);
 
         assert_eq!(super::device_poll_next_wake(now, deadline, 30), deadline);
+    }
+
+    #[test]
+    fn device_poll_interval_accepts_protocol_integer_shapes_and_default() {
+        assert_eq!(parse_device_poll_interval(None).unwrap(), 5);
+        assert_eq!(
+            parse_device_poll_interval(Some(&serde_json::json!(7))).unwrap(),
+            7
+        );
+        assert_eq!(
+            parse_device_poll_interval(Some(&serde_json::json!("9"))).unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn device_poll_interval_rejects_zero_overflow_and_malformed_values() {
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!("0"),
+            serde_json::json!("18446744073709551616"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("five"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                parse_device_poll_interval(Some(&value)).is_err(),
+                "malformed interval was accepted: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_user_code_display_removes_terminal_controls() {
+        let line = device_user_code_line("AB\u{1b}]52;c;clipboard\u{7}\nCD");
+
+        assert!(line.starts_with("  Enter code:"));
+        assert!(line.contains("AB]52;c;clipboardCD"));
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn device_poll_retry_display_removes_server_terminal_controls() {
+        let line = device_poll_retry_line(3, "wait\u{1b}]52;c;clipboard\u{7}\nagain");
+
+        assert!(line.contains("failed (3)"));
+        assert!(line.contains("wait]52;c;clipboardagain"));
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+
+    #[test]
+    fn device_poll_deadline_arithmetic_never_overflows_or_panics() {
+        let now = tokio::time::Instant::now();
+        assert!(device_authorization_deadline(now, u64::MAX).is_err());
+
+        let deadline = now + Duration::from_secs(1);
+        assert_eq!(device_poll_next_wake(now, deadline, u64::MAX), deadline);
     }
 
     #[test]
