@@ -48,6 +48,16 @@ fn unix_installer_os() -> &'static str {
     }
 }
 
+#[cfg(unix)]
+fn unix_installer_test_command() -> std::process::Command {
+    let helper = env!("CARGO_BIN_EXE_codex-switch-global-pace");
+    let mut command = std::process::Command::new("bash");
+    command
+        .env("CANDIDATE_BIN", helper)
+        .env("REAL_INSTALLER_HELPER", helper);
+    command
+}
+
 fn markdown_links(text: &str) -> Vec<&str> {
     let mut links = Vec::new();
     let mut remaining = text;
@@ -1678,7 +1688,7 @@ fn unix_installer_accepts_only_the_candidate_exact_state_tuple() {
     let parser = script
         .split("read_checked_daemon_status() {")
         .nth(1)
-        .and_then(|section| section.split("stop_and_confirm_daemon_absent() {").next())
+        .and_then(|section| section.split("verify_candidate_version() {").next())
         .expect("Unix installer exact daemon-state parser");
     assert!(parser.contains("\"$CANDIDATE_BIN\" daemon status --installer-state 8>&- 9>&- 2>&1"));
     for exact in [
@@ -2046,7 +2056,6 @@ cat >/dev/null
 #[test]
 fn unix_uninstall_keeps_its_lock_holder_alive_through_daemon_and_binary_removal() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let home = tempfile::tempdir().unwrap();
@@ -2132,14 +2141,10 @@ esac
         unix_uninstall_harness(&script)
     );
 
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
-        .env(
-            "REAL_INSTALLER_HELPER",
-            env!("CARGO_BIN_EXE_codex-switch-global-pace"),
-        )
         .env("UNINSTALL_TARGET", &binary)
         .env("UPDATE_LOCK_HELD", &held)
         .env("LIFECYCLE_HELD", home.path().join("lifecycle-held"))
@@ -2171,7 +2176,6 @@ esac
 #[test]
 fn unix_uninstall_restores_binary_and_path_when_service_commit_fails() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let home = tempfile::tempdir().unwrap();
@@ -2244,14 +2248,10 @@ esac
         "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
-        .env(
-            "REAL_INSTALLER_HELPER",
-            env!("CARGO_BIN_EXE_codex-switch-global-pace"),
-        )
         .env("UNINSTALL_TARGET", &binary)
         .env("SERVICE_ATTEMPTED", &attempted)
         .env("TEST_OS", unix_installer_os())
@@ -2511,7 +2511,6 @@ fn unix_uninstall_preserves_a_stale_path_block_without_a_lock_holder_binary() {
 #[test]
 fn unix_release_candidate_cleans_stale_marker_and_path_when_the_lock_parent_exists() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let home = tempfile::tempdir().unwrap();
@@ -2541,15 +2540,42 @@ case "$1" in
     printf 'codex-switch-global-pace update lock ready\n'
     cat >/dev/null
     ;;
-  daemon)
-    if [ "$2" = status ]; then
-      [ "$3" = --installer-state ] || exit 63
-      printf 'running=false service_installed=false\n'
-    else
-      [ "$2" = uninstall ]
-    fi
+  __hold-daemon-update-boundary)
+    [ "$2" = --initial-executable ] || exit 60
+    [ "$4" = --replacement-executable ] || exit 61
+    [ "$3" = "$CANDIDATE_EXPECTED_TARGET" ] || exit 62
+    [ "$5" = "$CANDIDATE_EXPECTED_TARGET" ] || exit 63
+    printf 'codex-switch-global-pace daemon update boundary ready running=false service_installed=false\n'
+    phase=stopped
+    while IFS= read -r command; do
+      case "$phase:$command" in
+        stopped:uninstall)
+          phase=uninstall
+          printf 'codex-switch-global-pace daemon update boundary uninstall state ready\n'
+          ;;
+        uninstall:finish)
+          phase=confirmed
+          printf 'codex-switch-global-pace daemon update boundary final state confirmed\n'
+          ;;
+        confirmed:release)
+          printf 'codex-switch-global-pace daemon update boundary lifecycle authority released\n'
+          exit 0
+          ;;
+        *) exit 64 ;;
+      esac
+    done
+    exit 65
     ;;
-  *) exit 64 ;;
+  __installer-file-op)
+    exec "$REAL_INSTALLER_HELPER" "$@"
+    ;;
+  daemon)
+    [ "$2" = uninstall ] || exit 66
+    [ "$3" = --expected-executable ] || exit 67
+    [ "$4" = "$CANDIDATE_EXPECTED_TARGET" ] || exit 68
+    [ "${5:-}" = --check-owner ] || exit 69
+    ;;
+  *) exit 70 ;;
 esac
 "#,
     )
@@ -2558,10 +2584,10 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&candidate, permissions).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_DIR=\"$TEST_SYSTEM_DIR\"\nLEGACY_BIN=\"$SYSTEM_INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_MARKER=\"$SYSTEM_INSTALL_DIR/.codex-switch-global-pace-system-install-v1\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_DIR=\"$TEST_SYSTEM_DIR\"\nLEGACY_BIN=\"$SYSTEM_INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_MARKER=\"$SYSTEM_INSTALL_DIR/.codex-switch-global-pace-system-install-v1\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nexport CANDIDATE_EXPECTED_TARGET=\"$LEGACY_BIN\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
@@ -2589,7 +2615,6 @@ esac
 #[test]
 fn unix_release_candidate_stops_a_detached_daemon_without_an_installed_binary() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let home = tempfile::tempdir().unwrap();
@@ -2615,21 +2640,44 @@ case "$1 $2" in
     cat >/dev/null
     rm -f "$LOCK_HELD"
     ;;
-  "daemon status")
-    [ "$3" = --installer-state ] || exit 60
-    printf 'running=%s service_installed=false\n' "$(cat "$DAEMON_STATE")"
-    ;;
-  "daemon stop")
-    [ -f "$LOCK_HELD" ] || exit 61
+  "__hold-daemon-update-boundary --initial-executable")
+    [ "$4" = --replacement-executable ] || exit 61
+    [ "$3" = "$CANDIDATE_EXPECTED_TARGET" ] || exit 62
+    [ "$5" = "$CANDIDATE_EXPECTED_TARGET" ] || exit 63
+    [ -f "$LOCK_HELD" ] || exit 64
     printf false > "$DAEMON_STATE"
     rm -f "$DAEMON_PIDFILE"
+    printf 'codex-switch-global-pace daemon update boundary ready running=true service_installed=false\n'
+    phase=stopped
+    while IFS= read -r command; do
+      case "$phase:$command" in
+        stopped:uninstall)
+          phase=uninstall
+          printf 'codex-switch-global-pace daemon update boundary uninstall state ready\n'
+          ;;
+        uninstall:finish)
+          phase=confirmed
+          printf 'codex-switch-global-pace daemon update boundary final state confirmed\n'
+          ;;
+        confirmed:release)
+          printf 'codex-switch-global-pace daemon update boundary lifecycle authority released\n'
+          exit 0
+          ;;
+        *) exit 65 ;;
+      esac
+    done
+    exit 66
+    ;;
+  "__installer-file-op "*)
+    exec "$REAL_INSTALLER_HELPER" "$@"
     ;;
   "daemon uninstall")
-    [ -f "$LOCK_HELD" ] || exit 62
-    [ "$3" = --expected-executable ] || exit 63
-    [ "${5:-}" = --check-owner ] || exit 64
+    [ -f "$LOCK_HELD" ] || exit 67
+    [ "$3" = --expected-executable ] || exit 68
+    [ "$4" = "$CANDIDATE_EXPECTED_TARGET" ] || exit 69
+    [ "${5:-}" = --check-owner ] || exit 70
     ;;
-  *) exit 65 ;;
+  *) exit 71 ;;
 esac
 "#,
     )
@@ -2638,11 +2686,11 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&candidate, permissions).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nexport CANDIDATE_EXPECTED_TARGET=\"$INSTALL_DEST\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
     let held = home.path().join("lock-held");
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
@@ -2676,17 +2724,11 @@ esac
 
 #[cfg(unix)]
 #[test]
-fn unix_daemon_upgrade_helpers_stop_and_restore_a_running_service() {
+fn unix_daemon_upgrade_boundary_restores_a_running_service() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
-    let start = script.find("read_checked_daemon_status() {").unwrap();
-    let end = script[start..]
-        .find("verify_candidate_version() {")
-        .unwrap()
-        + start;
-    let helpers = &script[start..end];
+    let definitions = script.split("# Parse arguments").next().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("daemon-fixture");
     let state = dir.path().join("state");
@@ -2694,10 +2736,19 @@ fn unix_daemon_upgrade_helpers_stop_and_restore_a_running_service() {
     fs::write(
         &binary,
         r#"#!/bin/sh
-case "$1 $2 $3" in
-  "daemon status --installer-state") printf 'running=%s service_installed=true\n' "$(cat "$DAEMON_FIXTURE_STATE")" ;;
-  "daemon stop ") printf false > "$DAEMON_FIXTURE_STATE" ;;
-  "daemon start ") printf true > "$DAEMON_FIXTURE_STATE" ;;
+case "$1" in
+  __hold-daemon-update-boundary)
+    [ "$2" = --initial-executable ] || exit 60
+    [ "$3" = "$0" ] || exit 61
+    [ "$4" = --replacement-executable ] || exit 62
+    [ "$5" = "$0" ] || exit 63
+    printf false > "$DAEMON_FIXTURE_STATE"
+    printf 'codex-switch-global-pace daemon update boundary ready running=true service_installed=true\n'
+    IFS= read -r command
+    [ "$command" = rollback ] || exit 64
+    printf true > "$DAEMON_FIXTURE_STATE"
+    printf 'codex-switch-global-pace daemon update boundary old state restored\n'
+    ;;
   *) exit 64 ;;
 esac
 "#,
@@ -2707,9 +2758,9 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&binary, permissions).unwrap();
     let harness = format!(
-        "set -eu\n{helpers}\nCANDIDATE_BIN=\"$BIN\"\nread_checked_daemon_status\n[ \"$DAEMON_STATUS_RUNNING\" = true ]\nstop_and_confirm_daemon_absent \"$BIN\"\n[ \"$DAEMON_STATUS_RUNNING\" = false ]\n\"$BIN\" daemon start 8>&- 9>&-\nconfirm_daemon_running\nprintf 'transaction-ok\\n'\n"
+        "{definitions}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nDAEMON_BOUNDARY_PID=\nDAEMON_BOUNDARY_ACTIVE=false\nDAEMON_BOUNDARY_ROLLBACK_SAFE=false\nDAEMON_STATE_CAPTURED=false\nstart_daemon_update_boundary \"$BIN\" \"$BIN\" \"$BIN\"\n[ \"$DAEMON_WAS_RUNNING\" = true ]\n[ \"$DAEMON_SERVICE_INSTALLED\" = true ]\n[ \"$(cat \"$DAEMON_FIXTURE_STATE\")\" = false ]\nrestore_daemon_update_boundary_old_state\n[ \"$DAEMON_BOUNDARY_ACTIVE\" = false ]\n[ \"$(cat \"$DAEMON_FIXTURE_STATE\")\" = true ]\nprintf 'transaction-ok\\n'\n"
     );
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("BIN", &binary)
         .env("DAEMON_FIXTURE_STATE", &state)
@@ -3152,7 +3203,6 @@ fi
 #[test]
 fn unix_installer_preserves_multi_level_profile_symlinks() {
     use std::os::unix::fs::symlink;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let function_prefix = script
@@ -3179,7 +3229,7 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
         ),
     )
     .unwrap();
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile_link)
         .output()
@@ -3211,8 +3261,6 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
 #[cfg(unix)]
 #[test]
 fn unix_path_addition_uses_the_shared_transaction_and_rolls_back_exactly() {
-    use std::process::Command;
-
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -3232,7 +3280,7 @@ rollback_managed_path_changes
 [ ! -e "$HOME/.profile.$BINARY_NAME.install" ]
 "#
     );
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("SHELL", "/bin/bash")
@@ -3251,8 +3299,6 @@ rollback_managed_path_changes
 #[cfg(unix)]
 #[test]
 fn unix_path_rollback_preserves_a_fixed_original_when_the_profile_is_replaced() {
-    use std::process::Command;
-
     let script = repo_file("scripts/install.sh");
     let definitions = script.split("# Parse arguments").next().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -3279,7 +3325,7 @@ fi
 [ "$(cat "$HOME/.profile.$BINARY_NAME.install")" = 'export KEEP=1' ]
 "#
     );
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("SHELL", "/bin/bash")
@@ -3300,7 +3346,6 @@ fi
 #[test]
 fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let function_prefix = script
@@ -3321,9 +3366,10 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
     let fake_bin = temp.path().join("fake-bin");
     fs::create_dir(&fake_bin).unwrap();
     let fake_cp = fake_bin.join("cp");
+    let race_triggered = temp.path().join("profile-link-race-triggered");
     fs::write(
         &fake_cp,
-        "#!/bin/sh\nrm -f \"$PROFILE_LINK\"\nln -s \"$REPLACEMENT_PROFILE\" \"$PROFILE_LINK\"\nexec /bin/cp \"$@\"\n",
+        "#!/bin/sh\nset -eu\nrm -f \"$PROFILE_LINK\"\nln -s \"$REPLACEMENT_PROFILE\" \"$PROFILE_LINK\"\nprintf triggered > \"$RACE_TRIGGERED\"\nexec /bin/cp \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3336,12 +3382,13 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
         ),
     )
     .unwrap();
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile_link)
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("PROFILE_LINK", &profile_link)
         .env("REPLACEMENT_PROFILE", &replacement_profile)
+        .env("RACE_TRIGGERED", &race_triggered)
         .output()
         .unwrap();
 
@@ -3349,6 +3396,7 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
         !output.status.success(),
         "a changed profile symlink must abort the rewrite"
     );
+    assert_eq!(fs::read_to_string(race_triggered).unwrap(), "triggered");
     assert_eq!(
         fs::read_to_string(&original_profile).unwrap(),
         original_contents
@@ -3363,7 +3411,6 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
 #[test]
 fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let function_prefix = script
@@ -3386,9 +3433,10 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     let fake_bin = temp.path().join("fake-bin");
     fs::create_dir(&fake_bin).unwrap();
     let fake_cp = fake_bin.join("cp");
+    let race_triggered = temp.path().join("profile-parent-race-triggered");
     fs::write(
         &fake_cp,
-        "#!/bin/sh\nrm -f \"$CURRENT_LINK\"\nln -s \"$NEW_DIR\" \"$CURRENT_LINK\"\nexec /bin/cp \"$@\"\n",
+        "#!/bin/sh\nset -eu\nrm -f \"$CURRENT_LINK\"\nln -s \"$NEW_DIR\" \"$CURRENT_LINK\"\nprintf triggered > \"$RACE_TRIGGERED\"\nexec /bin/cp \"$@\"\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cp, fs::Permissions::from_mode(0o755)).unwrap();
@@ -3401,16 +3449,18 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     )
     .unwrap();
 
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .arg(&harness)
         .arg(current.join("profile"))
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
         .env("CURRENT_LINK", &current)
         .env("NEW_DIR", &dir_b)
+        .env("RACE_TRIGGERED", &race_triggered)
         .output()
         .unwrap();
 
     assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(race_triggered).unwrap(), "triggered");
     assert_eq!(
         fs::read_to_string(dir_a.join("profile")).unwrap(),
         contents_a
@@ -3425,7 +3475,6 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
 #[test]
 fn unix_installer_aborts_if_profile_inode_changes() {
     use std::os::unix::fs::PermissionsExt;
-    use std::process::Command;
 
     let script = repo_file("scripts/install.sh");
     let function_prefix = script
@@ -3458,7 +3507,7 @@ fn unix_installer_aborts_if_profile_inode_changes() {
     )
     .unwrap();
 
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .arg(&harness)
         .arg(&profile)
         .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
@@ -4785,7 +4834,8 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
         detached.contains("pidfile::running_generation_checked()?")
             && detached.contains("stop_daemon_generation(target)?")
             && request.contains("pidfile::request_shutdown(&target)?")
-            && request.contains("self.shutdown_request.target_is_running()"),
+            && request.contains("wait_for_requested_generation_stop_with(")
+            && request.contains("observe_requested_generation(&target)"),
         "a live daemon must carry one exact generation token from selection through shutdown delivery"
     );
     assert!(
@@ -4793,6 +4843,28 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
         "Windows graceful-stop completion must propagate a locked PID-file cleanup failure"
     );
     assert!(detached.contains("pidfile::cleanup_pidfile()?"));
+    let generation_observer = daemon
+        .split("fn observe_requested_generation(")
+        .nth(1)
+        .and_then(|tail| tail.split("impl DaemonGenerationStopRequest").next())
+        .expect("shared exact-generation observer");
+    assert!(generation_observer.contains("pidfile::running_generation_checked()?"));
+    assert!(generation_observer.contains("RequestedGenerationObservation::TargetRunning"));
+    assert!(generation_observer.contains("RequestedGenerationObservation::Settled(observed)"));
+
+    let bounded_stop = daemon
+        .split("fn wait_for_requested_generation_stop_with")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("fn wait_for_requested_generation_to_settle(")
+                .next()
+        })
+        .expect("bounded exact-generation stop settlement");
+    assert!(bounded_stop.contains("RequestedGenerationObservation::Settled(None)"));
+    assert!(bounded_stop.contains("RequestedGenerationObservation::Settled(Some(current))"));
+    assert!(bounded_stop.contains("TransientDiagnostics::default()"));
+    assert!(bounded_stop.contains("elapsed() >= DAEMON_TRANSITION_TIMEOUT"));
+
     let lifecycle_settle = daemon
         .split("fn wait_for_requested_generation_to_settle(")
         .nth(1)
@@ -4801,7 +4873,7 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
                 .next()
         })
         .expect("lifecycle generation settlement");
-    assert!(lifecycle_settle.contains("running_generation_checked()?"));
+    assert!(lifecycle_settle.contains("observe_requested_generation(&target)"));
     assert!(lifecycle_settle.contains("authority remains held"));
 
     assert!(
