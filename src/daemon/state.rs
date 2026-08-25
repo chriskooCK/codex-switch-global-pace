@@ -53,8 +53,17 @@ fn write_at(path: &Path, state: &DaemonState) {
     let Ok(bytes) = serde_json::to_vec_pretty(state) else {
         return;
     };
-    if let Err(e) = crate::auth::atomic_write_private(path, &bytes) {
-        tracing::debug!("daemon state snapshot write failed: {e}");
+    match crate::auth::atomic_write_private(path, &bytes) {
+        Ok(outcome) => {
+            if let Err(error) =
+                crate::auth::require_durable_private_write(path, "daemon state snapshot", outcome)
+            {
+                tracing::warn!(
+                    "daemon state snapshot is visible, but its durability could not be confirmed: {error:#}"
+                );
+            }
+        }
+        Err(error) => tracing::debug!("daemon state snapshot write failed: {error:#}"),
     }
 }
 

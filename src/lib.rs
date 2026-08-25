@@ -17,6 +17,12 @@ pub mod config;
 mod daemon;
 #[allow(dead_code)]
 mod error;
+#[allow(dead_code)]
+mod fs_ops;
+#[allow(dead_code)]
+mod installer_fs;
+#[allow(dead_code)]
+mod installer_registry;
 pub mod jwt;
 #[allow(dead_code)]
 mod logging;
@@ -27,6 +33,8 @@ mod output;
 pub mod profile;
 #[allow(dead_code)]
 mod signals;
+#[allow(dead_code)]
+mod task_batch;
 #[allow(dead_code)]
 mod tui;
 #[allow(dead_code)]

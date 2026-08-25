@@ -67,8 +67,8 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
     let dst = profile::profile_auth_path(alias)?;
     // Re-check only after the lease is held: a rename/delete may have won the
     // race between command dispatch and lease acquisition.
-    crate::auth::read_auth(&dst)?;
-    let old_info = crate::auth::read_account_info(&dst);
+    let old_auth = crate::auth::read_auth(&dst)?;
+    let old_info = crate::auth::account_info_from_auth_value(&old_auth);
 
     if !json {
         println!(

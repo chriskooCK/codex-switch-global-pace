@@ -67,8 +67,9 @@ capacity, so accounts are weighted equally.
 Quota meters use one relative rule everywhere: yellow means actual usage is
 ahead of the elapsed-time pace, while green means usage is at or behind pace.
 The Global meter applies the same rule to aggregate usage and aggregate elapsed
-time. A fully exhausted quota is red, and unavailable comparisons stay neutral;
-quota labels do not append warning punctuation.
+time. Exhaustion does not create a third warning state: a valid comparison still
+uses yellow or green and keeps its pace marker. Unavailable comparisons stay
+neutral, and quota labels do not append warning punctuation.
 
 ## Existing profiles and daemon compatibility
 
@@ -95,7 +96,20 @@ project's releases. Direct updates verify the archive's SHA-256 checksum and a
 GitHub build-provenance bundle with `gh attestation verify`, bound to this
 repository, its release workflow, the exact tag ref, and the tag commit digest.
 A current [GitHub CLI](https://cli.github.com/) is therefore required for direct
-self-update.
+self-update. The previous executable is retained until a previously running
+daemon has restarted successfully, so a failed daemon restart can restore the
+exact prior binary and daemon state. The updater holds the daemon lifecycle
+lease through the replacement outcome and the PID-absence lease while the
+daemon is stopped. Normal CLI lifecycle commands remain serialized; a direct
+foreground contender is either rejected by PID absence or stopped by its exact
+published generation before rollback proceeds.
+
+On Windows, macOS, and Linux, the verified direct-installer candidate holds that
+same service-operation authority and PID-absence lease before an upgrade, a
+fresh public-path publication, or an uninstall mutation. It retains them through
+file/PATH rollback, replacement-daemon verification, service removal, and
+recovery-artifact cleanup; the scripts never stop the daemon in one child and
+reacquire lifecycle authority in another.
 
 ```bash
 codex-switch-global-pace self-update --check

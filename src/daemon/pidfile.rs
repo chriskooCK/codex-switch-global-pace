@@ -2,8 +2,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fs4::{FileExt, TryLockError};
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 
 static PIDFILE_HANDLE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
@@ -17,12 +18,51 @@ struct PidIdentity {
     generation: String,
 }
 
-#[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Deserialize, Serialize)]
 struct ShutdownRequest {
     version: u8,
     pid: u32,
     generation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DaemonGeneration {
+    pub(crate) pid: u32,
+    pub(crate) generation: String,
+}
+
+impl DaemonGeneration {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+enum ShutdownRequestDurability {
+    Durable,
+    VisibleDurabilityUnconfirmed(anyhow::Error),
+}
+
+#[must_use = "shutdown-request durability must be classified after the daemon stop result"]
+pub(crate) struct ShutdownRequestOutcome {
+    target: DaemonGeneration,
+    durability: ShutdownRequestDurability,
+}
+
+impl ShutdownRequestOutcome {
+    pub(crate) fn target(&self) -> &DaemonGeneration {
+        &self.target
+    }
+
+    pub(crate) fn target_is_running(&self) -> Result<bool> {
+        Ok(running_generation_checked()?.as_ref() == Some(&self.target))
+    }
+
+    pub(crate) fn require_durable(self) -> Result<()> {
+        match self.durability {
+            ShutdownRequestDurability::Durable => Ok(()),
+            ShutdownRequestDurability::VisibleDurabilityUnconfirmed(error) => Err(error),
+        }
+    }
 }
 
 pub fn pidfile_path() -> Result<PathBuf> {
@@ -47,18 +87,201 @@ fn open_pidfile_lock_at(path: &Path) -> Result<File> {
 }
 
 fn acquire_pidfile_lock_at(path: &Path) -> Result<File> {
-    let lock_file = open_pidfile_lock_at(path)?;
-    match FileExt::try_lock(&lock_file) {
-        Ok(()) => Ok(lock_file),
-        Err(TryLockError::WouldBlock) => anyhow::bail!(
+    match try_acquire_pidfile_lock_at(path)? {
+        Some(lock_file) => Ok(lock_file),
+        None => anyhow::bail!(
             "daemon PID lock is already held at {}; another daemon is running",
             pidfile_lock_path_for(path).display()
         ),
+    }
+}
+
+fn try_acquire_pidfile_lock_at(path: &Path) -> Result<Option<File>> {
+    let lock_file = open_pidfile_lock_at(path)?;
+    match FileExt::try_lock(&lock_file) {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
         Err(TryLockError::Error(err)) => anyhow::bail!(
             "locking daemon PID authority {}: {err}",
             pidfile_lock_path_for(path).display()
         ),
     }
+}
+
+pub(crate) enum DaemonAbsenceAcquireFor<Lease> {
+    Acquired(Lease),
+    Contended,
+}
+
+pub(crate) type DaemonAbsenceAcquire = DaemonAbsenceAcquireFor<DaemonAbsenceLease>;
+
+pub(crate) enum ContendingDaemonIdentity {
+    Pending,
+    Published(DaemonGeneration),
+}
+
+/// Exclusive proof that no cooperating daemon owns, or can acquire, the PID
+/// authority. Self-update keeps this guard while the public executable is
+/// replaced. A direct foreground start uses the same lock in
+/// `write_pidfile_exclusive`, so it fails instead of entering the update
+/// window.
+#[derive(Debug)]
+pub(crate) struct DaemonAbsenceLease {
+    path: PathBuf,
+    lock_file: File,
+}
+
+impl DaemonAbsenceLease {
+    pub(crate) fn verify(&self) -> Result<()> {
+        if crate::fs_ops::token_if_present(&self.path)?.is_some() {
+            anyhow::bail!(
+                "daemon PID identity appeared while its absence lease was held: {}",
+                self.path.display()
+            );
+        }
+        if legacy_pidfile_lock_is_held_checked(&self.path)? {
+            anyhow::bail!(
+                "a legacy daemon acquired the PID identity while its absence lease was held: {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DaemonAbsenceLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
+pub(crate) fn try_acquire_daemon_absence_lease(
+    expected_stale_generation: Option<&DaemonGeneration>,
+) -> Result<DaemonAbsenceAcquire> {
+    let path = pidfile_path()?;
+    try_acquire_daemon_absence_lease_at(&path, expected_stale_generation)
+}
+
+pub(crate) fn contending_daemon_identity(
+    expected_stale_generation: Option<&DaemonGeneration>,
+) -> Result<ContendingDaemonIdentity> {
+    let path = pidfile_path()?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ContendingDaemonIdentity::Pending);
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "reading contending daemon PID identity {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    Ok(classify_contending_daemon_identity(
+        &raw,
+        expected_stale_generation,
+    ))
+}
+
+fn classify_contending_daemon_identity(
+    raw: &str,
+    expected_stale_generation: Option<&DaemonGeneration>,
+) -> ContendingDaemonIdentity {
+    let Some(identity) = parse_pid_identity(raw) else {
+        return ContendingDaemonIdentity::Pending;
+    };
+    let observed = DaemonGeneration {
+        pid: identity.pid,
+        generation: identity.generation,
+    };
+    if expected_stale_generation == Some(&observed) {
+        ContendingDaemonIdentity::Pending
+    } else {
+        ContendingDaemonIdentity::Published(observed)
+    }
+}
+
+#[cfg(test)]
+fn acquire_daemon_absence_lease_at(
+    path: &Path,
+    expected_stale_generation: Option<&DaemonGeneration>,
+) -> Result<DaemonAbsenceLease> {
+    match try_acquire_daemon_absence_lease_at(path, expected_stale_generation)? {
+        DaemonAbsenceAcquire::Acquired(lease) => Ok(lease),
+        DaemonAbsenceAcquire::Contended => anyhow::bail!(
+            "acquiring the daemon PID absence lease for self-update: daemon PID lock is already held at {}; another daemon is running",
+            pidfile_lock_path_for(path).display()
+        ),
+    }
+}
+
+fn try_acquire_daemon_absence_lease_at(
+    path: &Path,
+    expected_stale_generation: Option<&DaemonGeneration>,
+) -> Result<DaemonAbsenceAcquire> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "creating daemon state directory for absence lease {}",
+                parent.display()
+            )
+        })?;
+    }
+    let Some(lock_file) = try_acquire_pidfile_lock_at(path)? else {
+        return Ok(DaemonAbsenceAcquire::Contended);
+    };
+    if legacy_pidfile_lock_is_held_checked(path)? {
+        anyhow::bail!(
+            "a legacy daemon still owns the PID identity at {}; refusing to enter the self-update replacement window",
+            path.display()
+        );
+    }
+
+    if let Some(stale_token) = crate::fs_ops::token_if_present(path)? {
+        let raw = std::fs::read(path)
+            .with_context(|| format!("reading stale daemon PID identity {}", path.display()))?;
+        if !stale_token.matches_bytes(&raw) {
+            anyhow::bail!(
+                "daemon PID identity changed while acquiring its absence lease: {}",
+                path.display()
+            );
+        }
+        let stale_raw = std::str::from_utf8(&raw)
+            .map_err(|_| anyhow::anyhow!("daemon PID file is malformed: {}", path.display()))?;
+        if let Some(expected) = expected_stale_generation {
+            let identity = parse_pid_identity(stale_raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "daemon PID identity at {} has no exact generation token; refusing to remove it as stale generation {expected:?}",
+                    path.display()
+                )
+            })?;
+            let observed = DaemonGeneration {
+                pid: identity.pid,
+                generation: identity.generation,
+            };
+            if &observed != expected {
+                anyhow::bail!(
+                    "daemon generation changed from {expected:?} to {observed:?} before the self-update absence lease was acquired"
+                );
+            }
+        } else if read_pid_from_raw(stale_raw).is_none() {
+            anyhow::bail!("daemon PID file is malformed: {}", path.display());
+        }
+        crate::fs_ops::remove_exact(path, &stale_token).with_context(|| {
+            format!(
+                "removing the exactly revalidated stale daemon PID identity {}",
+                path.display()
+            )
+        })?;
+    }
+
+    let lease = DaemonAbsenceLease {
+        path: path.to_path_buf(),
+        lock_file,
+    };
+    lease.verify()?;
+    Ok(DaemonAbsenceAcquire::Acquired(lease))
 }
 
 /// One-version migration probe for daemons that still lock `daemon.pid`
@@ -101,48 +324,15 @@ fn shutdown_request_path() -> Result<PathBuf> {
 /// Fails if the file already exists (prevents TOCTOU race).
 pub fn write_pidfile_exclusive() -> Result<()> {
     let path = pidfile_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let lock_file = acquire_pidfile_lock_at(&path)?;
     let identity = PidIdentity {
         version: 2,
         pid: std::process::id(),
         executable: std::env::current_exe()?,
         generation: daemon_generation(),
     };
-    let encoded = serde_json::to_vec(&identity)?;
-    // create_new(true) → O_CREAT | O_EXCL: atomic, fails if file exists.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                anyhow::anyhow!(
-                    "PID file already exists at {}; another daemon may be running",
-                    path.display()
-                )
-            } else {
-                anyhow::anyhow!("Failed to create PID file {}: {e}", path.display())
-            }
-        })?;
-    use std::io::Write;
-    if let Err(error) = file
-        .write_all(&encoded)
-        .map_err(|e| anyhow::anyhow!("Failed to write PID to {}: {e}", path.display()))
-        .and_then(|()| {
-            file.sync_data()
-                .map_err(|e| anyhow::anyhow!("Failed to sync PID file {}: {e}", path.display()))
-        })
-    {
-        drop(file);
-        let _ = std::fs::remove_file(&path);
-        return Err(error);
-    }
-    // A fresh PID file has exclusive ownership, so any request left by a prior
-    // daemon cannot target this generation.
-    let _ = std::fs::remove_file(shutdown_request_path()?);
+    let request_path = shutdown_request_path()?;
+    let request_path = Some(request_path.as_path());
+    let lock_file = publish_pid_identity_at(&path, request_path, &identity)?;
 
     let handle = PIDFILE_HANDLE.get_or_init(|| Mutex::new(None));
     let mut guard = handle
@@ -150,6 +340,110 @@ pub fn write_pidfile_exclusive() -> Result<()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = Some(lock_file);
     Ok(())
+}
+
+fn publish_pid_identity_at(
+    path: &Path,
+    request_path: Option<&Path>,
+    identity: &PidIdentity,
+) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating daemon PID directory {}", parent.display()))?;
+    }
+    let lock_file = acquire_pidfile_lock_at(path)?;
+    if let Some(request_path) = request_path {
+        cleanup_stale_shutdown_request_before_publication(request_path, identity)?;
+    }
+
+    let encoded = serde_json::to_vec(identity)?;
+    // create_new(true) → O_CREAT | O_EXCL: atomic, fails if a stale or foreign
+    // identity still occupies the public PID path.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow::anyhow!(
+                    "PID file already exists at {}; another daemon may be running",
+                    path.display()
+                )
+            } else {
+                anyhow::anyhow!("Failed to create PID file {}: {error}", path.display())
+            }
+        })?;
+    use std::io::Write as _;
+    let publication = file
+        .write_all(&encoded)
+        .map_err(|error| anyhow::anyhow!("Failed to write PID to {}: {error}", path.display()))
+        .and_then(|()| {
+            file.sync_data().map_err(|error| {
+                anyhow::anyhow!("Failed to sync PID file {}: {error}", path.display())
+            })
+        });
+    if let Err(publication_error) = publication {
+        return match cleanup_failed_pid_publication(path, file) {
+            Ok(()) => Err(publication_error.context(
+                "PID identity publication failed; its exact partial artifact was removed",
+            )),
+            Err(cleanup_error) => Err(publication_error.context(format!(
+                "PID identity publication failed and exact partial-artifact cleanup was incomplete: {cleanup_error:#}"
+            ))),
+        };
+    }
+    Ok(lock_file)
+}
+
+fn cleanup_failed_pid_publication(path: &Path, mut file: File) -> Result<()> {
+    let token = crate::fs_ops::token_for_file(&mut file)
+        .context("binding a partially published PID identity for exact cleanup")?;
+    drop(file);
+    match crate::fs_ops::remove_exact(path, &token)? {
+        crate::fs_ops::RemoveExactOutcome::Removed => Ok(()),
+        crate::fs_ops::RemoveExactOutcome::RemovedNamespaceDurabilityUnconfirmed => {
+            anyhow::bail!(
+                "partial PID identity was removed, but parent-directory durability is unconfirmed: {}",
+                path.display()
+            )
+        }
+    }
+}
+
+fn cleanup_stale_shutdown_request_before_publication(
+    request_path: &Path,
+    identity: &PidIdentity,
+) -> Result<()> {
+    let Some(token) = crate::fs_ops::token_if_present(request_path)? else {
+        return Ok(());
+    };
+    let raw = std::fs::read(request_path)
+        .with_context(|| format!("reading stale shutdown request {}", request_path.display()))?;
+    if !token.matches_bytes(&raw) {
+        anyhow::bail!(
+            "shutdown request changed while it was classified before PID publication: {}",
+            request_path.display()
+        );
+    }
+    let request: ShutdownRequest = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "shutdown request is malformed and was preserved before PID publication: {}",
+            request_path.display()
+        )
+    })?;
+    if shutdown_request_matches(identity, &request) {
+        return Ok(());
+    }
+    match crate::fs_ops::remove_exact(request_path, &token)? {
+        crate::fs_ops::RemoveExactOutcome::Removed => Ok(()),
+        crate::fs_ops::RemoveExactOutcome::RemovedNamespaceDurabilityUnconfirmed => {
+            anyhow::bail!(
+                "stale shutdown request was removed before PID publication, but parent-directory durability is unconfirmed: {}",
+                request_path.display()
+            )
+        }
+    }
 }
 
 pub fn read_pidfile() -> Option<u32> {
@@ -162,11 +456,34 @@ pub fn read_pidfile() -> Option<u32> {
 /// authoritative liveness signal. Unlike the status-oriented reader, this
 /// never folds malformed content, permissions, or lock errors into "stopped".
 pub(crate) fn running_pid_checked() -> Result<Option<u32>> {
-    let path = pidfile_path()?;
-    running_pid_checked_at(&path)
+    Ok(running_pid_identity_checked()?.map(|identity| identity.pid))
 }
 
+pub(crate) fn running_identity_checked() -> Result<Option<(u32, PathBuf)>> {
+    let path = pidfile_path()?;
+    Ok(running_pid_identity_checked_at(&path)?.map(|identity| (identity.pid, identity.executable)))
+}
+
+pub(crate) fn running_generation_checked() -> Result<Option<DaemonGeneration>> {
+    Ok(
+        running_pid_identity_checked()?.map(|identity| DaemonGeneration {
+            pid: identity.pid,
+            generation: identity.generation,
+        }),
+    )
+}
+
+fn running_pid_identity_checked() -> Result<Option<PidIdentity>> {
+    let path = pidfile_path()?;
+    running_pid_identity_checked_at(&path)
+}
+
+#[cfg(test)]
 fn running_pid_checked_at(path: &Path) -> Result<Option<u32>> {
+    Ok(running_pid_identity_checked_at(path)?.map(|identity| identity.pid))
+}
+
+fn running_pid_identity_checked_at(path: &Path) -> Result<Option<PidIdentity>> {
     let initial_raw = match std::fs::read_to_string(path) {
         Ok(raw) => Some(raw),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -217,7 +534,7 @@ fn running_pid_checked_at(path: &Path) -> Result<Option<u32>> {
                     path.display()
                 )
             })?;
-            Ok(Some(identity.pid))
+            Ok(Some(identity))
         }
         Err(TryLockError::Error(err)) => Err(anyhow::anyhow!(
             "checking daemon PID lock {}: {err}",
@@ -231,7 +548,7 @@ fn running_pid_checked_at(path: &Path) -> Result<Option<u32>> {
                 }
                 let legacy_lock_held = legacy_pidfile_lock_is_held_checked(path)?;
                 match (identity, legacy_lock_held) {
-                    (Some(identity), true) => Some(identity.pid),
+                    (Some(identity), true) => Some(identity),
                     (None, true) => anyhow::bail!(
                         "daemon PID file {} is locked but has no trusted process identity",
                         path.display()
@@ -270,33 +587,53 @@ fn parse_pid_identity(raw: &str) -> Option<PidIdentity> {
 }
 
 fn daemon_generation() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{}-{nanos}", std::process::id())
+    let mut nonce = [0_u8; 16];
+    rand::rng().fill_bytes(&mut nonce);
+    hex::encode(nonce)
 }
 
-#[cfg(target_os = "windows")]
-pub fn request_shutdown(pid: u32) -> Result<()> {
-    let path = pidfile_path()?;
-    let raw = std::fs::read_to_string(&path)?;
-    let identity = parse_pid_identity(&raw)
-        .filter(|identity| identity.pid == pid)
+pub fn request_shutdown(expected: &DaemonGeneration) -> Result<ShutdownRequestOutcome> {
+    let identity = running_pid_identity_checked()?
+        .filter(|identity| {
+            identity.pid == expected.pid && identity.generation == expected.generation
+        })
         .ok_or_else(|| {
-            anyhow::anyhow!("Refusing to stop PID {pid}: daemon process identity is stale")
+            anyhow::anyhow!(
+                "Refusing to stop PID {}: daemon generation changed before shutdown request publication",
+                expected.pid
+            )
         })?;
+    let pid = expected.pid;
+    if identity.generation.is_empty() {
+        anyhow::bail!(
+            "Refusing to stop PID {pid}: daemon generation predates the exact shutdown-request protocol"
+        );
+    }
     let request = ShutdownRequest {
         version: 1,
         pid,
-        generation: identity.generation,
+        generation: identity.generation.clone(),
     };
     let request_path = shutdown_request_path()?;
-    crate::auth::atomic_write_private(&request_path, &serde_json::to_vec(&request)?)?;
-    Ok(())
+    let outcome = crate::auth::atomic_write_private(&request_path, &serde_json::to_vec(&request)?)?;
+    let durability = match outcome {
+        crate::auth::PrivateWriteOutcome::DurablyPublished => ShutdownRequestDurability::Durable,
+        crate::auth::PrivateWriteOutcome::VisibleDurabilityUnconfirmed { cause } => {
+            ShutdownRequestDurability::VisibleDurabilityUnconfirmed(cause.context(format!(
+                "daemon shutdown request is visible at {}, but its durability is unconfirmed",
+                request_path.display()
+            )))
+        }
+    };
+    Ok(ShutdownRequestOutcome {
+        target: DaemonGeneration {
+            pid,
+            generation: expected.generation.clone(),
+        },
+        durability,
+    })
 }
 
-#[cfg(target_os = "windows")]
 pub fn shutdown_requested() -> bool {
     let Ok(pidfile_path) = pidfile_path() else {
         return false;
@@ -319,25 +656,25 @@ pub fn shutdown_requested() -> bool {
     shutdown_request_matches(&identity, &request)
 }
 
-#[cfg(any(target_os = "windows", test))]
 fn shutdown_request_matches(identity: &PidIdentity, request: &ShutdownRequest) -> bool {
     request.version == 1 && request.pid == identity.pid && request.generation == identity.generation
 }
 
-fn release_pidfile_handle() {
+fn release_pidfile_handle() -> Result<()> {
     let Some(handle) = PIDFILE_HANDLE.get() else {
-        return;
+        return Ok(());
     };
     let mut guard = handle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(file) = guard.take() {
-        let _ = FileExt::unlock(&file);
+        FileExt::unlock(&file).context("unlocking the daemon PID authority")?;
     }
+    Ok(())
 }
 
 pub fn cleanup_pidfile() -> Result<()> {
-    release_pidfile_handle();
+    release_pidfile_handle()?;
     let path = pidfile_path()?;
     cleanup_pidfile_at(&path)
 }
@@ -358,58 +695,72 @@ fn cleanup_pidfile_at(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    let remove_result = match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    };
-    FileExt::unlock(&lock_file).map_err(|err| {
+    let remove_result = (|| -> Result<()> {
+        let Some(token) = crate::fs_ops::token_if_present(path)? else {
+            return Ok(());
+        };
+        match crate::fs_ops::remove_exact(path, &token)? {
+            crate::fs_ops::RemoveExactOutcome::Removed => Ok(()),
+            crate::fs_ops::RemoveExactOutcome::RemovedNamespaceDurabilityUnconfirmed => {
+                anyhow::bail!(
+                    "daemon PID identity was removed, but parent-directory durability is unconfirmed: {}",
+                    path.display()
+                )
+            }
+        }
+    })();
+    let unlock_result = FileExt::unlock(&lock_file).map_err(|err| {
         anyhow::anyhow!(
             "unlocking daemon PID lock {}: {err}",
             pidfile_lock_path_for(path).display()
         )
-    })?;
-    remove_result
+    });
+    match (remove_result, unlock_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(remove_error), Ok(())) => Err(remove_error),
+        (Ok(()), Err(unlock_error)) => Err(unlock_error),
+        (Err(remove_error), Err(unlock_error)) => Err(remove_error.context(format!(
+            "PID cleanup failed and releasing its authority lock also failed: {unlock_error:#}"
+        ))),
+    }
 }
 
 /// RAII guard that cleans up the PID file on drop (including panics).
-pub struct PidGuard;
+pub struct PidGuard {
+    armed: bool,
+}
 
-impl Drop for PidGuard {
-    fn drop(&mut self) {
-        let _ = cleanup_pidfile();
+impl PidGuard {
+    pub fn new() -> Self {
+        Self { armed: true }
+    }
+
+    pub fn cleanup(mut self) -> Result<()> {
+        // Explicit cleanup owns the one material attempt. Do not make `Drop`
+        // silently retry a failed namespace mutation.
+        self.armed = false;
+        cleanup_pidfile()
     }
 }
 
-/// Send SIGTERM to a process.
-#[cfg(not(target_os = "windows"))]
-pub fn send_sigterm(pid: u32) -> Result<()> {
-    if running_pid_checked()? != Some(pid) {
-        anyhow::bail!("Refusing to stop PID {pid}: daemon process identity is stale");
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: sending SIGTERM to a known PID.
-        let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            anyhow::bail!("Failed to send SIGTERM to PID {pid}: {err}");
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = cleanup_pidfile()
+        {
+            eprintln!("Error: daemon PID cleanup during unwind failed: {error:#}");
         }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        anyhow::bail!("Stopping daemon is not supported on this platform");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        PidIdentity, ShutdownRequest, acquire_pidfile_lock_at, cleanup_pidfile_at,
-        parse_pid_identity, pidfile_lock_path_for, read_pid_from_raw, running_pid_checked_at,
-        shutdown_request_matches,
+        ContendingDaemonIdentity, DaemonAbsenceAcquire, DaemonGeneration, PidIdentity,
+        ShutdownRequest, acquire_daemon_absence_lease_at, acquire_pidfile_lock_at,
+        classify_contending_daemon_identity, cleanup_pidfile_at, parse_pid_identity,
+        pidfile_lock_path_for, publish_pid_identity_at, read_pid_from_raw, running_pid_checked_at,
+        shutdown_request_matches, try_acquire_daemon_absence_lease_at,
     };
     use fs4::FileExt;
     use std::path::PathBuf;
@@ -449,6 +800,94 @@ mod tests {
                 ..matching
             }
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_request_published_after_pid_identity_is_never_deleted_by_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        let request_path = dir.path().join("daemon.shutdown");
+        let stale = ShutdownRequest {
+            version: 1,
+            pid: 7,
+            generation: "stale-generation".to_string(),
+        };
+        std::fs::write(&request_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from(r"C:\bin\codex-switch.exe"),
+            generation: "new-generation".to_string(),
+        };
+        let writer_pid_path = pid_path.clone();
+        let writer_request_path = request_path.clone();
+        let writer_identity = PidIdentity {
+            version: identity.version,
+            pid: identity.pid,
+            executable: identity.executable.clone(),
+            generation: identity.generation.clone(),
+        };
+        let writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if std::fs::read(&writer_pid_path)
+                    .ok()
+                    .and_then(|raw| serde_json::from_slice::<PidIdentity>(&raw).ok())
+                    .is_some_and(|published| {
+                        published.pid == writer_identity.pid
+                            && published.generation == writer_identity.generation
+                    })
+                {
+                    let request = ShutdownRequest {
+                        version: 1,
+                        pid: writer_identity.pid,
+                        generation: writer_identity.generation,
+                    };
+                    std::fs::write(&writer_request_path, serde_json::to_vec(&request).unwrap())
+                        .unwrap();
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PID publication was not observed"
+                );
+                std::thread::yield_now();
+            }
+        });
+
+        let lock = publish_pid_identity_at(&pid_path, Some(&request_path), &identity).unwrap();
+        writer.join().unwrap();
+        let request: ShutdownRequest =
+            serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+        assert!(shutdown_request_matches(&identity, &request));
+
+        FileExt::unlock(&lock).unwrap();
+        cleanup_pidfile_at(&pid_path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn malformed_shutdown_residue_is_preserved_before_pid_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        let request_path = dir.path().join("daemon.shutdown");
+        std::fs::write(&request_path, b"not a shutdown request").unwrap();
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from(r"C:\bin\codex-switch.exe"),
+            generation: "new-generation".to_string(),
+        };
+
+        let error = publish_pid_identity_at(&pid_path, Some(&request_path), &identity)
+            .expect_err("malformed foreign residue must fail closed");
+        assert!(error.to_string().contains("malformed"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&request_path).unwrap(),
+            b"not a shutdown request"
+        );
+        assert!(!pid_path.exists());
     }
 
     #[test]
@@ -659,5 +1098,143 @@ mod tests {
         );
         FileExt::unlock(&owner).unwrap();
         contender.join().unwrap();
+    }
+
+    #[test]
+    fn self_update_absence_lease_blocks_foreground_start_until_commit_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch"),
+            generation: "stopped-generation".to_string(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&identity).unwrap()).unwrap();
+
+        let expected = DaemonGeneration {
+            pid: 4242,
+            generation: "stopped-generation".to_string(),
+        };
+        let absence = acquire_daemon_absence_lease_at(&path, Some(&expected)).unwrap();
+        assert!(!path.exists());
+        absence.verify().unwrap();
+
+        let contender_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            tx.send(acquire_pidfile_lock_at(&contender_path).map(|_| ()))
+                .unwrap();
+        });
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("foreground start must fail immediately while update owns absence")
+            .expect_err("foreground start entered the self-update replacement window");
+        assert!(error.to_string().contains("another daemon is running"));
+        contender.join().unwrap();
+
+        // The updater releases this guard only after commit/rollback outcome.
+        drop(absence);
+        let foreground = acquire_pidfile_lock_at(&path).unwrap();
+        FileExt::unlock(&foreground).unwrap();
+    }
+
+    #[test]
+    fn fresh_install_absence_lease_blocks_first_foreground_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let absence = acquire_daemon_absence_lease_at(&path, None).unwrap();
+        absence.verify().unwrap();
+
+        let contender_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            tx.send(acquire_pidfile_lock_at(&contender_path).map(|_| ()))
+                .unwrap();
+        });
+        let error = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("fresh foreground start must fail immediately during publication")
+            .expect_err("fresh foreground daemon entered the installer rollback window");
+        assert!(error.to_string().contains("another daemon is running"));
+        contender.join().unwrap();
+
+        drop(absence);
+        let foreground = acquire_pidfile_lock_at(&path).unwrap();
+        FileExt::unlock(&foreground).unwrap();
+    }
+
+    #[test]
+    fn contender_exit_before_pid_publication_becomes_exact_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let contender = acquire_pidfile_lock_at(&path).unwrap();
+        assert!(matches!(
+            try_acquire_daemon_absence_lease_at(&path, None).unwrap(),
+            DaemonAbsenceAcquire::Contended
+        ));
+
+        FileExt::unlock(&contender).unwrap();
+        let absence = match try_acquire_daemon_absence_lease_at(&path, None).unwrap() {
+            DaemonAbsenceAcquire::Acquired(lease) => lease,
+            DaemonAbsenceAcquire::Contended => {
+                panic!("released pre-publication contender still blocked absence")
+            }
+        };
+        absence.verify().unwrap();
+    }
+
+    #[test]
+    fn self_update_absence_lease_preserves_a_different_stale_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.pid");
+        let identity = PidIdentity {
+            version: 2,
+            pid: 4242,
+            executable: PathBuf::from("codex-switch"),
+            generation: "unexpected-generation".to_string(),
+        };
+        let encoded = serde_json::to_vec(&identity).unwrap();
+        std::fs::write(&path, &encoded).unwrap();
+
+        let expected = DaemonGeneration {
+            pid: 4242,
+            generation: "expected-generation".to_string(),
+        };
+        let error = acquire_daemon_absence_lease_at(&path, Some(&expected))
+            .expect_err("a changed daemon generation must fail closed");
+        assert!(
+            error.to_string().contains("generation changed"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), encoded);
+
+        let lock = acquire_pidfile_lock_at(&path).unwrap();
+        FileExt::unlock(&lock).unwrap();
+    }
+
+    #[test]
+    fn same_pid_with_a_different_generation_is_a_published_contender() {
+        let expected = DaemonGeneration {
+            pid: 4242,
+            generation: "stopped-generation".to_string(),
+        };
+        let successor = PidIdentity {
+            version: 2,
+            pid: expected.pid,
+            executable: PathBuf::from("codex-switch"),
+            generation: "successor-generation".to_string(),
+        };
+        let raw = serde_json::to_string(&successor).unwrap();
+
+        match classify_contending_daemon_identity(&raw, Some(&expected)) {
+            ContendingDaemonIdentity::Published(observed) => {
+                assert_eq!(observed.pid, expected.pid);
+                assert_eq!(observed.generation, successor.generation);
+            }
+            ContendingDaemonIdentity::Pending => {
+                panic!("PID reuse with a different generation must not remain pending")
+            }
+        }
     }
 }

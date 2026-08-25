@@ -3,6 +3,7 @@ use crate::output::{
     self, ProgressReporter, account_to_json, global_weekly_to_json, print_json, usage_to_json,
     user_println,
 };
+use crate::task_batch::{NamedTaskOutcome, batch_failure_error, drain_named_tasks};
 use crate::{auth, cache, color, config, jwt, profile, usage, workspace};
 use anyhow::{Context, Result};
 
@@ -46,7 +47,7 @@ pub(crate) async fn use_cmd(alias: Option<&str>, json: bool, consume_card: bool)
 
 pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result<()> {
     if !auth_already_handled {
-        profile::auto_track_current();
+        profile::auto_track_current()?;
     }
 
     let profiles = profile::list_profiles()?;
@@ -65,7 +66,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
 
     // Derive the active row from live credentials. A stale marker must not make
     // an unrelated profile look active while live auth is untracked.
-    let current = profile::active_profile_from_live().unwrap_or_default();
+    let current = profile::active_profile_from_live()?.unwrap_or_default();
 
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config::get().network.max_concurrent,
@@ -73,35 +74,31 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
 
     struct ListRow {
         name: String,
+        path: std::path::PathBuf,
         is_current: bool,
         info: jwt::AccountInfo,
         usage_result: Option<std::result::Result<usage::UsageInfo, usage::UsageError>>,
     }
 
-    let mut rows: Vec<ListRow> = profiles
-        .into_iter()
-        .filter_map(|name| {
-            let path = match profile::profile_auth_path(&name) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("[{name}] failed to resolve profile path: {e}");
-                    return None;
-                }
-            };
-            let info = auth::read_account_info(&path);
-            let usage_result = if force {
-                None
-            } else {
-                cache::get(&name).map(Ok)
-            };
-            Some(ListRow {
-                is_current: name == current,
-                name,
-                info,
-                usage_result,
-            })
-        })
-        .collect();
+    let mut rows: Vec<ListRow> = Vec::with_capacity(profiles.len());
+    for name in profiles {
+        let path = profile::profile_auth_path(&name)
+            .with_context(|| format!("resolving profile path for '{name}'"))?;
+        let info = auth::read_account_info_checked(&path)
+            .with_context(|| format!("loading profile '{name}' for list output"))?;
+        let usage_result = if force {
+            None
+        } else {
+            cache::get(&name)?.map(Ok)
+        };
+        rows.push(ListRow {
+            is_current: name == current,
+            name,
+            path,
+            info,
+            usage_result,
+        });
+    }
 
     let refresh_count = rows.iter().filter(|row| row.usage_result.is_none()).count();
     let mut progress = if json {
@@ -111,6 +108,12 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
     };
 
     let mut tasks = tokio::task::JoinSet::new();
+    let mut task_aliases = std::collections::HashMap::new();
+    let usage_aliases: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|row| row.usage_result.is_none())
+        .map(|row| row.name.clone())
+        .collect();
     for (idx, row) in rows.iter().enumerate() {
         let needs_usage = row.usage_result.is_none();
         let needs_workspace = force
@@ -124,8 +127,9 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
         }
 
         let alias = row.name.clone();
+        let path = row.path.clone();
         let sem = semaphore.clone();
-        tasks.spawn(async move {
+        let task = tasks.spawn(async move {
             let Ok(_permit) = sem.acquire_owned().await else {
                 return (
                     idx,
@@ -136,20 +140,6 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
                         })
                     }),
                 );
-            };
-            let path = match profile::profile_auth_path(&alias) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        idx,
-                        needs_usage.then(|| {
-                            Err(usage::UsageError {
-                                summary: format!("path error: {e}"),
-                                detail: format!("failed to resolve profile path: {e}"),
-                            })
-                        }),
-                    );
-                }
             };
             let usage_result = if needs_usage {
                 Some(if force {
@@ -168,23 +158,47 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
             }
             (idx, usage_result)
         });
+        let previous = task_aliases.insert(task.id(), row.name.clone());
+        debug_assert!(previous.is_none());
     }
 
     let mut completed = 0usize;
-    while let Some(task) = tasks.join_next().await {
-        let (idx, usage_result) = task.map_err(|e| anyhow::anyhow!("usage worker failed: {e}"))?;
-        if let Some(usage_result) = usage_result {
-            rows[idx].usage_result = Some(usage_result);
+    let outcomes = drain_named_tasks(&mut tasks, &mut task_aliases, |alias| {
+        if usage_aliases.contains(alias) {
             completed += 1;
+            if let Some(progress) = progress.as_mut() {
+                progress.advance(completed);
+            }
         }
-        cache::apply_workspace_name(&mut rows[idx].info);
-        if let Some(progress) = progress.as_mut() {
-            progress.advance(completed);
-        }
-    }
+    })
+    .await;
 
     if let Some(progress) = progress.as_mut() {
         progress.finish();
+    }
+
+    let mut worker_failures = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            NamedTaskOutcome::Completed {
+                value: (idx, usage_result),
+                ..
+            } => {
+                if let Some(usage_result) = usage_result {
+                    rows[idx].usage_result = Some(usage_result);
+                }
+                cache::apply_workspace_name(&mut rows[idx].info);
+            }
+            NamedTaskOutcome::Failed { alias, detail } => {
+                worker_failures.push((alias, detail));
+            }
+        }
+    }
+    if !worker_failures.is_empty() {
+        return Err(batch_failure_error(
+            "one or more list usage workers failed",
+            worker_failures,
+        ));
     }
 
     let global_now = auth::now_unix_secs();
@@ -294,7 +308,7 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     profile::validate_alias(alias)?;
-    if profile::active_profile_from_live().as_deref() == Some(alias) {
+    if profile::active_profile_from_live()?.as_deref() == Some(alias) {
         anyhow::bail!("cannot delete the active profile '{alias}'");
     }
     if !profile::profile_exists(alias)? {
@@ -330,17 +344,22 @@ fn score_profile_candidates(
     now: i64,
     safety_7d: f64,
     team_priority: bool,
-) -> Vec<(usage::Candidate, usage::UsageInfo, f64)> {
+) -> Result<Vec<(usage::Candidate, usage::UsageInfo, f64)>> {
+    let last_used = cache::last_used_snapshot_checked()
+        .context("loading profile-selection history for automatic ranking")?;
     let items = fetched
         .into_iter()
         .map(|(alias, u)| {
-            let info = profile::profile_auth_path(&alias)
-                .map(|p| auth::read_account_info(&p))
-                .unwrap_or_default();
-            let last_used = cache::get_last_used(&alias);
-            (alias, u, info, last_used)
+            let path = profile::profile_auth_path(&alias).with_context(|| {
+                format!("resolving profile path for automatic ranking: {alias}")
+            })?;
+            let info = auth::read_account_info_checked(&path).with_context(|| {
+                format!("reading profile metadata for automatic ranking: {alias}")
+            })?;
+            let last_used = last_used.get(&alias).copied().unwrap_or(0);
+            Ok((alias, u, info, last_used))
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let mut scored: Vec<(usage::Candidate, usage::UsageInfo, f64)> =
         usage::score_candidates(items, now, safety_7d, team_priority)
@@ -358,13 +377,13 @@ fn score_profile_candidates(
             .then(a.0.alias.cmp(&b.0.alias))
     });
 
-    scored
+    Ok(scored)
 }
 
 // ── reset-card-aware revival ──────────────────────────────
 
-/// How aggressively the pool-exhausted fallback may consume a reset card to
-/// revive an otherwise-ineligible account.
+/// How an exhausted-pool recovery may consume a reset card to revive an
+/// otherwise-ineligible account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardPolicy {
     /// Ask the user interactively before consuming a card.
@@ -389,6 +408,74 @@ pub(crate) struct SelectOutcome {
     pub(crate) usage: usage::UsageInfo,
     pub(crate) score: f64,
     pub(crate) revival_hint: Option<RevivalHint>,
+}
+
+struct PendingRevival {
+    target_candidate: usage::Candidate,
+    target_credit: usage::ResetCredit,
+    now: i64,
+    safety_7d: f64,
+}
+
+enum SelectionPlan {
+    Ready(SelectOutcome),
+    Revive(PendingRevival),
+}
+
+enum RevivalSideEffect {
+    None,
+    Consumed { alias: String },
+    OutcomeUnknown { alias: String, warning: String },
+}
+
+struct RevivalExecution {
+    outcome: SelectOutcome,
+    side_effect: RevivalSideEffect,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ResetCardActivationError {
+    #[error(
+        "reset card for '{alias}' was consumed, but activating that profile failed; do not consume another card, retry only the profile switch: {source:#}"
+    )]
+    Consumed {
+        alias: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error(
+        "{warning}; activating profile '{alias}' also failed, so verify the card before any retry and retry only the profile switch when appropriate: {source:#}"
+    )]
+    OutcomeUnknown {
+        alias: String,
+        warning: String,
+        #[source]
+        source: anyhow::Error,
+    },
+}
+
+impl RevivalSideEffect {
+    fn commit_result(self, result: Result<()>) -> Result<()> {
+        let Err(source) = result else {
+            return Ok(());
+        };
+        match self {
+            Self::None => Err(source),
+            Self::Consumed { alias } => {
+                Err(anyhow::Error::new(ResetCardActivationError::Consumed {
+                    alias,
+                    source,
+                }))
+            }
+            Self::OutcomeUnknown { alias, warning } => Err(anyhow::Error::new(
+                ResetCardActivationError::OutcomeUnknown {
+                    alias,
+                    warning,
+                    source,
+                },
+            )),
+        }
+    }
 }
 
 pub(crate) fn revival_hint_message(hint: &RevivalHint) -> String {
@@ -449,50 +536,64 @@ fn pick_revival_target(candidates: &[RevivalCandidate]) -> Option<String> {
         .map(|(c, _)| c.alias.to_string())
 }
 
-pub(crate) async fn select_best_profile(
+async fn collect_best_profile_usage_with<
+    CacheLookup,
+    CacheFuture,
+    PathLookup,
+    Worker,
+    WorkerFuture,
+>(
+    profiles: Vec<String>,
     json: bool,
-    card_policy: CardPolicy,
-) -> Result<SelectOutcome> {
-    let profiles = profile::list_profiles()?;
-    if profiles.is_empty() {
-        anyhow::bail!(
-            "no saved profiles; run `codex-switch-global-pace login` or `codex-switch-global-pace import <path>` first"
-        );
-    }
+    max_concurrent: usize,
+    mut cache_lookup: CacheLookup,
+    mut path_lookup: PathLookup,
+    worker: Worker,
+) -> Result<Vec<(String, usage::UsageInfo)>>
+where
+    CacheLookup: FnMut(String) -> CacheFuture,
+    CacheFuture: std::future::Future<Output = Result<Option<usage::UsageInfo>>>,
+    PathLookup: FnMut(&str) -> Result<std::path::PathBuf>,
+    Worker: Fn(String, std::path::PathBuf) -> WorkerFuture + Send + Sync + 'static,
+    WorkerFuture: std::future::Future<Output = Result<Option<usage::UsageInfo>>> + Send + 'static,
+{
+    let mut fetched = Vec::with_capacity(profiles.len());
+    let mut pending = Vec::new();
 
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        config::get().network.max_concurrent,
-    ));
-
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut fetched: Vec<(String, usage::UsageInfo)> = Vec::with_capacity(profiles.len());
-
+    // Complete every fallible local preflight before any worker can contact the
+    // auth server. A later cache/path failure must not abort an earlier token
+    // rotation by dropping its task.
     for alias in profiles {
-        if let Some(cached) = cache::get_async(&alias).await {
+        let cached = cache_lookup(alias.clone())
+            .await
+            .with_context(|| format!("reading cached usage during auto-select: {alias}"))?;
+        if let Some(cached) = cached {
             fetched.push((alias, cached));
             continue;
         }
+        let path = path_lookup(&alias)
+            .with_context(|| format!("resolving profile path during auto-select: {alias}"))?;
+        pending.push((alias, path));
+    }
 
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent));
+    let worker = std::sync::Arc::new(worker);
+    let mut tasks: tokio::task::JoinSet<Result<Option<usage::UsageInfo>>> =
+        tokio::task::JoinSet::new();
+    let mut task_aliases = std::collections::HashMap::new();
+    for (alias, path) in pending {
+        let tracked_alias = alias.clone();
         let sem = semaphore.clone();
-        tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire_owned().await else {
-                return None;
-            };
-            let path = match profile::profile_auth_path(&alias) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("[{alias}] failed to resolve profile path: {e}");
-                    return None;
-                }
-            };
-            match usage::fetch_usage_retried(&alias, &path).await {
-                Ok(u) => Some((alias, u)),
-                Err(e) => {
-                    tracing::warn!("[{alias}] usage fetch failed during auto-select: {e}");
-                    None
-                }
-            }
+        let worker = worker.clone();
+        let task = tasks.spawn(async move {
+            let _permit = sem
+                .acquire_owned()
+                .await
+                .context("automatic-selection usage limiter closed")?;
+            worker(alias, path).await
         });
+        let previous = task_aliases.insert(task.id(), tracked_alias);
+        debug_assert!(previous.is_none());
     }
 
     let mut progress = if json {
@@ -500,23 +601,66 @@ pub(crate) async fn select_best_profile(
     } else {
         Some(ProgressReporter::new("Testing accounts", tasks.len()))
     };
-
     let mut completed = 0usize;
-    while let Some(task) = tasks.join_next().await {
+    let outcomes = drain_named_tasks(&mut tasks, &mut task_aliases, |_| {
         completed += 1;
         if let Some(progress) = progress.as_mut() {
             progress.advance(completed);
         }
-        if let Some((alias, usage)) =
-            task.map_err(|e| anyhow::anyhow!("usage worker failed: {e}"))?
-        {
-            fetched.push((alias, usage));
-        }
-    }
-
+    })
+    .await;
     if let Some(progress) = progress.as_mut() {
         progress.finish();
     }
+
+    let mut worker_failures = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            NamedTaskOutcome::Completed { alias, value } => match value {
+                Ok(Some(usage)) => fetched.push((alias, usage)),
+                Ok(None) => {}
+                Err(error) => worker_failures.push((alias, format!("{error:#}"))),
+            },
+            NamedTaskOutcome::Failed { alias, detail } => {
+                worker_failures.push((alias, detail));
+            }
+        }
+    }
+    if !worker_failures.is_empty() {
+        return Err(batch_failure_error(
+            "one or more automatic-selection usage workers failed",
+            worker_failures,
+        ));
+    }
+
+    Ok(fetched)
+}
+
+async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<SelectionPlan> {
+    let profiles = profile::list_profiles()?;
+    if profiles.is_empty() {
+        anyhow::bail!(
+            "no saved profiles; run `codex-switch-global-pace login` or `codex-switch-global-pace import <path>` first"
+        );
+    }
+
+    let fetched = collect_best_profile_usage_with(
+        profiles,
+        json,
+        config::get().network.max_concurrent,
+        |alias| async move { cache::get_async(&alias).await },
+        profile::profile_auth_path,
+        |alias, path| async move {
+            match usage::fetch_usage_retried(&alias, &path).await {
+                Ok(usage) => Ok(Some(usage)),
+                Err(e) => {
+                    tracing::warn!("[{alias}] usage fetch failed during auto-select: {e}");
+                    Ok(None)
+                }
+            }
+        },
+    )
+    .await?;
 
     if fetched.is_empty() {
         anyhow::bail!("all usage queries failed");
@@ -525,19 +669,19 @@ pub(crate) async fn select_best_profile(
     let safety_7d = config::get().use_cfg.safety_margin_7d;
     let team_priority = config::get().use_cfg.team_priority;
     let now = auth::now_unix_secs();
-    let scored = score_profile_candidates(fetched, now, safety_7d, team_priority);
+    let scored = score_profile_candidates(fetched, now, safety_7d, team_priority)?;
     let (top_candidate, top_usage, top_score) = scored
         .first()
         .map(|(c, u, s)| (c.clone(), u.clone(), *s))
         .context("failed to select best profile")?;
 
     if usage::is_candidate_eligible(&top_candidate, safety_7d) {
-        return Ok(SelectOutcome {
+        return Ok(SelectionPlan::Ready(SelectOutcome {
             alias: top_candidate.alias,
             usage: top_usage,
             score: top_score,
             revival_hint: None,
-        });
+        }));
     }
 
     // Pool exhausted: see if a card-holding account can be revived.
@@ -553,12 +697,12 @@ pub(crate) async fn select_best_profile(
     let revival_target = pick_revival_target(&revival_candidates);
 
     let Some(target_alias) = revival_target else {
-        return Ok(SelectOutcome {
+        return Ok(SelectionPlan::Ready(SelectOutcome {
             alias: top_candidate.alias,
             usage: top_usage,
             score: top_score,
             revival_hint: None,
-        });
+        }));
     };
 
     let target_candidate = scored
@@ -585,7 +729,7 @@ pub(crate) async fn select_best_profile(
         }
     };
 
-    let fallback = |hint: Option<RevivalHint>| SelectOutcome {
+    let top_outcome = |hint: Option<RevivalHint>| SelectOutcome {
         alias: top_candidate.alias.clone(),
         usage: top_usage.clone(),
         score: top_score,
@@ -593,66 +737,193 @@ pub(crate) async fn select_best_profile(
     };
 
     if !approved {
-        return Ok(fallback(Some(RevivalHint {
+        return Ok(SelectionPlan::Ready(top_outcome(Some(RevivalHint {
             alias: target_alias,
             card_count,
             consumed_unconfirmed: None,
             consumption_unknown_message: None,
-        })));
+        }))));
     }
 
+    Ok(SelectionPlan::Revive(PendingRevival {
+        target_candidate,
+        target_credit,
+        now,
+        safety_7d,
+    }))
+}
+
+fn same_reset_credit(left: &usage::ResetCredit, right: &usage::ResetCredit) -> bool {
+    left.id == right.id
+        && left.granted_at == right.granted_at
+        && left.expires_at == right.expires_at
+}
+
+fn candidate_from_revival_usage(
+    base: &usage::Candidate,
+    usage: &usage::UsageInfo,
+    now: i64,
+    released_one_pool_member: bool,
+) -> usage::Candidate {
+    let mut candidate = usage::Candidate::from_usage(
+        base.alias.clone(),
+        usage,
+        base.is_team,
+        base.is_free,
+        base.last_used,
+        now,
+    );
+    candidate.pool_size = base.pool_size;
+    candidate.team_priority = base.team_priority;
+    candidate.pool_exhausted = if released_one_pool_member {
+        base.pool_exhausted.saturating_sub(1)
+    } else {
+        base.pool_exhausted
+    };
+    candidate
+}
+
+async fn execute_revival(
+    plan: PendingRevival,
+    authorized: &profile::AuthorizedProfileSwitch,
+) -> Result<RevivalExecution> {
+    let PendingRevival {
+        target_candidate,
+        target_credit,
+        now,
+        safety_7d,
+    } = plan;
+    let target_alias = target_candidate.alias.clone();
+    if authorized.alias() != target_alias {
+        anyhow::bail!(
+            "reset-card authorization was prepared for '{}' instead of '{target_alias}'; no card was requested",
+            authorized.alias()
+        );
+    }
     let target_path = profile::profile_auth_path(&target_alias)?;
-    match usage::consume_reset_credit_by_id(&target_alias, &target_path, target_credit).await {
+
+    // Re-read both quota and reset-card state while the authorization-owned
+    // profile lease is held. The exact card presented to the user must still
+    // belong to this target before the irreversible request is allowed.
+    let preflight_usage = usage::fetch_usage_retried_with_existing_lease(
+        &target_alias,
+        &target_path,
+        usage::Refresh::Forced,
+        authorized.lease(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error.detail))
+    .context("reset-card preflight failed; no card was requested and no profile was switched")?;
+    let preflight_candidate =
+        candidate_from_revival_usage(&target_candidate, &preflight_usage, now, false);
+    let preflight_score = usage::score_unified(&preflight_candidate, safety_7d);
+    if usage::is_candidate_eligible(&preflight_candidate, safety_7d) {
+        return Ok(RevivalExecution {
+            outcome: SelectOutcome {
+                alias: target_alias,
+                usage: preflight_usage,
+                score: preflight_score,
+                revival_hint: None,
+            },
+            side_effect: RevivalSideEffect::None,
+        });
+    }
+    if let Some(error) = preflight_usage.reset_credits_error.as_deref() {
+        anyhow::bail!(
+            "reset-card ownership could not be revalidated for '{target_alias}' ({error}); no card was requested and no profile was switched"
+        );
+    }
+    let matching_cards = preflight_usage
+        .reset_credits
+        .iter()
+        .filter(|current| same_reset_credit(current, &target_credit))
+        .count();
+    if matching_cards != 1 {
+        anyhow::bail!(
+            "the exact reset card approved for '{target_alias}' changed or disappeared before redemption; no card was requested and no profile was switched"
+        );
+    }
+    profile::revalidate_authorized_profile_switch(authorized).with_context(|| {
+        format!(
+            "reset-card target '{target_alias}' no longer matches its authorization; no card was requested and no profile was switched"
+        )
+    })?;
+
+    let card_count = preflight_usage.reset_credits.len() as u64;
+    match usage::consume_reset_credit_by_id_leased(
+        &target_alias,
+        &target_path,
+        target_credit,
+        authorized.lease(),
+    )
+    .await
+    {
         Ok(_consumed) => {
             if let Err(err) = cache::invalidate(&target_alias) {
                 tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
             }
-            let failure_summary = match usage::fetch_usage_retried_force(
-                &target_alias,
-                &target_path,
-            )
-            .await
-            {
-                Ok(revived_usage) => {
-                    let mut revived_candidate = usage::Candidate::from_usage(
-                        target_alias.clone(),
-                        &revived_usage,
-                        target_candidate.is_team,
-                        target_candidate.is_free,
-                        target_candidate.last_used,
-                        now,
-                    );
-                    revived_candidate.pool_size = target_candidate.pool_size;
-                    revived_candidate.team_priority = target_candidate.team_priority;
-                    revived_candidate.pool_exhausted =
-                        target_candidate.pool_exhausted.saturating_sub(1);
-                    if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
+            let (usage_after_attempt, score_after_attempt, failure_summary) =
+                match usage::fetch_usage_retried_with_existing_lease(
+                    &target_alias,
+                    &target_path,
+                    usage::Refresh::Forced,
+                    authorized.lease(),
+                )
+                .await
+                {
+                    Ok(revived_usage) => {
+                        let revived_candidate = candidate_from_revival_usage(
+                            &target_candidate,
+                            &revived_usage,
+                            now,
+                            true,
+                        );
                         let score = usage::score_unified(&revived_candidate, safety_7d);
-                        return Ok(SelectOutcome {
-                            alias: target_alias,
-                            usage: revived_usage,
+                        if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
+                            return Ok(RevivalExecution {
+                                outcome: SelectOutcome {
+                                    alias: target_alias.clone(),
+                                    usage: revived_usage,
+                                    score,
+                                    revival_hint: None,
+                                },
+                                side_effect: RevivalSideEffect::Consumed {
+                                    alias: target_alias,
+                                },
+                            });
+                        }
+                        tracing::warn!(
+                            "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
+                        );
+                        (
+                            revived_usage,
                             score,
-                            revival_hint: None,
-                        });
+                            "quota remained exhausted after refresh",
+                        )
                     }
-                    tracing::warn!(
-                        "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
-                    );
-                    "quota remained exhausted after refresh"
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
-                    );
-                    "usage refresh failed"
-                }
-            };
-            return Ok(fallback(Some(RevivalHint {
-                alias: target_alias,
-                card_count,
-                consumed_unconfirmed: Some(failure_summary),
-                consumption_unknown_message: None,
-            })));
+                    Err(e) => {
+                        tracing::warn!(
+                            "[{target_alias}] failed to refresh usage after consuming reset card: {e}"
+                        );
+                        (preflight_usage, preflight_score, "usage refresh failed")
+                    }
+                };
+            Ok(RevivalExecution {
+                outcome: SelectOutcome {
+                    alias: target_alias.clone(),
+                    usage: usage_after_attempt,
+                    score: score_after_attempt,
+                    revival_hint: Some(RevivalHint {
+                        alias: target_candidate.alias,
+                        card_count,
+                        consumed_unconfirmed: Some(failure_summary),
+                        consumption_unknown_message: None,
+                    }),
+                },
+                side_effect: RevivalSideEffect::Consumed {
+                    alias: target_alias,
+                },
+            })
         }
         Err(e) => {
             tracing::warn!("[{target_alias}] failed to consume reset card: {e}");
@@ -661,19 +932,31 @@ pub(crate) async fn select_best_profile(
                     tracing::warn!("Failed to invalidate usage cache for {target_alias}: {err}");
                 }
                 let message = e.user_facing_unknown_message(&target_alias);
-                return Ok(fallback(Some(RevivalHint {
-                    alias: target_alias,
-                    card_count,
-                    consumed_unconfirmed: None,
-                    consumption_unknown_message: Some(message),
-                })));
+                Ok(RevivalExecution {
+                    outcome: SelectOutcome {
+                        alias: target_alias.clone(),
+                        usage: preflight_usage,
+                        score: preflight_score,
+                        revival_hint: Some(RevivalHint {
+                            alias: target_candidate.alias,
+                            card_count,
+                            consumed_unconfirmed: None,
+                            consumption_unknown_message: Some(message.clone()),
+                        }),
+                    },
+                    side_effect: RevivalSideEffect::OutcomeUnknown {
+                        alias: target_alias,
+                        warning: message,
+                    },
+                })
             } else {
                 debug_assert!(e.definitely_not_consumed());
+                Err(anyhow::Error::new(e).context(format!(
+                    "reset card for '{target_alias}' was not consumed; no profile was switched"
+                )))
             }
         }
     }
-
-    Ok(fallback(None))
 }
 
 async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
@@ -687,7 +970,28 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
         CardPolicy::Deny
     };
 
-    let outcome = select_best_profile(json, card_policy).await?;
+    let allow_prompt = !json && std::io::stdin().is_terminal();
+    let outcome = match plan_best_profile(json, card_policy).await? {
+        SelectionPlan::Ready(outcome) => {
+            profile::switch_profile_with_prompt(&outcome.alias, allow_prompt)?;
+            outcome
+        }
+        SelectionPlan::Revive(plan) => {
+            // The overwrite authorization must precede card redemption. In
+            // particular, JSON/non-TTY mode cannot spend a card and only then
+            // discover that untracked live auth requires a prompt.
+            let target_alias = plan.target_candidate.alias.clone();
+            let lease = profile::acquire_profile_lease_async(target_alias).await?;
+            let authorized =
+                profile::authorize_profile_switch_before_side_effect(lease, allow_prompt)?;
+            let RevivalExecution {
+                outcome,
+                side_effect,
+            } = execute_revival(plan, &authorized).await?;
+            side_effect.commit_result(profile::commit_authorized_profile_switch(authorized))?;
+            outcome
+        }
+    };
     let SelectOutcome {
         alias: best_alias,
         usage: best_usage,
@@ -695,11 +999,11 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
         revival_hint,
     } = outcome;
 
-    profile::switch_profile(&best_alias)?;
     cache::set_last_used(&best_alias);
 
     let path = profile::profile_auth_path(&best_alias)?;
-    let info = auth::read_account_info(&path);
+    let info = auth::read_account_info_checked(&path)
+        .with_context(|| format!("reading selected profile metadata: {best_alias}"))?;
 
     if json {
         print_json(&output::JsonBest {
@@ -729,6 +1033,84 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
 #[cfg(test)]
 mod revival_target_tests {
     use super::*;
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(name);
+            // SAFETY: tests that mutate application paths hold the crate-wide
+            // profile environment lock for the guard's full lifetime.
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the owning test still holds the crate-wide profile
+            // environment lock while restoring the process environment.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    fn lock_profile_test_environment() -> std::sync::MutexGuard<'static, ()> {
+        crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn automatic_ranking_rejects_malformed_selection_history() {
+        let _lock = lock_profile_test_environment();
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_dir = home.path().join("profiles/alice");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("auth.json"), "{}").unwrap();
+        std::fs::write(home.path().join("cache.json"), "not-json").unwrap();
+
+        let error = score_profile_candidates(
+            vec![("alice".to_string(), usage::UsageInfo::default())],
+            0,
+            0.0,
+            false,
+        )
+        .expect_err("corrupt ranking history must stop automatic selection");
+
+        assert!(format!("{error:#}").contains("parsing cache file"));
+    }
+
+    #[test]
+    fn automatic_ranking_rejects_unreadable_profile_metadata() {
+        let _lock = lock_profile_test_environment();
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_dir = home.path().join("profiles/alice");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("auth.json"), "not-json").unwrap();
+        std::fs::write(home.path().join("cache.json"), r#"{"entries": {}}"#).unwrap();
+
+        let error = score_profile_candidates(
+            vec![("alice".to_string(), usage::UsageInfo::default())],
+            0,
+            0.0,
+            false,
+        )
+        .expect_err("invalid profile auth must not become empty ranking metadata");
+
+        let error = format!("{error:#}");
+        assert!(error.contains("reading profile metadata for automatic ranking"));
+        assert!(error.contains("parsing"));
+    }
 
     fn credit(id: &str, expires_at: Option<&str>) -> usage::ResetCredit {
         usage::ResetCredit {
@@ -877,5 +1259,169 @@ mod revival_target_tests {
             reset_credits: &cards,
         }];
         assert_eq!(pick_revival_target(&candidates), None);
+    }
+
+    #[test]
+    fn reset_card_binding_includes_grant_and_expiry_metadata() {
+        let approved = usage::ResetCredit {
+            id: "credit-1".to_string(),
+            granted_at: Some("2026-07-01T00:00:00Z".to_string()),
+            expires_at: Some("2026-07-08T00:00:00Z".to_string()),
+        };
+        assert!(same_reset_credit(&approved, &approved));
+
+        let mut rebound = approved.clone();
+        rebound.expires_at = Some("2026-07-09T00:00:00Z".to_string());
+        assert!(!same_reset_credit(&approved, &rebound));
+    }
+
+    #[test]
+    fn post_card_activation_errors_preserve_side_effect_status() {
+        let consumed = RevivalSideEffect::Consumed {
+            alias: "acct-a".to_string(),
+        }
+        .commit_result(Err(anyhow::anyhow!("live auth changed")))
+        .unwrap_err();
+        let consumed = format!("{consumed:#}");
+        assert!(consumed.contains("was consumed"), "{consumed}");
+        assert!(consumed.contains("do not consume another"), "{consumed}");
+        assert!(
+            consumed.contains("retry only the profile switch"),
+            "{consumed}"
+        );
+
+        let unknown = RevivalSideEffect::OutcomeUnknown {
+            alias: "acct-b".to_string(),
+            warning: "consumption may have occurred; verify before retry".to_string(),
+        }
+        .commit_result(Err(anyhow::anyhow!("live auth changed")))
+        .unwrap_err();
+        let unknown = format!("{unknown:#}");
+        assert!(
+            unknown.contains("consumption may have occurred"),
+            "{unknown}"
+        );
+        assert!(unknown.contains("verify the card"), "{unknown}");
+        assert!(
+            unknown.contains("retry only the profile switch"),
+            "{unknown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_cache_preflight_failure_starts_no_usage_worker() {
+        let worker_starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts_in_worker = worker_starts.clone();
+
+        let error = collect_best_profile_usage_with(
+            vec!["alice".to_string(), "bob".to_string()],
+            true,
+            2,
+            |alias| async move {
+                if alias == "bob" {
+                    anyhow::bail!("injected later cache failure");
+                }
+                Ok(None)
+            },
+            |alias| Ok(std::path::PathBuf::from(alias)),
+            move |_alias, _path| {
+                let starts_in_worker = starts_in_worker.clone();
+                async move {
+                    starts_in_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(None)
+                }
+            },
+        )
+        .await
+        .expect_err("a later cache preflight failure must fail the batch");
+
+        assert!(format!("{error:#}").contains("injected later cache failure"));
+        assert_eq!(worker_starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn later_path_preflight_failure_starts_no_usage_worker() {
+        let worker_starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts_in_worker = worker_starts.clone();
+
+        let error = collect_best_profile_usage_with(
+            vec!["alice".to_string(), "bob".to_string()],
+            true,
+            2,
+            |_alias| async { Ok(None) },
+            |alias| {
+                if alias == "bob" {
+                    anyhow::bail!("injected later path failure");
+                }
+                Ok(std::path::PathBuf::from(alias))
+            },
+            move |_alias, _path| {
+                let starts_in_worker = starts_in_worker.clone();
+                async move {
+                    starts_in_worker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(None)
+                }
+            },
+        )
+        .await
+        .expect_err("a later path preflight failure must fail the batch");
+
+        assert!(format!("{error:#}").contains("injected later path failure"));
+        assert_eq!(worker_starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn usage_worker_failures_are_reported_only_after_other_workers_persist() {
+        let temp = tempfile::tempdir().unwrap();
+        let persisted_path = temp.path().join("rotated-auth.json");
+        let path_in_worker = persisted_path.clone();
+        let workers_started = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let barrier_in_worker = workers_started.clone();
+
+        let error = collect_best_profile_usage_with(
+            vec![
+                "error".to_string(),
+                "panic".to_string(),
+                "persist".to_string(),
+            ],
+            true,
+            3,
+            |_alias| async { Ok(None) },
+            |alias| Ok(std::path::PathBuf::from(alias)),
+            move |alias, _path| {
+                let barrier_in_worker = barrier_in_worker.clone();
+                let path_in_worker = path_in_worker.clone();
+                async move {
+                    barrier_in_worker.wait().await;
+                    match alias.as_str() {
+                        "error" => anyhow::bail!("injected worker error"),
+                        "panic" => panic!("secret panic payload must stay private"),
+                        "persist" => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            std::fs::write(&path_in_worker, b"rotated credential persisted")
+                                .with_context(|| {
+                                    format!(
+                                        "writing persistence marker {}",
+                                        path_in_worker.display()
+                                    )
+                                })?;
+                            Ok(None)
+                        }
+                        other => anyhow::bail!("unexpected test worker: {other}"),
+                    }
+                }
+            },
+        )
+        .await
+        .expect_err("worker error and panic must be returned after the whole batch drains");
+
+        assert_eq!(
+            std::fs::read(&persisted_path).unwrap(),
+            b"rotated credential persisted"
+        );
+        let error = format!("{error:#}");
+        assert!(error.contains("[error] injected worker error"), "{error}");
+        assert!(error.contains("[panic] worker panicked"), "{error}");
+        assert!(!error.contains("secret panic payload"), "{error}");
     }
 }

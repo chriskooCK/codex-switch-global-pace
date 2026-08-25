@@ -349,6 +349,20 @@ pub struct UsageError {
 }
 
 impl UsageError {
+    /// A refresh was deliberately not started because the exact live-auth
+    /// state needed for a safe post-response compare-and-swap could not be
+    /// captured first. No server-side token rotation has happened yet.
+    pub fn refresh_authorization_failed(alias: &str, cause: &anyhow::Error) -> Self {
+        Self {
+            summary: "token refresh not started".to_string(),
+            detail: format!(
+                "[{alias}] token refresh was not started because the exact live-auth state could \
+                 not be authorized for a safe conditional update: {cause:#}. No credential was \
+                 sent to the refresh endpoint."
+            ),
+        }
+    }
+
     /// The auth server issued rotated credentials but they could not be written
     /// to disk.
     ///
@@ -368,15 +382,17 @@ impl UsageError {
         }
     }
 
-    /// The profile copy is safe, but its relationship with live Codex auth
-    /// could not be established or updated atomically.
+    /// The refreshed profile bytes are visible, but their full local commit
+    /// (directory durability and, when active, live-auth synchronization) did
+    /// not complete. Retrying the refresh would spend another single-use token.
     pub fn live_activation_incomplete(alias: &str, cause: &anyhow::Error) -> Self {
         Self {
-            summary: "live auth sync incomplete".to_string(),
+            summary: "credential commit incomplete".to_string(),
             detail: format!(
-                "[{alias}] refreshed credentials were saved in the profile, but live Codex auth \
-                 could not be synchronized safely: {cause:#}. Fix the reported live-auth path, \
-                 then run `codex-switch-global-pace use {alias}` to activate the saved credential."
+                "[{alias}] refreshed credentials are visible in the profile, but their durable \
+                 commit or live Codex auth synchronization could not be confirmed safely: \
+                 {cause:#}. The refresh was stopped without spending another token. Fix the \
+                 reported local path problem, then inspect the profile before retrying."
             ),
         }
     }

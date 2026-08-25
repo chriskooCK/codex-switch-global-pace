@@ -1,5 +1,6 @@
 use super::render::confirm_default_no;
 use crate::output::{format_local_datetime, print_json, user_println};
+use crate::task_batch::{NamedTaskOutcome, batch_failure_error, drain_named_tasks};
 use crate::{auth, cache, color, config, profile, usage, warmup};
 use anyhow::{Context, Result};
 
@@ -111,7 +112,7 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
 
     if aliases.is_empty() {
         if json {
-            print_json(&serde_json::json!({"results": []}));
+            print_json(&serde_json::json!({"ok": true, "results": []}));
         } else {
             user_println("(no saved profiles)");
         }
@@ -126,7 +127,7 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
     let now = auth::now_unix_secs();
     let mut to_warmup = Vec::new();
     for alias in &aliases {
-        let already_active = cache::get(alias)
+        let already_active = cache::get(alias)?
             .as_ref()
             .is_some_and(|u| usage::usage_has_active_warmup_window(u, now));
         if already_active {
@@ -162,34 +163,46 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
     ));
 
     let mut had_error = false;
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut failures = Vec::new();
+    let mut pending = Vec::with_capacity(to_warmup.len());
     for alias in to_warmup {
-        let path = match profile::profile_auth_path(&alias) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("[{alias}] failed to resolve profile path: {e}");
+        match profile::profile_auth_path(&alias) {
+            Ok(path) => pending.push((alias, path)),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                tracing::warn!("[{alias}] failed to resolve profile path: {detail}");
                 if json {
-                    results.push(
-                        serde_json::json!({"alias": alias, "ok": false, "error": e.to_string()}),
-                    );
+                    results
+                        .push(serde_json::json!({"alias": &alias, "ok": false, "error": &detail}));
+                } else {
+                    user_println(&format!("  {} failed: {}", color::error(&alias), detail));
                 }
+                failures.push((alias, detail));
                 had_error = true;
-                continue;
             }
-        };
-        let sem = semaphore.clone();
-        tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire().await else {
-                return (alias, Err(anyhow::anyhow!("semaphore closed")));
-            };
-            let result = warmup::warmup_account(&alias, &path).await;
-            (alias, result)
-        });
+        }
     }
 
-    while let Some(res) = tasks.join_next().await {
-        let (alias, result) = res.context("warmup task panicked")?;
-        match &result {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut task_aliases = std::collections::HashMap::new();
+    for (alias, path) in pending {
+        let tracked_alias = alias.clone();
+        let sem = semaphore.clone();
+        let task = tasks.spawn(async move {
+            let _permit = sem.acquire_owned().await.context("warmup limiter closed")?;
+            warmup::warmup_account(&alias, &path).await
+        });
+        let previous = task_aliases.insert(task.id(), tracked_alias);
+        debug_assert!(previous.is_none());
+    }
+
+    let outcomes = drain_named_tasks(&mut tasks, &mut task_aliases, |_| {}).await;
+    for outcome in outcomes {
+        let (alias, result) = match outcome {
+            NamedTaskOutcome::Completed { alias, value } => (alias, value),
+            NamedTaskOutcome::Failed { alias, detail } => (alias, Err(anyhow::anyhow!(detail))),
+        };
+        match result {
             Ok(()) => {
                 if json {
                     results.push(serde_json::json!({"alias": alias, "ok": true}));
@@ -201,14 +214,16 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                     ));
                 }
             }
-            Err(e) => {
-                let detail = format!("{e:#}");
+            Err(error) => {
+                let detail = format!("{error:#}");
                 tracing::error!(alias = %alias, error = %detail, "warmup failed");
                 if json {
-                    results.push(serde_json::json!({"alias": alias, "ok": false, "error": detail}));
+                    results
+                        .push(serde_json::json!({"alias": &alias, "ok": false, "error": &detail}));
                 } else {
                     user_println(&format!("  {} failed: {}", color::error(&alias), detail));
                 }
+                failures.push((alias, detail));
                 had_error = true;
             }
         }
@@ -222,13 +237,15 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
                 .cmp(b["alias"].as_str().unwrap_or(""))
         });
         // Embed overall status in JSON so callers get a single valid object.
-        // Use std::process::exit to signal failure without a second JSON error line.
         print_json(&serde_json::json!({"ok": !had_error, "results": results}));
         if had_error {
-            std::process::exit(1);
+            return Err(crate::OutputAlreadyReported.into());
         }
     } else if had_error {
-        anyhow::bail!("one or more warmup operations failed");
+        return Err(batch_failure_error(
+            "one or more warmup operations failed",
+            failures,
+        ));
     }
     Ok(())
 }

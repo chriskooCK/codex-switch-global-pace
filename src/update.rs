@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use fs4::FileExt;
+#[cfg(windows)]
+use rand::Rng as _;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +21,12 @@ const UPDATE_CACHE_NAME: &str = "global-pace-update-check.json";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
 const UPDATE_LOCK_TARGET_ENV: &str = "CS_UPDATE_LOCK_TARGET";
 const UPDATE_LOCK_READY_MARKER: &str = "codex-switch-global-pace update lock ready";
+#[cfg(windows)]
+const WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT: usize = 16;
+#[cfg(windows)]
+const WINDOWS_DISPLACED_RECOVERY_PREFIX: &str = ".self-update-displaced-";
+#[cfg(windows)]
+const WINDOWS_FAILED_RECOVERY_PREFIX: &str = ".self-update-failed-";
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -245,27 +253,57 @@ pub struct SelfUpdateResult {
     pub install_source: InstallSource,
     pub updated: bool,
     replacement: Option<PendingReplacement>,
+    replacement_state: SelfUpdateReplacementState,
     transaction_lease: Option<UpdateLease>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelfUpdateReplacementState {
+    NotReplaced,
+    Pending,
+    Committed,
+    RolledBack,
+    Preserved,
+}
+
 impl SelfUpdateResult {
+    pub(crate) fn replacement_state(&self) -> SelfUpdateReplacementState {
+        self.replacement
+            .as_ref()
+            .map(PendingReplacement::public_state)
+            .unwrap_or(self.replacement_state)
+    }
+
     /// Finish a successful update after every dependent process has restarted.
     ///
-    /// On Windows the old executable is the image backing this still-running
-    /// process, so cleanup is scheduled for process exit. Cleanup failure does
-    /// not invalidate a replacement whose binary and daemon are already healthy.
-    pub(crate) fn commit_replacement(&mut self) {
-        if let Some(mut replacement) = self.replacement.take() {
-            replacement.commit();
+    /// Commit revalidates the published executable token before removing either
+    /// exact recovery copy. A concurrent writer or incomplete cleanup is
+    /// reported and all unclassified recovery entries are preserved.
+    pub(crate) fn commit_replacement(&mut self) -> Result<()> {
+        if let Some(replacement) = self.replacement.as_mut() {
+            let commit = replacement.commit();
+            self.replacement_state = replacement.public_state();
+            commit?;
         }
+        self.replacement.take();
         self.transaction_lease.take();
+        Ok(())
     }
 
     /// Restore the pre-update executable before restarting the old daemon.
-    #[cfg(windows)]
     pub(crate) fn rollback_replacement(&mut self) -> Result<()> {
         if let Some(mut replacement) = self.replacement.take() {
-            replacement.rollback()?;
+            let rollback = replacement.rollback();
+            self.replacement_state = replacement.public_state();
+            if let Err(error) = rollback {
+                let recovery = replacement.recovery_paths();
+                replacement.preserve();
+                self.transaction_lease.take();
+                return Err(error.context(format!(
+                    "exact executable rollback was incomplete; {}",
+                    recovery.describe()
+                )));
+            }
         }
         self.transaction_lease.take();
         Ok(())
@@ -273,24 +311,103 @@ impl SelfUpdateResult {
 
     /// Keep the durable backup when process state cannot be proven safe enough
     /// for an automatic rollback, and return the exact manual-recovery paths.
-    #[cfg(windows)]
     pub(crate) fn preserve_replacement_for_recovery(&mut self) -> Result<ReplacementRecoveryPaths> {
         let mut replacement = self
             .replacement
             .take()
-            .context("updated Windows result has no pending executable replacement")?;
+            .context("updated result has no pending executable replacement")?;
         let recovery_paths = replacement.recovery_paths();
         replacement.preserve();
+        self.replacement_state = replacement.public_state();
         self.transaction_lease.take();
         Ok(recovery_paths)
     }
+
+    /// Convert an unsuccessful commit that still owns recovery material into
+    /// an explicit preserved state and return the paths actually observed.
+    /// A commit that reached `Committed` has already consumed those entries,
+    /// so there is no recovery set to preserve.
+    pub(crate) fn preserve_failed_commit_for_recovery(
+        &mut self,
+    ) -> Result<Option<ReplacementRecoveryPaths>> {
+        match self.replacement_state() {
+            SelfUpdateReplacementState::Pending | SelfUpdateReplacementState::Preserved => {
+                self.preserve_replacement_for_recovery().map(Some)
+            }
+            SelfUpdateReplacementState::NotReplaced
+            | SelfUpdateReplacementState::Committed
+            | SelfUpdateReplacementState::RolledBack => Ok(None),
+        }
+    }
 }
 
-#[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReplacementRecoveryPaths {
     pub(crate) executable: PathBuf,
-    pub(crate) previous_executable: PathBuf,
+    pub(crate) entries: Vec<ReplacementRecoveryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplacementRecoveryEntry {
+    role: &'static str,
+    path: PathBuf,
+    state: ReplacementRecoveryEntryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplacementRecoveryEntryState {
+    ExactPresent,
+    Absent,
+    DifferentIdentity,
+    InspectionUnconfirmed(String),
+}
+
+impl ReplacementRecoveryPaths {
+    pub(crate) fn describe(&self) -> String {
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| {
+                let state = match &entry.state {
+                    ReplacementRecoveryEntryState::ExactPresent => {
+                        "exact entry is present".to_string()
+                    }
+                    ReplacementRecoveryEntryState::Absent => "entry is absent".to_string(),
+                    ReplacementRecoveryEntryState::DifferentIdentity => {
+                        "path has a different identity and is not claimed as recovery material"
+                            .to_string()
+                    }
+                    ReplacementRecoveryEntryState::InspectionUnconfirmed(error) => {
+                        format!("entry inspection was not confirmed: {error}")
+                    }
+                };
+                format!("{} {} ({state})", entry.role, entry.path.display())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "public executable {}; observed transaction entries: {entries}",
+            self.executable.display()
+        )
+    }
+}
+
+fn observe_recovery_entry(
+    role: &'static str,
+    path: &Path,
+    expected: &crate::fs_ops::FileToken,
+) -> ReplacementRecoveryEntry {
+    let state = match crate::fs_ops::token_if_present(path) {
+        Ok(Some(observed)) if observed == *expected => ReplacementRecoveryEntryState::ExactPresent,
+        Ok(Some(_)) => ReplacementRecoveryEntryState::DifferentIdentity,
+        Ok(None) => ReplacementRecoveryEntryState::Absent,
+        Err(error) => ReplacementRecoveryEntryState::InspectionUnconfirmed(format!("{error:#}")),
+    };
+    ReplacementRecoveryEntry {
+        role,
+        path: path.to_path_buf(),
+        state,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -319,75 +436,199 @@ enum ReplacementState {
     Preserved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitFaultPoint {
+    BeforeFinalRecoveryCleanup,
+    AfterFinalRecoveryCleanup,
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMMIT_FAULT: std::cell::Cell<Option<CommitFaultPoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+thread_local! {
+    static PUBLICATION_ROLLBACK_PANIC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+fn inject_commit_fault(point: CommitFaultPoint) {
+    #[cfg(test)]
+    if COMMIT_FAULT.with(|fault| {
+        let matches = fault.get() == Some(point);
+        if matches {
+            fault.set(None);
+        }
+        matches
+    }) {
+        panic!("injected executable commit failure at {point:?}");
+    }
+    #[cfg(not(test))]
+    let _ = point;
+}
+
+fn panic_payload_description(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixReplaceFaultPoint {
+    CurrentExecutableChangedBeforePublish,
+    ConcurrentExecutableClaimedPublicPath,
+    AfterPublishBeforeClassification,
+    #[cfg(test)]
+    AfterPublishBeforeClassificationError,
+}
+
+#[cfg(all(not(windows), test))]
+thread_local! {
+    static UNIX_REPLACE_FAULT: std::cell::Cell<Option<UnixReplaceFaultPoint>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 #[derive(Debug)]
 struct PendingReplacement {
     lease: Option<UpdateLease>,
     state: ReplacementState,
-    #[cfg(windows)]
+    completion: Option<SelfUpdateReplacementState>,
     executable: PathBuf,
-    #[cfg(windows)]
     backup: PathBuf,
+    backup_token: crate::fs_ops::FileToken,
+    previous_token: crate::fs_ops::FileToken,
+    published_token: crate::fs_ops::FileToken,
+    displaced_previous: PathBuf,
     #[cfg(windows)]
     failed_candidate: PathBuf,
 }
 
 impl PendingReplacement {
-    #[cfg(not(windows))]
-    fn new(lease: UpdateLease) -> Self {
-        Self {
-            lease: Some(lease),
-            state: ReplacementState::Pending,
+    fn public_state(&self) -> SelfUpdateReplacementState {
+        match self.state {
+            ReplacementState::Pending => SelfUpdateReplacementState::Pending,
+            ReplacementState::Preserved => SelfUpdateReplacementState::Preserved,
+            ReplacementState::Finished => self
+                .completion
+                .expect("a finished executable replacement has a completion state"),
         }
     }
 
-    #[cfg(windows)]
-    fn new(
-        lease: UpdateLease,
-        executable: PathBuf,
-        backup: PathBuf,
-        failed_candidate: PathBuf,
-    ) -> Self {
-        Self {
-            lease: Some(lease),
-            state: ReplacementState::Pending,
-            executable,
-            backup,
-            failed_candidate,
-        }
-    }
-
-    #[cfg(windows)]
     fn recovery_paths(&self) -> ReplacementRecoveryPaths {
+        let mut entries = vec![observe_recovery_entry(
+            "independent previous-executable backup",
+            &self.backup,
+            &self.backup_token,
+        )];
+        entries.push(observe_recovery_entry(
+            "displaced previous executable",
+            &self.displaced_previous,
+            &self.previous_token,
+        ));
+        #[cfg(windows)]
+        entries.push(observe_recovery_entry(
+            "failed candidate executable",
+            &self.failed_candidate,
+            &self.published_token,
+        ));
         ReplacementRecoveryPaths {
             executable: self.executable.clone(),
-            previous_executable: self.backup.clone(),
+            entries,
         }
     }
 
-    fn commit(&mut self) {
+    fn commit(&mut self) -> Result<()> {
         if self.state != ReplacementState::Pending {
-            return;
+            return Ok(());
         }
-        #[cfg(windows)]
-        if let Err(err) = cleanup_committed_windows_backup(&self.backup) {
-            tracing::warn!(
-                "Updated executable is active, but old executable cleanup was deferred: {err}"
-            );
-        }
-        self.state = ReplacementState::Finished;
+        let result = (|| -> Result<Vec<String>> {
+            require_file_token(
+                &self.executable,
+                &self.published_token,
+                "published self-update candidate at commit",
+            )?;
+            // From the first recovery deletion onward automatic rollback is
+            // no longer sound. Publish that fact before any mutation so an
+            // unwind can never interpret a reduced recovery set as Pending.
+            self.completion = Some(SelfUpdateReplacementState::Committed);
+            self.state = ReplacementState::Preserved;
+            let displaced_cleanup = remove_exact_transaction_path(
+                &self.displaced_previous,
+                &self.previous_token,
+                "displaced previous executable",
+            )?;
+            inject_commit_fault(CommitFaultPoint::BeforeFinalRecoveryCleanup);
+            let backup_cleanup = remove_exact_transaction_path(
+                &self.backup,
+                &self.backup_token,
+                "old executable backup",
+            )?;
+            // Both recovery names are gone. Set the live state immediately,
+            // before formatting or allocating cleanup diagnostics.
+            self.state = ReplacementState::Finished;
+            inject_commit_fault(CommitFaultPoint::AfterFinalRecoveryCleanup);
+            let mut unconfirmed = Vec::new();
+            if let Some(note) = displaced_cleanup.unconfirmed_note() {
+                unconfirmed.push(note.to_string());
+            }
+            if let Some(note) = backup_cleanup.unconfirmed_note() {
+                unconfirmed.push(note.to_string());
+            }
+            Ok(unconfirmed)
+        })();
+        let result = match result {
+            Ok(unconfirmed) => {
+                if unconfirmed.is_empty() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!(
+                        "the executable replacement was committed and its recovery entries were removed, but cleanup durability remained unconfirmed: {}",
+                        unconfirmed.join("; ")
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        };
         self.lease.take();
+        result
     }
 
-    #[cfg(windows)]
     fn rollback(&mut self) -> Result<()> {
         if self.state != ReplacementState::Pending {
             return Ok(());
         }
         // A failed rollback must leave the backup untouched for manual recovery;
         // Drop must never reinterpret that state as permission to delete it.
+        self.completion = Some(SelfUpdateReplacementState::RolledBack);
         self.state = ReplacementState::Preserved;
         #[cfg(windows)]
-        rollback_windows_replacement(&self.executable, &self.backup, &self.failed_candidate)?;
+        let rollback = rollback_windows_replacement(
+            &self.executable,
+            &self.backup,
+            &self.backup_token,
+            &self.previous_token,
+            &self.published_token,
+            &self.displaced_previous,
+            &self.failed_candidate,
+        );
+        #[cfg(not(windows))]
+        let rollback = rollback_unix_replacement(
+            &self.executable,
+            &self.backup,
+            &self.backup_token,
+            &self.previous_token,
+            &self.published_token,
+            &self.displaced_previous,
+        );
+        rollback?;
         self.state = ReplacementState::Finished;
         self.lease.take();
         Ok(())
@@ -409,6 +650,89 @@ impl Drop for PendingReplacement {
         if self.state == ReplacementState::Pending {
             self.preserve();
         }
+    }
+}
+
+enum PublicationFailureRecovery {
+    Restored,
+    Preserved {
+        paths: ReplacementRecoveryPaths,
+        error: String,
+    },
+}
+
+struct PublicationRecoveryOwner {
+    pending: Option<PendingReplacement>,
+    failure_recovery: std::sync::Arc<std::sync::Mutex<Option<PublicationFailureRecovery>>>,
+}
+
+impl PublicationRecoveryOwner {
+    fn new(
+        pending: PendingReplacement,
+        failure_recovery: std::sync::Arc<std::sync::Mutex<Option<PublicationFailureRecovery>>>,
+    ) -> Self {
+        Self {
+            pending: Some(pending),
+            failure_recovery,
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut PendingReplacement {
+        self.pending
+            .as_mut()
+            .expect("publication recovery owner was already consumed")
+    }
+
+    fn into_pending(mut self) -> PendingReplacement {
+        self.pending
+            .take()
+            .expect("publication recovery owner was already consumed")
+    }
+
+    fn preserve_classified_error(&mut self) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.preserve();
+        }
+    }
+}
+
+impl Drop for PublicationRecoveryOwner {
+    fn drop(&mut self) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        if pending.state != ReplacementState::Pending {
+            return;
+        }
+        let rollback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if PUBLICATION_ROLLBACK_PANIC.with(|fault| fault.replace(false)) {
+                panic!("injected unwind inside publication rollback");
+            }
+            pending.rollback()
+        }));
+        let recovery = match rollback {
+            Ok(Ok(())) => PublicationFailureRecovery::Restored,
+            Ok(Err(error)) => PublicationFailureRecovery::Preserved {
+                paths: pending.recovery_paths(),
+                error: format!("{error:#}"),
+            },
+            Err(payload) => {
+                pending.preserve();
+                PublicationFailureRecovery::Preserved {
+                    paths: pending.recovery_paths(),
+                    error: format!(
+                        "rollback itself unwound: {}",
+                        panic_payload_description(payload.as_ref())
+                    ),
+                }
+            }
+        };
+        let mut report = self
+            .failure_recovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *report = Some(recovery);
     }
 }
 
@@ -524,6 +848,7 @@ pub(crate) async fn self_update(
                 install_source,
                 updated: false,
                 replacement: None,
+                replacement_state: SelfUpdateReplacementState::NotReplaced,
                 transaction_lease: Some(update_lease),
             });
         }
@@ -534,25 +859,32 @@ pub(crate) async fn self_update(
             install_source,
             updated: false,
             replacement: None,
+            replacement_state: SelfUpdateReplacementState::NotReplaced,
             transaction_lease: Some(update_lease),
         });
     }
 
-    let replacement = download_and_replace(&release, show_progress, "", update_lease).await?;
-
-    save_update_cache(&UpdateCache {
-        checked_at: crate::auth::now_unix_secs(),
-        latest_version: latest_version.clone(),
-    });
-
+    // Keep publication-to-owner transfer free of user code: once the await
+    // returns its guarded PendingReplacement, only infallible moves construct
+    // the result handed to the orchestration coordinator.
     Ok(SelfUpdateResult {
         current_version,
         latest_version,
         install_source,
         updated: true,
-        replacement: Some(replacement),
+        replacement: Some(download_and_replace(&release, show_progress, "", update_lease).await?),
+        replacement_state: SelfUpdateReplacementState::Pending,
         transaction_lease: None,
     })
+}
+
+pub(crate) fn record_successful_self_update(result: &SelfUpdateResult) {
+    if result.updated && result.replacement_state == SelfUpdateReplacementState::Committed {
+        save_update_cache(&UpdateCache {
+            checked_at: crate::auth::now_unix_secs(),
+            latest_version: result.latest_version.clone(),
+        });
+    }
 }
 
 /// Install the dev build from the `dev` GitHub Release tag.
@@ -581,6 +913,7 @@ pub(crate) async fn self_update_dev(
             install_source,
             updated: false,
             replacement: None,
+            replacement_state: SelfUpdateReplacementState::NotReplaced,
             transaction_lease: Some(update_lease),
         });
     }
@@ -593,6 +926,7 @@ pub(crate) async fn self_update_dev(
         install_source,
         updated: true,
         replacement: Some(replacement),
+        replacement_state: SelfUpdateReplacementState::Pending,
         transaction_lease: None,
     })
 }
@@ -723,6 +1057,50 @@ fn transaction_sibling_path(executable: &Path, suffix: &str) -> Result<PathBuf> 
     Ok(parent.join(transaction_name))
 }
 
+#[cfg(windows)]
+fn random_windows_recovery_sibling_path(
+    executable: &Path,
+    prefix: &str,
+    purpose: &str,
+) -> Result<PathBuf> {
+    windows_recovery_sibling_path_with_nonce_source(executable, prefix, purpose, || {
+        let mut nonce = [0_u8; 16];
+        rand::rng().fill_bytes(&mut nonce);
+        nonce
+    })
+}
+
+#[cfg(windows)]
+fn windows_recovery_sibling_path_with_nonce_source<F>(
+    executable: &Path,
+    prefix: &str,
+    purpose: &str,
+    mut next_nonce: F,
+) -> Result<PathBuf>
+where
+    F: FnMut() -> [u8; 16],
+{
+    for _ in 0..WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT {
+        let suffix = format!("{prefix}{}", hex::encode(next_nonce()));
+        let candidate = transaction_sibling_path(executable, &suffix)?;
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspecting randomized {purpose} path {}",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "could not allocate a randomized {purpose} path after {WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT} collisions"
+    )
+}
+
 pub(crate) fn acquire_self_update_lease() -> Result<SelfUpdateLease> {
     let executable =
         fs::canonicalize(std::env::current_exe().context("locating current executable")?)
@@ -840,7 +1218,6 @@ fn acquire_update_lease(executable: &Path) -> Result<UpdateLease> {
     })
 }
 
-#[cfg(not(windows))]
 fn replace_candidate(
     executable: &Path,
     candidate: &Path,
@@ -848,13 +1225,496 @@ fn replace_candidate(
     platform: UpdatePlatform,
     release_tag: &str,
 ) -> Result<PendingReplacement> {
-    self_replace::self_replace(candidate).with_context(|| {
+    let failure_recovery = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let replacement = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        replace_candidate_inner(
+            executable,
+            candidate,
+            update_lease,
+            platform,
+            release_tag,
+            failure_recovery.clone(),
+        )
+    }));
+    match replacement {
+        Ok(Ok(pending)) => Ok(pending),
+        Ok(Err(error)) => {
+            let recovery = failure_recovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            match recovery {
+                Some(PublicationFailureRecovery::Restored) => Err(error.context(
+                    "post-publication processing failed; the exact previous executable was restored before publication authority was released",
+                )),
+                Some(PublicationFailureRecovery::Preserved { paths, error: rollback }) => {
+                    Err(error.context(format!(
+                        "post-publication processing failed and exact rollback was incomplete ({rollback}); {}",
+                        paths.describe()
+                    )))
+                }
+                None => Err(error),
+            }
+        }
+        Err(payload) => {
+            let panic = panic_payload_description(payload.as_ref());
+            let recovery = failure_recovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            match recovery {
+                Some(PublicationFailureRecovery::Restored) => Err(anyhow::anyhow!(
+                    "self-update publication unwound ({panic}); the exact previous executable was restored before publication authority was released"
+                )),
+                Some(PublicationFailureRecovery::Preserved { paths, error }) => {
+                    Err(anyhow::anyhow!(
+                        "self-update publication unwound ({panic}) and exact rollback failed ({error}); {}",
+                        paths.describe()
+                    ))
+                }
+                None => Err(anyhow::anyhow!(
+                    "self-update preparation unwound before executable publication ({panic}); no publication recovery owner was armed"
+                )),
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_candidate_inner(
+    executable: &Path,
+    candidate: &Path,
+    update_lease: UpdateLease,
+    platform: UpdatePlatform,
+    release_tag: &str,
+    failure_recovery: std::sync::Arc<std::sync::Mutex<Option<PublicationFailureRecovery>>>,
+) -> Result<PendingReplacement> {
+    let backup = transaction_sibling_path(executable, ".self-update-backup")?;
+    let staged = transaction_sibling_path(executable, ".self-update-candidate")?;
+    require_transaction_path_absent(&backup, "self-update backup")?;
+    require_transaction_path_absent(&staged, "staged self-update candidate")?;
+
+    let previous_token = crate::fs_ops::token_for_path(executable)
+        .context("binding the current executable before self-update")?;
+    let backup_token = create_exclusive_copy_durable(
+        executable,
+        &backup,
+        &previous_token,
+        "independent previous-executable backup",
+    )
+    .with_context(|| {
         format!(
-            "replacing current executable: {}",
-            replacement_permission_hint(executable, platform, release_tag)
+            "preserving an independent copy of the current executable at {}",
+            backup.display()
         )
     })?;
-    Ok(PendingReplacement::new(update_lease))
+
+    let candidate_source_token = crate::fs_ops::token_for_path(candidate)
+        .context("binding the verified self-update candidate")?;
+    let published_token = match create_exclusive_copy_durable(
+        candidate,
+        &staged,
+        &candidate_source_token,
+        "staged self-update candidate",
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let backup_cleanup =
+                remove_exact_transaction_path(&backup, &backup_token, "unused self-update backup");
+            return Err(error.context(format!(
+                "staging the self-update candidate failed; backup cleanup was {}",
+                cleanup_result(backup_cleanup)
+            )));
+        }
+    };
+
+    inject_unix_replace_fault(
+        executable,
+        UnixReplaceFaultPoint::CurrentExecutableChangedBeforePublish,
+    )?;
+    if let Err(error) = require_file_token(
+        executable,
+        &previous_token,
+        "current executable immediately before publication",
+    ) {
+        let staged_cleanup = remove_exact_transaction_path(
+            &staged,
+            &published_token,
+            "unused staged self-update candidate",
+        );
+        let backup_cleanup =
+            remove_exact_transaction_path(&backup, &backup_token, "unused self-update backup");
+        return Err(error.context(format!(
+            "self-update stopped before publication; candidate cleanup was {} and backup cleanup was {}",
+            cleanup_result(staged_cleanup),
+            cleanup_result(backup_cleanup)
+        )));
+    }
+    require_file_token(
+        &backup,
+        &backup_token,
+        "independent previous-executable backup",
+    )?;
+
+    // This second test hook models a non-cooperating writer that wins after
+    // the last observation but before the only namespace publication call.
+    inject_unix_replace_fault(
+        executable,
+        UnixReplaceFaultPoint::ConcurrentExecutableClaimedPublicPath,
+    )?;
+
+    // Construct the recovery owner before the only publication syscall. If
+    // classification unwinds after exchange, its Drop retains the independent
+    // backup and exact displaced path instead of losing recovery ownership.
+    let publication_owner = PublicationRecoveryOwner::new(
+        PendingReplacement {
+            lease: Some(update_lease),
+            state: ReplacementState::Pending,
+            completion: None,
+            executable: executable.to_path_buf(),
+            backup: backup.clone(),
+            backup_token: backup_token.clone(),
+            previous_token: previous_token.clone(),
+            published_token: published_token.clone(),
+            displaced_previous: staged.clone(),
+        },
+        failure_recovery,
+    );
+    let exchange_result = crate::fs_ops::exchange(&staged, executable);
+    inject_unix_replace_fault(
+        executable,
+        UnixReplaceFaultPoint::AfterPublishBeforeClassification,
+    )?;
+    #[cfg(test)]
+    inject_unix_replace_fault(
+        executable,
+        UnixReplaceFaultPoint::AfterPublishBeforeClassificationError,
+    )?;
+    let public_token = crate::fs_ops::token_if_present(executable).with_context(|| {
+        format!(
+            "classifying published executable {}; exact recovery operands remain at {} and {}",
+            executable.display(),
+            backup.display(),
+            staged.display()
+        )
+    })?;
+    let displaced_token = crate::fs_ops::token_if_present(&staged).with_context(|| {
+        format!(
+            "classifying displaced executable {}; exact backup remains at {}",
+            staged.display(),
+            backup.display()
+        )
+    })?;
+
+    if public_token.as_ref() == Some(&published_token)
+        && displaced_token.as_ref() == Some(&previous_token)
+    {
+        if let Err(error) = confirm_unix_namespace_durability(
+            exchange_result,
+            executable,
+            "self-update candidate publication",
+        ) {
+            let rollback = rollback_uncommitted_unix_exchange(
+                executable,
+                &staged,
+                &backup,
+                &backup_token,
+                &previous_token,
+                &published_token,
+            );
+            publication_owner.preserve_classified_error();
+            return Err(error.context(format!(
+                "candidate and previous executable were exchanged, but publication durability was not confirmed; rollback was {}",
+                operation_result(rollback)
+            )));
+        }
+        return Ok(publication_owner.into_pending());
+    }
+
+    let state = format!(
+        "public={}, displaced={}",
+        describe_token_state(public_token.as_ref(), &published_token, &previous_token),
+        describe_token_state(displaced_token.as_ref(), &published_token, &previous_token)
+    );
+    if public_token.as_ref() == Some(&published_token) {
+        let restoration = restore_displaced_unix_writer(
+            executable,
+            &staged,
+            displaced_token.as_ref(),
+            &published_token,
+        );
+        if restoration.is_ok() {
+            let staged_cleanup = remove_exact_transaction_path(
+                &staged,
+                &published_token,
+                "refused self-update candidate",
+            );
+            let backup_cleanup =
+                remove_exact_transaction_path(&backup, &backup_token, "unused self-update backup");
+            publication_owner.preserve_classified_error();
+            return Err(anyhow::anyhow!(
+                "self-update exchanged a file that no longer matched the authorized executable; the displaced writer was restored. Candidate cleanup was {} and backup cleanup was {}",
+                cleanup_result(staged_cleanup),
+                cleanup_result(backup_cleanup)
+            ));
+        }
+        publication_owner.preserve_classified_error();
+        return Err(anyhow::anyhow!(
+            "self-update publication was not authorized ({state}); no file was deleted. Candidate/public path {}, displaced path {}, previous backup {}. Restoration failed: {}",
+            executable.display(),
+            staged.display(),
+            backup.display(),
+            operation_result(restoration)
+        ));
+    }
+
+    if public_token.as_ref() == Some(&previous_token)
+        && displaced_token.as_ref() == Some(&published_token)
+    {
+        let staged_cleanup = remove_exact_transaction_path(
+            &staged,
+            &published_token,
+            "unpublished self-update candidate",
+        );
+        let backup_cleanup =
+            remove_exact_transaction_path(&backup, &backup_token, "unused self-update backup");
+        let exchange_error = exchange_result
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| "exchange result did not match its postcondition".to_string());
+        publication_owner.preserve_classified_error();
+        return Err(anyhow::anyhow!(
+            "self-update candidate was not published: {exchange_error}. Candidate cleanup was {} and backup cleanup was {}",
+            cleanup_result(staged_cleanup),
+            cleanup_result(backup_cleanup)
+        ));
+    }
+
+    publication_owner.preserve_classified_error();
+    Err(anyhow::anyhow!(
+        "self-update publication ended in an unclassified external-writer state ({state}); no file was deleted. Public path {}, displaced path {}, previous backup {}. {}",
+        executable.display(),
+        staged.display(),
+        backup.display(),
+        replacement_permission_hint(executable, platform, release_tag)
+    ))
+}
+
+#[cfg(not(windows))]
+fn inject_unix_replace_fault(executable: &Path, point: UnixReplaceFaultPoint) -> Result<()> {
+    #[cfg(test)]
+    if UNIX_REPLACE_FAULT.with(|fault| {
+        let matches = fault.get() == Some(point);
+        if matches {
+            fault.set(None);
+        }
+        matches
+    }) {
+        #[cfg(test)]
+        match point {
+            UnixReplaceFaultPoint::AfterPublishBeforeClassification => {
+                panic!("injected unwind after Unix executable publication");
+            }
+            UnixReplaceFaultPoint::AfterPublishBeforeClassificationError => {
+                anyhow::bail!("injected error after Unix executable publication");
+            }
+            _ => {}
+        }
+        let external = transaction_sibling_path(executable, ".injected-external")?;
+        require_transaction_path_absent(&external, "injected external executable")?;
+        fs::write(&external, b"external executable")?;
+        fs::rename(&external, executable)?;
+    }
+    let _ = (executable, point);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restore_displaced_unix_writer(
+    executable: &Path,
+    displaced: &Path,
+    displaced_token: Option<&crate::fs_ops::FileToken>,
+    published_token: &crate::fs_ops::FileToken,
+) -> Result<()> {
+    let displaced_token =
+        displaced_token.context("the exchanged executable has no displaced recovery entry")?;
+    require_file_token(
+        executable,
+        published_token,
+        "candidate before restoring the displaced writer",
+    )?;
+    require_file_token(
+        displaced,
+        displaced_token,
+        "displaced writer before restoration",
+    )?;
+
+    let exchange_result = crate::fs_ops::exchange(displaced, executable);
+    let public_after = crate::fs_ops::token_if_present(executable)?;
+    let displaced_after = crate::fs_ops::token_if_present(displaced)?;
+    if public_after.as_ref() != Some(displaced_token)
+        || displaced_after.as_ref() != Some(published_token)
+    {
+        anyhow::bail!(
+            "the displaced writer could not be restored without changing another writer; public and displaced entries were preserved"
+        );
+    }
+    confirm_unix_namespace_durability(
+        exchange_result,
+        executable,
+        "restoring the displaced executable writer",
+    )
+}
+
+#[cfg(not(windows))]
+fn rollback_uncommitted_unix_exchange(
+    executable: &Path,
+    displaced: &Path,
+    backup: &Path,
+    backup_token: &crate::fs_ops::FileToken,
+    previous_token: &crate::fs_ops::FileToken,
+    published_token: &crate::fs_ops::FileToken,
+) -> Result<()> {
+    require_file_token(
+        backup,
+        backup_token,
+        "independent previous-executable backup before publication rollback",
+    )?;
+    require_file_token(
+        executable,
+        published_token,
+        "candidate before publication rollback",
+    )?;
+    require_file_token(
+        displaced,
+        previous_token,
+        "displaced previous executable before publication rollback",
+    )?;
+    let exchange_result = crate::fs_ops::exchange(displaced, executable);
+    let public_after = crate::fs_ops::token_if_present(executable)?;
+    let displaced_after = crate::fs_ops::token_if_present(displaced)?;
+    if public_after.as_ref() != Some(previous_token)
+        || displaced_after.as_ref() != Some(published_token)
+    {
+        anyhow::bail!(
+            "publication rollback ended in an unclassified state; public {}, candidate {}, backup {} were preserved",
+            executable.display(),
+            displaced.display(),
+            backup.display()
+        );
+    }
+    confirm_unix_namespace_durability(
+        exchange_result,
+        executable,
+        "restoring the previous executable during rollback",
+    )?;
+    remove_exact_transaction_path(
+        displaced,
+        published_token,
+        "rolled-back self-update candidate",
+    )?
+    .require_durable()?;
+    remove_exact_transaction_path(backup, backup_token, "redundant self-update backup")?
+        .require_durable()
+}
+
+#[cfg(not(windows))]
+fn rollback_unix_replacement(
+    executable: &Path,
+    backup: &Path,
+    backup_token: &crate::fs_ops::FileToken,
+    previous_token: &crate::fs_ops::FileToken,
+    published_token: &crate::fs_ops::FileToken,
+    displaced_previous: &Path,
+) -> Result<()> {
+    rollback_uncommitted_unix_exchange(
+        executable,
+        displaced_previous,
+        backup,
+        backup_token,
+        previous_token,
+        published_token,
+    )
+}
+
+#[derive(Debug)]
+enum ExactRemovalOutcome {
+    Durable,
+    DurabilityUnconfirmed(String),
+}
+
+impl ExactRemovalOutcome {
+    fn unconfirmed_note(&self) -> Option<&str> {
+        match self {
+            Self::Durable => None,
+            Self::DurabilityUnconfirmed(note) => {
+                #[cfg(windows)]
+                {
+                    let _ = note;
+                    None
+                }
+                #[cfg(not(windows))]
+                {
+                    Some(note)
+                }
+            }
+        }
+    }
+
+    fn require_durable(self) -> Result<()> {
+        match self {
+            Self::Durable => Ok(()),
+            Self::DurabilityUnconfirmed(note) => {
+                #[cfg(windows)]
+                {
+                    let _ = note;
+                    Ok(())
+                }
+                #[cfg(not(windows))]
+                {
+                    Err(anyhow::anyhow!(note))
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_result(result: Result<ExactRemovalOutcome>) -> String {
+    match result {
+        Ok(ExactRemovalOutcome::Durable) => "complete and durable".to_string(),
+        Ok(ExactRemovalOutcome::DurabilityUnconfirmed(note)) => {
+            format!("applied, but durability is unconfirmed: {note}")
+        }
+        Err(error) => format!("incomplete: {error:#}"),
+    }
+}
+
+fn operation_result(result: Result<()>) -> String {
+    match result {
+        Ok(()) => "complete".to_string(),
+        Err(error) => format!("incomplete: {error:#}"),
+    }
+}
+
+#[cfg(not(windows))]
+fn confirm_unix_namespace_durability(
+    boundary: Result<()>,
+    path: &Path,
+    operation: &str,
+) -> Result<()> {
+    match crate::fs_ops::sync_parent(path) {
+        Ok(()) => Ok(()),
+        Err(sync_error) => match boundary {
+            Ok(()) => Err(sync_error).with_context(|| {
+                format!(
+                    "{operation} reached its verified namespace state, but directory durability was not confirmed"
+                )
+            }),
+            Err(boundary_error) => Err(boundary_error).context(format!(
+                "{operation} reached its verified namespace state after the namespace call reported an error, and retrying directory durability also failed: {sync_error:#}"
+            )),
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -862,6 +1722,9 @@ fn replace_candidate(
 enum WindowsReplaceFaultPoint {
     BeforePublish,
     AfterPublish,
+    AfterPublishBeforeClassification,
+    #[cfg(test)]
+    AfterPublishBeforeClassificationError,
     #[cfg(test)]
     OriginalMovedToBackup,
     #[cfg(test)]
@@ -885,6 +1748,9 @@ fn inject_windows_replace_fault(point: WindowsReplaceFaultPoint) -> Result<()> {
         }
         matches
     }) {
+        if point == WindowsReplaceFaultPoint::AfterPublishBeforeClassification {
+            panic!("injected unwind after Windows executable publication");
+        }
         anyhow::bail!("injected Windows replacement failure at {point:?}");
     }
     let _ = point;
@@ -892,18 +1758,7 @@ fn inject_windows_replace_fault(point: WindowsReplaceFaultPoint) -> Result<()> {
 }
 
 #[cfg(windows)]
-#[derive(Debug)]
-enum WindowsReplaceOutcome {
-    Success,
-    UnchangedFailure(io::Error),
-    OriginalMovedToBackupPartialFailure(io::Error),
-}
-
-#[cfg(windows)]
-fn inject_windows_replace_api_fault(
-    replaced: &Path,
-    backup: &Path,
-) -> Option<WindowsReplaceOutcome> {
+fn inject_windows_replace_api_fault(replaced: &Path, displaced: &Path) -> Option<Result<()>> {
     #[cfg(test)]
     {
         let fault = WINDOWS_REPLACE_FAULT.with(|fault| match fault.get() {
@@ -921,22 +1776,20 @@ fn inject_windows_replace_api_fault(
             // layout: the original has already moved to lpBackupFileName,
             // the replacement remains at its original path, and the public
             // executable path is absent.
-            fs::rename(replaced, backup).expect("inject 1177 original-to-backup move");
+            fs::rename(replaced, displaced).expect("inject 1177 original-to-displaced move");
             if fault == WindowsReplaceFaultPoint::OriginalMovedToBackupAndBlockRestore {
                 fs::create_dir(replaced).expect("inject a blocker at the executable path");
             }
-            return Some(WindowsReplaceOutcome::OriginalMovedToBackupPartialFailure(
-                io::Error::from_raw_os_error(
-                    windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32,
-                ),
-            ));
+            return Some(Err(anyhow::Error::new(io::Error::from_raw_os_error(
+                windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32,
+            ))
+            .context("injected ReplaceFileW partial failure (1177)")));
         }
     }
-    let _ = (replaced, backup);
+    let _ = (replaced, displaced);
     None
 }
 
-#[cfg(windows)]
 fn require_transaction_path_absent(path: &Path, purpose: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -948,308 +1801,552 @@ fn require_transaction_path_absent(path: &Path, purpose: &str) -> Result<()> {
     }
 }
 
-#[cfg(windows)]
-fn stage_windows_candidate(executable: &Path, candidate: &Path) -> Result<PathBuf> {
-    let parent = executable
-        .parent()
-        .with_context(|| format!("current executable has no parent: {}", executable.display()))?;
-    let mut source = fs::File::open(candidate)
-        .with_context(|| format!("opening update candidate {}", candidate.display()))?;
-    let source_len = source
-        .metadata()
-        .with_context(|| format!("reading update candidate metadata {}", candidate.display()))?
-        .len();
-    let mut staged = tempfile::Builder::new()
-        .prefix(".codex-switch-global-pace.self-update-")
-        .suffix(".exe")
-        .tempfile_in(parent)
-        .with_context(|| format!("staging update beside {}", executable.display()))?;
-    let copied = io::copy(&mut source, staged.as_file_mut())
-        .with_context(|| format!("copying update candidate {}", candidate.display()))?;
-    if copied != source_len {
+fn require_file_token(
+    path: &Path,
+    expected: &crate::fs_ops::FileToken,
+    purpose: &str,
+) -> Result<()> {
+    let observed = crate::fs_ops::token_for_path(path)
+        .with_context(|| format!("binding {purpose} at {}", path.display()))?;
+    if &observed != expected {
         anyhow::bail!(
-            "staged update length changed while copying: expected {source_len} bytes, copied {copied}"
+            "{purpose} changed at {}; expected token {}, observed {}",
+            path.display(),
+            expected,
+            observed
         );
     }
-    staged
-        .as_file_mut()
-        .sync_all()
-        .context("flushing staged Windows update")?;
-    let (staged_file, staged_path) = staged
-        .keep()
-        .map_err(|err| err.error)
-        .context("preserving staged Windows update for atomic replacement")?;
-    drop(staged_file);
-    Ok(staged_path)
+    Ok(())
 }
 
-#[cfg(windows)]
-fn replace_file_windows(
-    replaced: &Path,
-    replacement: &Path,
-    backup: &Path,
-) -> WindowsReplaceOutcome {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
-    use windows_sys::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
-
-    if let Some(outcome) = inject_windows_replace_api_fault(replaced, backup) {
-        return outcome;
-    }
-
-    let replaced_wide: Vec<u16> = replaced.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replacement_wide: Vec<u16> = replacement
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    let backup_wide: Vec<u16> = backup.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: all three buffers are stable, NUL-terminated UTF-16 paths for the
-    // duration of the call; the optional pointer parameters are intentionally null.
-    let replace_succeeded = unsafe {
-        ReplaceFileW(
-            replaced_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            backup_wide.as_ptr(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if replace_succeeded != 0 {
-        return WindowsReplaceOutcome::Success;
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) {
-        WindowsReplaceOutcome::OriginalMovedToBackupPartialFailure(error)
-    } else {
-        WindowsReplaceOutcome::UnchangedFailure(error)
+fn describe_token_state(
+    observed: Option<&crate::fs_ops::FileToken>,
+    published: &crate::fs_ops::FileToken,
+    previous: &crate::fs_ops::FileToken,
+) -> &'static str {
+    match observed {
+        None => "absent",
+        Some(token) if token == published => "published candidate",
+        Some(token) if token == previous => "previous executable",
+        Some(_) => "foreign file",
     }
 }
 
-#[cfg(windows)]
-fn remove_windows_file_if_present(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-fn restore_windows_original_after_partial_replace(
-    executable: &Path,
-    original_backup: &Path,
-    retained_replacement: &Path,
-) -> Result<()> {
-    match fs::symlink_metadata(executable) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "inspecting the empty executable path {}; recovery files were preserved at {} and {}",
-                    executable.display(),
-                    original_backup.display(),
-                    retained_replacement.display()
-                )
-            });
-        }
-        Ok(_) => anyhow::bail!(
-            "executable path {} is no longer empty; recovery files were preserved at {} and {}",
-            executable.display(),
-            original_backup.display(),
-            retained_replacement.display()
-        ),
-    }
-    match fs::symlink_metadata(original_backup) {
-        Ok(metadata) if metadata.file_type().is_file() => {}
-        Ok(_) => anyhow::bail!(
-            "original backup is not a regular file at {}; executable path {} and retained replacement {} were preserved",
-            original_backup.display(),
-            executable.display(),
-            retained_replacement.display()
-        ),
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "inspecting original backup {}; executable path {} and retained replacement {} were preserved",
-                    original_backup.display(),
-                    executable.display(),
-                    retained_replacement.display()
-                )
-            });
+fn remove_exact_transaction_path(
+    path: &Path,
+    expected: &crate::fs_ops::FileToken,
+    purpose: &str,
+) -> Result<ExactRemovalOutcome> {
+    let outcome = crate::fs_ops::remove_exact(path, expected)
+        .with_context(|| format!("removing {purpose} at {}", path.display()))?;
+    match outcome {
+        crate::fs_ops::RemoveExactOutcome::Removed => Ok(ExactRemovalOutcome::Durable),
+        crate::fs_ops::RemoveExactOutcome::RemovedNamespaceDurabilityUnconfirmed => {
+            #[cfg(windows)]
+            {
+                Ok(ExactRemovalOutcome::DurabilityUnconfirmed(format!(
+                    "the exact {purpose} was removed from {} and the resulting names were verified; Windows exposes no supported directory-fsync boundary for this operation",
+                    path.display()
+                )))
+            }
+            #[cfg(not(windows))]
+            {
+                match crate::fs_ops::sync_parent(path) {
+                    Ok(()) => Ok(ExactRemovalOutcome::Durable),
+                    Err(error) => Ok(ExactRemovalOutcome::DurabilityUnconfirmed(format!(
+                        "the exact {purpose} was removed from {}, but retrying parent-directory durability failed: {error:#}",
+                        path.display()
+                    ))),
+                }
+            }
         }
     }
-    fs::rename(original_backup, executable).with_context(|| {
+}
+
+fn create_exclusive_copy_durable(
+    source: &Path,
+    destination: &Path,
+    expected: &crate::fs_ops::FileToken,
+    purpose: &str,
+) -> Result<crate::fs_ops::FileToken> {
+    let outcome = crate::fs_ops::create_exclusive_copy(source, destination, expected)
+        .with_context(|| format!("creating {purpose} at {}", destination.display()))?;
+    match outcome {
+        crate::fs_ops::CreateExactOutcome::Created(token) => Ok(token),
+        crate::fs_ops::CreateExactOutcome::CreatedNamespaceDurabilityUnconfirmed(token) => {
+            #[cfg(windows)]
+            {
+                // Windows has already flushed and rebound the exact file handle.
+                // It has no supported directory-fsync contract to retry here.
+                Ok(token)
+            }
+            #[cfg(not(windows))]
+            {
+                match crate::fs_ops::sync_parent(destination) {
+                    Ok(()) => Ok(token),
+                    Err(sync_error) => {
+                        let cleanup = remove_exact_transaction_path(destination, &token, purpose);
+                        anyhow::bail!(
+                            "{purpose} was created at {}, but retrying parent-directory durability failed: {sync_error:#}. Exact cleanup was {}",
+                            destination.display(),
+                            cleanup_result(cleanup)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_file_windows(replaced: &Path, replacement: &Path, displaced: &Path) -> Result<()> {
+    if let Some(result) = inject_windows_replace_api_fault(replaced, displaced) {
+        return result;
+    }
+    crate::fs_ops::replace_with_displaced(replacement, replaced, displaced).with_context(|| {
         format!(
-            "restoring original executable {} from {}; retained replacement remains at {}",
-            executable.display(),
-            original_backup.display(),
-            retained_replacement.display()
+            "atomically replacing {} with {} while preserving the displaced entry at {}",
+            replaced.display(),
+            replacement.display(),
+            displaced.display()
         )
     })
 }
 
 #[cfg(windows)]
-fn windows_replace_error(error: io::Error, replaced: &Path, replacement: &Path) -> anyhow::Error {
-    anyhow::Error::new(error).context(format!(
-        "atomically replacing {} with {}",
-        replaced.display(),
-        replacement.display()
-    ))
+fn restore_windows_displaced_to_empty_public(
+    executable: &Path,
+    displaced: &Path,
+    displaced_token: &crate::fs_ops::FileToken,
+) -> Result<()> {
+    if crate::fs_ops::token_if_present(executable)?.is_some() {
+        anyhow::bail!(
+            "public executable path was claimed before displaced-file recovery: {}",
+            executable.display()
+        );
+    }
+    require_file_token(
+        displaced,
+        displaced_token,
+        "displaced executable before no-replace recovery",
+    )?;
+    let restore_result = crate::fs_ops::rename_noreplace(displaced, executable);
+    let public_after = crate::fs_ops::token_if_present(executable)?;
+    let displaced_after = crate::fs_ops::token_if_present(displaced)?;
+    if public_after.as_ref() != Some(displaced_token) || displaced_after.is_some() {
+        anyhow::bail!(
+            "displaced executable recovery ended in an unclassified state; public {} and displaced {} were preserved",
+            executable.display(),
+            displaced.display()
+        );
+    }
+    restore_result.context(
+        "the displaced Windows executable reached the public path, but MoveFileExW did not confirm its write-through boundary",
+    )?;
+    require_file_token(
+        executable,
+        displaced_token,
+        "restored executable after partial Windows replacement",
+    )
 }
 
 #[cfg(windows)]
-fn replace_candidate(
+fn replace_windows_public_with_displaced(
+    executable: &Path,
+    displaced: &Path,
+    desired_token: &crate::fs_ops::FileToken,
+    current_token: &crate::fs_ops::FileToken,
+    failed_current: &Path,
+) -> Result<()> {
+    require_transaction_path_absent(failed_current, "failed Windows replacement candidate")?;
+    require_file_token(
+        executable,
+        current_token,
+        "current public executable before restoration",
+    )?;
+    require_file_token(
+        displaced,
+        desired_token,
+        "displaced executable before restoration",
+    )?;
+
+    let replace_result = replace_file_windows(executable, displaced, failed_current);
+    let public_after = crate::fs_ops::token_if_present(executable)?;
+    let desired_after = crate::fs_ops::token_if_present(displaced)?;
+    let failed_after = crate::fs_ops::token_if_present(failed_current)?;
+
+    if public_after.as_ref() == Some(desired_token)
+        && desired_after.is_none()
+        && failed_after.as_ref() == Some(current_token)
+    {
+        if let Err(error) = replace_result {
+            return Err(error.context(
+                "the desired executable reached the public path, but ReplaceFileW did not confirm restoration",
+            ));
+        }
+        return remove_exact_transaction_path(
+            failed_current,
+            current_token,
+            "displaced failed Windows candidate",
+        )?
+        .require_durable();
+    }
+
+    // ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 leaves the public name empty after
+    // moving the current file to the backup name. The post-state, not merely
+    // the numeric error, decides whether no-replace recovery is authorized.
+    if public_after.is_none()
+        && desired_after.as_ref() == Some(desired_token)
+        && failed_after.as_ref() == Some(current_token)
+    {
+        restore_windows_displaced_to_empty_public(executable, displaced, desired_token)?;
+        remove_exact_transaction_path(
+            failed_current,
+            current_token,
+            "displaced failed Windows candidate",
+        )?
+        .require_durable()?;
+        return Ok(());
+    }
+
+    let boundary_error = replace_result
+        .err()
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_else(|| {
+            "ReplaceFileW returned success with an unexpected post-state".to_string()
+        });
+    anyhow::bail!(
+        "Windows restoration ended in an unclassified state: public={}, desired={}, failed-current={}; no recovery entry was deleted ({boundary_error})",
+        describe_token_state(public_after.as_ref(), current_token, desired_token),
+        describe_token_state(desired_after.as_ref(), current_token, desired_token),
+        describe_token_state(failed_after.as_ref(), current_token, desired_token)
+    )
+}
+
+#[cfg(windows)]
+fn replace_candidate_inner(
     executable: &Path,
     candidate: &Path,
     update_lease: UpdateLease,
     platform: UpdatePlatform,
     release_tag: &str,
+    failure_recovery: std::sync::Arc<std::sync::Mutex<Option<PublicationFailureRecovery>>>,
 ) -> Result<PendingReplacement> {
-    let backup = transaction_sibling_path(executable, ".self-update-backup.exe")?;
-    let failed_candidate = transaction_sibling_path(executable, ".self-update-failed.exe")?;
+    let backup = transaction_sibling_path(executable, ".self-update-backup")?;
+    let staged = transaction_sibling_path(executable, ".self-update-candidate")?;
+    let displaced_previous = random_windows_recovery_sibling_path(
+        executable,
+        WINDOWS_DISPLACED_RECOVERY_PREFIX,
+        "displaced previous executable",
+    )?;
+    let failed_candidate = random_windows_recovery_sibling_path(
+        executable,
+        WINDOWS_FAILED_RECOVERY_PREFIX,
+        "failed self-update candidate",
+    )?;
     require_transaction_path_absent(&backup, "self-update backup")?;
-    require_transaction_path_absent(&failed_candidate, "failed self-update candidate")?;
-    let staged = stage_windows_candidate(executable, candidate)?;
+    require_transaction_path_absent(&staged, "staged self-update candidate")?;
 
-    if let Err(err) = inject_windows_replace_fault(WindowsReplaceFaultPoint::BeforePublish) {
-        let _ = fs::remove_file(&staged);
-        return Err(err.context("Windows self-update stopped before publication"));
-    }
-    match replace_file_windows(executable, &staged, &backup) {
-        WindowsReplaceOutcome::Success => {}
-        WindowsReplaceOutcome::UnchangedFailure(error) => {
-            let error = windows_replace_error(error, executable, &staged);
-            if let Err(cleanup_error) = remove_windows_file_if_present(&staged) {
-                return Err(error.context(format!(
-                    "Windows replacement left the original executable unchanged, but staged candidate cleanup failed at {}: {cleanup_error}",
-                    staged.display()
-                )));
-            }
+    let previous_token = crate::fs_ops::token_for_path(executable)
+        .context("binding the current Windows executable before self-update")?;
+    let backup_token = create_exclusive_copy_durable(
+        executable,
+        &backup,
+        &previous_token,
+        "independent Windows previous-executable backup",
+    )
+    .with_context(|| {
+        format!(
+            "preserving an independent copy of the current executable at {}",
+            backup.display()
+        )
+    })?;
+    let candidate_source_token = crate::fs_ops::token_for_path(candidate)
+        .context("binding the verified Windows self-update candidate")?;
+    let published_token = match create_exclusive_copy_durable(
+        candidate,
+        &staged,
+        &candidate_source_token,
+        "staged Windows self-update candidate",
+    ) {
+        Ok(token) => token,
+        Err(error) => {
+            let backup_cleanup = remove_exact_transaction_path(
+                &backup,
+                &backup_token,
+                "unused Windows self-update backup",
+            );
             return Err(error.context(format!(
-                "replacing current executable: {}",
-                replacement_permission_hint(executable, platform, release_tag)
+                "staging the Windows self-update candidate failed; backup cleanup was {}",
+                cleanup_result(backup_cleanup)
             )));
         }
-        WindowsReplaceOutcome::OriginalMovedToBackupPartialFailure(error) => {
-            let error = windows_replace_error(error, executable, &staged);
-            if let Err(recovery_error) =
-                restore_windows_original_after_partial_replace(executable, &backup, &staged)
-            {
-                return Err(error.context(format!(
-                    "ReplaceFileW returned ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177) after moving the original executable to {}; automatic recovery failed: {recovery_error}. Preserve the original backup at {}, the staged replacement at {}, and the executable path {} for manual recovery",
-                    backup.display(),
-                    backup.display(),
-                    staged.display(),
-                    executable.display()
-                )));
-            }
-            if let Err(cleanup_error) = remove_windows_file_if_present(&staged) {
-                return Err(error.context(format!(
-                    "ReplaceFileW returned ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177); the original executable was restored at {}, but the staged replacement could not be removed from {}: {cleanup_error}",
-                    executable.display(),
-                    staged.display()
-                )));
-            }
-            return Err(error.context(format!(
-                "ReplaceFileW returned ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177); the original executable was restored at {} and the update was not published",
-                executable.display()
-            )));
-        }
+    };
+
+    let prepublication = (|| {
+        require_file_token(
+            executable,
+            &previous_token,
+            "current Windows executable immediately before publication",
+        )?;
+        require_file_token(
+            &backup,
+            &backup_token,
+            "independent Windows previous-executable backup",
+        )?;
+        require_file_token(
+            &staged,
+            &published_token,
+            "staged Windows self-update candidate",
+        )?;
+        inject_windows_replace_fault(WindowsReplaceFaultPoint::BeforePublish)
+    })();
+    if let Err(error) = prepublication {
+        let staged_cleanup = remove_exact_transaction_path(
+            &staged,
+            &published_token,
+            "unpublished Windows self-update candidate",
+        );
+        let backup_cleanup = remove_exact_transaction_path(
+            &backup,
+            &backup_token,
+            "unused Windows self-update backup",
+        );
+        return Err(error.context(format!(
+            "Windows self-update stopped before publication; candidate cleanup was {} and backup cleanup was {}",
+            cleanup_result(staged_cleanup),
+            cleanup_result(backup_cleanup)
+        )));
     }
 
-    let mut pending = PendingReplacement::new(
-        update_lease,
-        executable.to_path_buf(),
-        backup,
-        failed_candidate,
+    // Own every exact recovery operand before ReplaceFileW. This guard is the
+    // publication-to-result handoff: an unwind during post-state probes keeps
+    // the backup and randomized displaced identities available for recovery.
+    let mut publication_owner = PublicationRecoveryOwner::new(
+        PendingReplacement {
+            lease: Some(update_lease),
+            state: ReplacementState::Pending,
+            completion: None,
+            executable: executable.to_path_buf(),
+            backup: backup.clone(),
+            backup_token: backup_token.clone(),
+            previous_token: previous_token.clone(),
+            published_token: published_token.clone(),
+            displaced_previous: displaced_previous.clone(),
+            failed_candidate: failed_candidate.clone(),
+        },
+        failure_recovery,
     );
-    if let Err(err) = inject_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublish) {
-        if let Err(rollback_err) = pending.rollback() {
-            return Err(err.context(format!(
-                "Windows replacement failed after publication and rollback also failed: {rollback_err}"
-            )));
+    let recovery_context = || {
+        format!(
+            "classifying Windows replacement recovery paths: public {}, staged {}, displaced {}, independent backup {}",
+            executable.display(),
+            staged.display(),
+            displaced_previous.display(),
+            backup.display()
+        )
+    };
+    let replace_result = replace_file_windows(executable, &staged, &displaced_previous);
+    inject_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublishBeforeClassification)?;
+    #[cfg(test)]
+    inject_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublishBeforeClassificationError)?;
+    let public_after =
+        crate::fs_ops::token_if_present(executable).with_context(recovery_context)?;
+    let staged_after = crate::fs_ops::token_if_present(&staged).with_context(recovery_context)?;
+    let displaced_after =
+        crate::fs_ops::token_if_present(&displaced_previous).with_context(recovery_context)?;
+    let replace_detail = replace_result
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_else(|| "ReplaceFileW reported success".to_string());
+
+    if public_after.as_ref() == Some(&published_token)
+        && staged_after.is_none()
+        && displaced_after.as_ref() == Some(&previous_token)
+    {
+        if let Err(error) = replace_result {
+            let restoration = replace_windows_public_with_displaced(
+                executable,
+                &displaced_previous,
+                &previous_token,
+                &published_token,
+                &failed_candidate,
+            );
+            let backup_cleanup = if restoration.is_ok() {
+                remove_exact_transaction_path(
+                    &backup,
+                    &backup_token,
+                    "unused Windows self-update backup",
+                )
+            } else {
+                Ok(ExactRemovalOutcome::Durable)
+            };
+            publication_owner.preserve_classified_error();
+            anyhow::bail!(
+                "Windows replacement reached the published layout but the operating system did not confirm it ({error:#}; namespace result: {replace_detail}); restoration was {} and backup cleanup was {}",
+                operation_result(restoration),
+                cleanup_result(backup_cleanup)
+            );
         }
-        return Err(err.context(
-            "Windows replacement failed after publication; previous executable was restored",
-        ));
+        if let Err(error) = inject_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublish) {
+            if let Err(rollback_error) = publication_owner.pending_mut().rollback() {
+                return Err(error.context(format!(
+                    "Windows replacement failed after publication and exact rollback also failed: {rollback_error:#}"
+                )));
+            }
+            return Err(error.context(
+                "Windows replacement failed after publication; the exact previous executable was restored",
+            ));
+        }
+        return Ok(publication_owner.into_pending());
     }
-    Ok(pending)
+
+    if public_after.as_ref() == Some(&previous_token)
+        && staged_after.as_ref() == Some(&published_token)
+        && displaced_after.is_none()
+    {
+        let staged_cleanup = remove_exact_transaction_path(
+            &staged,
+            &published_token,
+            "unpublished Windows self-update candidate",
+        );
+        let backup_cleanup = remove_exact_transaction_path(
+            &backup,
+            &backup_token,
+            "unused Windows self-update backup",
+        );
+        publication_owner.preserve_classified_error();
+        anyhow::bail!(
+            "Windows self-update candidate was not published ({replace_detail}); candidate cleanup was {} and backup cleanup was {}. {}",
+            cleanup_result(staged_cleanup),
+            cleanup_result(backup_cleanup),
+            replacement_permission_hint(executable, platform, release_tag)
+        );
+    }
+
+    if public_after.is_none()
+        && staged_after.as_ref() == Some(&published_token)
+        && let Some(displaced_token) = displaced_after.as_ref()
+    {
+        let restoration = restore_windows_displaced_to_empty_public(
+            executable,
+            &displaced_previous,
+            displaced_token,
+        );
+        if restoration.is_ok() {
+            let staged_cleanup = remove_exact_transaction_path(
+                &staged,
+                &published_token,
+                "unpublished Windows self-update candidate",
+            );
+            let backup_cleanup = remove_exact_transaction_path(
+                &backup,
+                &backup_token,
+                "unused Windows self-update backup",
+            );
+            publication_owner.preserve_classified_error();
+            anyhow::bail!(
+                "Windows replacement stopped after displacing the public executable ({replace_detail}); the actual displaced file was restored without replacement. Candidate cleanup was {} and backup cleanup was {}",
+                cleanup_result(staged_cleanup),
+                cleanup_result(backup_cleanup)
+            );
+        }
+        publication_owner.preserve_classified_error();
+        anyhow::bail!(
+            "Windows replacement stopped with an empty public path ({replace_detail}); no recovery file was deleted. Public {}, staged {}, displaced {}, independent backup {}. Restoration failed: {}",
+            executable.display(),
+            staged.display(),
+            displaced_previous.display(),
+            backup.display(),
+            operation_result(restoration)
+        );
+    }
+
+    if public_after.as_ref() == Some(&published_token)
+        && staged_after.is_none()
+        && let Some(displaced_token) = displaced_after.as_ref()
+        && displaced_token != &previous_token
+    {
+        let restoration = replace_windows_public_with_displaced(
+            executable,
+            &displaced_previous,
+            displaced_token,
+            &published_token,
+            &failed_candidate,
+        );
+        if restoration.is_ok() {
+            let backup_cleanup = remove_exact_transaction_path(
+                &backup,
+                &backup_token,
+                "unused Windows self-update backup",
+            );
+            publication_owner.preserve_classified_error();
+            anyhow::bail!(
+                "Windows self-update displaced a file that no longer matched the authorized executable; the actual displaced writer was restored. Backup cleanup was {}",
+                cleanup_result(backup_cleanup)
+            );
+        }
+        publication_owner.preserve_classified_error();
+        anyhow::bail!(
+            "Windows self-update displaced a foreign file and exact restoration failed; no recovery entry was deleted. Public {}, displaced {}, independent backup {}. Restoration failed: {}",
+            executable.display(),
+            displaced_previous.display(),
+            backup.display(),
+            operation_result(restoration)
+        );
+    }
+
+    publication_owner.preserve_classified_error();
+    anyhow::bail!(
+        "Windows self-update ended in an unclassified external-writer state: public={}, staged={}, displaced={} ({replace_detail}); no recovery entry was deleted. Public {}, staged {}, displaced {}, independent backup {}",
+        describe_token_state(public_after.as_ref(), &published_token, &previous_token),
+        describe_token_state(staged_after.as_ref(), &published_token, &previous_token),
+        describe_token_state(displaced_after.as_ref(), &published_token, &previous_token),
+        executable.display(),
+        staged.display(),
+        displaced_previous.display(),
+        backup.display()
+    );
 }
 
 #[cfg(windows)]
 fn rollback_windows_replacement(
     executable: &Path,
     backup: &Path,
+    backup_token: &crate::fs_ops::FileToken,
+    previous_token: &crate::fs_ops::FileToken,
+    published_token: &crate::fs_ops::FileToken,
+    displaced_previous: &Path,
     failed_candidate: &Path,
 ) -> Result<()> {
-    require_transaction_path_absent(failed_candidate, "failed self-update candidate")?;
-    match replace_file_windows(executable, backup, failed_candidate) {
-        WindowsReplaceOutcome::Success => {}
-        WindowsReplaceOutcome::UnchangedFailure(error) => {
-            return Err(windows_replace_error(error, executable, backup).context(format!(
-                "restoring previous executable {} from {}; the previous executable remains preserved at {}",
-                executable.display(),
-                backup.display(),
-                backup.display()
-            )));
-        }
-        WindowsReplaceOutcome::OriginalMovedToBackupPartialFailure(error) => {
-            let error = windows_replace_error(error, executable, backup);
-            if let Err(recovery_error) =
-                restore_windows_original_after_partial_replace(executable, backup, failed_candidate)
-            {
-                return Err(error.context(format!(
-                    "rollback ReplaceFileW returned ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177); automatic recovery failed: {recovery_error}. Preserve the previous executable at {}, the failed candidate at {}, and the executable path {} for manual recovery",
-                    backup.display(),
-                    failed_candidate.display(),
-                    executable.display()
-                )));
-            }
-            tracing::warn!(
-                "Rollback ReplaceFileW returned ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177), but the previous executable was restored at {}",
-                executable.display()
-            );
-        }
-    }
-    if let Err(err) = remove_windows_file_if_present(failed_candidate) {
-        tracing::warn!(
-            "Previous executable was restored, but failed update cleanup at {} was deferred: {err}",
-            failed_candidate.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn cleanup_committed_windows_backup(backup: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    };
-
-    match fs::remove_file(backup) {
-        Ok(()) => return Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(remove_err) => {
-            let delete_on_exit = fs::OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-                .open(backup)
-                .map_err(|schedule_err| {
-                    anyhow::anyhow!(
-                        "removing old executable {} failed ({remove_err}); marking it for deletion on process exit also failed: {schedule_err}",
-                        backup.display()
-                    )
-                })?;
-            // Keep the delete-on-close handle alive until this process releases
-            // the image section for the old executable.
-            std::mem::forget(delete_on_exit);
-        }
-    }
-    Ok(())
+    require_file_token(
+        backup,
+        backup_token,
+        "independent previous-executable backup before rollback",
+    )?;
+    replace_windows_public_with_displaced(
+        executable,
+        displaced_previous,
+        previous_token,
+        published_token,
+        failed_candidate,
+    )
+    .with_context(|| {
+        format!(
+            "rolling back Windows replacement: public {}, displaced previous {}, failed candidate {}, independent backup {}",
+            executable.display(),
+            displaced_previous.display(),
+            failed_candidate.display(),
+            backup.display()
+        )
+    })?;
+    remove_exact_transaction_path(
+        backup,
+        backup_token,
+        "redundant Windows previous-executable backup",
+    )?
+    .require_durable()
 }
 
 fn candidate_version_line(stdout: &str) -> Option<&str> {
@@ -1546,11 +2643,7 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, archive_path: &Pat
     let expected = extract_checksum_digest(&checksum_text)
         .context("checksum file did not contain a SHA256 digest")?;
 
-    let actual = {
-        let bytes = fs::read(archive_path)
-            .with_context(|| format!("reading downloaded asset {}", archive_path.display()))?;
-        hex::encode(Sha256::digest(&bytes))
-    };
+    let actual = sha256_file(archive_path)?;
 
     if !checksum_matches(expected, &actual) {
         anyhow::bail!(
@@ -1562,6 +2655,22 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, archive_path: &Pat
     }
 
     Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn extract_checksum_digest(checksum_text: &str) -> Option<&str> {
@@ -1865,6 +2974,16 @@ fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
 mod tests {
     use super::*;
 
+    fn set_commit_fault(point: CommitFaultPoint) {
+        COMMIT_FAULT.with(|fault| {
+            assert!(fault.replace(Some(point)).is_none());
+        });
+    }
+
+    fn set_publication_rollback_panic() {
+        PUBLICATION_ROLLBACK_PANIC.with(|fault| assert!(!fault.replace(true)));
+    }
+
     #[test]
     fn release_assets_and_update_cache_are_project_namespaced() {
         assert!(asset_name().starts_with("codex-switch-global-pace-"));
@@ -1936,6 +3055,141 @@ mod tests {
         (temp, executable, candidate)
     }
 
+    #[cfg(windows)]
+    fn typed_result_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        SelfUpdateResult,
+    ) {
+        let (temp, executable, candidate) = windows_replacement_fixture();
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        let replacement = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Windows,
+            "v1.2.3",
+        )
+        .expect("publish candidate");
+        let backup = replacement.backup.clone();
+        let displaced = replacement.displaced_previous.clone();
+        let result = SelfUpdateResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: Some(replacement),
+            replacement_state: SelfUpdateReplacementState::Pending,
+            transaction_lease: None,
+        };
+        (temp, executable, backup, displaced, result)
+    }
+
+    #[cfg(windows)]
+    fn windows_recovery_entries(executable: &Path, prefix: &str) -> Vec<PathBuf> {
+        let name_prefix = transaction_sibling_path(executable, prefix)
+            .expect("build recovery prefix")
+            .file_name()
+            .expect("recovery prefix file name")
+            .to_string_lossy()
+            .into_owned();
+        let mut entries = fs::read_dir(executable.parent().unwrap())
+            .expect("read replacement fixture")
+            .map(|entry| entry.expect("read replacement entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&name_prefix))
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    #[cfg(windows)]
+    fn only_windows_recovery_entry(executable: &Path, prefix: &str) -> PathBuf {
+        let entries = windows_recovery_entries(executable, prefix);
+        assert_eq!(entries.len(), 1, "expected one {prefix} recovery entry");
+        entries.into_iter().next().unwrap()
+    }
+
+    #[cfg(windows)]
+    fn assert_random_windows_recovery_name(executable: &Path, path: &Path, prefix: &str) {
+        let name_prefix = transaction_sibling_path(executable, prefix)
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let name = path.file_name().unwrap().to_string_lossy();
+        let nonce = name
+            .strip_prefix(&name_prefix)
+            .expect("recovery name must use its transaction prefix");
+        assert_eq!(nonce.len(), 32, "recovery nonce must encode 128 bits");
+        assert_eq!(hex::decode(nonce).unwrap().len(), 16);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_random_recovery_path_retries_collisions_with_a_fixed_bound() {
+        let (temp, executable, _candidate) = windows_replacement_fixture();
+        let colliding_nonce = [0x11; 16];
+        let available_nonce = [0x22; 16];
+        let collision = transaction_sibling_path(
+            &executable,
+            &format!(
+                "{WINDOWS_DISPLACED_RECOVERY_PREFIX}{}",
+                hex::encode(colliding_nonce)
+            ),
+        )
+        .unwrap();
+        fs::write(&collision, b"foreign recovery entry").unwrap();
+
+        let mut calls = 0;
+        let allocated = windows_recovery_sibling_path_with_nonce_source(
+            &executable,
+            WINDOWS_DISPLACED_RECOVERY_PREFIX,
+            "test displaced executable",
+            || {
+                calls += 1;
+                if calls == 1 {
+                    colliding_nonce
+                } else {
+                    available_nonce
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            allocated,
+            transaction_sibling_path(
+                &executable,
+                &format!(
+                    "{WINDOWS_DISPLACED_RECOVERY_PREFIX}{}",
+                    hex::encode(available_nonce)
+                )
+            )
+            .unwrap()
+        );
+
+        let error = windows_recovery_sibling_path_with_nonce_source(
+            &executable,
+            WINDOWS_DISPLACED_RECOVERY_PREFIX,
+            "test displaced executable",
+            || colliding_nonce,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT.to_string()),
+            "{error:#}"
+        );
+        drop(temp);
+    }
+
     #[test]
     fn self_update_lease_serializes_concurrent_replacements() {
         let temp = tempfile::tempdir().expect("create lease fixture");
@@ -1966,6 +3220,494 @@ mod tests {
         waiter.join().expect("join update-lease waiter");
     }
 
+    #[cfg(not(windows))]
+    fn set_unix_replace_fault(point: UnixReplaceFaultPoint) {
+        UNIX_REPLACE_FAULT.with(|fault| {
+            assert!(fault.replace(Some(point)).is_none());
+        });
+    }
+
+    #[cfg(not(windows))]
+    fn unix_pending_replacement_fixture()
+    -> (tempfile::TempDir, PathBuf, PathBuf, PendingReplacement) {
+        let temp = tempfile::tempdir().expect("create Unix replacement fixture");
+        let executable = temp.path().join("codex-switch-global-pace");
+        let candidate = temp.path().join("candidate");
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let displaced_previous = temp.path().join("displaced-previous");
+        fs::write(&executable, b"old executable").expect("write old executable");
+        fs::write(&candidate, b"new executable").expect("write candidate executable");
+        let previous_token = crate::fs_ops::token_for_path(&executable).unwrap();
+        let published_token = crate::fs_ops::token_for_path(&candidate).unwrap();
+        let backup_token =
+            crate::fs_ops::create_exclusive_copy(&executable, &backup, &previous_token)
+                .unwrap()
+                .token()
+                .clone();
+        fs::rename(&executable, &displaced_previous).expect("displace old executable");
+        fs::rename(&candidate, &executable).expect("publish candidate");
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        let pending = PendingReplacement {
+            lease: Some(lease),
+            state: ReplacementState::Pending,
+            completion: None,
+            executable: executable.clone(),
+            backup: backup.clone(),
+            backup_token,
+            previous_token,
+            published_token,
+            displaced_previous,
+        };
+        (temp, executable, backup, pending)
+    }
+
+    #[cfg(not(windows))]
+    fn typed_result_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+        SelfUpdateResult,
+    ) {
+        let (temp, executable, backup, pending) = unix_pending_replacement_fixture();
+        let displaced = pending.displaced_previous.clone();
+        let result = SelfUpdateResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: Some(pending),
+            replacement_state: SelfUpdateReplacementState::Pending,
+            transaction_lease: None,
+        };
+        (temp, executable, backup, displaced, result)
+    }
+
+    #[test]
+    fn pending_commit_failure_preserves_and_describes_actual_recovery_paths() {
+        let (_temp, executable, backup, displaced, mut result) = typed_result_fixture();
+        fs::write(&executable, b"externally changed executable")
+            .expect("inject a public executable token mismatch");
+
+        let commit_error = result
+            .commit_replacement()
+            .expect_err("a changed published executable must fail commit");
+        assert!(
+            format!("{commit_error:#}").contains("published self-update candidate at commit"),
+            "{commit_error:#}"
+        );
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Pending,
+            "pre-cleanup commit failure must retain the pending recovery owner"
+        );
+
+        let recovery = result
+            .preserve_failed_commit_for_recovery()
+            .expect("preserve the failed commit recovery set")
+            .expect("a pending failed commit must expose recovery paths");
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Preserved
+        );
+        let description = recovery.describe();
+        for path in [&executable, &backup, &displaced] {
+            assert!(
+                description.contains(&path.display().to_string()),
+                "missing actual recovery path {} in {description}",
+                path.display()
+            );
+        }
+        for path in [&backup, &displaced] {
+            let entry = recovery
+                .entries
+                .iter()
+                .find(|entry| &entry.path == path)
+                .expect("recovery path observation");
+            assert_eq!(entry.state, ReplacementRecoveryEntryState::ExactPresent);
+        }
+    }
+
+    #[test]
+    fn panic_before_final_recovery_cleanup_never_claims_old_binary_restoration() {
+        let (_temp, executable, backup, displaced, mut result) = typed_result_fixture();
+        set_commit_fault(CommitFaultPoint::BeforeFinalRecoveryCleanup);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = result.commit_replacement();
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Preserved
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+        assert!(
+            !displaced.exists(),
+            "the first exact recovery entry was already removed, so automatic rollback must not be claimed"
+        );
+        let recovery = result
+            .preserve_replacement_for_recovery()
+            .expect("classify the remaining recovery entries");
+        let backup_entry = recovery
+            .entries
+            .iter()
+            .find(|entry| entry.path == backup)
+            .expect("backup observation");
+        assert_eq!(
+            backup_entry.state,
+            ReplacementRecoveryEntryState::ExactPresent
+        );
+        let displaced_entry = recovery
+            .entries
+            .iter()
+            .find(|entry| entry.path == displaced)
+            .expect("displaced observation");
+        assert_eq!(displaced_entry.state, ReplacementRecoveryEntryState::Absent);
+        let description = recovery.describe();
+        assert!(description.contains("independent previous-executable backup"));
+        assert!(description.contains("exact entry is present"));
+        assert!(description.contains("displaced previous executable"));
+        assert!(description.contains("entry is absent"));
+    }
+
+    #[test]
+    fn panic_after_final_recovery_cleanup_reports_live_committed_state() {
+        let (_temp, executable, backup, displaced, mut result) = typed_result_fixture();
+        set_commit_fault(CommitFaultPoint::AfterFinalRecoveryCleanup);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = result.commit_replacement();
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Committed
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert!(!backup.exists());
+        assert!(!displaced.exists());
+        let recovery = result
+            .preserve_replacement_for_recovery()
+            .expect("observe the finished replacement without changing its live state");
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Committed
+        );
+        assert!(
+            recovery
+                .entries
+                .iter()
+                .filter(|entry| entry.path == backup || entry.path == displaced)
+                .all(|entry| entry.state == ReplacementRecoveryEntryState::Absent)
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_pending_replacement_preserves_backup_until_explicit_commit() {
+        let (_temp, executable, backup, mut pending) = unix_pending_replacement_fixture();
+
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+        pending.commit().expect("commit replacement");
+
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert!(!backup.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_daemon_failure_restores_the_exact_previous_executable() {
+        let (_temp, executable, backup, mut pending) = unix_pending_replacement_fixture();
+
+        pending.rollback().expect("rollback failed candidate");
+
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert!(!backup.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_rollback_refuses_to_overwrite_a_changed_executable() {
+        let (_temp, executable, backup, mut pending) = unix_pending_replacement_fixture();
+        let external = executable.with_extension("external");
+        fs::write(&external, b"external executable").unwrap();
+        fs::rename(&external, &executable).unwrap();
+
+        let error = pending.rollback().unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed"));
+        assert_eq!(fs::read(&executable).unwrap(), b"external executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn dropping_uncommitted_unix_replacement_keeps_manual_recovery_data() {
+        let (_temp, executable, backup, pending) = unix_pending_replacement_fixture();
+
+        drop(pending);
+
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_commit_does_not_delete_a_replaced_backup_path() {
+        let (temp, executable, backup, mut pending) = unix_pending_replacement_fixture();
+        let preserved = temp.path().join("actual-old-executable");
+        fs::rename(&backup, &preserved).unwrap();
+        fs::write(&backup, b"external file").unwrap();
+
+        let error = pending
+            .commit()
+            .expect_err("changed backup path must fail commit");
+
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&preserved).unwrap(), b"old executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"external file");
+        assert!(format!("{error:#}").contains("old executable backup"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_publication_refuses_to_overwrite_an_executable_changed_during_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex-switch-global-pace");
+        let candidate = temp.path().join("candidate");
+        fs::write(&executable, b"old executable").unwrap();
+        fs::write(&candidate, b"new executable").unwrap();
+        let lease = acquire_update_lease(&executable).unwrap();
+        set_unix_replace_fault(UnixReplaceFaultPoint::CurrentExecutableChangedBeforePublish);
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Unix,
+            "v1.2.3",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed"), "{error:#}");
+        assert_eq!(fs::read(&executable).unwrap(), b"external executable");
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        assert!(!backup.exists());
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-candidate")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_publication_preserves_a_writer_that_claims_the_atomic_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex-switch-global-pace");
+        let candidate = temp.path().join("candidate");
+        fs::write(&executable, b"old executable").unwrap();
+        fs::write(&candidate, b"new executable").unwrap();
+        let lease = acquire_update_lease(&executable).unwrap();
+        set_unix_replace_fault(UnixReplaceFaultPoint::ConcurrentExecutableClaimedPublicPath);
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Unix,
+            "v1.2.3",
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("displaced writer was restored"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"external executable");
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        assert!(!backup.exists());
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-candidate")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_unwind_immediately_after_exchange_restores_the_old_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex-switch-global-pace");
+        let candidate = temp.path().join("candidate");
+        fs::write(&executable, b"old executable").unwrap();
+        fs::write(&candidate, b"new executable").unwrap();
+        let lease = acquire_update_lease(&executable).unwrap();
+        set_unix_replace_fault(UnixReplaceFaultPoint::AfterPublishBeforeClassification);
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Unix,
+            "v1.2.3",
+        )
+        .expect_err("the injected post-exchange unwind must be recovered");
+
+        assert!(format!("{error:#}").contains("exact previous executable was restored"));
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-backup")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-candidate")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_error_immediately_after_exchange_reports_exact_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex-switch-global-pace");
+        let candidate = temp.path().join("candidate");
+        fs::write(&executable, b"old executable").unwrap();
+        fs::write(&candidate, b"new executable").unwrap();
+        let lease = acquire_update_lease(&executable).unwrap();
+        set_unix_replace_fault(UnixReplaceFaultPoint::AfterPublishBeforeClassificationError);
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Unix,
+            "v1.2.3",
+        )
+        .expect_err("the injected post-exchange error must be recovered");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("injected error after Unix executable publication"));
+        assert!(message.contains("exact previous executable was restored"));
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-backup")
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-candidate")
+                .unwrap()
+                .exists()
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn nested_unwind_during_unix_publication_rollback_preserves_exact_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("codex-switch-global-pace");
+        let candidate = temp.path().join("candidate");
+        fs::write(&executable, b"old executable").unwrap();
+        fs::write(&candidate, b"new executable").unwrap();
+        let lease = acquire_update_lease(&executable).unwrap();
+        set_unix_replace_fault(UnixReplaceFaultPoint::AfterPublishBeforeClassification);
+        set_publication_rollback_panic();
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Unix,
+            "v1.2.3",
+        )
+        .expect_err("nested rollback unwind must be classified without process abort");
+        let message = format!("{error:#}");
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let displaced = transaction_sibling_path(&executable, ".self-update-candidate").unwrap();
+        assert!(message.contains("rollback itself unwound"), "{message}");
+        assert!(message.contains(&backup.display().to_string()));
+        assert!(message.contains(&displaced.display().to_string()));
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+        assert_eq!(fs::read(&displaced).unwrap(), b"old executable");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn typed_result_distinguishes_pending_committed_and_rolled_back_states() {
+        let (_temp, executable, _backup, pending) = unix_pending_replacement_fixture();
+        let mut result = SelfUpdateResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: Some(pending),
+            replacement_state: SelfUpdateReplacementState::Pending,
+            transaction_lease: None,
+        };
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Pending
+        );
+        result
+            .rollback_replacement()
+            .expect("roll back pending replacement");
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::RolledBack
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+
+        let (_temp, executable, _backup, pending) = unix_pending_replacement_fixture();
+        let mut committed = SelfUpdateResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: Some(pending),
+            replacement_state: SelfUpdateReplacementState::Pending,
+            transaction_lease: None,
+        };
+        committed
+            .commit_replacement()
+            .expect("commit pending replacement");
+        assert_eq!(
+            committed.replacement_state(),
+            SelfUpdateReplacementState::Committed
+        );
+        committed
+            .rollback_replacement()
+            .expect("committed rollback is a no-op");
+        assert_eq!(
+            committed.replacement_state(),
+            SelfUpdateReplacementState::Committed
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_no_replace_rename_never_overwrites_the_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destination").unwrap();
+
+        crate::fs_ops::rename_noreplace(&source, &destination).unwrap_err();
+
+        assert_eq!(fs::read(&source).unwrap(), b"source");
+        assert_eq!(fs::read(&destination).unwrap(), b"destination");
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_failure_before_publish_leaves_the_old_executable_untouched() {
@@ -1985,9 +3727,12 @@ mod tests {
         assert!(error.to_string().contains("before publication"), "{error}");
         assert_eq!(fs::read(&executable).unwrap(), b"old executable");
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-backup.exe")
+            !transaction_sibling_path(&executable, ".self-update-backup")
                 .unwrap()
                 .exists()
+        );
+        assert!(
+            windows_recovery_entries(&executable, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty()
         );
     }
 
@@ -2008,14 +3753,12 @@ mod tests {
         .expect_err("the injected ReplaceFileW 1177 must fail publication");
 
         assert!(
-            error
-                .to_string()
-                .contains("ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177)"),
+            error.to_string().contains("partial failure (1177)"),
             "{error:#}"
         );
         assert_eq!(fs::read(&executable).unwrap(), b"old executable");
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-backup.exe")
+            !transaction_sibling_path(&executable, ".self-update-backup")
                 .unwrap()
                 .exists()
         );
@@ -2024,9 +3767,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_1177_publish_recovery_failure_preserves_every_recovery_path() {
-        let (temp, executable, candidate) = windows_replacement_fixture();
+        let (_temp, executable, candidate) = windows_replacement_fixture();
         let lease = acquire_update_lease(&executable).expect("acquire update lease");
-        let backup = transaction_sibling_path(&executable, ".self-update-backup.exe").unwrap();
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let staged = transaction_sibling_path(&executable, ".self-update-candidate").unwrap();
         set_windows_replace_fault(WindowsReplaceFaultPoint::OriginalMovedToBackupAndBlockRestore);
 
         let error = replace_candidate(
@@ -2037,19 +3781,8 @@ mod tests {
             "v1.2.3",
         )
         .expect_err("the blocked 1177 recovery must fail closed");
-        let staged = fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .find(|path| {
-                path.file_name().is_some_and(|name| {
-                    name.to_string_lossy()
-                        .starts_with(".codex-switch-global-pace.self-update-")
-                })
-            })
-            .expect("the staged replacement must be preserved");
-
-        let message = error.to_string();
-        assert!(message.contains("automatic recovery failed"), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("not a direct regular file"), "{error:#}");
         assert!(message.contains(&backup.display().to_string()), "{error:#}");
         assert!(message.contains(&staged.display().to_string()), "{error:#}");
         assert!(
@@ -2062,10 +3795,13 @@ mod tests {
         );
         assert_eq!(fs::read(&backup).unwrap(), b"old executable");
         assert_eq!(fs::read(&staged).unwrap(), b"new executable");
+        let displaced = only_windows_recovery_entry(&executable, WINDOWS_DISPLACED_RECOVERY_PREFIX);
+        assert_eq!(fs::read(&displaced).unwrap(), b"old executable");
 
         fs::remove_dir(&executable).unwrap();
         fs::remove_file(&backup).unwrap();
         fs::remove_file(&staged).unwrap();
+        fs::remove_file(&displaced).unwrap();
     }
 
     #[cfg(windows)]
@@ -2092,15 +3828,101 @@ mod tests {
         );
         assert_eq!(fs::read(&executable).unwrap(), b"old executable");
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-backup.exe")
+            !transaction_sibling_path(&executable, ".self-update-backup")
+                .unwrap()
+                .exists()
+        );
+        assert!(windows_recovery_entries(&executable, WINDOWS_FAILED_RECOVERY_PREFIX).is_empty());
+        assert!(
+            windows_recovery_entries(&executable, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unwind_immediately_after_publication_restores_the_old_executable() {
+        let (_temp, executable, candidate) = windows_replacement_fixture();
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        set_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublishBeforeClassification);
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Windows,
+            "v1.2.3",
+        )
+        .expect_err("publication seam unwind must be converted to exact recovery");
+
+        assert!(format!("{error:#}").contains("exact previous executable was restored"));
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-backup")
                 .unwrap()
                 .exists()
         );
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-failed.exe")
+            windows_recovery_entries(&executable, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty()
+        );
+        assert!(windows_recovery_entries(&executable, WINDOWS_FAILED_RECOVERY_PREFIX).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_error_immediately_after_publication_reports_exact_restoration() {
+        let (_temp, executable, candidate) = windows_replacement_fixture();
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        set_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublishBeforeClassificationError);
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Windows,
+            "v1.2.3",
+        )
+        .expect_err("publication seam error must be converted to exact recovery");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("AfterPublishBeforeClassificationError"));
+        assert!(message.contains("exact previous executable was restored"));
+        assert_eq!(fs::read(&executable).unwrap(), b"old executable");
+        assert!(
+            !transaction_sibling_path(&executable, ".self-update-backup")
                 .unwrap()
                 .exists()
         );
+        assert!(
+            windows_recovery_entries(&executable, WINDOWS_DISPLACED_RECOVERY_PREFIX).is_empty()
+        );
+        assert!(windows_recovery_entries(&executable, WINDOWS_FAILED_RECOVERY_PREFIX).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nested_unwind_during_windows_publication_rollback_preserves_exact_paths() {
+        let (_temp, executable, candidate) = windows_replacement_fixture();
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        set_windows_replace_fault(WindowsReplaceFaultPoint::AfterPublishBeforeClassification);
+        set_publication_rollback_panic();
+
+        let error = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Windows,
+            "v1.2.3",
+        )
+        .expect_err("nested rollback unwind must be classified without process abort");
+        let message = format!("{error:#}");
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let displaced = only_windows_recovery_entry(&executable, WINDOWS_DISPLACED_RECOVERY_PREFIX);
+        assert!(message.contains("rollback itself unwound"), "{message}");
+        assert!(message.contains(&backup.display().to_string()));
+        assert!(message.contains(&displaced.display().to_string()));
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
+        assert_eq!(fs::read(&backup).unwrap(), b"old executable");
+        assert_eq!(fs::read(&displaced).unwrap(), b"old executable");
     }
 
     #[cfg(windows)]
@@ -2116,16 +3938,20 @@ mod tests {
             "v1.2.3",
         )
         .expect("publish candidate");
+        let failed_candidate = replacement.failed_candidate.clone();
+        let displaced_previous = replacement.displaced_previous.clone();
         assert_eq!(fs::read(&executable).unwrap(), b"new executable");
 
         replacement.rollback().expect("restore old executable");
 
         assert_eq!(fs::read(&executable).unwrap(), b"old executable");
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-backup.exe")
+            !transaction_sibling_path(&executable, ".self-update-backup")
                 .unwrap()
                 .exists()
         );
+        assert!(!failed_candidate.exists());
+        assert!(!displaced_previous.exists());
     }
 
     #[cfg(windows)]
@@ -2141,6 +3967,8 @@ mod tests {
             "v1.2.3",
         )
         .expect("publish candidate");
+        let failed_candidate = replacement.failed_candidate.clone();
+        let displaced_previous = replacement.displaced_previous.clone();
         set_windows_replace_fault(WindowsReplaceFaultPoint::OriginalMovedToBackup);
 
         replacement
@@ -2149,14 +3977,17 @@ mod tests {
 
         assert_eq!(fs::read(&executable).unwrap(), b"old executable");
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-backup.exe")
+            !transaction_sibling_path(&executable, ".self-update-backup")
                 .unwrap()
                 .exists()
         );
         assert!(
-            !transaction_sibling_path(&executable, ".self-update-failed.exe")
-                .unwrap()
-                .exists()
+            !failed_candidate.exists(),
+            "the exact randomized failed-candidate path must be removed"
+        );
+        assert!(
+            !displaced_previous.exists(),
+            "the exact randomized displaced path must be removed"
         );
     }
 
@@ -2173,16 +4004,17 @@ mod tests {
             "v1.2.3",
         )
         .expect("publish candidate");
-        let backup = transaction_sibling_path(&executable, ".self-update-backup.exe").unwrap();
-        let failed = transaction_sibling_path(&executable, ".self-update-failed.exe").unwrap();
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let failed = replacement.failed_candidate.clone();
+        let displaced = replacement.displaced_previous.clone();
         set_windows_replace_fault(WindowsReplaceFaultPoint::OriginalMovedToBackupAndBlockRestore);
 
         let error = replacement
             .rollback()
             .expect_err("the blocked rollback recovery must fail closed");
 
-        let message = error.to_string();
-        assert!(message.contains("automatic recovery failed"), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("not a direct regular file"), "{error:#}");
         assert!(message.contains(&backup.display().to_string()), "{error:#}");
         assert!(message.contains(&failed.display().to_string()), "{error:#}");
         assert!(
@@ -2195,10 +4027,58 @@ mod tests {
         );
         assert_eq!(fs::read(&backup).unwrap(), b"old executable");
         assert_eq!(fs::read(&failed).unwrap(), b"new executable");
+        assert_eq!(fs::read(&displaced).unwrap(), b"old executable");
 
         fs::remove_dir(&executable).unwrap();
         fs::remove_file(&backup).unwrap();
         fs::remove_file(&failed).unwrap();
+        fs::remove_file(&displaced).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn typed_rollback_error_reports_only_observed_exact_recovery_entries() {
+        let (_temp, executable, candidate) = windows_replacement_fixture();
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        let replacement = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Windows,
+            "v1.2.3",
+        )
+        .expect("publish candidate");
+        let backup = replacement.backup.clone();
+        let displaced = replacement.displaced_previous.clone();
+        let failed = replacement.failed_candidate.clone();
+        let mut result = SelfUpdateResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: Some(replacement),
+            replacement_state: SelfUpdateReplacementState::Pending,
+            transaction_lease: None,
+        };
+        set_windows_replace_fault(WindowsReplaceFaultPoint::OriginalMovedToBackupAndBlockRestore);
+
+        let error = result
+            .rollback_replacement()
+            .expect_err("the injected rollback must retain a typed recovery observation");
+        let message = format!("{error:#}");
+        for path in [&backup, &displaced, &failed] {
+            assert!(message.contains(&path.display().to_string()), "{message}");
+        }
+        assert!(message.contains("exact entry is present"), "{message}");
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Preserved
+        );
+
+        fs::remove_dir(&executable).unwrap();
+        fs::remove_file(&backup).unwrap();
+        fs::remove_file(&failed).unwrap();
+        fs::remove_file(&displaced).unwrap();
     }
 
     #[cfg(windows)]
@@ -2214,7 +4094,7 @@ mod tests {
             "v1.2.3",
         )
         .expect("publish candidate");
-        let backup = transaction_sibling_path(&executable, ".self-update-backup.exe").unwrap();
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
 
         drop(replacement);
 
@@ -2235,13 +4115,22 @@ mod tests {
             "v1.2.3",
         )
         .expect("publish candidate");
-        let backup = transaction_sibling_path(&executable, ".self-update-backup.exe").unwrap();
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
+        let displaced = replacement.displaced_previous.clone();
+        let failed = replacement.failed_candidate.clone();
+        assert_random_windows_recovery_name(
+            &executable,
+            &displaced,
+            WINDOWS_DISPLACED_RECOVERY_PREFIX,
+        );
+        assert_random_windows_recovery_name(&executable, &failed, WINDOWS_FAILED_RECOVERY_PREFIX);
         let mut result = SelfUpdateResult {
             current_version: "1.0.0".to_string(),
             latest_version: "2.0.0".to_string(),
             install_source: InstallSource::Direct,
             updated: true,
             replacement: Some(replacement),
+            replacement_state: SelfUpdateReplacementState::Pending,
             transaction_lease: None,
         };
 
@@ -2250,10 +4139,24 @@ mod tests {
             .expect("preserve pending replacement");
 
         assert_eq!(recovery.executable, executable);
-        assert_eq!(recovery.previous_executable, backup);
+        assert_eq!(recovery.entries[0].path, backup);
+        assert_eq!(
+            recovery.entries[0].state,
+            ReplacementRecoveryEntryState::ExactPresent
+        );
+        assert_eq!(recovery.entries[1].path, displaced);
+        assert_eq!(
+            recovery.entries[1].state,
+            ReplacementRecoveryEntryState::ExactPresent
+        );
+        assert_eq!(recovery.entries[2].path, failed);
+        assert_eq!(
+            recovery.entries[2].state,
+            ReplacementRecoveryEntryState::Absent
+        );
         assert_eq!(fs::read(&recovery.executable).unwrap(), b"new executable");
         assert_eq!(
-            fs::read(&recovery.previous_executable).unwrap(),
+            fs::read(&recovery.entries[0].path).unwrap(),
             b"old executable"
         );
     }
@@ -2271,13 +4174,55 @@ mod tests {
             "v1.2.3",
         )
         .expect("publish candidate");
-        let backup = transaction_sibling_path(&executable, ".self-update-backup.exe").unwrap();
+        let backup = transaction_sibling_path(&executable, ".self-update-backup").unwrap();
         assert!(backup.exists());
 
-        replacement.commit();
+        replacement.commit().expect("commit replacement");
 
         assert_eq!(fs::read(&executable).unwrap(), b"new executable");
         assert!(!backup.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn committed_result_state_cannot_be_misreported_as_rolled_back() {
+        let (_temp, executable, candidate) = windows_replacement_fixture();
+        let lease = acquire_update_lease(&executable).expect("acquire update lease");
+        let replacement = replace_candidate(
+            &executable,
+            &candidate,
+            lease,
+            UpdatePlatform::Windows,
+            "v1.2.3",
+        )
+        .expect("publish candidate");
+        let mut result = SelfUpdateResult {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: Some(replacement),
+            replacement_state: SelfUpdateReplacementState::Pending,
+            transaction_lease: None,
+        };
+
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Pending
+        );
+        result.commit_replacement().expect("commit replacement");
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Committed
+        );
+        result
+            .rollback_replacement()
+            .expect("committed rollback is a no-op");
+        assert_eq!(
+            result.replacement_state(),
+            SelfUpdateReplacementState::Committed
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"new executable");
     }
 
     #[test]

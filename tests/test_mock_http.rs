@@ -6,14 +6,16 @@
 
 mod mock;
 
-use codex_switch::auth;
 use codex_switch::jwt::AccountInfo;
 use codex_switch::usage::{self, ResetCredit, ScoredCandidate};
+use codex_switch::{auth, config};
 use mock::scenarios;
 use serde_json::json;
 use std::path::PathBuf;
+use std::sync::Once;
 
 static HTTP_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CONFIG_INIT: Once = Once::new();
 
 struct EnvVarGuard {
     key: &'static str,
@@ -47,6 +49,17 @@ impl Drop for EnvVarGuard {
             }
         }
     }
+}
+
+fn init_test_config() {
+    CONFIG_INIT.call_once(|| {
+        let home = tempfile::tempdir().expect("test config home must be created");
+        let _home = EnvVarGuard::set(
+            "CODEX_SWITCH_HOME",
+            home.path().to_string_lossy().into_owned(),
+        );
+        config::init().expect("default test configuration must initialize");
+    });
 }
 
 /// Create a temp directory with fake profile auth.json files.
@@ -179,6 +192,7 @@ fn score_candidates_pool_size_counts_successful_responses_not_profiles() {
 #[tokio::test]
 async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
     let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
     let refreshed_access_token = "mock_access_refresh_old";
     let server = mock::MockServer::start_programmed(vec![
         (
@@ -231,6 +245,7 @@ async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
 #[tokio::test]
 async fn usage_5xx_returns_contextual_error() {
     let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
     let server = mock::MockServer::start_programmed(vec![(
         "server_error".to_string(),
         vec![mock::MockResponse::text(
@@ -261,6 +276,7 @@ async fn usage_5xx_returns_contextual_error() {
 #[tokio::test]
 async fn usage_malformed_json_returns_parse_context() {
     let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
     let server = mock::MockServer::start_programmed(vec![(
         "malformed".to_string(),
         vec![mock::MockResponse::text(
@@ -296,6 +312,7 @@ async fn usage_malformed_json_returns_parse_context() {
 #[tokio::test]
 async fn usage_retry_exhaustion_returns_last_error_after_three_attempts() {
     let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
     let server = mock::MockServer::start_programmed(vec![(
         "retry_exhausted".to_string(),
         vec![mock::MockResponse::text(
@@ -541,6 +558,7 @@ async fn http_mock_returns_correct_structure() {
 #[tokio::test]
 async fn http_reset_card_consume_uses_the_exact_confirmed_credit() {
     let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
     let entries = scenarios::healthy_pool();
     let (dir, profiles) = setup_profiles(&entries);
     let server = mock::MockServer::start(entries).await;
@@ -575,11 +593,12 @@ async fn http_reset_card_consume_uses_the_exact_confirmed_credit() {
 mod revival {
     use axum::Router;
     use axum::http::StatusCode;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::mock;
@@ -663,7 +682,7 @@ mod revival {
             .map(|(id, expires_at)| {
                 json!({
                     "id": id,
-                    "granted_at": null,
+                    "granted_at": "2026-07-01T00:00:00Z",
                     "expires_at": expires_at,
                 })
             })
@@ -741,6 +760,80 @@ mod revival {
         (format!("http://{address}/consume"), server)
     }
 
+    async fn counting_consume_url() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new().route(
+            "/consume",
+            post(move || {
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::OK, "{}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/consume"), requests, server)
+    }
+
+    async fn changed_reset_credit_url() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/credits",
+            get(|| async {
+                axum::Json(json!({
+                    "available_count": 1,
+                    "credits": [{
+                        "id": "reset_credit_1",
+                        "reset_type": "codex_rate_limits",
+                        "status": "available",
+                        "granted_at": "2026-07-01T00:00:00Z",
+                        "expires_at": "2026-07-09T00:00:00Z"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/credits"), server)
+    }
+
+    async fn consuming_url_that_changes_live(
+        live_path: PathBuf,
+        replacement: Value,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_requests = requests.clone();
+        let app = Router::new().route(
+            "/consume",
+            post(move || {
+                let live_path = live_path.clone();
+                let replacement = replacement.clone();
+                let requests = handler_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    write_json(live_path, &replacement);
+                    axum::Json(json!({
+                        "code": "reset",
+                        "credit": {
+                            "id": "reset_credit_1",
+                            "status": "redeemed",
+                            "redeemed_at": "2026-07-01T00:01:00Z"
+                        },
+                        "windows_reset": 2
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/consume"), requests, server)
+    }
+
     /// Contract 5: an eligible top candidate short-circuits card logic
     /// entirely -- the consume endpoint must never be reached, even though
     /// another account in the pool holds a reset card.
@@ -802,13 +895,15 @@ mod revival {
             ],
         );
 
-        // Real usage endpoint response used only for the post-consume force-refresh
-        // (the initial scan is served entirely from cache).
+        // The initial scan is cached. The first forced response revalidates that
+        // the target is still exhausted before redemption; the second confirms
+        // that the successful redemption released quota.
         let entries = vec![(
             "tok_card_holder".to_string(),
-            vec![mock::transformer::base_response(
-                "plus", 0.0, 18000, 10.0, 604800,
-            )],
+            vec![
+                mock::transformer::base_response("plus", 100.0, 1800, 10.0, 604800),
+                mock::transformer::base_response("plus", 0.0, 18000, 10.0, 604800),
+            ],
         )];
         let server = mock::MockServer::start(entries).await;
 
@@ -842,13 +937,162 @@ mod revival {
         let _ = fs::remove_dir_all(home);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn card_is_not_consumed_before_untracked_live_auth_is_authorized() {
+        let home = temp_home("authorize-before-consume");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let untracked =
+            auth_json_with_access("untracked@mock.test", "acct_untracked", "tok_untracked");
+        write_json(home.join(".codex/auth.json"), &untracked);
+        let (consume_url, consume_requests, server) = counting_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_URL", UNROUTABLE_URL),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(
+            consume_requests.load(Ordering::SeqCst),
+            0,
+            "switch authorization must happen before reset-card redemption"
+        );
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("interactive confirmation is required")),
+            "{error}"
+        );
+        let live: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codex/auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(live, untracked);
+
+        server.abort();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changed_card_metadata_is_refused_before_the_consume_request() {
+        let home = temp_home("changed-card-binding");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let usage_server = mock::MockServer::start(vec![(
+            "tok_card_holder".to_string(),
+            vec![mock::transformer::base_response(
+                "plus", 100.0, 1800, 10.0, 604800,
+            )],
+        )])
+        .await;
+        let (credits_url, credits_server) = changed_reset_credit_url().await;
+        let (consume_url, consume_requests, consume_server) = counting_consume_url().await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &credits_url),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(consume_requests.load(Ordering::SeqCst), 0);
+        let error = parse_stdout_json(&output);
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("exact reset card")
+                    && message.contains("no card was requested")),
+            "{error}"
+        );
+
+        consume_server.abort();
+        credits_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consumed_card_activation_failure_reports_the_irreversible_side_effect() {
+        let home = temp_home("consumed-activation-race");
+        write_long_ttl_config(&home);
+        write_cached_profile(
+            &home,
+            "card_holder",
+            "tok_card_holder",
+            100.0,
+            &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
+        );
+        let usage_server = mock::MockServer::start(vec![(
+            "tok_card_holder".to_string(),
+            vec![
+                mock::transformer::base_response("plus", 100.0, 1800, 10.0, 604800),
+                mock::transformer::base_response("plus", 0.0, 18000, 10.0, 604800),
+            ],
+        )])
+        .await;
+        let external = auth_json_with_access("external@mock.test", "acct_external", "tok_external");
+        let (consume_url, consume_requests, consume_server) =
+            consuming_url_that_changes_live(home.join(".codex/auth.json"), external.clone()).await;
+
+        let output = run_with_env(
+            &home,
+            &["--json", "use", "--consume-card"],
+            &[
+                ("CS_USAGE_URL", &usage_server.usage_url()),
+                ("CS_RESET_CREDITS_URL", &usage_server.reset_credits_url()),
+                ("CS_RESET_CREDITS_CONSUME_URL", &consume_url),
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(consume_requests.load(Ordering::SeqCst), 1);
+        let error = parse_stdout_json(&output);
+        let message = error["error"].as_str().expect("JSON error must be present");
+        assert!(message.contains("was consumed"), "{message}");
+        assert!(message.contains("do not consume another card"), "{message}");
+        assert!(
+            message.contains("retry only the profile switch"),
+            "{message}"
+        );
+        let live: Value =
+            serde_json::from_str(&fs::read_to_string(home.join(".codex/auth.json")).unwrap())
+                .unwrap();
+        assert_eq!(live, external, "the external live writer must win");
+
+        consume_server.abort();
+        usage_server.shutdown();
+        let _ = fs::remove_dir_all(home);
+    }
+
     /// Contract 7: consuming the card doesn't actually free quota (still
-    /// exhausted on recheck) -> falls back to the original scored candidate
-    /// without trying a second card.
+    /// exhausted on recheck) -> keeps the already-authorized card holder and
+    /// reports the unconfirmed revival without trying a second card.
     ///
     /// Multi-thread runtime: see `contract6_consume_card_revives_exhausted_pool`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn contract7_falls_back_when_still_exhausted_after_consume() {
+    async fn contract7_keeps_authorized_target_when_still_exhausted_after_consume() {
         let home = temp_home("contract7");
         write_long_ttl_config(&home);
         write_cached_profile(
@@ -883,8 +1127,8 @@ mod revival {
             String::from_utf8_lossy(&output.stderr)
         );
         let json = parse_stdout_json(&output);
-        // Still exhausted -> falls back to the (only, still-exhausted) scored
-        // candidate rather than erroring out.
+        // Still exhausted -> retains the exact target authorized before the
+        // irreversible card redemption rather than silently choosing another.
         assert_eq!(json["switched_to"], "card_holder");
         let hint = json["hint"]
             .as_str()

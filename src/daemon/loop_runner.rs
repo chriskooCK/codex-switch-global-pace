@@ -1,21 +1,16 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::state::{self, DaemonState, PendingSwitch, SwitchRecord};
 use crate::signals::ShutdownListener;
-use crate::{auth, cache, config, profile, usage, warmup};
+use crate::{auth, cache, config, profile, task_batch, usage, warmup};
 
 async fn shutdown_request_received() {
-    #[cfg(target_os = "windows")]
-    {
-        loop {
-            if super::pidfile::shutdown_requested() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    loop {
+        if super::pidfile::shutdown_requested() {
+            return;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    #[cfg(not(target_os = "windows"))]
-    std::future::pending::<()>().await;
 }
 
 /// Outcome of one monitor poll.
@@ -31,17 +26,28 @@ enum PollOutcome {
     },
 }
 
-/// Backoff after `consecutive_failures` failed polls, capped at 16 poll intervals.
-fn poll_backoff_secs(poll_secs: u64, consecutive_failures: u32) -> u64 {
-    poll_secs * 2u64.pow(consecutive_failures.min(4))
+/// Backoff after failed polls, capped at the configuration-validated horizon.
+fn poll_backoff_secs(poll_secs: u64, consecutive_failures: u32) -> Result<u64> {
+    let multiplier = 2u64
+        .saturating_pow(consecutive_failures)
+        .min(config::POLL_BACKOFF_MAX_MULTIPLIER);
+    poll_secs
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("daemon poll backoff exceeds the supported timer range"))
 }
 
-fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> f64 {
+fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> Option<f64> {
     // The threshold controls when to consider an optional optimization. It
     // must not suppress recovery from an account that cannot run at all,
     // including weekly exhaustion hidden behind a low primary-window value.
-    if !usage::is_available(current_usage) {
-        return 100.0;
+    if current_usage.account_limited
+        || current_usage
+            .primary
+            .iter()
+            .chain(current_usage.secondary.iter())
+            .any(|window| window.used_percent.is_some_and(|used| used >= 100.0))
+    {
+        return Some(100.0);
     }
 
     current_usage
@@ -49,7 +55,6 @@ fn current_usage_percent_for_switch(current_usage: &usage::UsageInfo) -> f64 {
         .as_ref()
         .or(current_usage.secondary.as_ref())
         .and_then(|w| w.used_percent)
-        .unwrap_or(0.0)
 }
 
 fn switch_defer_reason(
@@ -67,6 +72,40 @@ fn switch_defer_reason(
         super::codex_process::CodexActivity::Idle
         | super::codex_process::CodexActivity::Session => None,
     }
+}
+
+#[derive(Debug)]
+struct CandidateProfile {
+    alias: String,
+    path: std::path::PathBuf,
+    info: crate::jwt::AccountInfo,
+    last_used: i64,
+}
+
+fn preflight_candidate_profiles_with(
+    profiles: &[String],
+    current: &str,
+    last_used: &std::collections::HashMap<String, i64>,
+    mut resolve_path: impl FnMut(&str) -> Result<std::path::PathBuf>,
+    mut read_info: impl FnMut(&str, &std::path::Path) -> Result<crate::jwt::AccountInfo>,
+) -> Result<Vec<CandidateProfile>> {
+    let mut candidates = Vec::with_capacity(profiles.len().saturating_sub(1));
+    for alias in profiles {
+        if alias == current {
+            continue;
+        }
+        let path = resolve_path(alias)
+            .with_context(|| format!("resolving candidate profile path: {alias}"))?;
+        let info = read_info(alias, &path)
+            .with_context(|| format!("reading candidate profile metadata: {alias}"))?;
+        candidates.push(CandidateProfile {
+            alias: alias.clone(),
+            path,
+            info,
+            last_used: last_used.get(alias).copied().unwrap_or(0),
+        });
+    }
+    Ok(candidates)
 }
 
 /// Main daemon event loop: periodically checks usage and switches account when needed.
@@ -157,8 +196,14 @@ pub async fn run_daemon_loop() -> Result<()> {
                         st.consecutive_failures += 1;
                         st.last_poll_at = Some(auth::now_unix_secs());
                         st.last_error = Some(e.to_string());
-                        let backoff_secs = poll_backoff_secs(poll_secs, st.consecutive_failures);
-                        st.backoff_until = Some(auth::now_unix_secs() + backoff_secs as i64);
+                        let backoff_secs = poll_backoff_secs(poll_secs, st.consecutive_failures)?;
+                        let backoff_secs_i64 = i64::try_from(backoff_secs)
+                            .context("daemon poll backoff exceeds persisted state range")?;
+                        st.backoff_until = Some(
+                            auth::now_unix_secs()
+                                .checked_add(backoff_secs_i64)
+                                .context("daemon poll backoff timestamp overflowed")?,
+                        );
                         tracing::error!(
                             "Monitor cycle failed ({}x): {e}, backing off {backoff_secs}s",
                             st.consecutive_failures
@@ -195,7 +240,7 @@ pub async fn run_daemon_loop() -> Result<()> {
                 break;
             }
             _ = shutdown_request_received() => {
-                tracing::info!("Received Windows shutdown request, exiting daemon loop");
+                tracing::info!("Received generation-bound shutdown request, exiting daemon loop");
                 break;
             }
         }
@@ -210,7 +255,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
         return Ok(PollOutcome::NoAction);
     }
 
-    let Some(current) = profile::sync_current_from_live() else {
+    let Some(current) = profile::sync_current_from_live()? else {
         tracing::debug!("No saved profile matches the live Codex authentication");
         return Ok(PollOutcome::NoAction);
     };
@@ -229,7 +274,13 @@ async fn check_and_switch() -> Result<PollOutcome> {
     // 2. Check if current account exceeds threshold
     // Free accounts have no primary window (7d is remapped to secondary),
     // so fall back to secondary when primary is absent.
-    let current_used = current_usage_percent_for_switch(&current_usage);
+    let Some(current_used) = current_usage_percent_for_switch(&current_usage) else {
+        tracing::warn!(
+            "Current account '{}' has no usable quota-window percentage; skipping automatic switch",
+            current,
+        );
+        return Ok(PollOutcome::NoAction);
+    };
 
     if current_used < threshold {
         tracing::debug!(
@@ -248,29 +299,38 @@ async fn check_and_switch() -> Result<PollOutcome> {
         threshold,
     );
 
+    let last_used = cache::last_used_snapshot_checked()
+        .context("loading profile-selection history for automatic ranking")?;
+    let current_info = auth::read_account_info_checked(&current_path).with_context(|| {
+        format!("reading current profile metadata for automatic ranking: {current}")
+    })?;
+
     // 3. Fetch all other candidates concurrently
     let team_priority = cfg.use_cfg.team_priority;
+    let candidates = preflight_candidate_profiles_with(
+        &profiles,
+        &current,
+        &last_used,
+        profile::profile_auth_path,
+        |_alias, path| auth::read_account_info_checked(path),
+    )?;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.network.max_concurrent));
     let mut tasks = tokio::task::JoinSet::new();
+    let mut task_aliases = std::collections::HashMap::new();
 
-    for alias in &profiles {
-        if alias == &current {
-            continue;
-        }
-        let path = match profile::profile_auth_path(alias) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let alias = alias.clone();
+    for candidate in candidates {
+        let tracked_alias = candidate.alias.clone();
         let semaphore = semaphore.clone();
-        tasks.spawn(async move {
+        let task = tasks.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
                 .await
-                .expect("candidate usage limiter must stay open");
-            let u = usage::fetch_usage_retried(&alias, &path).await;
-            (alias, path, u)
+                .context("candidate usage limiter closed")?;
+            let fetched = usage::fetch_usage_retried(&candidate.alias, &candidate.path).await;
+            Ok::<_, anyhow::Error>((candidate.info, candidate.last_used, fetched))
         });
+        let previous = task_aliases.insert(task.id(), tracked_alias);
+        debug_assert!(previous.is_none());
     }
 
     // 4. Score everything uniformly (same helper as CLI `use`); the current
@@ -278,24 +338,32 @@ async fn check_and_switch() -> Result<PollOutcome> {
     let mut items = vec![(
         current.clone(),
         current_usage.clone(),
-        auth::read_account_info(&current_path),
-        cache::get_last_used(&current),
+        current_info,
+        last_used.get(&current).copied().unwrap_or(0),
     )];
-    while let Some(res) = tasks.join_next().await {
-        let (alias, path, u) = match res {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let u = match u {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::warn!("[{alias}] fetch failed: {}", e.summary);
-                continue;
+    let outcomes = task_batch::drain_named_tasks(&mut tasks, &mut task_aliases, |_| {}).await;
+    let mut worker_failures = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            task_batch::NamedTaskOutcome::Completed { alias, value } => match value {
+                Ok((info, alias_last_used, fetched)) => match fetched {
+                    Ok(fetched) => items.push((alias, fetched, info, alias_last_used)),
+                    Err(error) => {
+                        tracing::warn!("[{alias}] fetch failed: {}", error.summary);
+                    }
+                },
+                Err(error) => worker_failures.push((alias, format!("{error:#}"))),
+            },
+            task_batch::NamedTaskOutcome::Failed { alias, detail } => {
+                worker_failures.push((alias, detail));
             }
-        };
-        let info = auth::read_account_info(&path);
-        let last_used = cache::get_last_used(&alias);
-        items.push((alias, u, info, last_used));
+        }
+    }
+    if !worker_failures.is_empty() {
+        return Err(task_batch::batch_failure_error(
+            "one or more automatic-selection candidate workers failed",
+            worker_failures,
+        ));
     }
 
     let mut scored = usage::score_candidates(items, now, safety_7d, team_priority);
@@ -360,20 +428,26 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
 #[cfg(test)]
 mod tests {
-    use super::{current_usage_percent_for_switch, poll_backoff_secs, switch_defer_reason};
+    use super::{
+        current_usage_percent_for_switch, poll_backoff_secs, preflight_candidate_profiles_with,
+        switch_defer_reason,
+    };
     use crate::daemon::codex_process::CodexActivity;
     use crate::usage::{UsageInfo, WindowUsage};
+    use anyhow::Result;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
     #[test]
-    fn poll_backoff_doubles_and_caps_at_sixteen_intervals() {
-        assert_eq!(poll_backoff_secs(60, 1), 120);
-        assert_eq!(poll_backoff_secs(60, 2), 240);
-        assert_eq!(poll_backoff_secs(60, 4), 960);
-        assert_eq!(poll_backoff_secs(60, 10), 960);
+    fn poll_backoff_doubles_and_caps_at_sixteen_intervals() -> Result<()> {
+        assert_eq!(poll_backoff_secs(60, 1)?, 120);
+        assert_eq!(poll_backoff_secs(60, 2)?, 240);
+        assert_eq!(poll_backoff_secs(60, 4)?, 960);
+        assert_eq!(poll_backoff_secs(60, 10)?, 960);
+        assert!(poll_backoff_secs(u64::MAX, 1).is_err());
+        Ok(())
     }
 
     #[test]
@@ -387,7 +461,7 @@ mod tests {
             ..UsageInfo::default()
         };
 
-        assert!(current_usage_percent_for_switch(&usage) >= 80.0);
+        assert_eq!(current_usage_percent_for_switch(&usage), Some(100.0));
     }
 
     #[test]
@@ -415,15 +489,47 @@ mod tests {
             ..UsageInfo::default()
         };
 
-        assert_eq!(current_usage_percent_for_switch(&usage), 100.0);
+        assert_eq!(current_usage_percent_for_switch(&usage), Some(100.0));
     }
 
     #[test]
-    fn usage_without_any_quota_window_bypasses_switch_threshold() {
+    fn usage_without_any_quota_window_does_not_authorize_a_switch() {
+        let credits_only = UsageInfo {
+            credits_balance: Some(10.0),
+            unlimited_credits: Some(true),
+            ..UsageInfo::default()
+        };
+
+        assert_eq!(current_usage_percent_for_switch(&credits_only), None);
         assert_eq!(
             current_usage_percent_for_switch(&UsageInfo::default()),
-            100.0
+            None
         );
+    }
+
+    #[test]
+    fn quota_exhaustion_boundary_requires_a_full_hundred_percent() {
+        let below = UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(20.0),
+                ..WindowUsage::default()
+            }),
+            secondary: Some(WindowUsage {
+                used_percent: Some(99.999),
+                ..WindowUsage::default()
+            }),
+            ..UsageInfo::default()
+        };
+        let exhausted = UsageInfo {
+            secondary: Some(WindowUsage {
+                used_percent: Some(100.0),
+                ..WindowUsage::default()
+            }),
+            ..below.clone()
+        };
+
+        assert_eq!(current_usage_percent_for_switch(&below), Some(20.0));
+        assert_eq!(current_usage_percent_for_switch(&exhausted), Some(100.0));
     }
 
     #[tokio::test]
@@ -447,6 +553,39 @@ mod tests {
         }
         while tasks.join_next().await.is_some() {}
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn automatic_selection_preflights_every_candidate_before_spawning_workers() {
+        let profiles = vec![
+            "current".to_string(),
+            "alice".to_string(),
+            "bob".to_string(),
+        ];
+        let path_reads = AtomicUsize::new(0);
+        let info_reads = AtomicUsize::new(0);
+
+        let error = preflight_candidate_profiles_with(
+            &profiles,
+            "current",
+            &std::collections::HashMap::new(),
+            |alias| {
+                path_reads.fetch_add(1, Ordering::SeqCst);
+                Ok(std::path::PathBuf::from(alias))
+            },
+            |alias, _path| {
+                info_reads.fetch_add(1, Ordering::SeqCst);
+                if alias == "bob" {
+                    anyhow::bail!("injected later metadata failure");
+                }
+                Ok(crate::jwt::AccountInfo::default())
+            },
+        )
+        .expect_err("a later preflight failure must reject the complete candidate batch");
+
+        assert!(format!("{error:#}").contains("injected later metadata failure"));
+        assert_eq!(path_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(info_reads.load(Ordering::SeqCst), 2);
     }
 }
 

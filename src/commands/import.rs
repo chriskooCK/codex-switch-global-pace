@@ -297,6 +297,15 @@ async fn import_one_file(
         stage: "managed_policy",
         error: e.to_string(),
     })?;
+    let mut credential_reservation = Some(
+        profile::reserve_import_credential_for_validation(&val).map_err(|e| {
+            profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: "duplicate_credential",
+                error: e.to_string(),
+            }
+        })?,
+    );
     let suggested_alias = source_account
         .email
         .as_deref()
@@ -324,6 +333,7 @@ async fn import_one_file(
         // server still accepts. Hand that stage to recovery before reporting
         // the later validation failure.
         Err(error) if rotated => {
+            drop(credential_reservation.take());
             return Err(rescue_rotated_credentials(
                 source,
                 val,
@@ -349,6 +359,7 @@ async fn import_one_file(
     let mut account = match auth::validate_auth_value(&val) {
         Ok(account) => account,
         Err(error) if rotated => {
+            drop(credential_reservation.take());
             return Err(rescue_rotated_credentials(
                 source,
                 val,
@@ -385,12 +396,16 @@ async fn import_one_file(
         }
         (false, _) => None,
     };
-    let action = match profile::save_imported_auth_value_with_stage(
+    let reservation = credential_reservation
+        .take()
+        .expect("import credential reservation must remain held through commit");
+    let action = match profile::save_reserved_imported_auth_value_with_stage(
         &val,
         alias,
         &validated_account_id,
         suggested_alias.as_deref(),
         rotation_stage.take(),
+        reservation,
     ) {
         Ok(action) => action,
         // A validated commit failure must not be retried under another alias:

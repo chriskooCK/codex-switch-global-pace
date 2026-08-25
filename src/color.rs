@@ -101,7 +101,6 @@ pub fn usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f64>)
 
 fn colored_usage_pace(s: &str, used_percent: Option<f64>, pace_percent: Option<f64>) -> String {
     match quota_pace_state(used_percent, pace_percent) {
-        QuotaPaceState::Exhausted => format!("{}", s.red()),
         QuotaPaceState::UsageAhead => format!("{}", s.yellow()),
         QuotaPaceState::PaceAheadOrEqual => format!("{}", s.green()),
         QuotaPaceState::Unavailable => format!("{}", s.dimmed()),
@@ -170,11 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn quota_colors_use_only_relative_pace_plus_real_limit_states() {
+    fn quota_colors_use_only_relative_pace_states() {
         assert!(colored_usage_pace("x", Some(1.0), Some(0.0)).contains("\u{1b}[33m"));
         assert!(colored_usage_pace("x", Some(50.0), Some(50.0)).contains("\u{1b}[32m"));
         assert!(colored_usage_pace("x", Some(95.0), Some(99.0)).contains("\u{1b}[32m"));
-        assert!(colored_usage_pace("x", Some(100.0), Some(50.0)).contains("\u{1b}[31m"));
+        assert!(colored_usage_pace("x", Some(100.0), Some(50.0)).contains("\u{1b}[33m"));
         assert!(colored_usage_pace("x", Some(20.0), None).contains("\u{1b}[2m"));
     }
 }

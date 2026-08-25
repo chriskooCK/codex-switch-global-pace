@@ -13,8 +13,8 @@ use crate::jwt::AccountInfo;
 use crate::login;
 use crate::output::{format_local_datetime, format_local_timestamp, reset_credits_count};
 use crate::profile::{
-    self, cmd_delete, list_profiles, profile_auth_path, rename_profile, switch_profile,
-    sync_current_from_live, validate_alias,
+    self, cmd_delete, list_profiles, profile_auth_path, rename_profile, sync_current_from_live,
+    validate_alias,
 };
 use crate::usage::{
     ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary, Refresh, ResetCredit,
@@ -148,6 +148,7 @@ impl SortMode {
 }
 
 pub enum ConfirmAction {
+    Switch(profile::PreparedProfileSwitch),
     Delete(String),
     BatchDelete(Vec<String>),
     ConsumeResetCard {
@@ -176,6 +177,57 @@ pub struct WarmupTask {
     slow_reported: bool,
     lease_control: profile::ProfileLeaseAcquireControl,
     handle: tokio::task::JoinHandle<std::result::Result<(), String>>,
+}
+
+#[derive(Debug, Clone)]
+enum WarmupPreflightOrigin {
+    Single { alias: String },
+    Marked,
+    Automatic { refreshing_accounts: usize },
+}
+
+#[derive(Debug)]
+struct WarmupPreflightCandidate {
+    alias: String,
+    loaded_usage: Option<UsageInfo>,
+}
+
+#[derive(Debug)]
+struct WarmupPreflightTask {
+    origin: WarmupPreflightOrigin,
+    candidate_count: usize,
+    aliases: BTreeSet<String>,
+    handle: tokio::task::JoinHandle<Result<Vec<String>>>,
+}
+
+fn inspect_warmup_candidates(candidates: Vec<WarmupPreflightCandidate>) -> Result<Vec<String>> {
+    let now = crate::auth::now_unix_secs();
+    let disk_aliases = candidates
+        .iter()
+        .filter(|candidate| candidate.loaded_usage.is_none())
+        .map(|candidate| candidate.alias.clone())
+        .collect::<Vec<_>>();
+    let mut cached_usage = if disk_aliases.is_empty() {
+        HashMap::new()
+    } else {
+        crate::cache::get_many(&disk_aliases)
+            .context("reading cached usage for warmup candidates")?
+    };
+    let mut ready = Vec::new();
+    for candidate in candidates {
+        let usage = match candidate.loaded_usage {
+            Some(usage) => Some(usage),
+            None => cached_usage.remove(&candidate.alias),
+        };
+        let has_active_window = usage
+            .as_ref()
+            .is_some_and(|usage| crate::usage::usage_has_active_warmup_window(usage, now));
+        if !has_active_window {
+            ready.push(candidate.alias);
+        }
+    }
+    ready.sort();
+    Ok(ready)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,6 +275,10 @@ pub struct App {
     /// quota request must be allowed to reach its persistence boundary.
     pub warmup_tasks: HashMap<u64, WarmupTask>,
     pub warmup_next_id: u64,
+    /// One all-or-nothing warmup eligibility pass. Disk cache reads run on the
+    /// blocking pool, and no warmup credential task starts until this handle
+    /// has returned a decision for the complete candidate set.
+    warmup_preflight: Option<WarmupPreflightTask>,
     /// Join handles for account-scoped network work whose cancellation could
     /// strand a rotated credential or leave a reset-card outcome unknown.
     account_tasks: HashMap<u64, AccountTask>,
@@ -251,6 +307,8 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
+        #[cfg(test)]
+        crate::config::init_defaults_for_tests();
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let (workspace_tx, workspace_rx) = tokio::sync::mpsc::channel(128);
         let (reset_card_tx, reset_card_rx) = tokio::sync::mpsc::channel(16);
@@ -279,6 +337,7 @@ impl App {
             reset_cards_in_flight: BTreeSet::new(),
             warmup_tasks: HashMap::new(),
             warmup_next_id: 0,
+            warmup_preflight: None,
             account_tasks: HashMap::new(),
             account_task_next_id: 0,
             shutting_down: false,
@@ -338,11 +397,13 @@ impl App {
     /// permanently in flight. Successful tasks deliver their typed result over
     /// the existing result channels before their JoinHandle becomes finished.
     pub async fn poll_account_tasks(&mut self) {
-        let finished: Vec<u64> = self
+        let mut finished: Vec<u64> = self
             .account_tasks
             .iter()
             .filter_map(|(task_id, task)| task.handle.is_finished().then_some(*task_id))
             .collect();
+        finished.sort_unstable();
+        let mut failures = Vec::new();
 
         for task_id in finished {
             let Some(task) = self.account_tasks.remove(&task_id) else {
@@ -380,7 +441,7 @@ impl App {
                 continue;
             }
             let Err(error) = joined else { continue };
-            let detail = format!("{error}");
+            let detail = crate::task_batch::join_failure_detail(&error);
             match kind {
                 AccountTaskKind::Usage { request_id } => {
                     let is_current = self
@@ -418,7 +479,24 @@ impl App {
                     self.reset_cards_in_flight.remove(&alias);
                 }
             }
-            self.set_status_error(format!("Account task stopped ({alias}): {detail}"), 6);
+            failures.push((alias, detail));
+        }
+
+        if !failures.is_empty() {
+            failures.sort_by(|(a_alias, a_detail), (b_alias, b_detail)| {
+                a_alias.cmp(b_alias).then_with(|| a_detail.cmp(b_detail))
+            });
+            let detail = failures
+                .iter()
+                .map(|(alias, detail)| format!("[{alias}] {detail}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let subject = if failures.len() == 1 {
+                "Account task stopped"
+            } else {
+                "Account tasks stopped"
+            };
+            self.set_status_error(format!("{subject}: {detail}"), 6);
         }
     }
 
@@ -809,16 +887,12 @@ impl App {
             .filter(|(_, a)| a.alias == alias)
             .map(|(i, _)| i)
             .collect();
-        let (count, _, skipped) = self.warmup_indices(target_indices);
-        if count == 0 {
-            if skipped > 0 {
-                self.set_status(format!("{alias}: already active or in flight"), 4);
-            } else {
-                self.set_status(format!("{alias}: nothing to warm up"), 4);
-            }
-        } else {
-            self.set_status(format!("Warming up {alias}..."), 6);
-        }
+        self.start_warmup_preflight(
+            target_indices,
+            WarmupPreflightOrigin::Single {
+                alias: alias.to_string(),
+            },
+        );
     }
 
     pub fn request_consume_reset_card(&mut self, alias: &str) {
@@ -889,30 +963,36 @@ impl App {
     }
 
     pub fn load_profiles(&mut self) {
-        let mut retained_usage = retained_usage_by_alias(std::mem::take(&mut self.accounts));
-        let profiles = list_profiles().unwrap_or_else(|e| {
-            tracing::warn!("failed to load profiles: {e}");
-            Vec::new()
-        });
+        if let Err(error) = self.try_load_profiles() {
+            self.set_status_error(format!("Profile reload failed: {error:#}"), 6);
+        }
+    }
+
+    fn try_load_profiles(&mut self) -> Result<()> {
+        let profiles = list_profiles().context("listing saved profiles")?;
         // The live auth file is the source of truth. If it belongs to an
         // untracked account, no saved profile is active; retaining the stale
         // marker here would highlight the account that used to be active.
-        let current = sync_current_from_live();
-        self.accounts = profiles
+        let current = sync_current_from_live().context("synchronizing the active profile")?;
+        let mut loaded = Vec::with_capacity(profiles.len());
+        for alias in profiles {
+            let path = profile_auth_path(&alias)
+                .with_context(|| format!("resolving profile path for '{alias}'"))?;
+            let info = auth::read_account_info_checked(&path)
+                .with_context(|| format!("loading profile '{alias}'"))?;
+            loaded.push((alias, info));
+        }
+
+        // Do not take or mutate the displayed model until every path/read and
+        // active-binding check above has succeeded.
+        let mut retained_usage = retained_usage_by_alias(std::mem::take(&mut self.accounts));
+        self.accounts = loaded
             .into_iter()
-            .filter_map(|alias| {
-                let path = match profile_auth_path(&alias) {
-                    Ok(p) => p,
-                    Err(_) => return None,
-                };
-                let info = auth::read_account_info(&path);
-                let is_current = current.as_deref() == Some(alias.as_str());
-                Some(AccountEntry {
-                    usage: retained_usage.remove(&alias).unwrap_or(UsageStatus::Idle),
-                    alias,
-                    info,
-                    is_current,
-                })
+            .map(|(alias, info)| AccountEntry {
+                usage: retained_usage.remove(&alias).unwrap_or(UsageStatus::Idle),
+                is_current: current.as_deref() == Some(alias.as_str()),
+                alias,
+                info,
             })
             .collect();
         let known_aliases: BTreeSet<&str> = self
@@ -939,6 +1019,7 @@ impl App {
         {
             self.selected = view_idx;
         }
+        Ok(())
     }
 
     pub fn load_profiles_preserving_selection(&mut self) {
@@ -1092,61 +1173,220 @@ impl App {
         self.marked.clear();
     }
 
-    /// Returns true if usage data proves an active rate-limit window.
-    ///
-    /// A window that appears "just started" (elapsed < 5 min) likely means the previous warmup
-    /// ping didn't consume real quota — allow the user to retry.
-    fn is_already_warmed(&self, alias: &str) -> bool {
-        let now = crate::auth::now_unix_secs();
-
-        // Prefer in-memory loaded usage — most authoritative.
-        for a in &self.accounts {
-            if a.alias != alias {
-                continue;
-            }
-            if let UsageStatus::Loaded(u) = &a.usage {
-                return crate::usage::usage_has_active_warmup_window(u, now);
-            }
-        }
-
-        // No loaded data: fall back to disk-cached usage.
-        if let Some(u) = crate::cache::get(alias) {
-            return crate::usage::usage_has_active_warmup_window(&u, now);
-        }
-
-        false
-    }
-
     fn is_warmup_in_flight(&self, alias: &str) -> bool {
         self.warmup_tasks.values().any(|task| task.alias == alias)
+            || self
+                .warmup_preflight
+                .as_ref()
+                .is_some_and(|task| task.aliases.contains(alias))
     }
 
-    fn warmup_indices(&mut self, target_indices: Vec<usize>) -> (usize, usize, usize) {
-        let candidate_count = target_indices.len();
-        let aliases: Vec<String> = target_indices
-            .iter()
-            .filter_map(|&idx| self.accounts.get(idx))
-            .filter(|a| {
-                !matches!(a.usage, UsageStatus::Error(_))
-                    && !self.is_already_warmed(&a.alias)
-                    && !self.is_warmup_in_flight(&a.alias)
-            })
-            .map(|a| a.alias.clone())
-            .collect();
-        let skipped = candidate_count.saturating_sub(aliases.len());
+    fn start_warmup_preflight(
+        &mut self,
+        target_indices: Vec<usize>,
+        origin: WarmupPreflightOrigin,
+    ) {
+        if self.shutting_down {
+            return;
+        }
+        if self.warmup_preflight.is_some() {
+            self.set_status(
+                "Warmup eligibility inspection is already in progress".to_string(),
+                4,
+            );
+            return;
+        }
 
-        let count = aliases.len();
+        let candidate_count = target_indices.len();
+        let mut candidates = Vec::new();
+        for &idx in &target_indices {
+            let Some(account) = self.accounts.get(idx) else {
+                continue;
+            };
+            let alias = account.alias.clone();
+            let loaded_usage = match &account.usage {
+                UsageStatus::Loaded(usage) => Some(usage.as_ref().clone()),
+                UsageStatus::Error(_) => continue,
+                UsageStatus::Idle | UsageStatus::Loading => None,
+            };
+            if self.is_warmup_in_flight(&alias) {
+                continue;
+            }
+            candidates.push(WarmupPreflightCandidate {
+                alias,
+                loaded_usage,
+            });
+        }
+
+        if candidates.is_empty() {
+            self.report_warmup_preflight_success(origin, candidate_count, Vec::new());
+            return;
+        }
+
+        let aliases = candidates
+            .iter()
+            .map(|candidate| candidate.alias.clone())
+            .collect();
+        let handle = tokio::task::spawn_blocking(move || inspect_warmup_candidates(candidates));
+        match &origin {
+            WarmupPreflightOrigin::Single { alias } => {
+                self.set_status(format!("Inspecting warmup state for {alias}..."), 6);
+            }
+            WarmupPreflightOrigin::Marked => {
+                self.set_status(
+                    format!("Inspecting warmup state for {candidate_count} marked account(s)..."),
+                    6,
+                );
+            }
+            WarmupPreflightOrigin::Automatic {
+                refreshing_accounts,
+            } => {
+                self.set_status(
+                    format!(
+                        "Auto refresh: refreshing {refreshing_accounts} account(s), inspecting warmup eligibility"
+                    ),
+                    6,
+                );
+            }
+        }
+        self.warmup_preflight = Some(WarmupPreflightTask {
+            origin,
+            candidate_count,
+            aliases,
+            handle,
+        });
+    }
+
+    fn warmup_all(&mut self, refreshing_accounts: usize) {
+        let target_indices: Vec<usize> = (0..self.accounts.len()).collect();
+        self.start_warmup_preflight(
+            target_indices,
+            WarmupPreflightOrigin::Automatic {
+                refreshing_accounts,
+            },
+        );
+    }
+
+    fn report_warmup_preflight_success(
+        &mut self,
+        origin: WarmupPreflightOrigin,
+        candidate_count: usize,
+        aliases: Vec<String>,
+    ) {
+        let started = aliases.len();
+        let skipped = candidate_count.saturating_sub(started);
         for alias in aliases {
             self.spawn_warmup(alias);
         }
 
-        (count, candidate_count, skipped)
+        match origin {
+            WarmupPreflightOrigin::Single { alias } => {
+                if started == 0 {
+                    if candidate_count == 0 {
+                        self.set_status(format!("{alias}: nothing to warm up"), 4);
+                    } else {
+                        self.set_status(format!("{alias}: already active or in flight"), 4);
+                    }
+                } else {
+                    self.set_status(format!("Warming up {alias}..."), 6);
+                }
+            }
+            WarmupPreflightOrigin::Marked => {
+                if started == 0 {
+                    self.set_status(
+                        format!("All {candidate_count} marked already active or skipped"),
+                        4,
+                    );
+                } else {
+                    let mut message = format!("Warming up {started} marked account(s)");
+                    if skipped > 0 {
+                        message.push_str(&format!(" ({skipped} skipped)"));
+                    }
+                    self.set_status(message, 6);
+                }
+            }
+            WarmupPreflightOrigin::Automatic {
+                refreshing_accounts,
+            } => {
+                let mut message =
+                    format!("Auto refresh: refreshing {refreshing_accounts} account(s)");
+                if started > 0 {
+                    message.push_str(&format!(", warming {started}"));
+                }
+                self.set_status(message, 4);
+            }
+        }
     }
 
-    pub fn warmup_all(&mut self) -> usize {
-        let target_indices: Vec<usize> = (0..self.accounts.len()).collect();
-        let (count, _, _) = self.warmup_indices(target_indices);
-        count
+    fn report_warmup_preflight_failure(&mut self, origin: WarmupPreflightOrigin, detail: String) {
+        let message = match origin {
+            WarmupPreflightOrigin::Single { alias } => {
+                format!("Could not inspect usage state before warming up {alias}: {detail}")
+            }
+            WarmupPreflightOrigin::Marked => {
+                format!("Could not inspect usage state before marked warmup: {detail}")
+            }
+            WarmupPreflightOrigin::Automatic {
+                refreshing_accounts,
+            } => format!(
+                "Auto refresh: refreshing {refreshing_accounts} account(s); automatic warmup could not inspect cached usage: {detail}"
+            ),
+        };
+        self.set_status_error(message, 6);
+    }
+
+    pub async fn poll_warmup_preflight_result(&mut self) {
+        if !self
+            .warmup_preflight
+            .as_ref()
+            .is_some_and(|task| task.handle.is_finished())
+        {
+            return;
+        }
+        let Some(task) = self.warmup_preflight.take() else {
+            return;
+        };
+        let origin = task.origin;
+        let candidate_count = task.candidate_count;
+        let joined = task.handle.await;
+        if self.shutting_down {
+            return;
+        }
+
+        match joined {
+            Ok(Ok(aliases)) => {
+                // Account state may have refreshed while the blocking cache read
+                // was in flight. Recheck every returned alias in memory before
+                // starting any task, then publish the whole batch together.
+                let now = crate::auth::now_unix_secs();
+                let aliases = aliases
+                    .into_iter()
+                    .filter(|alias| {
+                        self.accounts
+                            .iter()
+                            .find(|account| account.alias == *alias)
+                            .is_some_and(|account| match &account.usage {
+                                UsageStatus::Error(_) => false,
+                                UsageStatus::Loaded(usage) => {
+                                    !crate::usage::usage_has_active_warmup_window(usage, now)
+                                }
+                                UsageStatus::Idle | UsageStatus::Loading => true,
+                            })
+                            && !self.is_warmup_in_flight(alias)
+                    })
+                    .collect();
+                self.report_warmup_preflight_success(origin, candidate_count, aliases);
+            }
+            Ok(Err(error)) => {
+                self.report_warmup_preflight_failure(origin, format!("{error:#}"));
+            }
+            Err(error) => {
+                self.report_warmup_preflight_failure(
+                    origin,
+                    crate::task_batch::join_failure_detail(&error),
+                );
+            }
+        }
     }
 
     pub fn refresh_one(&mut self, alias: &str) {
@@ -1257,33 +1497,15 @@ impl App {
 
     pub async fn poll_warmup_results(&mut self) {
         let mut to_refresh = std::collections::BTreeSet::<String>::new();
-        let now = Instant::now();
-        let mut slow_aliases = Vec::new();
-        for task in self.warmup_tasks.values_mut() {
-            if !task.handle.is_finished()
-                && !task.slow_reported
-                && now.duration_since(task.started) >= WARMUP_SLOW_NOTICE
-            {
-                task.slow_reported = true;
-                slow_aliases.push(task.alias.clone());
-            }
-        }
-        if !slow_aliases.is_empty() {
-            slow_aliases.sort();
-            self.set_status(
-                format!(
-                    "Warmup still running after 60s: {}",
-                    slow_aliases.join(", ")
-                ),
-                6,
-            );
-        }
+        let mut successes = Vec::new();
+        let mut failures = Vec::new();
 
-        let finished_task_ids: Vec<u64> = self
+        let mut finished_task_ids: Vec<u64> = self
             .warmup_tasks
             .iter()
             .filter_map(|(task_id, task)| task.handle.is_finished().then_some(*task_id))
             .collect();
+        finished_task_ids.sort_unstable();
 
         for task_id in finished_task_ids {
             let Some(task) = self.warmup_tasks.remove(&task_id) else {
@@ -1297,14 +1519,18 @@ impl App {
             }
             match joined {
                 Ok(Ok(())) => {
-                    self.set_status(format!("Warmed up {alias} — refreshing usage..."), 4);
-                    to_refresh.insert(alias);
+                    to_refresh.insert(alias.clone());
+                    successes.push(alias);
                 }
                 Ok(Err(e)) => {
-                    self.set_status_error(format!("Warmup failed ({alias}): {e}"), 6);
+                    failures.push((alias.clone(), format!("Warmup failed ({alias}): {e}")));
                 }
                 Err(error) => {
-                    self.set_status_error(format!("Warmup task stopped ({alias}): {error}"), 6);
+                    let detail = crate::task_batch::join_failure_detail(&error);
+                    failures.push((
+                        alias.clone(),
+                        format!("Warmup task stopped ({alias}): {detail}"),
+                    ));
                 }
             }
         }
@@ -1317,6 +1543,57 @@ impl App {
                 // quota visible until the replacement arrives.
                 self.fetch_usage_for(idx, Refresh::Forced);
             }
+        }
+
+        successes.sort();
+        failures.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let now = Instant::now();
+        let mut slow_aliases = Vec::new();
+        let mut newly_slow_task_ids = Vec::new();
+        for (task_id, task) in &self.warmup_tasks {
+            if now.duration_since(task.started) >= WARMUP_SLOW_NOTICE {
+                slow_aliases.push(task.alias.clone());
+                if !task.slow_reported {
+                    newly_slow_task_ids.push(*task_id);
+                }
+            }
+        }
+        slow_aliases.sort();
+        for task_id in &newly_slow_task_ids {
+            if let Some(task) = self.warmup_tasks.get_mut(task_id) {
+                task.slow_reported = true;
+            }
+        }
+
+        if !failures.is_empty() {
+            let message = if failures.len() == 1 {
+                failures.pop().expect("one failure was checked above").1
+            } else {
+                format!(
+                    "Warmup failures: {}",
+                    failures
+                        .into_iter()
+                        .map(|(_, message)| message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            };
+            self.set_status_error(message, 6);
+        } else if !slow_aliases.is_empty()
+            && (!newly_slow_task_ids.is_empty() || !successes.is_empty())
+        {
+            self.set_status(
+                format!(
+                    "Warmup still running after 60s: {}",
+                    slow_aliases.join(", ")
+                ),
+                6,
+            );
+        } else if !successes.is_empty() {
+            self.set_status(
+                format!("Warmed up {} — refreshing usage...", successes.join(", ")),
+                4,
+            );
         }
     }
 
@@ -1513,15 +1790,37 @@ impl App {
     }
 
     fn refresh_indices(&mut self, target_indices: &[usize], refresh: Refresh) {
+        let cached = if matches!(refresh, Refresh::Cached) {
+            let mut loaded = Vec::with_capacity(target_indices.len());
+            for &i in target_indices {
+                let Some(entry) = self.accounts.get(i) else {
+                    continue;
+                };
+                match crate::cache::get(&entry.alias) {
+                    Ok(value) => loaded.push((i, value)),
+                    Err(error) => {
+                        self.set_status_error(
+                            format!("Could not read usage cache for {}: {error:#}", entry.alias),
+                            6,
+                        );
+                        return;
+                    }
+                }
+            }
+            loaded
+        } else {
+            Vec::new()
+        };
+
         for &i in target_indices {
             let entry = &mut self.accounts[i];
             if let UsageStatus::Error(_) = &entry.usage {
                 entry.usage = UsageStatus::Idle;
             }
-            if matches!(refresh, Refresh::Cached)
-                && let Some(cached) = crate::cache::get(&entry.alias)
-            {
-                entry.usage = UsageStatus::Loaded(Box::new(cached));
+        }
+        for (i, value) in cached {
+            if let Some(cached) = value {
+                self.accounts[i].usage = UsageStatus::Loaded(Box::new(cached));
             }
         }
         for &i in target_indices {
@@ -1597,17 +1896,74 @@ impl App {
             .and_then(|idx| self.accounts.get(idx))
         {
             let alias = entry.alias.clone();
-            match switch_profile(&alias) {
-                Ok(()) => {
-                    cache::set_last_used(&alias);
-                    for a in &mut self.accounts {
-                        a.is_current = a.alias == alias;
-                    }
-                    self.set_status(format!("Switched to {alias}"), 3);
+            match profile::prepare_profile_switch(&alias) {
+                Ok(prepared) if prepared.requires_confirmation() => {
+                    self.confirm = Some(ConfirmAction::Switch(prepared));
                 }
-                Err(e) => self.set_status_error(format!("Switch failed: {e}"), 5),
+                Ok(prepared) => {
+                    match profile::confirm_prepared_profile_switch_without_overwrite(prepared) {
+                        Ok(confirmed) => self.commit_profile_switch(confirmed),
+                        Err(error) => {
+                            self.set_status_error(format!("Switch failed: {error}"), 5);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.set_status_error(format!("Switch failed: {error}"), 5);
+                }
             }
         }
+    }
+
+    fn commit_profile_switch(&mut self, confirmed: profile::ConfirmedProfileSwitch) {
+        let alias = confirmed.alias().to_string();
+        match profile::commit_confirmed_profile_switch(confirmed) {
+            Ok(()) => {
+                cache::set_last_used(&alias);
+                for account in &mut self.accounts {
+                    account.is_current = account.alias == alias;
+                }
+                self.set_status(format!("Switched to {alias}"), 3);
+            }
+            Err(error) => {
+                let reconciliation = self.reconcile_displayed_current_after_switch_error(&error);
+                if matches!(
+                    reconciliation.as_ref(),
+                    Ok(Some(active)) if active == &alias
+                ) {
+                    cache::set_last_used(&alias);
+                }
+                let mut message = format!("Switch failed: {error:#}");
+                if let Err(reconcile_error) = reconciliation {
+                    for account in &mut self.accounts {
+                        account.is_current = false;
+                    }
+                    message.push_str(&format!(
+                        "; active account could not be verified: {reconcile_error:#}"
+                    ));
+                }
+                self.set_status_error(message, 5);
+            }
+        }
+    }
+
+    fn reconcile_displayed_current_after_switch_error(
+        &mut self,
+        error: &anyhow::Error,
+    ) -> Result<Option<String>> {
+        let live_path = auth::codex_auth_path()?;
+        let active = if let Some(partial) =
+            error.downcast_ref::<profile::PartialProfileActivation>()
+            && profile::partial_activation_is_currently_bound_checked(partial)?
+        {
+            Some(partial.alias().to_string())
+        } else {
+            profile::find_matching_profile_checked(&live_path)?
+        };
+        for account in &mut self.accounts {
+            account.is_current = active.as_deref() == Some(account.alias.as_str());
+        }
+        Ok(active)
     }
 
     pub fn confirm_action(&mut self) {
@@ -1616,6 +1972,11 @@ impl App {
             None => return,
         };
         match action {
+            ConfirmAction::Switch(prepared) => {
+                let confirmed =
+                    profile::confirm_prepared_profile_switch_after_ui_approval(prepared);
+                self.commit_profile_switch(confirmed);
+            }
             ConfirmAction::Delete(alias) => {
                 if self.account_operation_in_flight(&alias) {
                     self.set_status(
@@ -1626,9 +1987,19 @@ impl App {
                     );
                     return;
                 }
-                if crate::profile::active_profile_from_live().as_deref() == Some(alias.as_str()) {
-                    self.set_status_error("Cannot delete the active profile".to_string(), 3);
-                    return;
+                match crate::profile::active_profile_from_live() {
+                    Ok(Some(active)) if active == alias => {
+                        self.set_status_error("Cannot delete the active profile".to_string(), 3);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.set_status_error(
+                            format!("Cannot verify the active profile: {error:#}"),
+                            5,
+                        );
+                        return;
+                    }
                 }
                 match cmd_delete(&alias) {
                     Ok(()) => {
@@ -1656,7 +2027,16 @@ impl App {
                 }
                 let mut ok = 0usize;
                 let mut errors: Vec<String> = Vec::new();
-                let current = crate::profile::active_profile_from_live();
+                let current = match crate::profile::active_profile_from_live() {
+                    Ok(current) => current,
+                    Err(error) => {
+                        self.set_status_error(
+                            format!("Cannot verify the active profile: {error:#}"),
+                            5,
+                        );
+                        return;
+                    }
+                };
                 for alias in &aliases {
                     if current.as_deref() == Some(alias.as_str()) {
                         errors.push(format!("{alias}: active, skipped"));
@@ -1801,20 +2181,7 @@ impl App {
             .filter(|(_, a)| self.marked.contains(&a.alias))
             .map(|(i, _)| i)
             .collect();
-        let candidate = target_indices.len();
-        let (count, _, skipped) = self.warmup_indices(target_indices);
-        if count == 0 {
-            self.set_status(
-                format!("All {candidate} marked already active or skipped"),
-                4,
-            );
-        } else {
-            let mut msg = format!("Warming up {count} marked account(s)");
-            if skipped > 0 {
-                msg.push_str(&format!(" ({skipped} skipped)"));
-            }
-            self.set_status(msg, 6);
-        }
+        self.start_warmup_preflight(target_indices, WarmupPreflightOrigin::Marked);
     }
 
     pub fn cancel_confirm(&mut self) {
@@ -2026,26 +2393,28 @@ impl App {
             return;
         }
 
-        if self.loading_count() > 0 || !self.warmup_tasks.is_empty() {
+        if self.loading_count() > 0
+            || !self.warmup_tasks.is_empty()
+            || self.warmup_preflight.is_some()
+        {
             self.next_auto_refresh = Some(now + Duration::from_secs(5));
             return;
         }
 
         self.load_profiles_preserving_selection();
         let account_count = self.accounts.len();
-        let warmup_count = if self.auto_warmup_enabled {
-            self.warmup_all()
-        } else {
-            0
-        };
+        if self.auto_warmup_enabled {
+            self.warmup_all(account_count);
+        }
         self.refresh_all(Refresh::Unattended);
         self.next_auto_refresh = Some(now + self.auto_refresh_interval);
 
-        let mut msg = format!("Auto refresh: refreshing {account_count} account(s)");
-        if warmup_count > 0 {
-            msg.push_str(&format!(", warming {warmup_count}"));
+        if !self.auto_warmup_enabled {
+            self.set_status(
+                format!("Auto refresh: refreshing {account_count} account(s)"),
+                4,
+            );
         }
-        self.set_status(msg, 4);
     }
 
     pub fn tick(&mut self) {
@@ -2097,6 +2466,7 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
 
     loop {
         app.poll_results();
+        app.poll_warmup_preflight_result().await;
         app.poll_warmup_results().await;
         app.poll_reset_card_results();
         app.poll_model_results();
@@ -2732,6 +3102,56 @@ mod tests {
         }
     }
 
+    fn write_auth_durable(path: &std::path::Path, value: &serde_json::Value) {
+        crate::auth::write_auth(path, value)
+            .unwrap()
+            .assert_durably_published();
+    }
+
+    fn managed_auth(
+        email: &str,
+        account_id: &str,
+        access: &str,
+        refresh: &str,
+    ) -> serde_json::Value {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_plan_type": "plus",
+                "organizations": [],
+            }
+        });
+        let token = format!(
+            "x.{}.y",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        serde_json::json!({
+            "tokens": {
+                "id_token": token,
+                "access_token": access,
+                "refresh_token": refresh,
+                "account_id": account_id,
+            }
+        })
+    }
+
+    async fn finish_warmup_preflight(app: &mut App) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                app.poll_warmup_preflight_result().await;
+                if app.warmup_preflight.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("warmup preflight must finish");
+    }
+
     #[test]
     fn stopped_batch_distinguishes_cancelled_from_completed_accounts() {
         assert_eq!(batch_relogin_not_attempted(3, 1, 0, 1), 1);
@@ -2782,6 +3202,97 @@ mod tests {
         assert_eq!(summary.excluded_accounts, 1);
         assert!((summary.effective_capacity - 195.0).abs() < 1e-9);
         assert_eq!(summary.next_reset_alias.as_deref(), Some("filtered-out"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn warmup_cache_failure_remains_visible_and_starts_no_task() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        std::fs::write(home.path().join("cache.json"), b"{not valid json")
+            .expect("write malformed usage cache");
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "broken-cache".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+
+        app.warmup_one("broken-cache");
+
+        assert!(app.warmup_preflight.is_some());
+        assert!(app.warmup_tasks.is_empty());
+        finish_warmup_preflight(&mut app).await;
+
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Could not inspect usage state")),
+            "unexpected warmup status: {:?}",
+            app.status_msg
+        );
+        assert!(app.warmup_tasks.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn blocked_cache_preflight_keeps_the_ui_path_nonblocking_and_starts_no_partial_batch() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let cache_lock_path = home.path().join("cache.lock");
+        let cache_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&cache_lock_path)
+            .unwrap();
+        fs4::FileExt::lock(&cache_lock).unwrap();
+
+        let mut app = App::new();
+        app.accounts = vec![
+            AccountEntry {
+                alias: "loaded-ready".into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::default()),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "disk-waiting".into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Idle,
+                is_current: false,
+            },
+        ];
+        app.marked = ["loaded-ready".to_string(), "disk-waiting".to_string()]
+            .into_iter()
+            .collect();
+
+        app.warmup_marked();
+
+        assert!(app.warmup_preflight.is_some());
+        assert!(app.warmup_tasks.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        app.poll_warmup_preflight_result().await;
+        assert!(app.warmup_preflight.is_some());
+        assert!(app.warmup_tasks.is_empty());
+
+        fs4::FileExt::unlock(&cache_lock).unwrap();
+        finish_warmup_preflight(&mut app).await;
+
+        assert!(app.warmup_preflight.is_none());
+        assert_eq!(app.warmup_tasks.len(), 2);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.drain_credential_tasks(),
+        )
+        .await
+        .expect("spawned warmups must drain");
     }
 
     #[tokio::test]
@@ -2850,6 +3361,52 @@ mod tests {
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(app.account_tasks.is_empty());
         assert!(app.shutting_down);
+    }
+
+    #[tokio::test]
+    async fn account_task_panics_are_redacted_and_reported_deterministically() {
+        let mut app = App::new();
+        for (alias, secret) in [
+            ("z-account", "SECRET_Z_ACCOUNT_TOKEN"),
+            ("a-account", "SECRET_A_ACCOUNT_TOKEN"),
+        ] {
+            app.reset_cards_in_flight.insert(alias.to_string());
+            let handle = tokio::spawn(async move { panic!("{secret}") });
+            app.track_account_task(
+                alias.to_string(),
+                AccountTaskKind::ResetCard,
+                profile::ProfileLeaseAcquireControl::new(),
+                handle,
+            );
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while app
+                .account_tasks
+                .values()
+                .any(|task| !task.handle.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("panicking account tasks must finish");
+        app.poll_account_tasks().await;
+
+        let status = app
+            .status_msg
+            .as_deref()
+            .expect("join failures are visible");
+        assert!(status.contains("Account tasks stopped"), "{status}");
+        assert!(status.contains("worker panicked"), "{status}");
+        assert!(!status.contains("SECRET_A_ACCOUNT_TOKEN"), "{status}");
+        assert!(!status.contains("SECRET_Z_ACCOUNT_TOKEN"), "{status}");
+        assert!(
+            status.find("a-account").unwrap() < status.find("z-account").unwrap(),
+            "{status}"
+        );
+        assert!(app.account_tasks.is_empty());
+        assert!(app.reset_cards_in_flight.is_empty());
     }
 
     #[tokio::test]
@@ -3209,20 +3766,21 @@ mod tests {
         let profile_path = home.path().join("profiles/tracked/auth.json");
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&codex_home).unwrap();
-        crate::auth::write_auth(
+        write_auth_durable(
             &profile_path,
-            &serde_json::json!({
-                "tokens": { "access_token": "tracked", "refresh_token": "tracked-refresh" }
-            }),
-        )
-        .unwrap();
-        crate::auth::write_auth(
+            &managed_auth(
+                "tracked@example.com",
+                "acct_tracked",
+                "tracked",
+                "tracked-refresh",
+            ),
+        );
+        write_auth_durable(
             &codex_home.join("auth.json"),
             &serde_json::json!({
                 "tokens": { "access_token": "untracked", "refresh_token": "untracked-refresh" }
             }),
-        )
-        .unwrap();
+        );
         std::fs::write(home.path().join("current"), "tracked").unwrap();
 
         let mut app = App::new();
@@ -3230,6 +3788,257 @@ mod tests {
 
         assert_eq!(app.accounts.len(), 1);
         assert!(!app.accounts[0].is_current);
+
+        app.switch_selected();
+        assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
+        write_auth_durable(
+            &codex_home.join("auth.json"),
+            &serde_json::json!({
+                "tokens": { "access_token": "newer", "refresh_token": "newer-refresh" }
+            }),
+        );
+        app.confirm_action();
+
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("live auth changed"))
+        );
+        assert_eq!(
+            crate::auth::read_auth(&codex_home.join("auth.json"))
+                .unwrap()
+                .pointer("/tokens/access_token")
+                .and_then(serde_json::Value::as_str),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn partial_switch_publication_updates_the_tui_to_the_actual_live_account() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let alice = managed_auth(
+            "alice@example.com",
+            "acct_alice",
+            "alice-access",
+            "alice-refresh",
+        );
+        let bob = managed_auth("bob@example.com", "acct_bob", "bob-access", "bob-refresh");
+        for (alias, auth) in [("alice", &alice), ("bob", &bob)] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(&path, auth);
+        }
+        write_auth_durable(&codex_home.join("auth.json"), &alice);
+        std::fs::write(home.path().join("current"), "alice").unwrap();
+
+        let mut app = App::new();
+        app.load_profiles();
+        let bob_account = app
+            .accounts
+            .iter()
+            .position(|account| account.alias == "bob")
+            .unwrap();
+        app.selected = app
+            .view_indices
+            .iter()
+            .position(|index| *index == bob_account)
+            .unwrap();
+
+        crate::profile::fail_next_activation_marker_write();
+        app.switch_selected();
+
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("was published to live auth")),
+            "{:?}",
+            app.status_msg
+        );
+        assert!(
+            app.accounts
+                .iter()
+                .find(|account| account.alias == "bob")
+                .is_some_and(|account| account.is_current)
+        );
+        assert!(
+            app.accounts
+                .iter()
+                .find(|account| account.alias == "alice")
+                .is_some_and(|account| !account.is_current)
+        );
+        assert_eq!(
+            crate::auth::read_auth(&codex_home.join("auth.json")).unwrap(),
+            bob
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("current")).unwrap(),
+            "alice"
+        );
+    }
+
+    #[test]
+    fn partial_switch_rechecks_live_auth_before_updating_the_tui() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let alice = managed_auth(
+            "alice@example.com",
+            "acct_alice",
+            "alice-access",
+            "alice-refresh",
+        );
+        let bob = managed_auth("bob@example.com", "acct_bob", "bob-access", "bob-refresh");
+        for (alias, auth) in [("alice", &alice), ("bob", &bob)] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(&path, auth);
+        }
+        let live_path = codex_home.join("auth.json");
+        write_auth_durable(&live_path, &alice);
+        std::fs::write(home.path().join("current"), "alice").unwrap();
+
+        let mut app = App::new();
+        app.load_profiles();
+        let bob_account = app
+            .accounts
+            .iter()
+            .position(|account| account.alias == "bob")
+            .unwrap();
+        app.selected = app
+            .view_indices
+            .iter()
+            .position(|index| *index == bob_account)
+            .unwrap();
+
+        crate::profile::fail_next_activation_marker_write();
+        let replacement_path = live_path.clone();
+        let replacement = alice.clone();
+        crate::profile::after_next_partial_activation(move || {
+            write_auth_durable(&replacement_path, &replacement);
+        });
+        app.switch_selected();
+
+        assert!(app.status_is_error);
+        assert_eq!(crate::auth::read_auth(&live_path).unwrap(), alice);
+        assert!(
+            app.accounts
+                .iter()
+                .find(|account| account.alias == "alice")
+                .is_some_and(|account| account.is_current)
+        );
+        assert!(
+            app.accounts
+                .iter()
+                .find(|account| account.alias == "bob")
+                .is_some_and(|account| !account.is_current)
+        );
+    }
+
+    #[test]
+    fn partial_switch_reconciliation_failure_clears_every_active_highlight() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let alice = managed_auth(
+            "alice@example.com",
+            "acct_alice",
+            "alice-access",
+            "alice-refresh",
+        );
+        let bob = managed_auth("bob@example.com", "acct_bob", "bob-access", "bob-refresh");
+        for (alias, auth) in [("alice", &alice), ("bob", &bob)] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(&path, auth);
+        }
+        let live_path = codex_home.join("auth.json");
+        write_auth_durable(&live_path, &alice);
+        std::fs::write(home.path().join("current"), "alice").unwrap();
+
+        let mut app = App::new();
+        app.load_profiles();
+        let bob_account = app
+            .accounts
+            .iter()
+            .position(|account| account.alias == "bob")
+            .unwrap();
+        app.selected = app
+            .view_indices
+            .iter()
+            .position(|index| *index == bob_account)
+            .unwrap();
+
+        crate::profile::fail_next_activation_marker_write();
+        let unreadable_live = live_path.clone();
+        crate::profile::after_next_partial_activation(move || {
+            std::fs::remove_file(&unreadable_live).unwrap();
+            std::fs::create_dir(&unreadable_live).unwrap();
+        });
+        app.switch_selected();
+
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("active account could not be verified")),
+            "{:?}",
+            app.status_msg
+        );
+        assert!(
+            app.accounts.iter().all(|account| !account.is_current),
+            "an unverifiable live binding must not leave a stale active highlight"
+        );
+    }
+
+    #[test]
+    fn failed_profile_reload_preserves_the_previous_model_and_reports_the_error() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(home.path().join("profiles/broken/auth.json")).unwrap();
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "retained".to_string(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::default()),
+            is_current: true,
+        });
+        app.view_indices.push(0);
+
+        app.load_profiles();
+
+        assert_eq!(app.accounts.len(), 1);
+        assert_eq!(app.accounts[0].alias, "retained");
+        assert!(app.accounts[0].is_current);
+        assert!(matches!(app.accounts[0].usage, UsageStatus::Loaded(_)));
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("Profile reload failed")),
+            "{:?}",
+            app.status_msg
+        );
     }
 
     #[tokio::test]
@@ -3320,6 +4129,156 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.starts_with("Warmup task stopped (account):"))
         );
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| !message.contains("warmup panic"))
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_warmup_results_keep_the_deterministic_failure_status() {
+        let mut app = App::new();
+        let success = tokio::spawn(async { Ok(()) });
+        let failure = tokio::spawn(async { Err("injected warmup failure".to_string()) });
+        app.warmup_tasks.insert(
+            20,
+            WarmupTask {
+                alias: "success".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: success,
+            },
+        );
+        app.warmup_tasks.insert(
+            10,
+            WarmupTask {
+                alias: "failure".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: failure,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while app
+                .warmup_tasks
+                .values()
+                .any(|task| !task.handle.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("warmup fixtures should finish");
+
+        app.poll_warmup_results().await;
+
+        assert!(app.warmup_tasks.is_empty());
+        assert!(app.status_is_error);
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Warmup failed (failure): injected warmup failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn new_slow_notice_does_not_replace_a_warmup_failure_on_the_next_poll() {
+        let mut app = App::new();
+        let slow = tokio::spawn(std::future::pending::<std::result::Result<(), String>>());
+        let failure = tokio::spawn(async { Err("injected warmup failure".to_string()) });
+        app.warmup_tasks.insert(
+            2,
+            WarmupTask {
+                alias: "slow".into(),
+                started: Instant::now() - std::time::Duration::from_secs(61),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: slow,
+            },
+        );
+        app.warmup_tasks.insert(
+            1,
+            WarmupTask {
+                alias: "failure".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: failure,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !app.warmup_tasks[&1].handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed warmup fixture should finish");
+
+        app.poll_warmup_results().await;
+        assert!(app.status_is_error);
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Warmup failed (failure): injected warmup failure")
+        );
+        assert!(app.warmup_tasks[&2].slow_reported);
+
+        app.poll_warmup_results().await;
+        assert!(app.status_is_error);
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Warmup failed (failure): injected warmup failure")
+        );
+
+        let slow = app.warmup_tasks.remove(&2).unwrap().handle;
+        slow.abort();
+        let _ = slow.await;
+    }
+
+    #[tokio::test]
+    async fn ongoing_slow_warmup_status_outranks_a_completed_success() {
+        let mut app = App::new();
+        let slow = tokio::spawn(std::future::pending::<std::result::Result<(), String>>());
+        let success = tokio::spawn(async { Ok(()) });
+        app.warmup_tasks.insert(
+            2,
+            WarmupTask {
+                alias: "slow".into(),
+                started: Instant::now() - std::time::Duration::from_secs(61),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: slow,
+            },
+        );
+        app.warmup_tasks.insert(
+            1,
+            WarmupTask {
+                alias: "success".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: success,
+            },
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !app.warmup_tasks[&1].handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful warmup fixture should finish");
+
+        app.poll_warmup_results().await;
+
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Warmup still running after 60s: slow")
+        );
+        assert!(app.warmup_tasks[&2].slow_reported);
+        let slow = app.warmup_tasks.remove(&2).unwrap().handle;
+        slow.abort();
+        let _ = slow.await;
     }
 
     #[test]

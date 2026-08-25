@@ -23,7 +23,7 @@ const BG: Color = Color::Rgb(24, 24, 24); // near-black background
 const C_WHITE: Color = Color::Rgb(240, 240, 240); // primary text
 const C_GRAY: Color = Color::Rgb(180, 180, 180); // secondary text
 const DIM: Color = Color::Rgb(120, 120, 120); // dim labels / placeholders
-const C_RED: Color = Color::Rgb(255, 90, 90); // errors, exhausted quotas
+const C_RED: Color = Color::Rgb(255, 90, 90); // errors and unavailable account states
 const C_GREEN: Color = Color::Rgb(80, 220, 120); // OK, active
 const C_YELLOW: Color = Color::Rgb(255, 220, 80); // keys, usage ahead of pace
 const C_CYAN: Color = Color::Rgb(100, 210, 255); // headers, prompts
@@ -335,7 +335,6 @@ fn global_weekly_panel_height(total_height: u16, status_height: u16) -> u16 {
 
 pub(super) fn quota_pace_color(used_percent: Option<f64>, pace_percent: Option<f64>) -> Color {
     match quota_pace_state(used_percent, pace_percent) {
-        QuotaPaceState::Exhausted => C_RED,
         QuotaPaceState::UsageAhead => C_YELLOW,
         QuotaPaceState::PaceAheadOrEqual => C_GREEN,
         QuotaPaceState::Unavailable => DIM,
@@ -1213,6 +1212,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     // Confirmation prompt
     if let Some(confirm) = &app.confirm {
         let msg = match confirm {
+            super::app::ConfirmAction::Switch(prepared) => format!(
+                "Current Codex login is not saved. Switch to '{}' and overwrite it? (y/n)",
+                prepared.alias()
+            ),
             super::app::ConfirmAction::Delete(alias) => {
                 format!("Delete profile '{alias}'? (y/n)")
             }
@@ -1846,7 +1849,7 @@ mod tests {
         assert_eq!(quota_pace_color(Some(1.0), Some(0.0)), C_YELLOW);
         assert_eq!(quota_pace_color(Some(50.0), Some(50.0)), C_GREEN);
         assert_eq!(quota_pace_color(Some(95.0), Some(99.0)), C_GREEN);
-        assert_eq!(quota_pace_color(Some(100.0), Some(50.0)), C_RED);
+        assert_eq!(quota_pace_color(Some(100.0), Some(50.0)), C_YELLOW);
         assert_eq!(quota_pace_color(Some(20.0), None), DIM);
         assert_eq!(quota_pace_color(None, Some(20.0)), DIM);
     }
@@ -2036,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_global_meter_hides_the_pace_marker() {
+    fn exhausted_global_meter_keeps_the_pace_marker() {
         let now = 1_000_000;
         let mut summary = global_summary(now);
         summary.aggregate_used_percent = Some(100.0);
@@ -2050,8 +2053,11 @@ mod tests {
             .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
             .unwrap();
 
-        assert_eq!(symbol_x(terminal.backend(), 1, "|"), None);
-        assert_eq!(symbol_x(terminal.backend(), 2, "↑"), None);
+        let (meter_start, meter_end) = meter_bounds(terminal.backend(), 1).expect("global meter");
+        let expected_offset = percent_marker_offset(50.0, meter_end - meter_start).unwrap();
+        let marker_x = symbol_x(terminal.backend(), 1, "|").expect("pace marker");
+        assert_eq!(marker_x, meter_start + expected_offset);
+        assert_eq!(symbol_x(terminal.backend(), 2, "↑"), Some(marker_x));
     }
 
     #[test]

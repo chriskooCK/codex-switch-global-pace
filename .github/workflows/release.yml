@@ -10,10 +10,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
-  # Never overlap two publications for the same tag. A stable candidate uses a
-  # deterministic tag, so the next serialized run can identify and remove an
-  # interrupted draft before creating a new one.
+  group: ${{ github.workflow }}-publication
+  # Never overlap two participating publications in this repository. Stable
+  # recovery enumerates the repository-wide Release collection, so even different
+  # tags must not move its pagination boundaries concurrently. A stable candidate
+  # uses a deterministic tag, allowing the next serialized run to identify an
+  # interrupted draft before creating a new one. GitHub's ref and Release deletion
+  # APIs have no conditional version precondition, so repository administrators
+  # must not mutate these temporary objects while a run is active.
+  # The stable job also acquires the historical
+  # refs/tags/codex-switch-publish-dev-lock remote lease before it reads or changes
+  # refs or Releases. That shared lease serializes Actions with publish-dev.ps1;
+  # its old name is retained so an existing publisher lock cannot be bypassed.
+  # Release deletion APIs have no conditional version precondition; only the
+  # shared lock and immediate identity checks serialize cooperating writers.
   cancel-in-progress: false
 
 env:
@@ -525,6 +535,146 @@ jobs:
           path: dev-bundle/
           retention-days: 7
           if-no-files-found: error
+      - name: Acquire shared remote publication lock
+        id: publication_lock
+        if: needs.meta.outputs.is_dev != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          lock_tag="codex-switch-publish-dev-lock"
+          lock_ref="refs/tags/${lock_tag}"
+          source_sha="${GITHUB_SHA,,}"
+
+          existing_error="$RUNNER_TEMP/shared-publication-lock-existing-error"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${lock_tag}" \
+            > /dev/null 2>"$existing_error"; then
+            echo "Shared publication lock ${lock_ref} already exists; it was not acquired or removed." >&2
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$existing_error"; then
+            cat "$existing_error" >&2
+            echo "Shared publication lock absence could not be established; no ownership was claimed." >&2
+            exit 1
+          fi
+
+          transaction=$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')
+          if [[ ! "$transaction" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "Could not create an exact publication-lock transaction identity." >&2
+            exit 1
+          fi
+          # Keep the historical v1 identity format used by publish-dev.ps1. The
+          # tag is now a shared publication lock even though its durable protocol
+          # name predates stable Actions publication.
+          message="codex-switch-global-pace publish-dev lock v1|repo=${GITHUB_REPOSITORY}|source=${source_sha}|transaction=${transaction}"
+          jq -n \
+            --arg tag "$lock_tag" \
+            --arg message "$message" \
+            --arg object "$source_sha" \
+            '{tag:$tag,message:$message,object:$object,type:"commit"}' \
+            > "$RUNNER_TEMP/shared-publication-lock-tag.json"
+
+          tag_error="$RUNNER_TEMP/shared-publication-lock-tag-error"
+          if ! tag_object=$(gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/git/tags" \
+            --input "$RUNNER_TEMP/shared-publication-lock-tag.json" \
+            2>"$tag_error"); then
+            cat "$tag_error" >&2
+            echo "Shared publication lock object creation failed or its response was lost; no ownership was claimed and nothing will be removed." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' <<<"$tag_object" > /dev/null; then
+            echo "Shared publication lock object creation returned invalid JSON; no ownership was claimed." >&2
+            exit 1
+          fi
+          tag_object_sha=$(jq -r '.sha' <<<"$tag_object")
+          if [[ ! "$tag_object_sha" =~ ^[0-9a-fA-F]{40}$ || \
+                "$(jq -r '.tag' <<<"$tag_object")" != "$lock_tag" || \
+                "$(jq -r '.message' <<<"$tag_object")" != "$message" || \
+                "$(jq -r '.object.type' <<<"$tag_object")" != commit || \
+                "$(jq -r '.object.sha' <<<"$tag_object" | tr '[:upper:]' '[:lower:]')" != "$source_sha" ]]; then
+            echo "Shared publication lock object creation returned an unexpected identity; no ownership was claimed." >&2
+            exit 1
+          fi
+          tag_object_sha="${tag_object_sha,,}"
+
+          # Persist the complete candidate identity before creating the fixed
+          # ref. If GitHub applies the POST but its response is lost, the
+          # always-run cleanup can still prove the exact candidate identity and perform one
+          # leased deletion. The trigger is written last so a partial output
+          # write never enables cleanup with an incomplete identity tuple.
+          {
+            echo "tag=${lock_tag}"
+            echo "tag_object_sha=${tag_object_sha}"
+            echo "source_sha=${source_sha}"
+            echo "transaction=${transaction}"
+            echo "message=${message}"
+            echo "cleanup_candidate=true"
+          } >> "$GITHUB_OUTPUT"
+
+          jq -n \
+            --arg ref "$lock_ref" \
+            --arg sha "$tag_object_sha" \
+            '{ref:$ref,sha:$sha}' \
+            > "$RUNNER_TEMP/shared-publication-lock-ref.json"
+          ref_error="$RUNNER_TEMP/shared-publication-lock-ref-error"
+          if ! created_ref=$(gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/git/refs" \
+            --input "$RUNNER_TEMP/shared-publication-lock-ref.json" \
+            2>"$ref_error"); then
+            cat "$ref_error" >&2
+            echo "Shared publication lock acquisition failed or its response was lost; exact candidate cleanup will inspect the fixed ref before removing anything." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' <<<"$created_ref" > /dev/null; then
+            echo "Shared publication lock acquisition returned invalid JSON; exact candidate cleanup will inspect the fixed ref before removing anything." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.ref' <<<"$created_ref")" != "$lock_ref" || \
+                "$(jq -r '.object.type' <<<"$created_ref")" != tag || \
+                "$(jq -r '.object.sha' <<<"$created_ref" | tr '[:upper:]' '[:lower:]')" != "$tag_object_sha" ]]; then
+            echo "Shared publication lock acquisition returned an unexpected identity; exact candidate cleanup will preserve any non-matching ref." >&2
+            exit 1
+          fi
+
+          verify_ref_error="$RUNNER_TEMP/shared-publication-lock-verify-ref-error"
+          if ! verified_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${lock_tag}" \
+            2>"$verify_ref_error"); then
+            cat "$verify_ref_error" >&2
+            echo "Shared publication lock ownership could not be confirmed; exact candidate cleanup will re-inspect the fixed ref." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' <<<"$verified_ref" > /dev/null; then
+            echo "Shared publication lock ref verification returned invalid JSON; exact candidate cleanup will re-inspect the fixed ref." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.ref' <<<"$verified_ref")" != "$lock_ref" || \
+                "$(jq -r '.object.type' <<<"$verified_ref")" != tag || \
+                "$(jq -r '.object.sha' <<<"$verified_ref" | tr '[:upper:]' '[:lower:]')" != "$tag_object_sha" ]]; then
+            echo "Shared publication lock ref changed before ownership confirmation; exact candidate cleanup will preserve a non-matching identity." >&2
+            exit 1
+          fi
+          verify_tag_error="$RUNNER_TEMP/shared-publication-lock-verify-tag-error"
+          if ! verified_tag=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" \
+            2>"$verify_tag_error"); then
+            cat "$verify_tag_error" >&2
+            echo "Shared publication lock object could not be confirmed; exact candidate cleanup will revalidate it before removing the ref." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' <<<"$verified_tag" > /dev/null; then
+            echo "Shared publication lock object verification returned invalid JSON; exact candidate cleanup will revalidate it before removing the ref." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.sha' <<<"$verified_tag" | tr '[:upper:]' '[:lower:]')" != "$tag_object_sha" || \
+                "$(jq -r '.tag' <<<"$verified_tag")" != "$lock_tag" || \
+                "$(jq -r '.message' <<<"$verified_tag")" != "$message" || \
+                "$(jq -r '.object.type' <<<"$verified_tag")" != commit || \
+                "$(jq -r '.object.sha' <<<"$verified_tag" | tr '[:upper:]' '[:lower:]')" != "$source_sha" ]]; then
+            echo "Shared publication lock object changed before ownership confirmation; exact candidate cleanup will preserve the ref." >&2
+            exit 1
+          fi
       - name: Confirm release tag still targets this source before publish
         if: needs.meta.outputs.is_dev != 'true'
         shell: bash
@@ -618,11 +768,52 @@ jobs:
           # A hosted runner can disappear without executing an `always()`
           # cleanup step. The candidate tag is deterministic for this exact
           # serialized release, so a rerun can recover only a draft whose full
-          # identity still belongs to the same source and release.
-          candidate_release_error="$RUNNER_TEMP/candidate-release-preflight-error"
-          if prior_release=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/releases/tags/${candidate_tag}" \
-            2>"$candidate_release_error"); then
+          # identity still belongs to the same source and release. The by-ID and
+          # by-name checks immediately before deletion preserve every mismatch
+          # they observe; they are the strongest available REST checks, not an
+          # atomic compare-and-delete against an external administrator.
+          candidate_releases="$RUNNER_TEMP/candidate-releases.json"
+          if ! gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            > "$candidate_releases"; then
+            echo "Could not enumerate authenticated repository releases to recover ${candidate_tag}." >&2
+            exit 1
+          fi
+          if ! jq -e '
+            (type == "array")
+            and (length > 0)
+            and all(.[];
+              (type == "array")
+              and all(.[];
+                (type == "object")
+                and (.id | (type == "number") and (. > 0) and (floor == .))
+                and (.tag_name | type == "string")
+                and (.tag_name | length > 0)
+              )
+            )
+          ' "$candidate_releases" > /dev/null; then
+            echo "GitHub returned an invalid paginated release list." >&2
+            exit 1
+          fi
+          candidate_release_count=$(jq \
+            --arg tag "$candidate_tag" \
+            '[.[][] | select(.tag_name == $tag)] | length' \
+            "$candidate_releases")
+          if (( candidate_release_count > 1 )); then
+            echo "Found ${candidate_release_count} releases for candidate tag ${candidate_tag}; refusing ambiguous recovery." >&2
+            exit 1
+          fi
+          if (( candidate_release_count == 1 )); then
+            prior_release_id=$(jq -r \
+              --arg tag "$candidate_tag" \
+              '.[][] | select(.tag_name == $tag) | .id' \
+              "$candidate_releases")
+            if [[ ! "$prior_release_id" =~ ^[1-9][0-9]*$ ]]; then
+              echo "Candidate release ${candidate_tag} has no valid release ID; it was preserved." >&2
+              exit 1
+            fi
+            prior_release=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/releases/${prior_release_id}")
             prior_release_id=$(jq -r '.id' <<<"$prior_release")
             prior_body=$(jq -c '.body' <<<"$prior_release")
             expected_body_prefix=$(cat release_body.md)
@@ -700,10 +891,6 @@ jobs:
               exit 1
             fi
             echo "Removed verified interrupted candidate release ${prior_release_id}."
-          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_release_error"; then
-            cat "$candidate_release_error" >&2
-            echo "Could not prove candidate release ${candidate_tag} is absent." >&2
-            exit 1
           fi
           candidate_ref_error="$RUNNER_TEMP/candidate-ref-preflight-error"
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${candidate_tag}" \
@@ -888,6 +1075,11 @@ jobs:
           RELEASE_ID: ${{ steps.candidate.outputs.id }}
           CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
         run: |
+          # Releases are deleted by stable positive ID and refs by their verified
+          # full name after immediate revalidation. GitHub offers no conditional
+          # delete token for either object, so this cleanup is safe among the
+          # serialized workflow participants but assumes administrators do not
+          # race a manual mutation between the observation and delete request.
           candidate_release_error="$RUNNER_TEMP/incomplete-candidate-release-error"
           if release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             2>"$candidate_release_error"); then
@@ -998,3 +1190,106 @@ jobs:
             exit 1
           fi
           echo "Removed this run's incomplete candidate release ${RELEASE_ID}."
+      - name: Recover or release exact shared remote publication lock
+        if: always() && needs.meta.outputs.is_dev != 'true' && steps.publication_lock.outputs.cleanup_candidate == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCK_TAG: ${{ steps.publication_lock.outputs.tag }}
+          LOCK_TAG_OBJECT_SHA: ${{ steps.publication_lock.outputs.tag_object_sha }}
+          LOCK_SOURCE_SHA: ${{ steps.publication_lock.outputs.source_sha }}
+          LOCK_TRANSACTION: ${{ steps.publication_lock.outputs.transaction }}
+          LOCK_MESSAGE: ${{ steps.publication_lock.outputs.message }}
+        run: |
+          set -euo pipefail
+          expected_ref="refs/tags/${LOCK_TAG}"
+          if [[ "$LOCK_TAG" != codex-switch-publish-dev-lock || \
+                ! "$LOCK_TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ || \
+                ! "$LOCK_SOURCE_SHA" =~ ^[0-9a-f]{40}$ || \
+                ! "$LOCK_TRANSACTION" =~ ^[0-9a-f]{32}$ ]]; then
+            echo "Persisted shared publication lock candidate identity is invalid; nothing was removed." >&2
+            exit 1
+          fi
+          expected_message="codex-switch-global-pace publish-dev lock v1|repo=${GITHUB_REPOSITORY}|source=${LOCK_SOURCE_SHA}|transaction=${LOCK_TRANSACTION}"
+          if [[ "$LOCK_MESSAGE" != "$expected_message" ]]; then
+            echo "Persisted shared publication lock message is invalid; nothing was removed." >&2
+            exit 1
+          fi
+
+          current_ref_error="$RUNNER_TEMP/shared-publication-lock-release-ref-error"
+          if ! current_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${LOCK_TAG}" \
+            2>"$current_ref_error"); then
+            if grep -Eq 'HTTP 404|Not Found' "$current_ref_error"; then
+              echo "Shared publication lock ${expected_ref} was never created or is already absent."
+              exit 0
+            fi
+            cat "$current_ref_error" >&2
+            echo "Candidate shared publication lock could not be read before cleanup; nothing was removed." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' <<<"$current_ref" > /dev/null; then
+            echo "Candidate shared publication lock ref returned invalid JSON; nothing was removed." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.ref' <<<"$current_ref")" != "$expected_ref" || \
+                "$(jq -r '.object.type' <<<"$current_ref")" != tag || \
+                "$(jq -r '.object.sha' <<<"$current_ref" | tr '[:upper:]' '[:lower:]')" != "$LOCK_TAG_OBJECT_SHA" ]]; then
+            echo "Shared publication lock ref changed identity; it was preserved." >&2
+            exit 1
+          fi
+
+          current_tag_error="$RUNNER_TEMP/shared-publication-lock-release-tag-error"
+          if ! current_tag=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${LOCK_TAG_OBJECT_SHA}" \
+            2>"$current_tag_error"); then
+            cat "$current_tag_error" >&2
+            echo "Candidate shared publication lock object could not be read before cleanup; nothing was removed." >&2
+            exit 1
+          fi
+          if ! jq -e 'type == "object"' <<<"$current_tag" > /dev/null; then
+            echo "Candidate shared publication lock object returned invalid JSON; nothing was removed." >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.sha' <<<"$current_tag" | tr '[:upper:]' '[:lower:]')" != "$LOCK_TAG_OBJECT_SHA" || \
+                "$(jq -r '.tag' <<<"$current_tag")" != "$LOCK_TAG" || \
+                "$(jq -r '.message' <<<"$current_tag")" != "$LOCK_MESSAGE" || \
+                "$(jq -r '.object.type' <<<"$current_tag")" != commit || \
+                "$(jq -r '.object.sha' <<<"$current_tag" | tr '[:upper:]' '[:lower:]')" != "$LOCK_SOURCE_SHA" ]]; then
+            echo "Shared publication lock object changed identity; it was preserved." >&2
+            exit 1
+          fi
+
+          lease="--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}"
+          if git -c credential.helper= \
+            -c 'credential.helper=!gh auth git-credential' \
+            push --porcelain --no-verify "$lease" \
+            "https://github.com/${GITHUB_REPOSITORY}.git" ":${expected_ref}"; then
+            delete_status=0
+          else
+            delete_status=$?
+            echo "Leased shared publication lock deletion returned status ${delete_status}; checking the exact final ref state." >&2
+          fi
+
+          after_error="$RUNNER_TEMP/shared-publication-lock-after-delete-error"
+          if after_ref=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${LOCK_TAG}" \
+            2>"$after_error"); then
+            if ! jq -e 'type == "object"' <<<"$after_ref" > /dev/null; then
+              echo "Shared publication lock post-delete check returned invalid JSON; deletion was not retried." >&2
+              exit 1
+            fi
+            if [[ "$(jq -r '.ref' <<<"$after_ref")" == "$expected_ref" && \
+                  "$(jq -r '.object.type' <<<"$after_ref")" == tag && \
+                  "$(jq -r '.object.sha' <<<"$after_ref" | tr '[:upper:]' '[:lower:]')" == "$LOCK_TAG_OBJECT_SHA" ]]; then
+              echo "The exact shared publication lock remains after leased deletion; it was not deleted again." >&2
+            else
+              echo "The shared publication lock changed identity during leased deletion; the new ref was preserved." >&2
+            fi
+            exit 1
+          elif ! grep -Eq 'HTTP 404|Not Found' "$after_error"; then
+            cat "$after_error" >&2
+            echo "Shared publication lock deletion state is ambiguous; deletion was not retried." >&2
+            exit 1
+          fi
+          echo "Released exact shared publication lock ${expected_ref}."

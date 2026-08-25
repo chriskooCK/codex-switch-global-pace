@@ -100,36 +100,66 @@ guesses between them.
 
 GitHub Actions Release builds are the only distribution source of truth; `publish-dev.ps1` downloads the Actions artifact and never publishes from local `target/release`. The Release job verifies every archive against its `.sha256` and generates the Sigstore provenance bundle before uploading the development bundle. The publisher independently checks the remote tag, workflow run, exact file set, checksums, provenance, packaged version, and uploaded bytes before it exposes the new release.
 
-Release runs are serialized per tag. The workflow resolves lightweight or
-annotated tags to their commit before producing any distribution bundle. Stable
-publication keeps the isolated-draft flow inside Actions. Its candidate name is
-deterministic for the stable tag, so a rerun can remove a draft left by a lost
-runner only after matching its source SHA, tag, release metadata, body marker,
-and every uploaded candidate asset; any mismatched release or ref is preserved
-and blocks publication. If the publish request commits but its response is lost,
-cleanup verifies and preserves the published release. The serialized rerun then
-recognizes that exact final release instead of deleting it as an incomplete draft.
-Development
-publication is deliberately local because GitHub's built-in Actions token cannot
-modify a Release whose target changes workflow files relative to the default
-branch. The publisher uses the maintainer's existing `gh` authentication; no
-personal token is copied into repository secrets and no permission fallback is
-attempted. A local mutex prevents overlap on one machine. Before its first
-Release mutation, the publisher also atomically creates the single remote
-`refs/tags/codex-switch-publish-dev-lock` lock as a uniquely identified annotated
-tag. Only the process that receives and verifies the successful create response
-owns that lock. An existing lock or an ambiguous create response is never stolen
-or removed automatically. While the lock is held, candidate/park release tags
-form the crash-recovery journal. Each journal tag explicitly records whether the
-prior `dev` release was a draft or public, so recovery never guesses visibility
-from a temporarily parked release. That value is also bound into the v2 prior-
-release fingerprint. After exact verification, a successful replacement always
-finalizes the new candidate as public (`draft=false`). If replacement fails or is
-interrupted, rollback instead restores the prior release to its original tag and
-exact draft/public state without temporarily publishing a prior draft. Here,
-exact recovery covers release metadata, asset identity and bytes, tag, and draft
-flag; it does not claim to restore GitHub's
-server-generated timestamps.
+Release runs are serialized across the whole workflow because stable recovery
+enumerates a repository-wide paginated Release collection. Before the stable path
+inspects its source tag, any Release, or a candidate ref, it also acquires the
+single remote `refs/tags/codex-switch-publish-dev-lock` lease used by
+`publish-dev.ps1`. The historical name and v1 annotated-tag identity format are
+intentionally retained: renaming the tag would let stable publication overlook an
+already active development publisher. Actions concurrency serializes Actions
+runs; this shared remote lease additionally serializes stable Actions publication
+with the local development publisher.
+
+Both publishers acquire that lease by first proving the ref absent, creating a
+uniquely identified annotated tag object, and atomically creating the ref to that
+exact object. Publication proceeds only after the ref-create response and both the
+ref and annotated-tag identities have been verified. The stable job persists its
+exact tag name, tag-object SHA, source SHA, transaction, and message before it asks
+GitHub to create the fixed ref. Its final `always()` step therefore also runs when
+that request fails or its response is lost. The step treats an absent ref as a
+no-op, removes only the ref whose complete persisted identity still matches, uses
+an exact Git `--force-with-lease`, and succeeds only after the API confirms the ref
+is absent. Any mismatched or unreadable identity is preserved. It does not retry,
+force-delete a different ref, or infer ownership from later visibility. The local
+publisher cannot persist cleanup state outside its process, so an ambiguous local
+ref-create response remains a manual-recovery case.
+
+The workflow resolves lightweight or annotated release tags to their commit before
+producing any distribution bundle. Stable publication keeps the isolated-draft
+flow inside Actions. Its candidate name is deterministic for the stable tag, so a
+rerun can remove a draft left by a lost runner only after the authenticated release
+list finds exactly one matching tag and a by-ID read confirms its source SHA,
+release metadata, body marker, and every uploaded candidate asset. Zero matches
+starts a new candidate; duplicate, malformed, mismatched, or unreadable release
+state is preserved and blocks publication. If the publish request commits but its
+response is lost, cleanup verifies and preserves the published release. The
+serialized rerun then recognizes that exact final release instead of deleting it
+as an incomplete draft. These guarantees serialize participating workflow runs.
+The shared lease also serializes the cooperating local publisher. GitHub's REST
+APIs delete a tag ref by name and a Release by ID without a conditional
+object-version precondition. The workflow therefore revalidates the by-name/by-ID
+object and its assets immediately before deletion and preserves every mismatch it
+observes, but this is not an atomic compare-and-delete against a repository administrator.
+Administrators must not manually change candidate refs or Releases while a
+publication or recovery run is active.
+
+Development publication is deliberately local because GitHub's built-in Actions
+token cannot modify a Release whose target changes workflow files relative to the
+default branch. The publisher uses the maintainer's existing `gh` authentication;
+no personal token is copied into repository secrets and no permission fallback is
+attempted. A local mutex prevents overlap on one machine. Before its first Release
+collection or Release-object inspection or mutation, the publisher acquires the
+same shared remote lock. While the lock is held, candidate/park release tags form
+the crash-recovery journal. Each
+journal tag explicitly records whether the prior `dev` release was a draft or public,
+so recovery never guesses visibility from a temporarily parked release.
+That value is also bound into the v2 prior-release fingerprint. After exact
+verification, a successful replacement always finalizes the new candidate as
+public (`draft=false`). If replacement fails or is interrupted, rollback instead
+restores the prior release to its original tag and exact draft/public state without
+temporarily publishing a prior draft. Here, exact recovery covers release metadata,
+asset identity and bytes, tag, and draft flag; it does not claim to restore
+GitHub's server-generated timestamps.
 The successful candidate-create response is the authoritative candidate identity:
 the publisher accepts its positive release ID only after exact metadata validation
 and an explicit empty asset set. It does not replace that response with an
@@ -206,14 +236,19 @@ and restores the exact original visibility if replacement fails. A successful
 replacement assigns `dev` to only the newly verified candidate and makes that
 candidate public. The prior visibility is used only for exact rollback.
 
-**The remote development-publication lock already exists**
+**The shared remote publication lock already exists**
 Do not rerun with a different token or delete the lock speculatively. First make
-sure no publisher process is active and inspect both the lock and any
-`dev-candidate-*` / `dev-park-*` journal releases. The lock is intentionally not
-auto-recovered after a lost create response. Once its exact annotated-tag object
-and the journal state have been reviewed, remove that one ref explicitly with
+sure no stable Release job or local publisher process is active and inspect both
+the lock and any stable `release-candidate-*` or development
+`dev-candidate-*` / `dev-park-*` journal releases. The stable workflow normally
+recovers an exact ref-create response loss in its `always()` cleanup. A lock can
+still remain if the runner itself disappears before cleanup, if the local
+publisher receives an ambiguous create response, or if cleanup cannot verify the
+persisted identity. Once the exact annotated-tag object and all journal state have
+been reviewed, remove that one ref explicitly with
 `gh api --method DELETE repos/chriskooCK/codex-switch-global-pace/git/refs/tags/codex-switch-publish-dev-lock`,
-then rerun the publisher so journal recovery happens under a newly acquired lock.
+then rerun the failed stable job or local publisher so journal recovery happens
+under a newly acquired lock.
 
 **`self-update --dev` cannot find the new build**
 The GitHub Release tag must be the lowercase literal `dev` and the release must be public (`draft=false`). A separate tag such as `v20260712.1.0-dev` creates an independent prerelease that the client channel cannot see, and a `dev` draft is intentionally unavailable to unauthenticated clients.

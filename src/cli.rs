@@ -55,13 +55,16 @@ pub enum DaemonCommand {
 #[command(
     name = "codex-switch-global-pace",
     version = concat!(env!("CARGO_PKG_VERSION"), "\n", env!("CARGO_PKG_REPOSITORY")),
-    about = "Codex multi-profile manager with a global weekly pace dashboard\nhttps://github.com/chriskooCK/codex-switch-global-pace",
+    about = concat!(
+        "Codex multi-profile manager with a global weekly pace dashboard\n",
+        env!("CARGO_PKG_REPOSITORY")
+    ),
     long_about = None,
     override_usage = "codex-switch-global-pace [OPTIONS] [COMMAND]",
     after_help = "Examples:\n  codex-switch-global-pace                 # open the TUI\n  codex-switch-global-pace list\n  codex-switch-global-pace use\n  codex-switch-global-pace rename old-alias new-alias\n  codex-switch-global-pace import ./auth-backups\n  codex-switch-global-pace self-update --check\n\nRun `codex-switch-global-pace <command> --help` for command-specific options."
 )]
 pub struct Cli {
-    /// Output as compact JSON (supported by list, use, reset-card, rename, delete, login, import, self-update, daemon status)
+    /// Output as compact JSON (supported by list, use, reset-card, warmup, rename, delete, login, import, self-update, daemon status)
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -96,6 +99,28 @@ pub struct Cli {
 pub enum Commands {
     #[command(name = "__hold-update-lock", hide = true)]
     HoldUpdateLock,
+    #[command(name = "__hold-daemon-update-boundary", hide = true)]
+    HoldDaemonUpdateBoundary {
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        initial_executable: std::path::PathBuf,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        replacement_executable: std::path::PathBuf,
+    },
+    #[command(name = "__installer-file-op", hide = true)]
+    InstallerFileOp {
+        #[arg(value_enum)]
+        operation: crate::installer_fs::InstallerFileOperation,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        source: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        destination: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "ABSOLUTE_PATH")]
+        displaced: Option<std::path::PathBuf>,
+        #[arg(long)]
+        expected_token: Option<String>,
+        #[arg(long)]
+        expected_destination_token: Option<String>,
+    },
     /// Switch to a profile; omit alias to auto-select using the unified scoring algorithm
     Use {
         /// Profile alias (omit to auto-select)
@@ -174,13 +199,13 @@ pub enum Commands {
     /// Fresh accounts show no reset timer until their first real request.
     /// This command triggers that timer without running a real task.
     #[command(
-        after_help = "Examples:\n  codex-switch-global-pace warmup          # warmup all profiles\n  codex-switch-global-pace warmup myalias  # warmup a specific profile"
+        after_help = "Examples:\n  codex-switch-global-pace warmup          # warmup all profiles\n  codex-switch-global-pace warmup myalias  # warmup a specific profile\n  codex-switch-global-pace --json warmup   # report per-profile JSON results"
     )]
     Warmup {
         /// Profile alias to warm up (omit to warm up all profiles)
         alias: Option<String>,
     },
-    /// Open the ~/.codex-switch directory in the system file manager
+    /// Open the application data directory in the system file manager
     Open,
     /// Background daemon (Beta) for automatic account switching
     #[command(subcommand)]
@@ -338,6 +363,18 @@ mod tests {
                     installer_state: true
                 }))
             ));
+        }
+    }
+
+    #[test]
+    fn warmup_accepts_global_json_mode_with_or_without_an_alias() {
+        for args in [
+            vec!["codex-switch-global-pace", "--json", "warmup"],
+            vec!["codex-switch-global-pace", "warmup", "work", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.json);
+            assert!(matches!(cli.command, Some(Commands::Warmup { .. })));
         }
     }
 }

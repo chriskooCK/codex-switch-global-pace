@@ -5,7 +5,11 @@
 #   $env:CS_VERSION="20260712.1.0"; irm .../install.ps1 | iex # install specific version
 #   $env:CS_UNINSTALL="1"; irm .../install.ps1 | iex         # uninstall this program
 
+& {
 $ErrorActionPreference = "Stop"
+$TmpDir = $null
+$InstallerFailure = $null
+$TempCleanupError = $null
 $Repo = "chriskooCK/codex-switch-global-pace"
 $PackagedReleaseVersion = ""
 $BinaryName = "codex-switch-global-pace.exe"
@@ -13,6 +17,11 @@ $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\codex-switch-global-pace"
 $DataDir = Join-Path $env:USERPROFILE ".codex-switch"
 $SemVerPattern = '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?\z'
 $DevVersionPattern = '\A[0-9]+\.[0-9]+\.[0-9]+-dev(?:\.|(?=\+|\z))'
+$RecoveryNameCollisionLimit = 16
+$UpdateLockStartupExitTimeoutMilliseconds = 5000
+$UpdateLockReleaseExitTimeoutMilliseconds = 10000
+$DaemonBoundaryPrefix = "codex-switch-global-pace daemon update boundary"
+$DaemonBoundaryExitTimeoutMilliseconds = 10000
 
 function Assert-SupportedVersion {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -52,6 +61,24 @@ function Test-DirectInstallDirectory {
     return $true
 }
 
+function Remove-NewEmptyInstallDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $Item = Get-DirectPathItem -Path $Path
+    if ($null -eq $Item) {
+        return
+    }
+    if (($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        -not $Item.PSIsContainer) {
+        throw "New install directory path changed type and was preserved: $Path"
+    }
+    $Children = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
+    if ($Children.Count -ne 0) {
+        throw "New install directory is no longer empty and was preserved: $Path"
+    }
+    [System.IO.Directory]::Delete($Item.FullName, $false)
+}
+
 function Test-DirectInstalledBinary {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -68,11 +95,36 @@ function Test-DirectInstalledBinary {
     return $true
 }
 
+function New-InstallerRecoveryPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Stem,
+        [Parameter(Mandatory = $true)][ValidateSet("displaced", "failed")][string]$Role
+    )
+
+    $Generator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        for ($Attempt = 0; $Attempt -lt $RecoveryNameCollisionLimit; $Attempt++) {
+            $Nonce = New-Object byte[] 16
+            $Generator.GetBytes($Nonce)
+            $Hex = [System.BitConverter]::ToString($Nonce).Replace("-", "").ToLowerInvariant()
+            $Path = Join-Path $Directory ".$Stem.$Role-$Hex.exe"
+            if ($null -eq (Get-DirectPathItem -Path $Path)) {
+                return $Path
+            }
+        }
+    } finally {
+        $Generator.Dispose()
+    }
+    throw "Could not allocate a fresh random $Role recovery name after $RecoveryNameCollisionLimit collisions."
+}
+
 function Assert-NoInstallTransactionResidue {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Binary,
-        [string]$ExpectedStagedPath
+        [string]$ExpectedStagedPath,
+        [string]$ExpectedBackupPath
     )
 
     if (-not (Test-DirectInstallDirectory -Path $Path)) {
@@ -82,18 +134,24 @@ function Assert-NoInstallTransactionResidue {
     $ReservedNames = @(
         ".$Stem.install.exe",
         ".$Stem.rollback.exe",
+        ".$Stem.displaced.exe",
         ".$Stem.failed.exe",
         ".$Stem.uninstall.exe"
     )
     $LegacyTransactionPattern = '^\.' + [regex]::Escape($Stem) + '\.(install|rollback|failed)-[0-9A-Fa-f]{32}\.exe$'
+    $CurrentRecoveryPattern = '^\.' + [regex]::Escape($Stem) + '\.(displaced|failed)-[0-9a-f]{32}\.exe$'
     $Residues = @(
         Get-ChildItem -LiteralPath $Path -Force |
             Where-Object {
                 $IsExpectedStagedPath = -not [string]::IsNullOrEmpty($ExpectedStagedPath) -and
                     [System.StringComparer]::OrdinalIgnoreCase.Equals($_.FullName, $ExpectedStagedPath)
-                -not $IsExpectedStagedPath -and (
+                $IsExpectedBackupPath = -not [string]::IsNullOrEmpty($ExpectedBackupPath) -and
+                    [System.StringComparer]::OrdinalIgnoreCase.Equals($_.FullName, $ExpectedBackupPath)
+                -not $IsExpectedStagedPath -and -not $IsExpectedBackupPath -and (
                     $ReservedNames -contains $_.Name -or
-                    $_.Name -cmatch $LegacyTransactionPattern
+                    $_.Name -cmatch $LegacyTransactionPattern -or
+                    $_.Name -cmatch $CurrentRecoveryPattern -or
+                    $_.Name -cmatch '^\.codex-switch-global-pace\.installer-quarantine-[0-9a-f]{32}$'
                 )
             } |
             ForEach-Object { $_.FullName }
@@ -134,334 +192,253 @@ function Get-DirectFileSha256 {
     }
 }
 
-function Remove-StagedCandidate {
-    param([Parameter(Mandatory = $true)][string]$Path)
+function Invoke-InstallerFileOperation {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [string]$Source,
+        [string]$Destination,
+        [string]$Displaced,
+        [string]$ExpectedToken,
+        [string]$ExpectedDestinationToken
+    )
+
+    $Arguments = @("__installer-file-op", $Operation)
+    if (-not [string]::IsNullOrEmpty($Source)) {
+        $Arguments += @("--source", $Source)
+    }
+    if (-not [string]::IsNullOrEmpty($Destination)) {
+        $Arguments += @("--destination", $Destination)
+    }
+    if (-not [string]::IsNullOrEmpty($Displaced)) {
+        $Arguments += @("--displaced", $Displaced)
+    }
+    if (-not [string]::IsNullOrEmpty($ExpectedToken)) {
+        $Arguments += @("--expected-token", $ExpectedToken)
+    }
+    if (-not [string]::IsNullOrEmpty($ExpectedDestinationToken)) {
+        $Arguments += @("--expected-destination-token", $ExpectedDestinationToken)
+    }
 
     try {
-        if ($null -eq (Get-DirectFileSha256 -Path $Path)) {
+        $Lines = @(& $CandidatePath @Arguments 2>&1 | ForEach-Object { [string]$_ })
+        $ExitCode = $LASTEXITCODE
+    } catch {
+        return [pscustomobject]@{
+            Succeeded = $false
+            Result = $null
+            Error = "installer helper process could not be invoked: $_"
+        }
+    }
+    if ($ExitCode -ne 0) {
+        return [pscustomobject]@{
+            Succeeded = $false
+            Result = $null
+            Error = "installer helper exited with code ${ExitCode}: $($Lines -join '; ')"
+        }
+    }
+    if ($Lines.Count -ne 1 -or [string]::IsNullOrWhiteSpace($Lines[0])) {
+        return [pscustomobject]@{
+            Succeeded = $false
+            Result = $null
+            Error = "installer helper returned $($Lines.Count) lines instead of one machine-readable result"
+        }
+    }
+    return [pscustomobject]@{
+        Succeeded = $true
+        Result = $Lines[0]
+        Error = $null
+    }
+}
+
+function Invoke-RequiredInstallerFileOperation {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [string]$Source,
+        [string]$Destination,
+        [string]$Displaced,
+        [string]$ExpectedToken,
+        [string]$ExpectedDestinationToken
+    )
+
+    $Result = Invoke-InstallerFileOperation @PSBoundParameters
+    if (-not $Result.Succeeded) {
+        throw $Result.Error
+    }
+    return $Result.Result
+}
+
+function Get-InstallerFileToken {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $Token = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "token" `
+        -Source $Path
+    if ($Token -cnotmatch '^[0-9]+:[0-9]+\|[0-9a-f]{64}$') {
+        throw "installer helper returned an invalid file token for ${Path}: $Token"
+    }
+    return $Token
+}
+
+function Get-InstallerFileTokenIfPresent {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq (Get-DirectPathItem -Path $Path)) {
+        return $null
+    }
+    return Get-InstallerFileToken -CandidatePath $CandidatePath -Path $Path
+}
+
+function Remove-InstallerOwnedFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedToken
+    )
+
+    $Outcome = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "remove-owned" `
+        -Source $Path `
+        -ExpectedToken $ExpectedToken
+    switch -CaseSensitive ($Outcome) {
+        "removed" { return }
+        "removed-namespace-durability-unconfirmed" {
+            Write-Host "[warn]  Removed exact owned file at $Path, but directory durability was not confirmed." -ForegroundColor Yellow
+            return
+        }
+        default { throw "installer helper returned an unknown removal outcome for ${Path}: $Outcome" }
+    }
+}
+
+function ConvertFrom-InstallerCreateOutcome {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Outcome
+    )
+
+    if ($Outcome -cnotmatch '^(?<state>created|created-namespace-durability-unconfirmed)\|(?<token>[0-9]+:[0-9]+\|[0-9a-f]{64})$') {
+        throw "installer helper returned an invalid creation outcome for ${Path}: $Outcome"
+    }
+    $State = $Matches.state
+    $Token = $Matches.token
+    if ($State -ceq "created-namespace-durability-unconfirmed") {
+        $CleanupError = $null
+        try {
+            Remove-InstallerOwnedFile `
+                -CandidatePath $CandidatePath `
+                -Path $Path `
+                -ExpectedToken $Token
+        } catch {
+            $CleanupError = $_
+        }
+        $Suffix = if ($null -eq $CleanupError) {
+            " The exact staged file was removed."
+        } else {
+            " Exact cleanup failed and the token-bound residue was preserved at ${Path}: $CleanupError"
+        }
+        throw "Creation reached ${Path}, but directory durability was not confirmed.$Suffix"
+    }
+    return $Token
+}
+
+function Copy-InstallerFileExclusive {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [Parameter(Mandatory = $true)][string]$ExpectedToken
+    )
+
+    $Outcome = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "copy-exclusive" `
+        -Source $Source `
+        -Destination $Destination `
+        -ExpectedToken $ExpectedToken
+    return ConvertFrom-InstallerCreateOutcome `
+        -CandidatePath $CandidatePath `
+        -Path $Destination `
+        -Outcome $Outcome
+}
+
+function New-InstallerEmptyFileExclusive {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $Outcome = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "create-empty-exclusive" `
+        -Destination $Destination
+    return ConvertFrom-InstallerCreateOutcome `
+        -CandidatePath $CandidatePath `
+        -Path $Destination `
+        -Outcome $Outcome
+}
+
+function Remove-InstallerArtifactIfOwned {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [AllowNull()][string]$ExpectedToken
+    )
+
+    if ([string]::IsNullOrEmpty($ExpectedToken)) {
+        return $null
+    }
+    try {
+        $ObservedToken = Get-InstallerFileTokenIfPresent `
+            -CandidatePath $CandidatePath `
+            -Path $Path
+        if ($null -eq $ObservedToken) {
             return $null
         }
-        Remove-Item -LiteralPath $Path -Force
-        if ($null -ne (Get-DirectFileSha256 -Path $Path)) {
-            return "the staged candidate still exists after removal"
+        if ($ObservedToken -cne $ExpectedToken) {
+            return "${Path}: a foreign file identity was preserved"
         }
+        Remove-InstallerOwnedFile `
+            -CandidatePath $CandidatePath `
+            -Path $Path `
+            -ExpectedToken $ExpectedToken
         return $null
     } catch {
-        return "$_"
+        return "${Path}: $_"
     }
 }
 
-function Invoke-AtomicUpgradePublication {
+function New-InstallerRegistryRequest {
     param(
-        [Parameter(Mandatory = $true)][string]$StagedPath,
-        [Parameter(Mandatory = $true)][string]$InstalledPath,
-        [Parameter(Mandatory = $true)][string]$BackupPath,
-        [Parameter(Mandatory = $true)][string]$FailedPath,
-        [Parameter(Mandatory = $true)][string]$StagedSha256,
-        [Parameter(Mandatory = $true)][string]$PreviousSha256
+        [Parameter(Mandatory = $true)][string]$TemporaryDirectory,
+        [Parameter(Mandatory = $true)][hashtable]$Value
     )
 
-    try {
-        $InstalledSha256 = Get-DirectFileSha256 -Path $InstalledPath
-        $StagedSha256Before = Get-DirectFileSha256 -Path $StagedPath
-        $BackupSha256 = Get-DirectFileSha256 -Path $BackupPath
-        $FailedSha256 = Get-DirectFileSha256 -Path $FailedPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "$_"
-        }
-    }
-    if ($InstalledSha256 -cne $PreviousSha256 -or
-        $StagedSha256Before -cne $StagedSha256 -or
-        $null -ne $BackupSha256 -or
-        $null -ne $FailedSha256) {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "publication inputs did not match the exact pre-transaction state"
-        }
-    }
-
-    $OperationError = $null
-    try {
-        [System.IO.File]::Replace($StagedPath, $InstalledPath, $BackupPath, $true)
-    } catch {
-        $OperationError = "$_"
-    }
-
-    try {
-        $InstalledSha256 = Get-DirectFileSha256 -Path $InstalledPath
-        $StagedSha256After = Get-DirectFileSha256 -Path $StagedPath
-        $BackupSha256 = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $OperationError
-            InspectionError = "$_"
-        }
-    }
-
-    $State = if ($InstalledSha256 -ceq $StagedSha256 -and
-        $null -eq $StagedSha256After -and
-        $BackupSha256 -ceq $PreviousSha256) {
-        "Published"
-    } elseif ($InstalledSha256 -ceq $PreviousSha256 -and
-        $StagedSha256After -ceq $StagedSha256 -and
-        $null -eq $BackupSha256) {
-        "Unchanged"
-    } else {
-        "Ambiguous"
-    }
-
-    return [pscustomobject]@{
-        State           = $State
-        OperationError  = $OperationError
-        InspectionError = $null
-    }
-}
-
-function Invoke-AtomicUpgradeRollback {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstalledPath,
-        [Parameter(Mandatory = $true)][string]$BackupPath,
-        [Parameter(Mandatory = $true)][string]$FailedPath,
-        [Parameter(Mandatory = $true)][string]$StagedSha256,
-        [Parameter(Mandatory = $true)][string]$PreviousSha256
+    $Path = Join-Path $TemporaryDirectory "path-request-$([Guid]::NewGuid().ToString('N')).json"
+    $Json = $Value | ConvertTo-Json -Compress
+    $Stream = New-Object System.IO.FileStream(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
     )
-
     try {
-        $InstalledSha256 = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256 = Get-DirectFileSha256 -Path $BackupPath
-        $FailedSha256 = Get-DirectFileSha256 -Path $FailedPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "$_"
-        }
+        $Bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Json)
+        $Stream.Write($Bytes, 0, $Bytes.Length)
+        $Stream.Flush($true)
+    } finally {
+        $Stream.Dispose()
     }
-    if ($InstalledSha256 -cne $StagedSha256 -or
-        $BackupSha256 -cne $PreviousSha256 -or
-        $null -ne $FailedSha256) {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "rollback inputs did not match the exact published state"
-        }
-    }
-
-    $OperationError = $null
-    try {
-        [System.IO.File]::Replace($BackupPath, $InstalledPath, $FailedPath, $true)
-    } catch {
-        $OperationError = "$_"
-    }
-
-    try {
-        $InstalledSha256 = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256 = Get-DirectFileSha256 -Path $BackupPath
-        $FailedSha256 = Get-DirectFileSha256 -Path $FailedPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $OperationError
-            InspectionError = "$_"
-        }
-    }
-
-    $State = if ($InstalledSha256 -ceq $PreviousSha256 -and
-        $null -eq $BackupSha256 -and
-        $FailedSha256 -ceq $StagedSha256) {
-        "Restored"
-    } elseif ($InstalledSha256 -ceq $StagedSha256 -and
-        $BackupSha256 -ceq $PreviousSha256 -and
-        $null -eq $FailedSha256) {
-        "Unchanged"
-    } else {
-        "Ambiguous"
-    }
-
-    return [pscustomobject]@{
-        State           = $State
-        OperationError  = $OperationError
-        InspectionError = $null
-    }
-}
-
-function Invoke-AtomicUninstallStaging {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstalledPath,
-        [Parameter(Mandatory = $true)][string]$BackupPath,
-        [Parameter(Mandatory = $true)][string]$InstalledSha256
-    )
-
-    try {
-        $InstalledSha256Before = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256Before = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "$_"
-        }
-    }
-    if ($InstalledSha256Before -cne $InstalledSha256 -or $null -ne $BackupSha256Before) {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "uninstall staging inputs did not match the exact pre-transaction state"
-        }
-    }
-
-    $OperationError = $null
-    try {
-        [System.IO.File]::Move($InstalledPath, $BackupPath)
-    } catch {
-        $OperationError = "$_"
-    }
-
-    try {
-        $InstalledSha256After = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256After = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $OperationError
-            InspectionError = "$_"
-        }
-    }
-
-    $State = if ($null -eq $InstalledSha256After -and $BackupSha256After -ceq $InstalledSha256) {
-        "Staged"
-    } elseif ($InstalledSha256After -ceq $InstalledSha256 -and $null -eq $BackupSha256After) {
-        "Unchanged"
-    } else {
-        "Ambiguous"
-    }
-
-    return [pscustomobject]@{
-        State           = $State
-        OperationError  = $OperationError
-        InspectionError = $null
-    }
-}
-
-function Invoke-AtomicUninstallRestore {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstalledPath,
-        [Parameter(Mandatory = $true)][string]$BackupPath,
-        [Parameter(Mandatory = $true)][string]$InstalledSha256
-    )
-
-    try {
-        $InstalledSha256Before = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256Before = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "$_"
-        }
-    }
-    if ($null -ne $InstalledSha256Before -or $BackupSha256Before -cne $InstalledSha256) {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "uninstall restore inputs did not match the exact staged state"
-        }
-    }
-
-    $OperationError = $null
-    try {
-        [System.IO.File]::Move($BackupPath, $InstalledPath)
-    } catch {
-        $OperationError = "$_"
-    }
-
-    try {
-        $InstalledSha256After = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256After = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $OperationError
-            InspectionError = "$_"
-        }
-    }
-
-    $State = if ($InstalledSha256After -ceq $InstalledSha256 -and $null -eq $BackupSha256After) {
-        "Restored"
-    } elseif ($null -eq $InstalledSha256After -and $BackupSha256After -ceq $InstalledSha256) {
-        "Unchanged"
-    } else {
-        "Ambiguous"
-    }
-
-    return [pscustomobject]@{
-        State           = $State
-        OperationError  = $OperationError
-        InspectionError = $null
-    }
-}
-
-function Invoke-AtomicUninstallCommit {
-    param(
-        [Parameter(Mandatory = $true)][string]$InstalledPath,
-        [Parameter(Mandatory = $true)][string]$BackupPath,
-        [Parameter(Mandatory = $true)][string]$InstalledSha256
-    )
-
-    try {
-        $InstalledSha256Before = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256Before = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "$_"
-        }
-    }
-    if ($null -ne $InstalledSha256Before -or $BackupSha256Before -cne $InstalledSha256) {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $null
-            InspectionError = "uninstall commit inputs did not match the exact staged state"
-        }
-    }
-
-    $OperationError = $null
-    try {
-        [System.IO.File]::Delete($BackupPath)
-    } catch {
-        $OperationError = "$_"
-    }
-
-    try {
-        $InstalledSha256After = Get-DirectFileSha256 -Path $InstalledPath
-        $BackupSha256After = Get-DirectFileSha256 -Path $BackupPath
-    } catch {
-        return [pscustomobject]@{
-            State           = "Ambiguous"
-            OperationError  = $OperationError
-            InspectionError = "$_"
-        }
-    }
-
-    $State = if ($null -eq $InstalledSha256After -and $null -eq $BackupSha256After) {
-        "Committed"
-    } elseif ($null -eq $InstalledSha256After -and $BackupSha256After -ceq $InstalledSha256) {
-        "Unchanged"
-    } else {
-        "Ambiguous"
-    }
-
-    return [pscustomobject]@{
-        State           = $State
-        OperationError  = $OperationError
-        InspectionError = $null
-    }
+    return $Path
 }
 
 function Start-UpdateLockHolder {
@@ -487,7 +464,7 @@ function Start-UpdateLockHolder {
         $ReadyLine = $LockProcess.StandardOutput.ReadLine()
         if ($ReadyLine -cne "codex-switch-global-pace update lock ready") {
             try { $LockProcess.StandardInput.Close() } catch {}
-            $Exited = $LockProcess.WaitForExit(5000)
+            $Exited = $LockProcess.WaitForExit($UpdateLockStartupExitTimeoutMilliseconds)
             $ExitDescription = if ($Exited) { "exit code $($LockProcess.ExitCode)" } else { "PID $($LockProcess.Id) did not exit after stdin closed" }
             $ErrorText = if ($Exited) { $LockProcess.StandardError.ReadToEnd().Trim() } else { "" }
             throw "Downloaded binary does not support the required installer transaction lock ($ExitDescription): $ErrorText"
@@ -496,7 +473,7 @@ function Start-UpdateLockHolder {
     } catch {
         $StartError = $_
         try { $LockProcess.StandardInput.Close() } catch {}
-        try { [void]$LockProcess.WaitForExit(5000) } catch {}
+        try { [void]$LockProcess.WaitForExit($UpdateLockStartupExitTimeoutMilliseconds) } catch {}
         try { $LockProcess.Dispose() } catch {}
         throw "Could not acquire the exclusive installer transaction lock; the existing installation was not changed: $StartError"
     }
@@ -514,7 +491,7 @@ function Complete-UpdateLockHolder {
 
     $Exited = $false
     try {
-        $Exited = $LockProcess.WaitForExit(10000)
+        $Exited = $LockProcess.WaitForExit($UpdateLockReleaseExitTimeoutMilliseconds)
         if (-not $Exited) {
             $ReleaseErrors += "lock-holder PID $($LockProcess.Id) did not exit after stdin EOF"
         }
@@ -538,43 +515,189 @@ function Complete-UpdateLockHolder {
     }
 }
 
-function Get-CheckedDaemonStatus {
-    param([Parameter(Mandatory = $true)][string]$CandidatePath)
+function ConvertTo-InstallerProcessArgument {
+    param([Parameter(Mandatory = $true)][string]$Value)
 
-    $StatusLines = @(& $CandidatePath daemon status --installer-state 2>&1 | ForEach-Object { [string]$_ })
-    $StatusExitCode = $LASTEXITCODE
-    if ($StatusExitCode -ne 0) {
-        throw "release-verified daemon state probe exited with code ${StatusExitCode}: $($StatusLines -join '; ')"
+    if ($Value.Contains([string][char]0) -or $Value.Contains('"')) {
+        throw "Installer lifecycle path contains a character that cannot be passed to the verified helper."
     }
-    if ($StatusLines.Count -ne 1) {
-        throw "release-verified daemon state probe returned $($StatusLines.Count) lines instead of one exact state tuple"
+    return '"' + $Value + '"'
+}
+
+function Close-DaemonLifecycleHolder {
+    param(
+        [Parameter(Mandatory = $true)]$Holder,
+        [Parameter(Mandatory = $true)][bool]$ExpectSuccess
+    )
+
+    if ($Holder.Phase -ceq "Closed") {
+        return
+    }
+    if ($Holder.Phase -ceq "Retained") {
+        throw "daemon lifecycle holder PID $($Holder.Process.Id) remains alive with its service/PID authority retained for inspection"
+    }
+    $CloseErrors = @()
+    try {
+        $Holder.Process.StandardInput.Close()
+    } catch {
+        $CloseErrors += "could not close daemon lifecycle stdin: $_"
+    }
+    $Exited = $false
+    try {
+        $Exited = $Holder.Process.WaitForExit($DaemonBoundaryExitTimeoutMilliseconds)
+    } catch {
+        $CloseErrors += "could not wait for daemon lifecycle holder: $_"
+    }
+    if (-not $Exited) {
+        $Holder.Phase = "Retained"
+        throw "daemon lifecycle holder PID $($Holder.Process.Id) did not exit after stdin EOF; it was not terminated, so its service/PID authority remains held for inspection"
+    }
+    if ($Exited) {
+        $RemainingOutput = $Holder.Process.StandardOutput.ReadToEnd()
+        if (-not [string]::IsNullOrEmpty($RemainingOutput)) {
+            $CloseErrors += "daemon lifecycle holder emitted unexpected protocol output: $($RemainingOutput.Trim())"
+        }
+        if ($ExpectSuccess -and $Holder.Process.ExitCode -ne 0) {
+            $CloseErrors += "daemon lifecycle holder exited with code $($Holder.Process.ExitCode)"
+        } elseif (-not $ExpectSuccess -and $Holder.Process.ExitCode -eq 0) {
+            $CloseErrors += "abandoned daemon lifecycle holder accepted an incomplete transaction"
+        }
+    }
+    try {
+        $Holder.Process.Dispose()
+    } catch {
+        $CloseErrors += "could not dispose daemon lifecycle process handle: $_"
+    }
+    $Holder.Phase = "Closed"
+    if ($CloseErrors.Count -gt 0) {
+        throw ($CloseErrors -join "; ")
+    }
+}
+
+function Start-DaemonLifecycleHolder {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$InitialExecutable,
+        [Parameter(Mandatory = $true)][string]$ReplacementExecutable
+    )
+
+    $StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $StartInfo.FileName = $CandidatePath
+    $StartInfo.Arguments = "__hold-daemon-update-boundary --initial-executable $(ConvertTo-InstallerProcessArgument -Value $InitialExecutable) --replacement-executable $(ConvertTo-InstallerProcessArgument -Value $ReplacementExecutable)"
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardInput = $true
+    $StartInfo.RedirectStandardOutput = $true
+    # Stderr is inherited instead of redirected: the protocol uses stdout
+    # only, and an unread redirected error pipe could deadlock a verbose fatal
+    # path before the holder releases its authorities.
+    $StartInfo.RedirectStandardError = $false
+
+    $Process = New-Object System.Diagnostics.Process
+    $Process.StartInfo = $StartInfo
+    $Holder = [pscustomobject]@{
+        Process = $Process
+        Phase = "Starting"
+        Running = $false
+        ServiceInstalled = $false
+    }
+    try {
+        [void]$Process.Start()
+        $ReadyLine = $Process.StandardOutput.ReadLine()
+        switch -CaseSensitive ($ReadyLine) {
+            "$DaemonBoundaryPrefix ready running=true service_installed=true" {
+                $Holder.Running = $true
+                $Holder.ServiceInstalled = $true
+            }
+            "$DaemonBoundaryPrefix ready running=true service_installed=false" {
+                $Holder.Running = $true
+            }
+            "$DaemonBoundaryPrefix ready running=false service_installed=true" {
+                $Holder.ServiceInstalled = $true
+            }
+            "$DaemonBoundaryPrefix ready running=false service_installed=false" {}
+            default {
+                throw "verified helper returned an invalid daemon lifecycle readiness marker: $ReadyLine"
+            }
+        }
+        $Holder.Phase = "Stopped"
+        return $Holder
+    } catch {
+        $StartError = $_
+        $Holder.Phase = "Unknown"
+        try {
+            Close-DaemonLifecycleHolder -Holder $Holder -ExpectSuccess $false
+        } catch {
+            throw "Could not establish the daemon lifecycle boundary: $StartError. Holder cleanup also failed: $_"
+        }
+        throw "Could not establish the daemon lifecycle boundary: $StartError"
+    }
+}
+
+function Invoke-DaemonLifecycleCommand {
+    param(
+        [Parameter(Mandatory = $true)]$Holder,
+        [Parameter(Mandatory = $true)][ValidateSet("new", "uninstall", "rollback", "finish", "release")][string]$Command
+    )
+
+    $AllowedPhase = switch -CaseSensitive ($Command) {
+        "finish" { @("NewReady", "UninstallReady") }
+        "release" { @("FinalConfirmed") }
+        default { @("Stopped") }
+    }
+    if ($AllowedPhase -cnotcontains $Holder.Phase) {
+        throw "daemon lifecycle command '$Command' is invalid in phase '$($Holder.Phase)'"
+    }
+    try {
+        $Holder.Process.StandardInput.WriteLine($Command)
+        $Holder.Process.StandardInput.Flush()
+        $Marker = $Holder.Process.StandardOutput.ReadLine()
+    } catch {
+        $Holder.Phase = "Unknown"
+        throw "daemon lifecycle holder communication failed while sending '$Command': $_"
+    }
+    if ($null -eq $Marker) {
+        $Holder.Phase = "Unknown"
+        throw "daemon lifecycle holder exited before acknowledging '$Command'"
     }
 
-    switch -CaseSensitive ($StatusLines[0]) {
-        "running=true service_installed=true" {
-            $Running = $true
-            $ServiceInstalled = $true
+    switch -CaseSensitive ("$Command`n$Marker") {
+        "new`n$DaemonBoundaryPrefix new state ready" {
+            $Holder.Phase = "NewReady"
+            return
         }
-        "running=true service_installed=false" {
-            $Running = $true
-            $ServiceInstalled = $false
+        "new`n$DaemonBoundaryPrefix new state failed" {
+            throw "replacement daemon state was rejected; exact daemon absence was retained for rollback"
         }
-        "running=false service_installed=true" {
-            $Running = $false
-            $ServiceInstalled = $true
+        "uninstall`n$DaemonBoundaryPrefix uninstall state ready" {
+            $Holder.Phase = "UninstallReady"
+            return
         }
-        "running=false service_installed=false" {
-            $Running = $false
-            $ServiceInstalled = $false
+        "uninstall`n$DaemonBoundaryPrefix uninstall state failed" {
+            throw "daemon uninstall state was rejected; exact stopped state was retained for rollback"
+        }
+        "rollback`n$DaemonBoundaryPrefix old state restored" {
+            $Holder.Phase = "Restored"
+            Close-DaemonLifecycleHolder -Holder $Holder -ExpectSuccess $true
+            return
+        }
+        "rollback`n$DaemonBoundaryPrefix old state failed" {
+            $Holder.Phase = "Unknown"
+            throw "the prior daemon state could not be restored; exact daemon absence was re-established"
+        }
+        "finish`n$DaemonBoundaryPrefix final state confirmed" {
+            $Holder.Phase = "FinalConfirmed"
+            return
+        }
+        "release`n$DaemonBoundaryPrefix lifecycle authority released" {
+            $Holder.Phase = "Released"
+            Close-DaemonLifecycleHolder -Holder $Holder -ExpectSuccess $true
+            return
         }
         default {
-            throw "release-verified daemon state probe returned an unsupported tuple: $($StatusLines[0])"
+            $Holder.Phase = "Unknown"
+            throw "daemon lifecycle holder returned an invalid marker for '$Command': $Marker"
         }
-    }
-
-    return [pscustomobject]@{
-        running = $Running
-        platform = [pscustomobject]@{ service_installed = $ServiceInstalled }
     }
 }
 
@@ -594,72 +717,317 @@ function Assert-CandidateServiceOwner {
     }
 }
 
-function Restore-UninstallRunningState {
+function Set-ExactUserPathTransition {
     param(
-        [Parameter(Mandatory = $true)][string]$BinPath,
         [Parameter(Mandatory = $true)][string]$CandidatePath,
-        [Parameter(Mandatory = $true)][bool]$WasRunning,
-        [Parameter(Mandatory = $true)][bool]$ServiceWasInstalled
+        [Parameter(Mandatory = $true)][string]$TemporaryDirectory,
+        [Parameter(Mandatory = $true)][ValidateSet("add", "remove")][string]$Action,
+        [Parameter(Mandatory = $true)][string]$ExpectedSnapshot,
+        [Parameter(Mandatory = $true)][string]$Entry
     )
 
-    $Current = Get-CheckedDaemonStatus -CandidatePath $CandidatePath
-    if ($Current.platform.service_installed -ne $ServiceWasInstalled) {
-        throw "service installation state did not match its exact pre-uninstall value"
-    }
-    if ($ServiceWasInstalled) {
-        Assert-CandidateServiceOwner `
-            -CandidatePath $CandidatePath `
-            -ExpectedExecutable $BinPath
-    }
-    if ($WasRunning -and -not $Current.running) {
-        $StartOutput = (& $CandidatePath daemon start --expected-executable $BinPath 2>&1 | Out-String)
-        $StartExitCode = $LASTEXITCODE
-        $Current = Get-CheckedDaemonStatus -CandidatePath $CandidatePath
-        if ($StartExitCode -ne 0 -or -not $Current.running) {
-            throw "daemon start did not restore the previously running daemon (exit code ${StartExitCode}): $StartOutput"
+    $RequestPath = New-InstallerRegistryRequest `
+        -TemporaryDirectory $TemporaryDirectory `
+        -Value @{ expected = $ExpectedSnapshot; entry = $Entry }
+    $Outcome = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "user-path-$Action" `
+        -Source $RequestPath
+    return ConvertFrom-InstallerPathTransitionOutcome -Outcome $Outcome
+}
+
+function Restore-ExactUserPathTransition {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$TemporaryDirectory,
+        [Parameter(Mandatory = $true)][string]$OriginalSnapshot,
+        [Parameter(Mandatory = $true)][string]$RequestedSnapshot
+    )
+
+    $CurrentSnapshot = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "user-path-snapshot"
+    if ($CurrentSnapshot -ceq $OriginalSnapshot) {
+        return [pscustomobject]@{
+            Snapshot = $OriginalSnapshot
+            Notification = "unchanged"
+            NotificationSucceeded = $true
         }
     }
-    if ($Current.running -ne $WasRunning) {
-        throw "daemon running state did not match its exact pre-uninstall value after rollback"
+    if ($CurrentSnapshot -cne $RequestedSnapshot) {
+        throw "User PATH changed independently; refusing to overwrite its raw value during rollback."
+    }
+    $RequestPath = New-InstallerRegistryRequest `
+        -TemporaryDirectory $TemporaryDirectory `
+        -Value @{ expected = $RequestedSnapshot; requested = $OriginalSnapshot }
+    $Outcome = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "user-path-restore" `
+        -Source $RequestPath
+    return ConvertFrom-InstallerPathTransitionOutcome -Outcome $Outcome
+}
+
+function ConvertFrom-InstallerPathTransitionOutcome {
+    param([Parameter(Mandatory = $true)][string]$Outcome)
+
+    if ($Outcome -cnotmatch '^path-transition\|(?<snapshot>absent|v1:[0-9]+:[0-9a-f]*)\|(?<notification>unchanged|broadcast-ok|broadcast-failed:[0-9]+)$') {
+        throw "installer helper returned an invalid User PATH transition result: $Outcome"
+    }
+    $Notification = $Matches.notification
+    return [pscustomobject]@{
+        Snapshot = $Matches.snapshot
+        Notification = $Notification
+        NotificationSucceeded = $Notification -ceq "unchanged" -or $Notification -ceq "broadcast-ok"
     }
 }
 
-function Stop-And-ConfirmDaemonAbsent {
+function Get-ProcessPathSnapshot {
+    $Present = Test-Path -LiteralPath "Env:Path"
+    return [pscustomobject]@{
+        Present = $Present
+        Value = if ($Present) { [Environment]::GetEnvironmentVariable("Path", "Process") } else { $null }
+    }
+}
+
+function Test-ProcessPathSnapshotEqual {
     param(
-        [Parameter(Mandatory = $true)][string]$BinPath,
-        [Parameter(Mandatory = $true)][string]$CandidatePath
+        [Parameter(Mandatory = $true)]$Left,
+        [Parameter(Mandatory = $true)]$Right
     )
 
-    $Before = Get-CheckedDaemonStatus -CandidatePath $CandidatePath
-    if ($Before.platform.service_installed) {
-        Assert-CandidateServiceOwner `
-            -CandidatePath $CandidatePath `
-            -ExpectedExecutable $BinPath
+    if ([bool]$Left.Present -ne [bool]$Right.Present) {
+        return $false
     }
-    if ($Before.running -or $Before.platform.service_installed) {
-        & $CandidatePath daemon stop --expected-service-executable $BinPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "daemon stop exited with code $LASTEXITCODE"
+    if (-not $Left.Present) {
+        return $true
+    }
+    return [System.StringComparer]::Ordinal.Equals([string]$Left.Value, [string]$Right.Value)
+}
+
+function Get-RequestedProcessPathSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Current,
+        [Parameter(Mandatory = $true)][ValidateSet("add", "remove")][string]$Action,
+        [Parameter(Mandatory = $true)][string]$Entry
+    )
+
+    if ([string]::IsNullOrEmpty($Entry) -or $Entry.Contains(";") -or $Entry.Contains([char]0)) {
+        throw "Process PATH entry is empty or contains a separator/NUL."
+    }
+    if (-not $Current.Present) {
+        if ($Action -ceq "remove") {
+            return [pscustomobject]@{ Present = $false; Value = $null }
+        }
+        return [pscustomobject]@{ Present = $true; Value = $Entry }
+    }
+
+    $CurrentValue = [string]$Current.Value
+    $Segments = $CurrentValue.Split([char[]]@(';'), [System.StringSplitOptions]::None)
+    $Matching = @($Segments | ForEach-Object {
+        [System.StringComparer]::OrdinalIgnoreCase.Equals($_, $Entry)
+    })
+    if ($Action -ceq "add") {
+        if ($Matching -contains $true) {
+            return [pscustomobject]@{ Present = $true; Value = $CurrentValue }
+        }
+        # A fully empty value becomes the exact entry, so this installer does
+        # not introduce a CWD-search segment. Existing empty segments in any
+        # nonempty raw PATH, including a trailing one, remain byte-for-byte.
+        $RequestedValue = if ($CurrentValue.Length -eq 0) { $Entry } else { "$CurrentValue;$Entry" }
+        return [pscustomobject]@{ Present = $true; Value = $RequestedValue }
+    }
+
+    if ($Matching -notcontains $true) {
+        return [pscustomobject]@{ Present = $true; Value = $CurrentValue }
+    }
+    $Kept = New-Object System.Collections.Generic.List[string]
+    for ($Index = 0; $Index -lt $Segments.Count; $Index++) {
+        if (-not $Matching[$Index]) {
+            $Kept.Add($Segments[$Index])
         }
     }
-    $After = Get-CheckedDaemonStatus -CandidatePath $CandidatePath
-    if ($After.running) {
-        throw "daemon still reports running after the stop boundary"
+    if ($Kept.Count -eq 0) {
+        return [pscustomobject]@{ Present = $false; Value = $null }
     }
-    if ($After.platform.service_installed -ne $Before.platform.service_installed) {
-        throw "daemon stop changed the service installation state"
+    return [pscustomobject]@{ Present = $true; Value = [string]::Join(";", $Kept) }
+}
+
+function Set-ExactProcessPathSnapshot {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Requested
+    )
+
+    $Observed = Get-ProcessPathSnapshot
+    if (-not (Test-ProcessPathSnapshotEqual -Left $Observed -Right $Expected)) {
+        throw "Current PowerShell process PATH changed independently; refusing to overwrite it."
     }
-    if ($After.platform.service_installed) {
-        Assert-CandidateServiceOwner `
-            -CandidatePath $CandidatePath `
-            -ExpectedExecutable $BinPath
+    if (Test-ProcessPathSnapshotEqual -Left $Expected -Right $Requested) {
+        return
+    }
+    $RequestedValue = if ($Requested.Present) { [string]$Requested.Value } else { $null }
+    [Environment]::SetEnvironmentVariable("Path", $RequestedValue, "Process")
+    $After = Get-ProcessPathSnapshot
+    if (-not (Test-ProcessPathSnapshotEqual -Left $After -Right $Requested)) {
+        throw "Current PowerShell process PATH did not reach the exact requested state."
+    }
+}
+
+function Restore-ExactProcessPathTransition {
+    param(
+        [Parameter(Mandatory = $true)]$Original,
+        [Parameter(Mandatory = $true)]$Requested
+    )
+
+    $Observed = Get-ProcessPathSnapshot
+    if (Test-ProcessPathSnapshotEqual -Left $Observed -Right $Original) {
+        return
+    }
+    if (-not (Test-ProcessPathSnapshotEqual -Left $Observed -Right $Requested)) {
+        throw "Current PowerShell process PATH changed independently; its exact value was preserved during rollback."
+    }
+    Set-ExactProcessPathSnapshot -Expected $Requested -Requested $Original
+}
+
+function Invoke-ExactProcessPathTransition {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet("add", "remove")][string]$Action,
+        [Parameter(Mandatory = $true)][string]$Entry
+    )
+
+    $Original = Get-ProcessPathSnapshot
+    $Requested = Get-RequestedProcessPathSnapshot `
+        -Current $Original `
+        -Action $Action `
+        -Entry $Entry
+    $TransitionError = $null
+    try {
+        Set-ExactProcessPathSnapshot -Expected $Original -Requested $Requested
+    } catch {
+        $TransitionError = $_
+    }
+    $Observed = Get-ProcessPathSnapshot
+    $AtOriginal = Test-ProcessPathSnapshotEqual -Left $Observed -Right $Original
+    $AtRequested = Test-ProcessPathSnapshotEqual -Left $Observed -Right $Requested
+    return [pscustomobject]@{
+        Original = $Original
+        Requested = $Requested
+        Applied = -not (Test-ProcessPathSnapshotEqual -Left $Original -Right $Requested) -and $AtRequested
+        Ambiguous = -not $AtOriginal -and -not $AtRequested
+        Error = $TransitionError
+    }
+}
+
+function Invoke-ClassifiedInstallerReplace {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$ReplacementPath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [Parameter(Mandatory = $true)][string]$DisplacedPath,
+        [Parameter(Mandatory = $true)][string]$ReplacementToken,
+        [Parameter(Mandatory = $true)][string]$DestinationToken
+    )
+
+    $Boundary = Invoke-InstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "replace-with-displaced" `
+        -Source $ReplacementPath `
+        -Destination $DestinationPath `
+        -Displaced $DisplacedPath `
+        -ExpectedToken $ReplacementToken `
+        -ExpectedDestinationToken $DestinationToken
+    $InspectionError = $null
+    try {
+        $ReplacementAfter = Get-InstallerFileTokenIfPresent -CandidatePath $CandidatePath -Path $ReplacementPath
+        $DestinationAfter = Get-InstallerFileTokenIfPresent -CandidatePath $CandidatePath -Path $DestinationPath
+        $DisplacedAfter = Get-InstallerFileTokenIfPresent -CandidatePath $CandidatePath -Path $DisplacedPath
+    } catch {
+        $InspectionError = "$_"
+    }
+    $State = if ($null -eq $InspectionError -and
+        $null -eq $ReplacementAfter -and
+        $DestinationAfter -ceq $ReplacementToken -and
+        $DisplacedAfter -ceq $DestinationToken) {
+        "Published"
+    } elseif ($null -eq $InspectionError -and
+        $ReplacementAfter -ceq $ReplacementToken -and
+        $DestinationAfter -ceq $DestinationToken -and
+        $null -eq $DisplacedAfter) {
+        "Unchanged"
+    } else {
+        "Ambiguous"
+    }
+    if ($Boundary.Succeeded -and $Boundary.Result -cne "replaced") {
+        $Boundary = [pscustomobject]@{
+            Succeeded = $false
+            Result = $null
+            Error = "installer helper returned an unknown replacement result: $($Boundary.Result)"
+        }
+    }
+    return [pscustomobject]@{
+        State = $State
+        OperationError = if ($Boundary.Succeeded) { $null } else { $Boundary.Error }
+        InspectionError = $InspectionError
+    }
+}
+
+function Invoke-ClassifiedInstallerMoveNoReplace {
+    param(
+        [Parameter(Mandatory = $true)][string]$CandidatePath,
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [Parameter(Mandatory = $true)][string]$SourceToken
+    )
+
+    $Boundary = Invoke-InstallerFileOperation `
+        -CandidatePath $CandidatePath `
+        -Operation "move-noreplace" `
+        -Source $SourcePath `
+        -Destination $DestinationPath `
+        -ExpectedToken $SourceToken
+    $InspectionError = $null
+    try {
+        $SourceAfter = Get-InstallerFileTokenIfPresent -CandidatePath $CandidatePath -Path $SourcePath
+        $DestinationAfter = Get-InstallerFileTokenIfPresent -CandidatePath $CandidatePath -Path $DestinationPath
+    } catch {
+        $InspectionError = "$_"
+    }
+    $State = if ($null -eq $InspectionError -and
+        $null -eq $SourceAfter -and
+        $DestinationAfter -ceq $SourceToken) {
+        "Published"
+    } elseif ($null -eq $InspectionError -and
+        $SourceAfter -ceq $SourceToken -and
+        $null -eq $DestinationAfter) {
+        "Unchanged"
+    } else {
+        "Ambiguous"
+    }
+    if ($Boundary.Succeeded -and $Boundary.Result -cne $SourceToken) {
+        $Boundary = [pscustomobject]@{
+            Succeeded = $false
+            Result = $null
+            Error = "installer helper returned an unexpected no-replace token"
+        }
+    }
+    return [pscustomobject]@{
+        State = $State
+        OperationError = if ($Boundary.Succeeded) { $null } else { $Boundary.Error }
+        InspectionError = $InspectionError
     }
 }
 
 # ── Installer entrypoint: resolve and verify the release binary ──
 
 # Detect architecture
-$Arch = if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq "Arm64") { "arm64" } else { "amd64" }
+try {
+$Arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
+    ([System.Runtime.InteropServices.Architecture]::X64) { "amd64" }
+    ([System.Runtime.InteropServices.Architecture]::Arm64) { "arm64" }
+    default {
+        throw "Unsupported Windows architecture: $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture). Only X64 and Arm64 release assets are supported."
+    }
+}
 $AssetName = "codex-switch-global-pace-windows-${Arch}.zip"
 
 # Determine version / channel. Uninstall uses the release that packaged this
@@ -712,8 +1080,8 @@ Write-Host "[info]  Detected: windows/$Arch" -ForegroundColor Blue
 Write-Host "[info]  Downloading: $DownloadUrl" -ForegroundColor Blue
 
 # Download
-$TmpDir = Join-Path $env:TEMP "codex-switch-global-pace-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "codex-switch-global-pace-install-$([Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $TmpDir | Out-Null
 $ZipPath = Join-Path $TmpDir $AssetName
 $ChecksumUrl = "$DownloadUrl.sha256"
 $ChecksumPath = "$ZipPath.sha256"
@@ -722,26 +1090,21 @@ try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
     Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -UseBasicParsing
 } catch {
-    Write-Host "[error] Archive or checksum download failed: $_" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    exit 1
+    $DownloadError = $_
+    throw "Archive or checksum download failed: $DownloadError"
 }
 
 # Verify checksum before extracting any downloaded content
 $ChecksumText = (Get-Content -LiteralPath $ChecksumPath -Raw).Trim()
 $ChecksumPattern = '^(?<hash>[0-9A-Fa-f]{64})\s+\*?(?<file>\S+)$'
 if ($ChecksumText -notmatch $ChecksumPattern -or (Split-Path -Leaf $Matches.file) -ne $AssetName) {
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    Write-Error "Invalid or empty checksum file for $AssetName."
-    exit 1
+    throw "Invalid or empty checksum file for $AssetName."
 }
 
 $ExpectedSha256 = $Matches.hash.ToUpperInvariant()
 $ActualSha256 = (Get-DirectFileSha256 -Path $ZipPath).ToUpperInvariant()
 if ($ActualSha256 -ne $ExpectedSha256) {
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    Write-Error "Checksum mismatch for $AssetName; refusing to extract it."
-    exit 1
+    throw "Checksum mismatch for $AssetName; refusing to extract it."
 }
 Write-Host "[info]  Checksum verified: $AssetName" -ForegroundColor Blue
 
@@ -763,16 +1126,16 @@ try {
         throw "candidate reported '$CandidateVersionLine', expected '$ExpectedVersionLine'"
     }
 } catch {
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    Write-Host "[error] Downloaded binary failed its pre-install check; the existing installation was not changed: $_" -ForegroundColor Red
-    exit 1
+    $CandidateError = $_
+    throw "Downloaded binary failed its pre-install check; the existing installation was not changed: $CandidateError"
 }
 
 # ── Uninstall ────────────────────────────────────────────
 $BinaryStem = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
 $StagedBin = Join-Path $InstallDir ".$BinaryStem.install.exe"
 $BackupBin = Join-Path $InstallDir ".$BinaryStem.rollback.exe"
-$FailedBin = Join-Path $InstallDir ".$BinaryStem.failed.exe"
+$DisplacedBin = New-InstallerRecoveryPath -Directory $InstallDir -Stem $BinaryStem -Role "displaced"
+$FailedBin = New-InstallerRecoveryPath -Directory $InstallDir -Stem $BinaryStem -Role "failed"
 
 if ($Uninstall) {
     Write-Host "[info]  Uninstalling codex-switch-global-pace..." -ForegroundColor Blue
@@ -781,45 +1144,9 @@ if ($Uninstall) {
     $UninstallBackupBin = Join-Path $InstallDir ".$BinaryStem.uninstall.exe"
     try {
         $InstallDirWasPresent = Test-DirectInstallDirectory -Path $InstallDir
-        $PreflightUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $PreflightPathEntries = @($PreflightUserPath -split ";" | Where-Object { $_.Trim() -ne "" })
-        $PreflightDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
     } catch {
-        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-        Write-Host "[error] Could not inspect the existing uninstall state; nothing was changed: $_" -ForegroundColor Red
-        exit 1
-    }
-
-    # An absent install directory is the only state in which taking the normal
-    # sibling lock would itself create persistent installation state. Confirm
-    # the complete no-op state twice, then linearize the no-op at the final
-    # absence check. An installer that starts afterwards is a later transaction.
-    if (-not $InstallDirWasPresent -and
-        $PreflightPathEntries -notcontains $InstallDir -and
-        -not $PreflightDaemonStatus.running -and
-        -not $PreflightDaemonStatus.platform.service_installed) {
-        try {
-            $ConfirmedUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            $ConfirmedPathEntries = @($ConfirmedUserPath -split ";" | Where-Object { $_.Trim() -ne "" })
-            $ConfirmedDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
-            $ConfirmedInstallDirPresent = Test-DirectInstallDirectory -Path $InstallDir
-            $UninstallIsNoOp = -not $ConfirmedInstallDirPresent -and
-                $ConfirmedPathEntries -notcontains $InstallDir -and
-                -not $ConfirmedDaemonStatus.running -and
-                -not $ConfirmedDaemonStatus.platform.service_installed
-        } catch {
-            Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-            Write-Host "[error] Could not confirm the no-op uninstall state; nothing was changed: $_" -ForegroundColor Red
-            exit 1
-        }
-        if ($UninstallIsNoOp) {
-            Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-            if (Test-Path -LiteralPath $DataDir) {
-                Write-Host "[info]  Kept shared profile data: $DataDir" -ForegroundColor Blue
-            }
-            Write-Host "[info]  codex-switch-global-pace is already uninstalled." -ForegroundColor Blue
-            exit 0
-        }
+        $PreflightError = $_
+        throw "Could not inspect the existing uninstall state; nothing was changed: $PreflightError"
     }
 
     if (-not $InstallDirWasPresent) {
@@ -829,24 +1156,29 @@ if ($Uninstall) {
                 throw "Install path was not created as a direct directory: $InstallDir"
             }
         } catch {
-            Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-            Write-Host "[error] Could not create the direct install directory; nothing was changed: $_" -ForegroundColor Red
-            exit 1
+            $DirectoryError = $_
+            throw "Could not create the direct install directory; nothing was changed: $DirectoryError"
         }
     }
 
     $UninstallLockHolder = $null
+    $UninstallLifecycleHolder = $null
     $UninstallError = $null
     $PostCommitCleanupError = $null
     $LockReleaseError = $null
     $InstalledBinaryWasPresent = $false
-    $OriginalBinarySha256 = $null
-    $OriginalUserPath = $null
-    $RequestedUserPath = $null
+    $OriginalBinaryToken = $null
+    $UninstallHoldToken = $null
+    $UninstallPlaceholderToken = $null
+    $OriginalUserPathSnapshot = $null
+    $RequestedUserPathSnapshot = $null
+    $OriginalProcessPathSnapshot = $null
+    $RequestedProcessPathSnapshot = $null
     $DaemonWasRunning = $false
     $DaemonServiceInstalled = $false
     $PathMutationAttempted = $false
-    $DaemonStopAttempted = $false
+    $ProcessPathMutationAttempted = $false
+    $ProcessPathStateAmbiguous = $false
     $UninstallMutationAttempted = $false
     $UninstallCommitted = $false
     try {
@@ -862,13 +1194,33 @@ if ($Uninstall) {
         }
         Assert-NoInstallTransactionResidue -Path $InstallDir -Binary $BinaryName
         $InstalledBinaryWasPresent = Test-DirectInstalledBinary -Path $InstalledBin
-        $OriginalBinarySha256 = if ($InstalledBinaryWasPresent) {
-            Get-DirectFileSha256 -Path $InstalledBin
+        $OriginalBinaryToken = if ($InstalledBinaryWasPresent) {
+            Get-InstallerFileToken -CandidatePath $CandidateBin -Path $InstalledBin
         } else {
             $null
         }
-        if ($InstalledBinaryWasPresent -and [string]::IsNullOrEmpty($OriginalBinarySha256)) {
-            throw "The installed binary disappeared before the uninstall transaction began."
+        if ($InstalledBinaryWasPresent) {
+            $UninstallHoldToken = Copy-InstallerFileExclusive `
+                -CandidatePath $CandidateBin `
+                -Source $InstalledBin `
+                -Destination $UninstallBackupBin `
+                -ExpectedToken $OriginalBinaryToken
+            try {
+                $UninstallPlaceholderToken = New-InstallerEmptyFileExclusive `
+                    -CandidatePath $CandidateBin `
+                    -Destination $StagedBin
+            } catch {
+                $PlaceholderError = $_
+                $HoldCleanupError = Remove-InstallerArtifactIfOwned `
+                    -CandidatePath $CandidateBin `
+                    -Path $UninstallBackupBin `
+                    -ExpectedToken $UninstallHoldToken
+                if ($null -ne $HoldCleanupError) {
+                    throw "Could not create the uninstall placeholder ($PlaceholderError); independent recovery cleanup also failed: $HoldCleanupError"
+                }
+                throw $PlaceholderError
+            }
+            $UninstallMutationAttempted = $true
         }
 
         # Ownership is a read-only precondition. The actual uninstall repeats
@@ -877,77 +1229,76 @@ if ($Uninstall) {
             -CandidatePath $CandidateBin `
             -ExpectedExecutable $InstalledBin
 
-        $OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $OriginalPathEntries = @($OriginalUserPath -split ";" | Where-Object { $_.Trim() -ne "" })
-        $InstallDirWasOnPath = $OriginalPathEntries -contains $InstallDir
+        $OriginalUserPathSnapshot = Invoke-RequiredInstallerFileOperation `
+            -CandidatePath $CandidateBin `
+            -Operation "user-path-snapshot"
 
-        $DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
-        $DaemonWasRunning = $DaemonStatus.running
-        $DaemonServiceInstalled = $DaemonStatus.platform.service_installed
+        $UninstallLifecycleHolder = Start-DaemonLifecycleHolder `
+            -CandidatePath $CandidateBin `
+            -InitialExecutable $InstalledBin `
+            -ReplacementExecutable $InstalledBin
+        $DaemonWasRunning = $UninstallLifecycleHolder.Running
+        $DaemonServiceInstalled = $UninstallLifecycleHolder.ServiceInstalled
+        # The holder owns a PID-absence authority even when the daemon was
+        # initially stopped, so every later failure must explicitly roll it
+        # back or commit it before the update lock can be released.
+        $UninstallMutationAttempted = $true
 
-        # A loaded executable cannot be renamed on Windows. Only the stable
-        # installed binary may stop its own running generation before staging;
-        # a binary-missing daemon is handled as the final commit command below.
-        if ($InstalledBinaryWasPresent -and $DaemonWasRunning) {
-            $DaemonStopAttempted = $true
-            $UninstallMutationAttempted = $true
-            Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin
+        # The candidate performs raw type/byte/absence CAS inside a Windows
+        # registry transaction. Unrelated PATH segments are never reconstructed.
+        $UserPathTransition = Set-ExactUserPathTransition `
+            -CandidatePath $CandidateBin `
+            -TemporaryDirectory $TmpDir `
+            -Action "remove" `
+            -ExpectedSnapshot $OriginalUserPathSnapshot `
+            -Entry $InstallDir
+        $RequestedUserPathSnapshot = $UserPathTransition.Snapshot
+        $PathMutationAttempted = $RequestedUserPathSnapshot -cne $OriginalUserPathSnapshot
+        if (-not $UserPathTransition.NotificationSucceeded) {
+            Write-Host "[warn]  User PATH committed, but Windows environment notification failed ($($UserPathTransition.Notification)). New terminals may require sign-out/sign-in." -ForegroundColor Yellow
         }
 
-        # PATH is reversible without touching the service or binary, so commit
-        # it first. If any later step fails, restore the exact original string.
-        if ($InstallDirWasOnPath) {
-            $NewPath = ($OriginalPathEntries | Where-Object { $_ -ne $InstallDir }) -join ";"
-            $RequestedUserPath = if ([string]::IsNullOrEmpty($NewPath)) { $null } else { $NewPath }
-            $UserPathBeforeMutation = [Environment]::GetEnvironmentVariable("Path", "User")
-            if ($UserPathBeforeMutation -cne $OriginalUserPath) {
-                throw "User PATH changed after uninstall preflight; refusing to overwrite it."
-            }
-            $PathMutationAttempted = $true
+        $ProcessPathTransition = Invoke-ExactProcessPathTransition -Action "remove" -Entry $InstallDir
+        $OriginalProcessPathSnapshot = $ProcessPathTransition.Original
+        $RequestedProcessPathSnapshot = $ProcessPathTransition.Requested
+        $ProcessPathMutationAttempted = $ProcessPathTransition.Applied
+        $ProcessPathStateAmbiguous = $ProcessPathTransition.Ambiguous
+        if ($null -ne $ProcessPathTransition.Error -or $ProcessPathStateAmbiguous) {
+            Write-Host "[warn]  User PATH was committed, but the current PowerShell process PATH update was not confirmed exactly: $($ProcessPathTransition.Error)" -ForegroundColor Yellow
+        }
+        if ($PathMutationAttempted -or $ProcessPathMutationAttempted) {
             $UninstallMutationAttempted = $true
-            [Environment]::SetEnvironmentVariable("Path", $RequestedUserPath, "User")
-            $ObservedUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-            if ($ObservedUserPath -cne $RequestedUserPath) {
-                throw "User PATH did not match the exact requested value after removal."
-            }
             Write-Host "[info]  Removed $InstallDir from user PATH" -ForegroundColor Blue
         }
 
         if ($InstalledBinaryWasPresent) {
             $UninstallMutationAttempted = $true
-            $Staging = Invoke-AtomicUninstallStaging `
-                -InstalledPath $InstalledBin `
-                -BackupPath $UninstallBackupBin `
-                -InstalledSha256 $OriginalBinarySha256
-            if ($Staging.State -cne "Staged") {
-                throw "Installed binary could not be staged for reversible removal ($($Staging.State)): operation=$($Staging.OperationError); inspection=$($Staging.InspectionError)"
+            $Staging = Invoke-ClassifiedInstallerReplace `
+                -CandidatePath $CandidateBin `
+                -ReplacementPath $StagedBin `
+                -DestinationPath $InstalledBin `
+                -DisplacedPath $DisplacedBin `
+                -ReplacementToken $UninstallPlaceholderToken `
+                -DestinationToken $OriginalBinaryToken
+            if ($Staging.State -ceq "Published") {
+                if ($null -ne $Staging.OperationError) {
+                    throw "Uninstall placeholder reached the public path, but the replacement boundary reported an error: $($Staging.OperationError)"
+                }
+            } elseif ($Staging.State -ceq "Unchanged") {
+                throw "Installed binary could not be staged without replacement: $($Staging.OperationError)"
+            } else {
+                throw "Installed binary staging was ambiguous; public, placeholder, displaced, and independent hold paths were preserved: operation=$($Staging.OperationError); inspection=$($Staging.InspectionError)"
             }
         } elseif (Test-DirectInstalledBinary -Path $InstalledBin) {
             throw "An installed binary appeared after the locked uninstall preflight; refusing to commit against changed state."
         }
 
-        # Service removal is the last meaningful commit boundary. When no
-        # installed binary and no service exist, a detached daemon is stopped as
-        # that boundary instead; the temporary candidate is never installed.
-        if ($InstalledBinaryWasPresent -or $DaemonServiceInstalled) {
-            $UninstallMutationAttempted = $true
-            $DaemonCleanupOutput = (& $CandidateBin daemon uninstall --expected-executable $InstalledBin 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-                throw "daemon service cleanup exited with code ${LASTEXITCODE}: $DaemonCleanupOutput"
-            }
-        } elseif ($DaemonWasRunning) {
-            $UninstallMutationAttempted = $true
-            $DaemonCleanupOutput = (& $CandidateBin daemon stop 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-                throw "detached daemon cleanup exited with code ${LASTEXITCODE}: $DaemonCleanupOutput"
-            }
-        }
-        $CommittedDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
-        if ($CommittedDaemonStatus.running -or
-            $CommittedDaemonStatus.platform.service_installed) {
-            throw "daemon cleanup returned without removing the exact running/service state"
-        }
+        # Service removal is the last meaningful commit boundary. The verified
+        # child performs it while retaining the same service/PID authorities
+        # used for the stop, then keeps them until final file cleanup is done.
+        Invoke-DaemonLifecycleCommand -Holder $UninstallLifecycleHolder -Command "uninstall"
         $UninstallCommitted = $true
+        Invoke-DaemonLifecycleCommand -Holder $UninstallLifecycleHolder -Command "finish"
         if ($InstalledBinaryWasPresent -or $DaemonServiceInstalled) {
             Write-Host "[info]  Daemon scheduled task cleanup completed." -ForegroundColor Blue
         }
@@ -957,21 +1308,42 @@ if ($Uninstall) {
         # potentially different Task XML definition.
         if ($InstalledBinaryWasPresent) {
             try {
-                $Commit = Invoke-AtomicUninstallCommit `
-                    -InstalledPath $InstalledBin `
-                    -BackupPath $UninstallBackupBin `
-                    -InstalledSha256 $OriginalBinarySha256
-                if ($Commit.State -cne "Committed") {
-                    $PostCommitCleanupError = "verified binary backup cleanup was $($Commit.State): operation=$($Commit.OperationError); inspection=$($Commit.InspectionError)"
-                } else {
-                    Write-Host "[info]  Removed $InstalledBin" -ForegroundColor Blue
+                if ((Get-InstallerFileToken -CandidatePath $CandidateBin -Path $InstalledBin) -cne $UninstallPlaceholderToken -or
+                    (Get-InstallerFileToken -CandidatePath $CandidateBin -Path $DisplacedBin) -cne $OriginalBinaryToken -or
+                    (Get-InstallerFileToken -CandidatePath $CandidateBin -Path $UninstallBackupBin) -cne $UninstallHoldToken) {
+                    throw "uninstall file identities changed before post-commit cleanup"
                 }
+                Remove-InstallerOwnedFile `
+                    -CandidatePath $CandidateBin `
+                    -Path $InstalledBin `
+                    -ExpectedToken $UninstallPlaceholderToken
+                Remove-InstallerOwnedFile `
+                    -CandidatePath $CandidateBin `
+                    -Path $UninstallBackupBin `
+                    -ExpectedToken $UninstallHoldToken
+                Remove-InstallerOwnedFile `
+                    -CandidatePath $CandidateBin `
+                    -Path $DisplacedBin `
+                    -ExpectedToken $OriginalBinaryToken
+                Write-Host "[info]  Removed $InstalledBin" -ForegroundColor Blue
             } catch {
-                $PostCommitCleanupError = "verified binary backup cleanup raised an exception: $_"
+                $PostCommitCleanupError = "token-bound uninstall file cleanup raised an exception: $_"
+            }
+        }
+        try {
+            Invoke-DaemonLifecycleCommand -Holder $UninstallLifecycleHolder -Command "release"
+        } catch {
+            $LifecycleFinalizationError = "daemon lifecycle authority release failed after uninstall cleanup: $_"
+            if ($null -eq $PostCommitCleanupError) {
+                $PostCommitCleanupError = $LifecycleFinalizationError
+            } else {
+                $PostCommitCleanupError = "$PostCommitCleanupError; $LifecycleFinalizationError"
             }
         }
     } catch {
         $UninstallFailure = $_
+        $UninstallMutationAttempted = $UninstallMutationAttempted -or
+            $PathMutationAttempted -or $ProcessPathMutationAttempted
         if ($UninstallCommitted) {
             $PostCommitCleanupError = "post-commit cleanup or reporting failed: $UninstallFailure"
         } elseif (-not $UninstallMutationAttempted) {
@@ -979,43 +1351,74 @@ if ($Uninstall) {
         } else {
             $RollbackErrors = @()
 
+            if ($null -ne $UninstallLifecycleHolder -and
+                $UninstallLifecycleHolder.Phase -cne "Stopped") {
+                $UninstallError = "The uninstall state is ambiguous after a lifecycle protocol failure; binary, PATH, service, and recovery paths were preserved without speculative rollback: $UninstallFailure"
+            } else {
+
             # Restore exact binary bytes before restarting a daemon generation.
             # The Rust service transaction restores its original Task XML on
             # failure; the script never recreates that definition.
             $StableRollbackBinary = $false
             if ($InstalledBinaryWasPresent) {
                 try {
-                    $InstalledSha256AfterFailure = Get-DirectFileSha256 -Path $InstalledBin
-                    $BackupSha256AfterFailure = Get-DirectFileSha256 -Path $UninstallBackupBin
-                    if ($InstalledSha256AfterFailure -ceq $OriginalBinarySha256 -and
-                        $null -eq $BackupSha256AfterFailure) {
+                    $InstalledTokenAfterFailure = Get-InstallerFileTokenIfPresent -CandidatePath $CandidateBin -Path $InstalledBin
+                    $DisplacedTokenAfterFailure = Get-InstallerFileTokenIfPresent -CandidatePath $CandidateBin -Path $DisplacedBin
+                    $PlaceholderTokenAfterFailure = Get-InstallerFileTokenIfPresent -CandidatePath $CandidateBin -Path $StagedBin
+                    $HoldTokenAfterFailure = Get-InstallerFileTokenIfPresent -CandidatePath $CandidateBin -Path $UninstallBackupBin
+                    if ($InstalledTokenAfterFailure -ceq $OriginalBinaryToken -and
+                        $null -eq $DisplacedTokenAfterFailure) {
                         $StableRollbackBinary = $true
-                    } elseif ($null -eq $InstalledSha256AfterFailure -and
-                        $BackupSha256AfterFailure -ceq $OriginalBinarySha256) {
-                        $Restore = Invoke-AtomicUninstallRestore `
-                            -InstalledPath $InstalledBin `
-                            -BackupPath $UninstallBackupBin `
-                            -InstalledSha256 $OriginalBinarySha256
-                        if ($Restore.State -ceq "Restored") {
+                    } elseif ($InstalledTokenAfterFailure -ceq $UninstallPlaceholderToken -and
+                        $DisplacedTokenAfterFailure -ceq $OriginalBinaryToken -and
+                        $null -eq $PlaceholderTokenAfterFailure) {
+                        $Restore = Invoke-ClassifiedInstallerReplace `
+                            -CandidatePath $CandidateBin `
+                            -ReplacementPath $DisplacedBin `
+                            -DestinationPath $InstalledBin `
+                            -DisplacedPath $FailedBin `
+                            -ReplacementToken $OriginalBinaryToken `
+                            -DestinationToken $UninstallPlaceholderToken
+                        if ($Restore.State -ceq "Published") {
                             $StableRollbackBinary = $true
+                            if ($null -ne $Restore.OperationError) {
+                                $RollbackErrors += "binary was restored, but the replacement boundary reported: $($Restore.OperationError)"
+                            }
                         } else {
                             $RollbackErrors += "binary restoration was $($Restore.State): operation=$($Restore.OperationError); inspection=$($Restore.InspectionError)"
                         }
                     } else {
-                        $RollbackErrors += "binary state was ambiguous; installed=$InstalledSha256AfterFailure backup=$BackupSha256AfterFailure"
+                        $RollbackErrors += "binary state was ambiguous; installed=$InstalledTokenAfterFailure displaced=$DisplacedTokenAfterFailure placeholder=$PlaceholderTokenAfterFailure hold=$HoldTokenAfterFailure"
+                    }
+                    if ($StableRollbackBinary) {
+                        foreach ($PlaceholderPath in @($StagedBin, $FailedBin)) {
+                            $PlaceholderCleanup = Remove-InstallerArtifactIfOwned `
+                                -CandidatePath $CandidateBin `
+                                -Path $PlaceholderPath `
+                                -ExpectedToken $UninstallPlaceholderToken
+                            if ($null -ne $PlaceholderCleanup) {
+                                $RollbackErrors += "placeholder cleanup failed: $PlaceholderCleanup"
+                            }
+                        }
+                        $HoldCleanup = Remove-InstallerArtifactIfOwned `
+                            -CandidatePath $CandidateBin `
+                            -Path $UninstallBackupBin `
+                            -ExpectedToken $UninstallHoldToken
+                        if ($null -ne $HoldCleanup) {
+                            $RollbackErrors += "independent hold cleanup failed: $HoldCleanup"
+                        }
                     }
                 } catch {
                     $RollbackErrors += "binary rollback inspection failed: $_"
                 }
             } else {
                 try {
-                    $InstalledSha256AfterFailure = Get-DirectFileSha256 -Path $InstalledBin
-                    $BackupSha256AfterFailure = Get-DirectFileSha256 -Path $UninstallBackupBin
-                    if ($null -eq $InstalledSha256AfterFailure -and
-                        $null -eq $BackupSha256AfterFailure) {
+                    $UnexpectedPaths = @($InstalledBin, $UninstallBackupBin, $StagedBin, $DisplacedBin) |
+                        Where-Object { $null -ne (Get-InstallerFileTokenIfPresent -CandidatePath $CandidateBin -Path $_) }
+                    if ($UnexpectedPaths.Count -eq 0) {
                         $StableRollbackBinary = $true
                     } else {
-                        $RollbackErrors += "binary paths changed after an absent-binary preflight; installed=$InstalledSha256AfterFailure backup=$BackupSha256AfterFailure"
+                        $RollbackErrors += "binary paths changed after an absent-binary preflight and were preserved: $($UnexpectedPaths -join ', ')"
                     }
                 } catch {
                     $RollbackErrors += "absent-binary rollback inspection failed: $_"
@@ -1024,33 +1427,45 @@ if ($Uninstall) {
 
             if ($PathMutationAttempted) {
                 try {
-                    $RestoredUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-                    if ($RestoredUserPath -ceq $RequestedUserPath) {
-                        [Environment]::SetEnvironmentVariable("Path", $OriginalUserPath, "User")
-                        $RestoredUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-                    } elseif ($RestoredUserPath -cne $OriginalUserPath) {
-                        throw "User PATH changed independently after uninstall mutation; refusing to overwrite it during rollback."
+                    $RestoredUserPath = Restore-ExactUserPathTransition `
+                        -CandidatePath $CandidateBin `
+                        -TemporaryDirectory $TmpDir `
+                        -OriginalSnapshot $OriginalUserPathSnapshot `
+                        -RequestedSnapshot $RequestedUserPathSnapshot
+                    if (-not $RestoredUserPath.NotificationSucceeded) {
+                        $RollbackErrors += "user PATH was restored, but Windows environment notification failed ($($RestoredUserPath.Notification))"
                     }
-                    if ($RestoredUserPath -cne $OriginalUserPath) {
-                        throw "User PATH did not match its exact pre-uninstall value after restoration."
-                    }
+                    $PathMutationAttempted = $false
                 } catch {
                     $RollbackErrors += "user PATH restoration failed: $_"
                 }
             }
 
-            if ($StableRollbackBinary) {
+            if ($ProcessPathMutationAttempted) {
                 try {
-                    Restore-UninstallRunningState `
-                        -BinPath $InstalledBin `
-                        -CandidatePath $CandidateBin `
-                        -WasRunning $DaemonWasRunning `
-                        -ServiceWasInstalled $DaemonServiceInstalled
+                    Restore-ExactProcessPathTransition `
+                        -Original $OriginalProcessPathSnapshot `
+                        -Requested $RequestedProcessPathSnapshot
+                    $ProcessPathMutationAttempted = $false
+                } catch {
+                    $RollbackErrors += "current PowerShell process PATH restoration failed: $_"
+                }
+            } elseif ($ProcessPathStateAmbiguous) {
+                $RollbackErrors += "current PowerShell process PATH changed independently and was preserved"
+            }
+
+            if ($StableRollbackBinary -and $null -ne $UninstallLifecycleHolder) {
+                try {
+                    Invoke-DaemonLifecycleCommand `
+                        -Holder $UninstallLifecycleHolder `
+                        -Command "rollback"
                 } catch {
                     $RollbackErrors += "daemon running/service-state restoration failed: $_"
                 }
             } elseif ($DaemonWasRunning -or $DaemonServiceInstalled) {
                 $RollbackErrors += "daemon running/service state could not be restored without the exact installed binary state"
+            } elseif ($null -ne $UninstallLifecycleHolder) {
+                $RollbackErrors += "daemon absence authority could not be released as a successful rollback without the exact binary state"
             }
 
             if ($RollbackErrors.Count -eq 0) {
@@ -1058,8 +1473,20 @@ if ($Uninstall) {
             } else {
                 $UninstallError = "The uninstall did not commit and rollback was incomplete: $UninstallFailure. $($RollbackErrors -join '; ')"
             }
+            }
         }
     } finally {
+        $LifecycleReleaseError = $null
+        if ($null -ne $UninstallLifecycleHolder -and
+            $UninstallLifecycleHolder.Phase -cne "Closed") {
+            try {
+                Close-DaemonLifecycleHolder `
+                    -Holder $UninstallLifecycleHolder `
+                    -ExpectSuccess $false
+            } catch {
+                $LifecycleReleaseError = $_
+            }
+        }
         if ($null -ne $UninstallLockHolder) {
             try {
                 Complete-UpdateLockHolder -LockProcess $UninstallLockHolder
@@ -1067,30 +1494,51 @@ if ($Uninstall) {
                 $LockReleaseError = $_
             }
         }
-        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    }
+
+    $NewInstallDirectoryCleanupError = $null
+    if (-not $InstallDirWasPresent) {
+        try {
+            Remove-NewEmptyInstallDirectory -Path $InstallDir
+        } catch {
+            $NewInstallDirectoryCleanupError = $_
+        }
     }
 
     if ($null -ne $UninstallError) {
-        $Suffix = if ($null -ne $LockReleaseError) {
-            " Additionally, the exclusive update lock did not close cleanly: $LockReleaseError"
-        } else {
-            ""
+        $Suffix = ""
+        if ($null -ne $LifecycleReleaseError) {
+            $Suffix += " Additionally, the daemon lifecycle holder did not close cleanly: $LifecycleReleaseError"
         }
-        Write-Host "[error] Uninstall did not complete: $UninstallError$Suffix" -ForegroundColor Red
-        exit 1
+        if ($null -ne $LockReleaseError) {
+            $Suffix += " Additionally, the exclusive update lock did not close cleanly: $LockReleaseError"
+        }
+        if ($null -ne $NewInstallDirectoryCleanupError) {
+            $Suffix += " Additionally, exact cleanup of the newly created install directory failed: $NewInstallDirectoryCleanupError"
+        }
+        throw "Uninstall did not complete: $UninstallError$Suffix"
     }
     if ($null -ne $PostCommitCleanupError) {
-        $Suffix = if ($null -ne $LockReleaseError) {
-            " Additionally, the exclusive update lock did not close cleanly: $LockReleaseError"
-        } else {
-            ""
+        $Suffix = ""
+        if ($null -ne $LifecycleReleaseError) {
+            $Suffix += " Additionally, the daemon lifecycle holder did not close cleanly: $LifecycleReleaseError"
         }
-        Write-Host "[error] Uninstall committed, but post-commit cleanup could not be confirmed. Official executable path: $InstalledBin. Recovery residue path: $UninstallBackupBin. $PostCommitCleanupError$Suffix" -ForegroundColor Red
-        exit 1
+        if ($null -ne $LockReleaseError) {
+            $Suffix += " Additionally, the exclusive update lock did not close cleanly: $LockReleaseError"
+        }
+        if ($null -ne $NewInstallDirectoryCleanupError) {
+            $Suffix += " Additionally, exact cleanup of the newly created install directory failed: $NewInstallDirectoryCleanupError"
+        }
+        throw "Uninstall committed, but post-commit cleanup could not be confirmed. Official executable path: $InstalledBin. Recovery residue path: $UninstallBackupBin. $PostCommitCleanupError$Suffix"
+    }
+    if ($null -ne $LifecycleReleaseError) {
+        throw "Uninstall committed, but the daemon lifecycle holder did not close cleanly: $LifecycleReleaseError"
     }
     if ($null -ne $LockReleaseError) {
-        Write-Host "[error] Uninstall completed, but the exclusive update lock did not close cleanly: $LockReleaseError" -ForegroundColor Red
-        exit 1
+        throw "Uninstall completed, but the exclusive update lock did not close cleanly: $LockReleaseError"
+    }
+    if ($null -ne $NewInstallDirectoryCleanupError) {
+        throw "Uninstall completed, but exact cleanup of the newly created install directory failed: $NewInstallDirectoryCleanupError"
     }
 
     # This directory is deliberately shared with codex-switch so existing
@@ -1099,7 +1547,7 @@ if ($Uninstall) {
         Write-Host "[info]  Kept shared profile data: $DataDir" -ForegroundColor Blue
     }
     Write-Host "[info]  codex-switch-global-pace has been uninstalled." -ForegroundColor Blue
-    exit 0
+    return
 }
 
 # Stage the verified candidate beside the installed executable before stopping a
@@ -1110,12 +1558,12 @@ $InstalledBin = Join-Path $InstallDir $BinaryName
 try {
     $InstallDirWasPresent = Test-DirectInstallDirectory -Path $InstallDir
 } catch {
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    Write-Host "[error] $_" -ForegroundColor Red
-    exit 1
+    $DirectoryError = $_
+    throw $DirectoryError
 }
 
 $UpdateLockHolder = $null
+$InstallLifecycleHolder = $null
 
 try {
     if (-not $InstallDirWasPresent) {
@@ -1129,12 +1577,18 @@ try {
         -DestinationPath $InstalledBin
 } catch {
     $LockError = $_
-    if (-not $InstallDirWasPresent -and (Test-Path -LiteralPath $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
-        Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
+    $DirectoryCleanupError = $null
+    if (-not $InstallDirWasPresent) {
+        try {
+            Remove-NewEmptyInstallDirectory -Path $InstallDir
+        } catch {
+            $DirectoryCleanupError = $_
+        }
     }
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-    Write-Host "[error] $LockError" -ForegroundColor Red
-    exit 1
+    if ($null -ne $DirectoryCleanupError) {
+        throw "${LockError}. Additionally, exact cleanup of the newly created install directory failed: $DirectoryCleanupError"
+    }
+    throw $LockError
 }
 
 $TransactionSucceeded = $false
@@ -1147,10 +1601,20 @@ try {
     }
     Assert-NoInstallTransactionResidue -Path $InstallDir -Binary $BinaryName
     $ExistingBinaryWasPresent = Test-DirectInstalledBinary -Path $InstalledBin
-    $OriginalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $OriginalUserPathSnapshot = Invoke-RequiredInstallerFileOperation `
+        -CandidatePath $CandidateBin `
+        -Operation "user-path-snapshot"
 
+    $StagedBinaryToken = $null
+    $PreviousBinaryToken = $null
+    $BackupBinaryToken = $null
     try {
-    Copy-Item -LiteralPath $CandidateBin -Destination $StagedBin
+    $CandidateBinaryToken = Get-InstallerFileToken -CandidatePath $CandidateBin -Path $CandidateBin
+    $StagedBinaryToken = Copy-InstallerFileExclusive `
+        -CandidatePath $CandidateBin `
+        -Source $CandidateBin `
+        -Destination $StagedBin `
+        -ExpectedToken $CandidateBinaryToken
     $StagedVersionOutput = & $StagedBin --version 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "staged candidate version check exited with code ${LASTEXITCODE}: $StagedVersionOutput"
@@ -1159,78 +1623,96 @@ try {
     if ($StagedVersionLine -cne "codex-switch-global-pace $ExpectedReleaseVersion") {
         throw "staged candidate reported '$StagedVersionLine', expected 'codex-switch-global-pace $ExpectedReleaseVersion'"
     }
-    $StagedBinarySha256 = Get-DirectFileSha256 -Path $StagedBin
-    $PreviousBinarySha256 = if ($ExistingBinaryWasPresent) {
-        Get-DirectFileSha256 -Path $InstalledBin
+    $PreviousBinaryToken = if ($ExistingBinaryWasPresent) {
+        Get-InstallerFileToken -CandidatePath $CandidateBin -Path $InstalledBin
     } else {
         $null
     }
-    if ([string]::IsNullOrEmpty($StagedBinarySha256) -or
-        ($ExistingBinaryWasPresent -and [string]::IsNullOrEmpty($PreviousBinarySha256))) {
-        throw "A staged or existing binary disappeared before atomic replacement."
+    if ($ExistingBinaryWasPresent) {
+        $BackupBinaryToken = Copy-InstallerFileExclusive `
+            -CandidatePath $CandidateBin `
+            -Source $InstalledBin `
+            -Destination $BackupBin `
+            -ExpectedToken $PreviousBinaryToken
     }
     } catch {
         $StageError = $_
-        $StageCleanupError = Remove-StagedCandidate -Path $StagedBin
-        if (-not $InstallDirWasPresent -and (Test-Path -LiteralPath $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
-            Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
+        $StageCleanupErrors = @()
+        if ($null -ne $StagedBinaryToken) {
+            try {
+                Remove-InstallerOwnedFile -CandidatePath $CandidateBin -Path $StagedBin -ExpectedToken $StagedBinaryToken
+            } catch {
+                $StageCleanupErrors += "staged candidate ${StagedBin}: $_"
+            }
         }
-        $CleanupSuffix = if ($null -ne $StageCleanupError) {
-            " The staged candidate was preserved at ${StagedBin}: $StageCleanupError"
+        if ($null -ne $BackupBinaryToken) {
+            try {
+                Remove-InstallerOwnedFile -CandidatePath $CandidateBin -Path $BackupBin -ExpectedToken $BackupBinaryToken
+            } catch {
+                $StageCleanupErrors += "independent backup ${BackupBin}: $_"
+            }
+        }
+        if (-not $InstallDirWasPresent) {
+            try {
+                Remove-NewEmptyInstallDirectory -Path $InstallDir
+            } catch {
+                $StageCleanupErrors += "new install directory ${InstallDir}: $_"
+            }
+        }
+        $CleanupSuffix = if ($StageCleanupErrors.Count -gt 0) {
+            " Exact cleanup was incomplete: $($StageCleanupErrors -join '; ')"
         } else {
             ""
         }
-        Write-Host "[error] Could not stage the verified binary; the existing installation was not changed: $StageError.$CleanupSuffix" -ForegroundColor Red
-        exit 1
+        throw "Could not stage the verified binary; the existing installation was not changed: $StageError.$CleanupSuffix"
     }
 
-# A running daemon holds the executable open. Its state is part of this
-# transaction, so an unreadable or malformed status is an error rather than a
-# guess that it is stopped.
+# A release-verified child captures and stops the daemon while retaining both
+# service-operation and PID-absence authority through commit or rollback.
 $DaemonWasRunning = $false
 $DaemonServiceInstalled = $false
 try {
-    $DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
-    $DaemonWasRunning = $DaemonStatus.running
-    $DaemonServiceInstalled = $DaemonStatus.platform.service_installed
+    $InstallLifecycleHolder = Start-DaemonLifecycleHolder `
+        -CandidatePath $CandidateBin `
+        -InitialExecutable $InstalledBin `
+        -ReplacementExecutable $InstalledBin
+    $DaemonWasRunning = $InstallLifecycleHolder.Running
+    $DaemonServiceInstalled = $InstallLifecycleHolder.ServiceInstalled
     if (-not $ExistingBinaryWasPresent -and
         ($DaemonWasRunning -or $DaemonServiceInstalled)) {
         throw "The installed binary is absent while daemon/service state still exists. Restore or explicitly uninstall that exact installation before retrying."
     }
-    if ($DaemonServiceInstalled) {
-        Assert-CandidateServiceOwner `
-            -CandidatePath $CandidateBin `
-            -ExpectedExecutable $InstalledBin
-    }
 } catch {
     $StatusError = $_
-    $StageCleanupError = Remove-StagedCandidate -Path $StagedBin
-    if (-not $InstallDirWasPresent -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
-        Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
+    $LifecycleRollbackError = $null
+    if ($null -ne $InstallLifecycleHolder -and
+        $InstallLifecycleHolder.Phase -ceq "Stopped") {
+        try {
+            Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command "rollback"
+        } catch {
+            $LifecycleRollbackError = $_
+        }
     }
-    $CleanupSuffix = if ($null -ne $StageCleanupError) {
-        " The staged candidate was preserved at ${StagedBin}: $StageCleanupError"
+    $CleanupErrors = @(
+        Remove-InstallerArtifactIfOwned -CandidatePath $CandidateBin -Path $StagedBin -ExpectedToken $StagedBinaryToken
+        Remove-InstallerArtifactIfOwned -CandidatePath $CandidateBin -Path $BackupBin -ExpectedToken $BackupBinaryToken
+    ) | Where-Object { $null -ne $_ }
+    if (-not $InstallDirWasPresent) {
+        try {
+            Remove-NewEmptyInstallDirectory -Path $InstallDir
+        } catch {
+            $CleanupErrors += "new install directory ${InstallDir}: $_"
+        }
+    }
+    if ($null -ne $LifecycleRollbackError) {
+        $CleanupErrors += "daemon lifecycle restoration failed: $LifecycleRollbackError"
+    }
+    $CleanupSuffix = if ($CleanupErrors.Count -gt 0) {
+        " Exact preparation cleanup was incomplete: $($CleanupErrors -join '; ')"
     } else {
         ""
     }
-    Write-Host "[error] Could not validate the existing daemon/service state; nothing was replaced: $StatusError.$CleanupSuffix" -ForegroundColor Red
-    exit 1
-}
-
-if ($DaemonWasRunning -or $DaemonServiceInstalled) {
-    Write-Host "[info]  Stopping the existing daemon task before upgrade..." -ForegroundColor Blue
-    try {
-        Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin
-    } catch {
-        $StageCleanupError = Remove-StagedCandidate -Path $StagedBin
-        $CleanupSuffix = if ($null -ne $StageCleanupError) {
-            " The staged candidate was preserved at ${StagedBin}: $StageCleanupError"
-        } else {
-            ""
-        }
-        Write-Host "[error] The existing daemon could not be stopped safely: $_. The installed binary was not replaced.$CleanupSuffix" -ForegroundColor Red
-        exit 1
-    }
+    throw "Could not validate the existing daemon/service state; nothing was replaced: $StatusError.$CleanupSuffix"
 }
 
 $InstallError = $null
@@ -1238,8 +1720,12 @@ $VersionOutput = $null
 $OldBinaryBackedUp = $false
 $NewBinaryPublished = $false
 $PathMutationAttempted = $false
-$DaemonRestarted = $false
-$DaemonRestartAttempted = $false
+$RequestedUserPathSnapshot = $OriginalUserPathSnapshot
+$OriginalProcessPathSnapshot = $null
+$RequestedProcessPathSnapshot = $null
+$ProcessPathMutationAttempted = $false
+$ProcessPathStateAmbiguous = $false
+$InstallPostCommitErrors = @()
 $PreviousBinaryRestored = $ExistingBinaryWasPresent
 $AmbiguousBinaryState = $false
 try {
@@ -1250,15 +1736,22 @@ try {
         Assert-NoInstallTransactionResidue `
             -Path $InstallDir `
             -Binary $BinaryName `
-            -ExpectedStagedPath $StagedBin
+            -ExpectedStagedPath $StagedBin `
+            -ExpectedBackupPath $BackupBin
         if ($DaemonServiceInstalled) {
             Assert-CandidateServiceOwner `
                 -CandidatePath $CandidateBin `
                 -ExpectedExecutable $InstalledBin
         }
-        if (-not $ExistingBinaryWasPresent -and
-            ((Test-DirectInstalledBinary -Path $InstalledBin) -or
-                (Get-DirectFileSha256 -Path $StagedBin) -cne $StagedBinarySha256)) {
+        if ((Get-InstallerFileToken -CandidatePath $CandidateBin -Path $StagedBin) -cne $StagedBinaryToken) {
+            throw "Staged candidate identity changed before binary publication."
+        }
+        if ($ExistingBinaryWasPresent -and
+            ((Get-InstallerFileToken -CandidatePath $CandidateBin -Path $InstalledBin) -cne $PreviousBinaryToken -or
+                (Get-InstallerFileToken -CandidatePath $CandidateBin -Path $BackupBin) -cne $BackupBinaryToken)) {
+            throw "Existing binary or independent rollback copy changed before publication."
+        }
+        if (-not $ExistingBinaryWasPresent -and (Test-DirectInstalledBinary -Path $InstalledBin)) {
             throw "First-install transaction files changed before binary publication."
         }
     } catch {
@@ -1267,13 +1760,13 @@ try {
     }
 
     if ($ExistingBinaryWasPresent) {
-        $Publication = Invoke-AtomicUpgradePublication `
-            -StagedPath $StagedBin `
-            -InstalledPath $InstalledBin `
-            -BackupPath $BackupBin `
-            -FailedPath $FailedBin `
-            -StagedSha256 $StagedBinarySha256 `
-            -PreviousSha256 $PreviousBinarySha256
+        $Publication = Invoke-ClassifiedInstallerReplace `
+            -CandidatePath $CandidateBin `
+            -ReplacementPath $StagedBin `
+            -DestinationPath $InstalledBin `
+            -DisplacedPath $DisplacedBin `
+            -ReplacementToken $StagedBinaryToken `
+            -DestinationToken $PreviousBinaryToken
 
         if ($Publication.State -ceq "Published") {
             $OldBinaryBackedUp = $true
@@ -1302,28 +1795,46 @@ try {
             throw "Atomic binary replacement produced an ambiguous file state$DetailSuffix. The installed, staged, and rollback paths were preserved for explicit recovery."
         }
     } else {
-        Move-Item -LiteralPath $StagedBin -Destination $InstalledBin
-        $NewBinaryPublished = $true
-        try {
-            if ((Get-DirectFileSha256 -Path $InstalledBin) -cne $StagedBinarySha256 -or
-                $null -ne (Get-DirectFileSha256 -Path $StagedBin)) {
-                throw "First-install publication did not produce the exact expected executable."
+        $Publication = Invoke-ClassifiedInstallerMoveNoReplace `
+            -CandidatePath $CandidateBin `
+            -SourcePath $StagedBin `
+            -DestinationPath $InstalledBin `
+            -SourceToken $StagedBinaryToken
+        if ($Publication.State -ceq "Published") {
+            $NewBinaryPublished = $true
+            if ($null -ne $Publication.OperationError) {
+                throw "First-install publication reached the exact state but its boundary reported an error: $($Publication.OperationError)"
             }
-        } catch {
+        } elseif ($Publication.State -ceq "Unchanged") {
+            throw "First-install no-replace publication did not apply: $($Publication.OperationError)"
+        } else {
             $AmbiguousBinaryState = $true
-            throw
+            throw "First-install publication produced an ambiguous file state: operation=$($Publication.OperationError); inspection=$($Publication.InspectionError)"
         }
     }
 
-    # Preserve the exact original User PATH for rollback. Empty entries are
-    # excluded only from the successful new value because Windows interprets
-    # them as the current working directory.
-    $PathEntries = @($OriginalUserPath -split ";" | Where-Object { $_.Trim() -ne "" })
-    if ($PathEntries -notcontains $InstallDir) {
-        $NewPath = ($PathEntries + $InstallDir) -join ";"
-        $PathMutationAttempted = $true
-        [Environment]::SetEnvironmentVariable("Path", $NewPath, "User")
-        Write-Host "[info]  Added $InstallDir to user PATH (restart terminal to take effect)" -ForegroundColor Blue
+    $UserPathTransition = Set-ExactUserPathTransition `
+        -CandidatePath $CandidateBin `
+        -TemporaryDirectory $TmpDir `
+        -Action "add" `
+        -ExpectedSnapshot $OriginalUserPathSnapshot `
+        -Entry $InstallDir
+    $RequestedUserPathSnapshot = $UserPathTransition.Snapshot
+    $PathMutationAttempted = $RequestedUserPathSnapshot -cne $OriginalUserPathSnapshot
+    if (-not $UserPathTransition.NotificationSucceeded) {
+        Write-Host "[warn]  User PATH committed, but Windows environment notification failed ($($UserPathTransition.Notification)). New terminals may require sign-out/sign-in." -ForegroundColor Yellow
+    }
+
+    $ProcessPathTransition = Invoke-ExactProcessPathTransition -Action "add" -Entry $InstallDir
+    $OriginalProcessPathSnapshot = $ProcessPathTransition.Original
+    $RequestedProcessPathSnapshot = $ProcessPathTransition.Requested
+    $ProcessPathMutationAttempted = $ProcessPathTransition.Applied
+    $ProcessPathStateAmbiguous = $ProcessPathTransition.Ambiguous
+    if ($null -ne $ProcessPathTransition.Error -or $ProcessPathStateAmbiguous) {
+        Write-Host "[warn]  User PATH was committed, but the current PowerShell process PATH update was not confirmed exactly: $($ProcessPathTransition.Error)" -ForegroundColor Yellow
+    }
+    if ($PathMutationAttempted) {
+        Write-Host "[info]  Added $InstallDir to user PATH" -ForegroundColor Blue
     }
 
     $VersionOutput = & $InstalledBin --version 2>&1
@@ -1335,42 +1846,40 @@ try {
         throw "installed binary reported '$InstalledVersionLine', expected 'codex-switch-global-pace $ExpectedReleaseVersion'"
     }
 
-    if ($DaemonWasRunning) {
-        Write-Host "[info]  Restoring the previously running daemon..." -ForegroundColor Blue
-        $DaemonRestartAttempted = $true
-        & $InstalledBin daemon start
-        if ($LASTEXITCODE -ne 0) {
-            throw "daemon start exited with code $LASTEXITCODE"
-        }
-        $DaemonRestarted = $true
-    }
+    Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command "new"
 
-    # If this final proof fails, rollback must first prove that no process from
-    # the replacement generation still owns the executable.
-    $DaemonRestartAttempted = $true
-    $FinalDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
-    if ($FinalDaemonStatus.running -ne $DaemonWasRunning -or
-        $FinalDaemonStatus.platform.service_installed -ne $DaemonServiceInstalled) {
-        throw "daemon running/service state did not match its exact pre-upgrade value"
+    try {
+        Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command "finish"
+    } catch {
+        $InstallPostCommitErrors += "daemon lifecycle finalization failed after the replacement state became ready; exact recovery paths were preserved: $_"
     }
-    if ($DaemonServiceInstalled) {
-        Assert-CandidateServiceOwner `
-            -CandidatePath $CandidateBin `
-            -ExpectedExecutable $InstalledBin
-    }
-
-    if ($OldBinaryBackedUp) {
+    if ($InstallPostCommitErrors.Count -eq 0 -and $OldBinaryBackedUp) {
         try {
-            if ((Get-DirectFileSha256 -Path $InstalledBin) -cne $StagedBinarySha256 -or
-                (Get-DirectFileSha256 -Path $BackupBin) -cne $PreviousBinarySha256) {
+            if ((Get-InstallerFileToken -CandidatePath $CandidateBin -Path $InstalledBin) -cne $StagedBinaryToken -or
+                (Get-InstallerFileToken -CandidatePath $CandidateBin -Path $DisplacedBin) -cne $PreviousBinaryToken -or
+                (Get-InstallerFileToken -CandidatePath $CandidateBin -Path $BackupBin) -cne $BackupBinaryToken) {
                 throw "Binary state changed before the rollback backup commit boundary."
             }
+            Remove-InstallerOwnedFile `
+                -CandidatePath $CandidateBin `
+                -Path $BackupBin `
+                -ExpectedToken $BackupBinaryToken
+            $BackupBinaryToken = $null
+            Remove-InstallerOwnedFile `
+                -CandidatePath $CandidateBin `
+                -Path $DisplacedBin `
+                -ExpectedToken $PreviousBinaryToken
+            $OldBinaryBackedUp = $false
         } catch {
-            $AmbiguousBinaryState = $true
-            throw
+            $InstallPostCommitErrors += "binary recovery cleanup failed; exact recovery paths were preserved: $_"
         }
-        Remove-Item -LiteralPath $BackupBin -Force
-        $OldBinaryBackedUp = $false
+    }
+    if ($InstallLifecycleHolder.Phase -ceq "FinalConfirmed") {
+        try {
+            Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command "release"
+        } catch {
+            $InstallPostCommitErrors += "daemon lifecycle authority release failed after recovery cleanup: $_"
+        }
     }
 } catch {
     $InstallError = $_
@@ -1379,15 +1888,10 @@ try {
 if ($null -ne $InstallError) {
     $RollbackErrors = @()
 
-    $DaemonSafeForBinaryRollback = $true
-    if ($DaemonRestarted -or $DaemonRestartAttempted) {
-        try {
-            Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin
-            $DaemonRestarted = $false
-        } catch {
-            $DaemonSafeForBinaryRollback = $false
-            $RollbackErrors += "could not prove the new daemon/task was stopped: $_"
-        }
+    $DaemonSafeForBinaryRollback = $null -ne $InstallLifecycleHolder -and
+        $InstallLifecycleHolder.Phase -ceq "Stopped"
+    if (-not $DaemonSafeForBinaryRollback) {
+        $RollbackErrors += "daemon lifecycle authority was not retained in the stopped phase; automatic binary rollback was refused"
     }
 
     $NewBinaryMovedAside = $false
@@ -1396,14 +1900,15 @@ if ($null -ne $InstallError) {
     } elseif (-not $DaemonSafeForBinaryRollback) {
         $RollbackErrors += "the previous binary remains preserved at $BackupBin; automatic binary rollback was refused"
     } elseif ($NewBinaryPublished -and $OldBinaryBackedUp) {
-        $Rollback = Invoke-AtomicUpgradeRollback `
-            -InstalledPath $InstalledBin `
-            -BackupPath $BackupBin `
-            -FailedPath $FailedBin `
-            -StagedSha256 $StagedBinarySha256 `
-            -PreviousSha256 $PreviousBinarySha256
+        $Rollback = Invoke-ClassifiedInstallerReplace `
+            -CandidatePath $CandidateBin `
+            -ReplacementPath $DisplacedBin `
+            -DestinationPath $InstalledBin `
+            -DisplacedPath $FailedBin `
+            -ReplacementToken $PreviousBinaryToken `
+            -DestinationToken $StagedBinaryToken
 
-        if ($Rollback.State -ceq "Restored") {
+        if ($Rollback.State -ceq "Published") {
             $OldBinaryBackedUp = $false
             $PreviousBinaryRestored = $true
             $NewBinaryPublished = $false
@@ -1413,10 +1918,24 @@ if ($null -ne $InstallError) {
                 $RollbackErrors += "atomic rollback reported an error after restoring the exact previous bytes; the failed candidate was preserved at ${FailedBin}: $($Rollback.OperationError)"
             } else {
                 try {
-                    Remove-Item -LiteralPath $FailedBin -Force
+                    Remove-InstallerOwnedFile `
+                        -CandidatePath $CandidateBin `
+                        -Path $FailedBin `
+                        -ExpectedToken $StagedBinaryToken
                     $NewBinaryMovedAside = $false
                 } catch {
                     $RollbackErrors += "the previous binary was restored, but the failed candidate could not be removed from ${FailedBin}: $_"
+                }
+            }
+            if ($null -ne $BackupBinaryToken) {
+                try {
+                    Remove-InstallerOwnedFile `
+                        -CandidatePath $CandidateBin `
+                        -Path $BackupBin `
+                        -ExpectedToken $BackupBinaryToken
+                    $BackupBinaryToken = $null
+                } catch {
+                    $RollbackErrors += "the previous binary was restored, but the independent recovery copy remains at ${BackupBin}: $_"
                 }
             }
         } elseif ($Rollback.State -ceq "Unchanged") {
@@ -1440,14 +1959,10 @@ if ($null -ne $InstallError) {
         }
     } elseif ($NewBinaryPublished) {
         try {
-            Move-Item -LiteralPath $InstalledBin -Destination $FailedBin
-            $NewBinaryMovedAside = $true
-            if ($null -ne (Get-DirectFileSha256 -Path $InstalledBin) -or
-                (Get-DirectFileSha256 -Path $FailedBin) -cne $StagedBinarySha256) {
-                throw "First-install rollback did not isolate the exact failed candidate."
-            }
-            Remove-Item -LiteralPath $FailedBin -Force
-            $NewBinaryMovedAside = $false
+            Remove-InstallerOwnedFile `
+                -CandidatePath $CandidateBin `
+                -Path $InstalledBin `
+                -ExpectedToken $StagedBinaryToken
             $NewBinaryPublished = $false
             $PreviousBinaryRestored = $true
         } catch {
@@ -1464,75 +1979,92 @@ if ($null -ne $InstallError) {
 
     if ($PathMutationAttempted) {
         try {
-            [Environment]::SetEnvironmentVariable("Path", $OriginalUserPath, "User")
+            $RestoredUserPath = Restore-ExactUserPathTransition `
+                -CandidatePath $CandidateBin `
+                -TemporaryDirectory $TmpDir `
+                -OriginalSnapshot $OriginalUserPathSnapshot `
+                -RequestedSnapshot $RequestedUserPathSnapshot
+            if (-not $RestoredUserPath.NotificationSucceeded) {
+                $RollbackErrors += "user PATH was restored, but Windows environment notification failed ($($RestoredUserPath.Notification))"
+            }
             $PathMutationAttempted = $false
         } catch {
             $RollbackErrors += "could not restore the exact previous User PATH: $_"
         }
     }
 
-    if (-not $AmbiguousBinaryState -and $DaemonWasRunning -and $DaemonSafeForBinaryRollback -and $PreviousBinaryRestored -and (Test-Path -LiteralPath $InstalledBin)) {
+    if ($ProcessPathMutationAttempted) {
         try {
-            Write-Host "[info]  Restarting the previous daemon after rollback..." -ForegroundColor Blue
-            & $CandidateBin daemon start --expected-executable $InstalledBin
-            if ($LASTEXITCODE -ne 0) {
-                throw "daemon start exited with code $LASTEXITCODE"
-            }
+            Restore-ExactProcessPathTransition `
+                -Original $OriginalProcessPathSnapshot `
+                -Requested $RequestedProcessPathSnapshot
+            $ProcessPathMutationAttempted = $false
         } catch {
-            $RollbackErrors += "could not restart the previous daemon: $_"
+            $RollbackErrors += "could not restore the exact previous current-process PATH: $_"
         }
+    } elseif ($ProcessPathStateAmbiguous) {
+        $RollbackErrors += "current PowerShell process PATH changed independently and was preserved"
     }
 
     if (-not $AmbiguousBinaryState -and $DaemonSafeForBinaryRollback -and
         $PreviousBinaryRestored) {
         try {
-            $RestoredDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin
-            if ($RestoredDaemonStatus.running -ne $DaemonWasRunning -or
-                $RestoredDaemonStatus.platform.service_installed -ne $DaemonServiceInstalled) {
-                throw "daemon running/service state did not match its exact pre-upgrade value after rollback"
-            }
-            if ($DaemonServiceInstalled) {
-                Assert-CandidateServiceOwner `
-                    -CandidatePath $CandidateBin `
-                    -ExpectedExecutable $InstalledBin
-            }
+            Invoke-DaemonLifecycleCommand `
+                -Holder $InstallLifecycleHolder `
+                -Command "rollback"
         } catch {
-            $RollbackErrors += "could not verify the exact daemon state after rollback: $_"
+            $RollbackErrors += "could not restore and verify the exact daemon state after rollback: $_"
         }
     }
 
     if (-not $AmbiguousBinaryState) {
-        $StageCleanupError = Remove-StagedCandidate -Path $StagedBin
-        if ($null -ne $StageCleanupError) {
-            $RollbackErrors += "staged candidate remains preserved at ${StagedBin}: $StageCleanupError"
+        $StageTokenAfter = Get-InstallerFileTokenIfPresent -CandidatePath $CandidateBin -Path $StagedBin
+        if ($StageTokenAfter -ceq $StagedBinaryToken) {
+            $StageCleanupError = Remove-InstallerArtifactIfOwned `
+                -CandidatePath $CandidateBin `
+                -Path $StagedBin `
+                -ExpectedToken $StagedBinaryToken
+            if ($null -ne $StageCleanupError) {
+                $RollbackErrors += "staged candidate remains preserved: $StageCleanupError"
+            }
+        } elseif ($null -ne $StageTokenAfter) {
+            $RollbackErrors += "a foreign staged path was preserved at $StagedBin"
         }
     }
     if ($NewBinaryMovedAside) {
         $RollbackErrors += "failed candidate remains at $FailedBin"
     }
-    if (-not $AmbiguousBinaryState -and -not $InstallDirWasPresent -and (Test-Path -LiteralPath $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir).Count -eq 0) {
+    if (-not $AmbiguousBinaryState -and -not $InstallDirWasPresent) {
         try {
-            Remove-Item -LiteralPath $InstallDir -Force
+            Remove-NewEmptyInstallDirectory -Path $InstallDir
         } catch {
             $RollbackErrors += "could not remove the newly created empty install directory: $_"
         }
     }
     if ($RollbackErrors.Count -eq 0) {
-        Write-Host "[error] Installation failed and the previous binary, User PATH, and daemon state were restored: $InstallError" -ForegroundColor Red
-    } else {
-        Write-Host "[error] Installation failed: $InstallError. Rollback was incomplete: $($RollbackErrors -join '; ')" -ForegroundColor Red
+        throw "Installation failed and the previous binary, User PATH, and daemon state were restored: $InstallError"
     }
-    exit 1
+    throw "Installation failed: $InstallError. Rollback was incomplete: $($RollbackErrors -join '; ')"
 }
 $TransactionSucceeded = $true
 } finally {
+    $LifecycleReleaseError = $null
+    if ($null -ne $InstallLifecycleHolder -and
+        $InstallLifecycleHolder.Phase -cne "Closed") {
+        try {
+            Close-DaemonLifecycleHolder `
+                -Holder $InstallLifecycleHolder `
+                -ExpectSuccess $false
+        } catch {
+            $LifecycleReleaseError = $_
+        }
+    }
     $LockReleaseError = $null
     try {
         Complete-UpdateLockHolder -LockProcess $UpdateLockHolder
     } catch {
         $LockReleaseError = $_
     }
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
     if ($null -ne $LockReleaseError) {
         $LockMessage = "The exclusive update lock did not close cleanly: $LockReleaseError"
         if ($TransactionSucceeded) {
@@ -1540,7 +2072,47 @@ $TransactionSucceeded = $true
         }
         Write-Host "[error] Additionally, $LockMessage" -ForegroundColor Red
     }
+    if ($null -ne $LifecycleReleaseError) {
+        if ($TransactionSucceeded) {
+            throw "Installer transaction reached its replacement state, but the daemon lifecycle holder did not close cleanly: $LifecycleReleaseError"
+        }
+        Write-Host "[error] Additionally, the daemon lifecycle holder did not close cleanly: $LifecycleReleaseError" -ForegroundColor Red
+    }
 }
 
+if ($InstallPostCommitErrors.Count -gt 0) {
+    throw "Installation committed, but post-commit cleanup was incomplete: $($InstallPostCommitErrors -join '; ')"
+}
 Write-Host "[info]  Installed: $VersionOutput" -ForegroundColor Blue
 Write-Host "[info]  Run 'codex-switch-global-pace --help' to get started" -ForegroundColor Blue
+} catch {
+    $InstallerFailure = $_
+    Write-Host "[error] $($_.Exception.Message)" -ForegroundColor Red
+} finally {
+    try {
+        if ($null -ne $TmpDir -and (Test-Path -LiteralPath $TmpDir)) {
+            $TempItem = Get-Item -LiteralPath $TmpDir -Force
+            $ExpectedTempParent = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\')
+            $ObservedTempParent = [System.IO.Path]::GetFullPath($TempItem.Parent.FullName).TrimEnd('\')
+            if (-not $TempItem.PSIsContainer -or
+                ($TempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                -not [System.StringComparer]::OrdinalIgnoreCase.Equals($ExpectedTempParent, $ObservedTempParent) -or
+                $TempItem.Name -cnotmatch '^codex-switch-global-pace-install-[0-9a-f]{32}$') {
+                throw "Refused to recursively clean an unexpected installer temp path: $TmpDir"
+            }
+            Remove-Item -LiteralPath $TmpDir -Recurse -Force
+        }
+    } catch {
+        $TempCleanupError = $_
+    }
+}
+if ($null -ne $InstallerFailure) {
+    if ($null -ne $TempCleanupError) {
+        throw "$($InstallerFailure.Exception.Message) Additionally, exact installer temp cleanup failed: $TempCleanupError"
+    }
+    throw $InstallerFailure
+}
+if ($null -ne $TempCleanupError) {
+    throw "Installer work completed, but exact installer temp cleanup failed: $TempCleanupError"
+}
+}

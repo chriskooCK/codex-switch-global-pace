@@ -17,6 +17,228 @@ fn ensure_system_install_migrated(use_dev: bool, version: Option<&str>, json: bo
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptedSelfUpdateRecoveryStep {
+    StopReplacement,
+    RollbackExecutable,
+    RestorePriorDaemon,
+    ReleaseCommittedReplacement,
+}
+
+fn interrupted_self_update_recovery_plan(
+    replacement_running: bool,
+    replacement_state: update::SelfUpdateReplacementState,
+    final_state_verified: bool,
+    boundary_finished: bool,
+) -> Vec<InterruptedSelfUpdateRecoveryStep> {
+    if boundary_finished {
+        return Vec::new();
+    }
+    if matches!(
+        replacement_state,
+        update::SelfUpdateReplacementState::Committed
+            | update::SelfUpdateReplacementState::Preserved
+    ) {
+        return final_state_verified
+            .then_some(InterruptedSelfUpdateRecoveryStep::ReleaseCommittedReplacement)
+            .into_iter()
+            .collect();
+    }
+    let mut plan = Vec::with_capacity(3);
+    if replacement_running {
+        plan.push(InterruptedSelfUpdateRecoveryStep::StopReplacement);
+    }
+    if replacement_state == update::SelfUpdateReplacementState::Pending {
+        plan.push(InterruptedSelfUpdateRecoveryStep::RollbackExecutable);
+    }
+    plan.push(InterruptedSelfUpdateRecoveryStep::RestorePriorDaemon);
+    plan
+}
+
+fn recover_interrupted_self_update(
+    boundary: &mut daemon::SelfUpdateDaemonBoundaryClient,
+    result: &mut update::SelfUpdateResult,
+) -> Result<()> {
+    if boundary.transition_is_ambiguous() {
+        anyhow::bail!(
+            "the lifecycle control channel unwound during a phase transition; no executable or process mutation was guessed, and the independent holder retained final-state classification authority"
+        );
+    }
+    let plan = interrupted_self_update_recovery_plan(
+        boundary.replacement_is_running(),
+        result.replacement_state(),
+        boundary.replacement_is_finally_verified(),
+        boundary.is_finished(),
+    );
+    if plan.is_empty() && !boundary.is_finished() {
+        anyhow::bail!(
+            "the executable replacement is {:?}, but the independent holder has no matching verified release or rollback boundary; no prior-state claim was made",
+            result.replacement_state()
+        );
+    }
+    for step in plan {
+        match step {
+            InterruptedSelfUpdateRecoveryStep::StopReplacement => {
+                boundary.stop_replacement_for_rollback()?
+            }
+            InterruptedSelfUpdateRecoveryStep::RollbackExecutable => result
+                .rollback_replacement()
+                .context("rolling back the executable after self-update interruption")?,
+            InterruptedSelfUpdateRecoveryStep::RestorePriorDaemon => boundary
+                .restore_prior()
+                .context("restoring the exact prior daemon after self-update interruption")?,
+            InterruptedSelfUpdateRecoveryStep::ReleaseCommittedReplacement => boundary
+                .release_verified_replacement()
+                .context("releasing the verified committed replacement after interruption")?,
+        }
+    }
+    Ok(())
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+fn finish_self_update_result_inner(
+    daemon_boundary: &mut daemon::SelfUpdateDaemonBoundaryClient,
+    result: &mut update::SelfUpdateResult,
+) -> Result<()> {
+    let restart = match daemon_boundary.restart_replacement() {
+        Ok(restart) => restart,
+        Err(boundary_error) if result.updated => {
+            let recovery = result
+                .preserve_replacement_for_recovery()
+                .context("preserving the previous executable after lifecycle-holder failure")?;
+            return Err(boundary_error.context(format!(
+                "the executable was replaced, but the independent holder did not return an exact restart classification; automatic rollback was refused. {}",
+                format_recovery_paths(&recovery)
+            )));
+        }
+        Err(boundary_error) => {
+            return Err(boundary_error.context(
+                "the no-op self-update lifecycle holder did not return an exact restart classification",
+            ));
+        }
+    };
+
+    if restart == daemon::SelfUpdateBoundaryRestart::FailedStopped {
+        if result.updated {
+            result.rollback_replacement().context(
+                "the replacement daemon failed to start safely, and restoring the exact previous executable failed while daemon absence remained held",
+            )?;
+        }
+        return match daemon_boundary.restore_prior() {
+            Ok(()) => Err(anyhow::anyhow!(
+                "self-update daemon restart failed; the exact previous executable and prior daemon state were restored"
+            )),
+            Err(restoration_error) => Err(restoration_error.context(
+                "self-update daemon restart failed; the previous executable was restored, but exact prior daemon-state restoration was not confirmed",
+            )),
+        };
+    }
+
+    // Verify while recovery material still exists. `finish` retains both
+    // lifecycle authorities; only a later `release` lets the holder exit.
+    if let Err(verification_error) = daemon_boundary.verify_replacement_before_commit() {
+        if result.replacement_state() == update::SelfUpdateReplacementState::Pending {
+            let recovery = result.preserve_replacement_for_recovery().context(
+                "preserving executable recovery material after final-state verification failed",
+            )?;
+            return Err(verification_error.context(format_recovery_paths(&recovery)));
+        }
+        return Err(verification_error);
+    }
+
+    let commit_result = result
+        .commit_replacement()
+        .context("committing the verified executable replacement");
+    let commit_state = result.replacement_state();
+    let recovery_result = if commit_result.is_err() {
+        result
+            .preserve_failed_commit_for_recovery()
+            .context("retaining exact recovery paths after executable commit failed")
+    } else {
+        Ok(None)
+    };
+    let replacement_state = result.replacement_state();
+    let release_result = daemon_boundary
+        .release_verified_replacement()
+        .context("releasing the independently verified daemon boundary after executable commit");
+    match commit_result {
+        Ok(()) => match (recovery_result, release_result) {
+            (Ok(None), Ok(())) => Ok(()),
+            (Ok(None), Err(release_error)) => Err(release_error.context(format!(
+                "the executable reached replacement state {replacement_state:?}; lifecycle authority release was not confirmed"
+            ))),
+            (Ok(Some(paths)), release) => {
+                let release = release
+                    .err()
+                    .map(|error| format!("; lifecycle authority release also failed: {error:#}"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "self-update retained recovery material despite a successful executable commit. {}{release}",
+                    format_recovery_paths(&paths)
+                )
+            }
+            (Err(recovery_error), release) => {
+                let release = release
+                    .err()
+                    .map(|error| format!("; lifecycle authority release also failed: {error:#}"))
+                    .unwrap_or_default();
+                Err(recovery_error.context(format!(
+                    "a successful executable commit unexpectedly entered recovery classification{release}"
+                )))
+            }
+        },
+        Err(commit_error) => {
+            let recovery = match recovery_result {
+                Ok(Some(paths)) => format!(". {}", format_recovery_paths(&paths)),
+                Ok(None) if commit_state == update::SelfUpdateReplacementState::Committed => {
+                    ". The replacement was committed and its final daemon state was verified, but cleanup durability was not fully confirmed".to_string()
+                }
+                Ok(None) => format!(
+                    ". No executable recovery entries exist for exact replacement state {commit_state:?}"
+                ),
+                Err(recovery_error) => format!(
+                    ". Exact executable recovery paths could not be retained: {recovery_error:#}"
+                ),
+            };
+            let release = release_result
+                .err()
+                .map(|error| format!("; lifecycle authority release also failed: {error:#}"))
+                .unwrap_or_default();
+            Err(commit_error.context(format!(
+                "executable commit failed from replacement state {commit_state:?} and ended in state {replacement_state:?}{recovery}{release}"
+            )))
+        }
+    }
+}
+
+fn format_recovery_paths(paths: &update::ReplacementRecoveryPaths) -> String {
+    format!("manual recovery observation: {}", paths.describe())
+}
+
+async fn catch_async_unwind<F>(future: F) -> std::thread::Result<F::Output>
+where
+    F: std::future::Future,
+{
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(|context| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future.as_mut().poll(context)
+        })) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
 // ── self-update ──────────────────────────────────────────
 
 pub(crate) async fn self_update_cmd(
@@ -124,59 +346,67 @@ pub(crate) async fn self_update_cmd(
     // The ownership marker can change between preflight and lock acquisition.
     // Revalidate it under the same lease that protects the replacement.
     ensure_system_install_migrated(use_dev, version, json)?;
-    let mut daemon_restart = daemon::SelfUpdateDaemonRestart::capture()
-        .context("capturing daemon state before self-update")?;
-    if daemon_restart.is_needed() {
-        daemon_restart.stop_before_update()?;
+    // A separate holder process owns the service-operation and PID-absence
+    // leases across the async network work. If this command future is
+    // cancelled, closing its control pipe makes the holder restore the exact
+    // prior state before it releases either lifecycle authority.
+    let mut daemon_boundary = daemon::SelfUpdateDaemonBoundaryClient::start()
+        .context("establishing the independent daemon boundary before self-update")?;
+    let mut result_slot = None;
+    // Start the unwind boundary before the first network await. Publication
+    // itself is guarded inside `update`; after publication there are no async
+    // suspension points before the typed result is installed in `result_slot`.
+    let transaction = catch_async_unwind(async {
+        let update_result = if use_dev {
+            update::self_update_dev(show_progress, update_lease.clone()).await
+        } else {
+            update::self_update(version, show_progress, update_lease.clone()).await
+        };
+        let result = match update_result {
+            Ok(result) => result,
+            Err(update_error) => {
+                return match daemon_boundary.restore_prior() {
+                    Ok(()) => Err(update_error.context(
+                        "self-update failed; the independent holder restored the exact prior daemon state",
+                    )),
+                    Err(restoration_error) => Err(update_error.context(format!(
+                        "self-update failed and the independent holder could not confirm exact prior daemon-state restoration: {restoration_error:#}"
+                    ))),
+                };
+            }
+        };
+        result_slot = Some(result);
+        finish_self_update_result_inner(
+            &mut daemon_boundary,
+            result_slot
+                .as_mut()
+                .context("self-update coordinator lost its replacement result")?,
+        )
+    })
+    .await;
+    match transaction {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(error),
+        Err(payload) => {
+            let panic_message = panic_payload_message(payload.as_ref()).to_string();
+            let recovery = match result_slot.as_mut() {
+                Some(result) => recover_interrupted_self_update(&mut daemon_boundary, result),
+                None => daemon_boundary.restore_prior().context(
+                    "restoring the exact prior daemon after a pre-result self-update panic",
+                ),
+            };
+            return match recovery {
+                Ok(()) => Err(anyhow::anyhow!(
+                    "self-update transaction panicked ({panic_message}); its typed executable state and daemon lifecycle boundary were recovered"
+                )),
+                Err(recovery_error) => Err(anyhow::anyhow!(
+                    "self-update transaction panicked ({panic_message}), and exact interruption recovery was incomplete: {recovery_error:#}"
+                )),
+            };
+        }
     }
-    let update_result = if use_dev {
-        update::self_update_dev(show_progress, update_lease.clone()).await
-    } else {
-        update::self_update(version, show_progress, update_lease.clone()).await
-    };
-    let result = match update_result {
-        Ok(mut result) => {
-            if let Err(restart_err) = daemon_restart.restart_after_update() {
-                #[cfg(target_os = "windows")]
-                if result.updated {
-                    if let Err(stop_err) = daemon_restart.stop_failed_restart_before_rollback() {
-                        let recovery = result
-                            .preserve_replacement_for_recovery()
-                            .context("preserving the previous executable for manual recovery")?;
-                        return Err(restart_err.context(format!(
-                            "self-update installed the new binary, but its daemon did not restart; the new daemon could not be proven stopped, so automatic rollback was refused: {stop_err}. Manual recovery paths: current executable {}, previous executable backup {}",
-                            recovery.executable.display(),
-                            recovery.previous_executable.display()
-                        )));
-                    }
-                    if let Err(rollback_err) = result.rollback_replacement() {
-                        return Err(restart_err.context(format!(
-                            "self-update installed the new binary, but its daemon did not restart and restoring the previous binary failed: {rollback_err}"
-                        )));
-                    }
-                    if let Err(old_restart_err) = daemon_restart.restart_after_update() {
-                        return Err(restart_err.context(format!(
-                            "self-update daemon restart failed; the previous binary was restored, but its daemon also could not be restarted: {old_restart_err}"
-                        )));
-                    }
-                    return Err(restart_err.context(
-                        "self-update daemon restart failed; the previous binary and daemon state were restored",
-                    ));
-                }
-                return Err(restart_err.context("self-update completed, but daemon restart failed"));
-            }
-            result.commit_replacement();
-            result
-        }
-        Err(err) => {
-            if let Err(restart_err) = daemon_restart.restart_after_update() {
-                return Err(err.context(format!(
-                    "self-update failed; additionally failed to restart daemon: {restart_err}"
-                )));
-            }
-            return Err(err);
-        }
-    };
+    let result = result_slot.context("self-update coordinator completed without a result")?;
+    update::record_successful_self_update(&result);
 
     if json {
         print_json(&output::JsonSelfUpdate {
@@ -219,4 +449,42 @@ pub(crate) async fn self_update_cmd(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InterruptedSelfUpdateRecoveryStep as Step, interrupted_self_update_recovery_plan};
+    use crate::update::SelfUpdateReplacementState as State;
+
+    #[test]
+    fn interrupted_new_generation_is_stopped_before_file_rollback_and_prior_restore() {
+        assert_eq!(
+            interrupted_self_update_recovery_plan(true, State::Pending, false, false),
+            vec![
+                Step::StopReplacement,
+                Step::RollbackExecutable,
+                Step::RestorePriorDaemon,
+            ]
+        );
+        assert_eq!(
+            interrupted_self_update_recovery_plan(false, State::Pending, false, false),
+            vec![Step::RollbackExecutable, Step::RestorePriorDaemon]
+        );
+        assert_eq!(
+            interrupted_self_update_recovery_plan(true, State::NotReplaced, false, false),
+            vec![Step::StopReplacement, Step::RestorePriorDaemon]
+        );
+        assert!(
+            interrupted_self_update_recovery_plan(true, State::Committed, true, true).is_empty()
+        );
+        assert_eq!(
+            interrupted_self_update_recovery_plan(true, State::Committed, true, false),
+            vec![Step::ReleaseCommittedReplacement],
+            "a committed binary must never be rolled back or described as the prior executable"
+        );
+        assert!(
+            interrupted_self_update_recovery_plan(true, State::Committed, false, false).is_empty(),
+            "an unverified committed phase must fail closed instead of guessing a rollback"
+        );
+    }
 }

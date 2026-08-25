@@ -7,14 +7,23 @@
   per-profile OS lease for their complete credential lifetime. Rotated tokens
   are written before any follow-up request, and the TUI waits for every started
   credential task before a normal exit instead of cancelling valid responses.
-- **Atomic profile state** — Profile activation commits live authentication and
-  the current marker as one recoverable operation, while newly issued tokens
-  are never rolled back to an already-consumed refresh token. Rename, delete,
+- **Atomic profile state** — Profile activation conditionally publishes live
+  authentication first, only while its exact authorized observation still
+  matches, and writes the app-owned marker second. A marker failure leaves the
+  new live credential active and reports the partial activation for repair;
+  live credentials are never rolled back across a non-cooperating Codex writer.
+  Newly issued tokens are never restored to an already-consumed
+  refresh token. Reset-card auto-selection authorizes the live overwrite before
+  redemption, and import reserves the profile registry across token-consuming
+  validation and final commit. Rename, delete,
   login, import, cache mutation, and reset-card confirmation fail closed on
   unreadable state and use the live Codex identity rather than a stale marker.
   Legacy duplicate identities require an exact current binding, private writes
   preserve their publication boundary, and auxiliary selection history can no
-  longer report an already-committed account switch as failed.
+  longer report an already-committed account switch as failed. Post-command
+  credential synchronization remains bound to the exact marker confirmed at
+  startup, runs after both successful and failed commands, and never guesses a
+  replacement alias from changed marker state.
 - **Bounded refresh and routing** — Opportunistic token refresh stops waiting for
   profile locks when its start budget expires and rechecks that budget at the
   final HTTP boundary. Usage and reset-credit requests now share the same
@@ -27,7 +36,20 @@
 - **Deterministic TUI state** — Usage and model responses carry request
   generations, relogin invalidates stale model data, rename/delete waits for
   account work, exact reset-card consent is preserved, and search/rename editing
-  now treats combining characters and emoji sequences as whole graphemes.
+  now treats combining characters and emoji sequences as whole graphemes. If
+  live authentication was published but its derived marker failed, the active
+  account highlight revalidates the typed publication digest against current
+  live and profile bytes instead of trusting either the stale marker or a
+  publication result that Codex may since have replaced. Quota meters keep a
+  valid pace marker through display rounding and full exhaustion, and use only
+  the agreed yellow-ahead / green-behind-or-equal comparison states.
+- **Fail-closed configuration** — Unknown keys, invalid percentages, unsafe
+  timer ranges, unsupported concurrency, and malformed configured proxy URLs
+  stop startup instead of selecting defaults. Removed launch/selection keys
+  remain explicit warning-only compatibility fields. A credential state home,
+  or its nearest existing parent before creation, must be an ordinary directory;
+  symbolic links, Windows junctions, and other reparse points fail at startup
+  instead of waiting for the first private write.
 - **Transactional distribution** — Installers verify the exact executable
   version before replacement and use one destination lock across install,
   self-update, and uninstall. Daemon service mutations use one OS-level lease
@@ -38,14 +60,37 @@
   state on failure. Windows upgrades classify
   atomic replacement bytes explicitly and reject reparse destinations or
   current and legacy incomplete-transaction files without overwriting them.
-  Self-update rechecks mutable tags after candidate execution, preserves exact
-  recovery files across partial Windows replacement failures, and uses a
-  generation-bound PID lock for daemon transitions. Stable release candidates
-  use one deterministic tag per release and recover only an exact interrupted
-  draft; mismatched remote state is preserved. Releases remain drafts until
-  their exact tag and release ID are verified for publish. Development
-  builds are preserved as one attested Actions bundle and published through a
-  crash-recoverable remote journal using the maintainer's existing GitHub CLI
+  Self-update rechecks mutable tags after candidate execution, keeps an
+  independent previous-binary copy plus the actual file displaced by Windows
+  `ReplaceFileW` or a Unix atomic exchange, and classifies every post-state by
+  file identity and digest before cleanup or rollback. It does not overstate
+  that boundary as a strict compare-and-swap against non-cooperating writers;
+  ambiguous files are preserved. Unix recovery-file creation and namespace
+  changes are parent-directory synced, including a retry after a verified
+  error-after-mutation state. Windows flushes exact file handles, uses the
+  available Win32 write-through boundary, and does not overstate `ReplaceFileW`
+  directory-entry power-loss durability, for which Windows exposes no supported
+  directory-fsync contract. Windows `ReplaceFileW` displaced and failed-candidate
+  paths now use independent CSPRNG 128-bit nonces with bounded collision retries;
+  the exact paths remain owned by the pending recovery transaction and are
+  printed on manual-recovery failures. LaunchAgent and systemd definitions now use
+  the same token-bound exchange/no-replace transactions, including exact
+  uninstall rollback and parent-directory sync. Daemon transitions use a
+  generation-bound PID lock. Self-update holds the service-operation lease from
+  capture through commit or rollback and retains that PID lock as an absence
+  lease after stop, including when the daemon was initially stopped. Normal CLI
+  detached start/stop uses the same lifecycle lease, and final PID/service state
+  is revalidated before executable recovery copies are removed. The verified
+  Windows and Unix direct installers now retain those same service/PID
+  authorities across install and uninstall instead of splitting stop, file,
+  PATH, and service mutations among independent child commands. Stable release
+  candidates use one deterministic tag per release; interrupted drafts are
+  discovered through the authenticated paginated release list, rejected when
+  duplicate, and reverified by release ID before cleanup. Mismatched remote state
+  is preserved. Releases remain drafts until their exact tag and release ID are
+  verified for publish. Development builds are preserved as one attested Actions
+  bundle and published through a crash-recoverable remote journal using the
+  maintainer's existing GitHub CLI
   authentication without repository secrets. That journal binds the prior
   release's draft/public state into its fingerprint, so a verified replacement
   is published without first exposing an old draft and any rollback restores

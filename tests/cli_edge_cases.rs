@@ -191,6 +191,20 @@ fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+#[test]
+fn json_warmup_with_no_profiles_reports_a_complete_success_object() {
+    let home = temp_home("empty-json-warmup");
+
+    let output = run(&home, &["--json", "warmup"]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        parse_stdout_json(&output),
+        serde_json::json!({"ok": true, "results": []})
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 fn quarantined_path_from_error(error: &str) -> PathBuf {
     let (_, after_path) = error
         .split_once("credential copy was quarantined at ")
@@ -412,7 +426,7 @@ fn json_list_auto_track_keeps_stdout_machine_readable() {
 }
 
 #[test]
-fn zero_max_concurrent_is_sanitized() {
+fn zero_max_concurrent_fails_instead_of_being_replaced() {
     let home = temp_home("zero-max-concurrent");
     write_json(
         home.join(".codex-switch/profiles/dave/auth.json"),
@@ -427,11 +441,14 @@ fn zero_max_concurrent_is_sanitized() {
     .unwrap();
 
     let output = run_with_timeout(&home, &["--json", "list"], Duration::from_secs(10));
-    assert!(output.status.success());
-    assert_eq!(parse_stdout_json(&output)["profiles"][0]["alias"], "dave");
+    assert!(!output.status.success());
+    let report = parse_stdout_json(&output);
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("config.network.max_concurrent=0 is invalid; using 1 instead")
+        report["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("config.network.max_concurrent must be at least 1"),
+        "{report}"
     );
 
     let _ = fs::remove_dir_all(home);
@@ -463,7 +480,7 @@ fn invalid_config_error_does_not_echo_proxy_credentials() {
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     fs::write(
         home.join(".codex-switch/config.toml"),
-        "[proxy]\nurl = \"http://user:SENTINEL_PASSWORD@example.com\n",
+        "[proxy]\nurl = \"http://user:SENTINEL_PASSWORD@[\"\n",
     )
     .unwrap();
 
@@ -471,9 +488,68 @@ fn invalid_config_error_does_not_echo_proxy_credentials() {
     assert!(!output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("failed to parse config file"));
+    assert!(
+        stdout.contains("failed to validate config file"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("config.proxy.url"), "{stdout}");
     assert!(!stdout.contains("SENTINEL_PASSWORD"));
     assert!(!stderr.contains("SENTINEL_PASSWORD"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_cli_proxy_fails_before_dispatch_without_echoing_credentials() {
+    let home = temp_home("invalid-cli-proxy-secret");
+    let output = run(
+        &home,
+        &[
+            "--proxy",
+            "http://user:SENTINEL_CLI_PROXY_PASSWORD@[/",
+            "list",
+        ],
+    );
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--proxy is not a valid proxy URL"),
+        "{stderr}"
+    );
+    assert!(!stdout.contains("SENTINEL_CLI_PROXY_PASSWORD"));
+    assert!(!stderr.contains("SENTINEL_CLI_PROXY_PASSWORD"));
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn invalid_cli_proxy_preserves_json_error_contract() {
+    let home = temp_home("invalid-cli-proxy-json-secret");
+    let output = run(
+        &home,
+        &[
+            "--json",
+            "--proxy",
+            "http://user:SENTINEL_JSON_PROXY_PASSWORD@[/",
+            "list",
+        ],
+    );
+
+    assert!(!output.status.success());
+    let report = parse_stdout_json(&output);
+    assert_eq!(report["ok"], false);
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("--proxy is not a valid proxy URL")),
+        "{report}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("SENTINEL_JSON_PROXY_PASSWORD"));
+    assert!(!stderr.contains("SENTINEL_JSON_PROXY_PASSWORD"));
 
     let _ = fs::remove_dir_all(home);
 }
@@ -708,6 +784,25 @@ fn automatic_use_without_profiles_explains_how_to_get_started() {
 }
 
 #[test]
+fn list_propagates_a_saved_profile_read_error_instead_of_skipping_the_row() {
+    let home = temp_home("list-unreadable-profile");
+    let broken = home.join(".codex-switch/profiles/broken/auth.json");
+    fs::create_dir_all(broken.parent().unwrap()).unwrap();
+    fs::write(&broken, "{not-json").unwrap();
+
+    let output = run(&home, &["--json", "list"]);
+
+    assert!(!output.status.success());
+    let error = parse_stdout_json(&output)["error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("loading profile 'broken'"), "{error}");
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn json_list_uses_per_account_cached_refresh_time() {
     let home = temp_home("json-list-cache-ts");
     write_json(
@@ -915,6 +1010,11 @@ struct MockState {
     /// lets one file in a directory import fail its usage check without
     /// forcing every other file in the same run to fail too.
     fail_access_tokens: std::collections::HashSet<String>,
+    /// Paths replaced by regular files after the refresh request reaches the
+    /// server but before rotated credentials are returned. This keeps import
+    /// preflight healthy and injects a genuine post-rotation persistence
+    /// failure at the boundary the recovery tests exercise.
+    post_rotation_blockers: Vec<PathBuf>,
 }
 
 async fn mock_usage_handler(
@@ -965,6 +1065,12 @@ async fn mock_token_handler(
             })),
         );
     }
+    for path in &state.post_rotation_blockers {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, "not a directory").unwrap();
+    }
     (
         axum::http::StatusCode::OK,
         axum::Json(serde_json::json!({
@@ -992,12 +1098,30 @@ fn start_rotating_mock_with_failures(
     usage_ok: bool,
     fail_access_tokens: &[&str],
 ) -> MockServer {
+    start_rotating_mock_with_options(rotated_id_token, usage_ok, fail_access_tokens, Vec::new())
+}
+
+fn start_rotating_mock_with_blockers(
+    rotated_id_token: String,
+    usage_ok: bool,
+    post_rotation_blockers: Vec<PathBuf>,
+) -> MockServer {
+    start_rotating_mock_with_options(rotated_id_token, usage_ok, &[], post_rotation_blockers)
+}
+
+fn start_rotating_mock_with_options(
+    rotated_id_token: String,
+    usage_ok: bool,
+    fail_access_tokens: &[&str],
+    post_rotation_blockers: Vec<PathBuf>,
+) -> MockServer {
     let token_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = MockState {
         rotated_id_token,
         usage_ok,
         token_calls: token_calls.clone(),
         fail_access_tokens: fail_access_tokens.iter().map(|s| s.to_string()).collect(),
+        post_rotation_blockers,
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1128,6 +1252,75 @@ fn import_rejects_a_disallowed_workspace_before_consuming_the_refresh_token() {
             .unwrap_or_default()
             .contains("managed_policy"),
         "the rejection must identify the policy boundary: {report}"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn import_rejects_a_saved_refresh_token_before_consuming_it() {
+    let home = temp_home("import-duplicate-token-preflight");
+    let sample = auth_json_needing_refresh("duplicate@example.com", "acct_duplicate");
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+
+    let mut saved = sample.clone();
+    saved["tokens"]["access_token"] = serde_json::json!("a-different-access-token");
+    write_json(
+        home.join(".codex-switch/profiles/existing/auth.json"),
+        &saved,
+    );
+
+    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+    let server = start_rotating_mock(rotated_id_token, true);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "duplicate"],
+        &server,
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        server.token_calls.lock().unwrap().is_empty(),
+        "a refresh token already owned by a profile must not be sent to the auth server"
+    );
+    let report = parse_stdout_json(&output);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("duplicate_credential"),
+        "{report}"
+    );
+    assert_eq!(
+        stored_refresh_token(&home.join(".codex-switch/profiles/existing/auth.json")),
+        "refresh_old"
+    );
+
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn import_rejects_the_live_refresh_token_before_consuming_it() {
+    let home = temp_home("import-live-token-preflight");
+    let sample = auth_json_needing_refresh("live@example.com", "acct_live");
+    let source = home.join("donor-auth.json");
+    write_json(&source, &sample);
+    write_json(home.join(".codex/auth.json"), &sample);
+
+    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+    let server = start_rotating_mock(rotated_id_token, true);
+    let output = run_import(
+        &home,
+        &["--json", "import", source.to_str().unwrap(), "duplicate"],
+        &server,
+    );
+
+    assert!(!output.status.success());
+    assert!(server.token_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        stored_refresh_token(&home.join(".codex/auth.json")),
+        "refresh_old"
     );
 
     let _ = fs::remove_dir_all(home);
@@ -1386,14 +1579,17 @@ fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
     write_json(&source, &sample);
-    // Occupy both durable destinations with regular files so profile and
-    // quarantine writes fail deterministically, with no permission-bit
-    // semantics involved.
-    fs::create_dir_all(home.join(".codex-switch")).unwrap();
-    fs::write(home.join(".codex-switch/profiles"), "not a directory").unwrap();
-    fs::write(home.join(".codex-switch/recovery"), "not a directory").unwrap();
-
-    let server = start_rotating_mock(rotated_id_token, false);
+    // Occupy both durable destinations only after preflight and token
+    // presentation, so this remains a post-rotation recovery failure rather
+    // than a deterministic preflight rejection.
+    let server = start_rotating_mock_with_blockers(
+        rotated_id_token,
+        false,
+        vec![
+            home.join(".codex-switch/profiles"),
+            home.join(".codex-switch/recovery"),
+        ],
+    );
     let output = run_import(
         &home,
         &["--json", "import", source.to_str().unwrap(), "lost"],
@@ -1425,10 +1621,11 @@ fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
     write_json(&source, &sample);
-    fs::create_dir_all(home.join(".codex-switch")).unwrap();
-    fs::write(home.join(".codex-switch/profiles"), "not a directory").unwrap();
-
-    let server = start_rotating_mock(rotated_id_token, true);
+    let server = start_rotating_mock_with_blockers(
+        rotated_id_token,
+        true,
+        vec![home.join(".codex-switch/profiles")],
+    );
     let output = run_import(
         &home,
         &["--json", "import", source.to_str().unwrap(), "savefail"],

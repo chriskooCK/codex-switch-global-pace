@@ -57,8 +57,9 @@ also shows the nearest included-account reset.
 Every quota meter uses the same relative state: yellow when actual usage is
 ahead of elapsed-time pace, and green when usage is at or behind pace. The
 Global meter compares aggregate usage with aggregate elapsed time in exactly
-the same way. Fully exhausted quotas are red, unavailable comparisons are
-neutral, and quota labels carry no warning suffix.
+the same way. Exhaustion does not create a third warning state: a valid
+comparison still uses yellow or green and keeps its pace marker. Unavailable
+comparisons are neutral, and quota labels carry no warning suffix.
 
 The TUI account detail page is a single scrollable column with identity and organization labels, token expiry times in the local timezone, every quota pool with a pace marker, available reset cards, and the models the account may use. Model names and reasoning-effort capabilities are discovered from the authenticated service at runtime, not hardcoded. The full shortcut list is in the [command reference](Command-Reference.md#tui-shortcuts) and under `h` inside the TUI.
 
@@ -83,7 +84,7 @@ Selection has two phases:
 
 If every account is ineligible, the best fallback is reported instead of pretending an account is healthy.
 
-Switching replaces the live `$CODEX_HOME/auth.json` atomically while holding a process lock. Restart Codex after a manual switch because Codex reads the file at startup.
+Switching replaces the live `$CODEX_HOME/auth.json` atomically while holding the app's credential transaction. Ordinary CLI and TUI switches are bound to the exact live and profile snapshots observed for that decision. Reset-card auto-selection authorizes the exact live snapshot and the target account identity before redemption, then permits only a same-account token rotation during the network request. The final publication rechecks the authorized live bytes and refuses a detected change instead of deliberately overwriting it. Restart Codex after a manual switch because Codex reads the file at startup.
 
 ## Recover exhausted accounts
 
@@ -94,7 +95,7 @@ codex-switch-global-pace use --consume-card
 codex-switch-global-pace reset-card work --yes
 ```
 
-JSON or non-interactive execution never consumes a card without the explicit flag.
+JSON or non-interactive execution never consumes a card without the explicit flag. Even with `--consume-card`, an untracked live login is rejected before the redemption request because non-interactive execution cannot approve overwriting it.
 
 ## Warm quota windows
 
@@ -103,9 +104,10 @@ Fresh accounts show no reset timer until their first real request. `warmup` send
 ```bash
 codex-switch-global-pace warmup
 codex-switch-global-pace warmup work
+codex-switch-global-pace --json warmup
 ```
 
-Model names are discovered at runtime rather than maintained as a hardcoded compatibility list. Already-active or unavailable pools are skipped. Inside the TUI, `W` toggles automatic warmup for accounts whose 5-hour window has expired; the daemon has a separate `auto_warmup` setting.
+Model names are discovered at runtime rather than maintained as a hardcoded compatibility list. Already-active or unavailable pools are skipped. JSON mode returns every profile result and a top-level `ok` field. Inside the TUI, `W` toggles automatic warmup for paid accounts whose primary 5-hour window, or Free accounts whose weekly window, has expired; the daemon has a separate `auto_warmup` setting.
 
 ## Run the background daemon
 
@@ -122,13 +124,13 @@ The data directory and daemon-state files remain compatible with the original
 `codex-switch`. Do not install or run both daemon services simultaneously;
 stop and uninstall one daemon before enabling the other.
 
-The daemon runs three independent timers: account polling (`poll_interval_secs`), full cache refresh with optional warmup (`cache_refresh_interval_secs`, `auto_warmup`), and proactive token refresh (`token_check_interval_secs`). A switch happens only when at least two profiles exist and the current profile's 5-hour usage reaches `switch_threshold`.
+The daemon runs three independent timers: account polling (`poll_interval_secs`), full cache refresh with optional warmup (`cache_refresh_interval_secs`, `auto_warmup`), and proactive token refresh (`token_check_interval_secs`). With at least two profiles, `switch_threshold` starts a candidate search from the current profile's primary usage. If the account has no primary window — including Free accounts — the secondary weekly window is the trigger instead. An unavailable, account-limited, or exhausted current account is treated as 100% for this trigger so a low primary value cannot suppress recovery. Reaching the threshold does not force a credential change: the unified eligibility and scoring rules must still find a strictly better candidate.
 
-By default, a switch is deferred while an interactive Codex process (`codex`, `codex resume`, `codex exec`) is running; the daemon records the pending switch and retries on the next poll. Long-lived MCP or app-server processes do not block a switch. Operational state lives in `daemon-state.json` and is shown by `daemon status`. Daemon switches cannot ask for confirmation: an untracked live `auth.json` is replaced after the normal backup rotation, so save or import an account first if you want to keep it selectable.
+By default, a switch is deferred while an interactive Codex process (`codex`, `codex resume`, `codex exec`) is running; the daemon records the pending switch and retries on the next poll. Long-lived MCP or app-server processes do not block a switch. Operational state lives in `daemon-state.json` and is shown by `daemon status`. Daemon switching uses the same compare-and-switch boundary: if the current marker no longer matches the live credentials observed by the poll — including when live authentication becomes untracked — the commit is refused and a later poll starts from fresh state.
 
 ## Update the binary
 
-Direct installs support the stable and rolling development channels, verify release checksums and build provenance before replacing the binary, and restart a running daemon around the update. See [Updating](Updating.md) for channels and installation migration, and [Testing development releases](Development-Releases.md) for the dev channel.
+Direct installs support the stable and rolling development channels, verify release checksums and build provenance before replacing the binary, and retain the exact previous executable until a running daemon has restarted successfully. See [Updating](Updating.md) for channels and installation migration, and [Testing development releases](Development-Releases.md) for the dev channel.
 
 ```bash
 codex-switch-global-pace self-update --check
