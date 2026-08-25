@@ -423,6 +423,28 @@ fn component_c_string(name: &OsStr, path: &Path) -> Result<CString> {
         .with_context(|| format!("transaction path contains a NUL byte: {}", path.display()))
 }
 
+#[cfg(target_os = "linux")]
+unsafe fn linux_renameat2(
+    source_directory: libc::c_int,
+    source_name: *const libc::c_char,
+    destination_directory: libc::c_int,
+    destination_name: *const libc::c_char,
+    flags: libc::c_uint,
+) -> libc::c_long {
+    unsafe {
+        // SAFETY: callers keep both directory descriptors and NUL-terminated
+        // component names live for this Linux kernel syscall.
+        libc::syscall(
+            libc::SYS_renameat2,
+            source_directory,
+            source_name,
+            destination_directory,
+            destination_name,
+            flags,
+        )
+    }
+}
+
 /// Atomically renames one explicit sibling file without replacing any entry at
 /// the destination. Linux and macOS provide the required kernel primitive; no
 /// check-then-rename fallback is permitted.
@@ -445,7 +467,7 @@ pub(crate) fn rename_noreplace(source: &Path, destination: &Path) -> Result<()> 
     let result = unsafe {
         // SAFETY: the directory descriptor and both NUL-terminated names remain
         // valid for this call. RENAME_NOREPLACE is the required atomic boundary.
-        libc::renameat2(
+        linux_renameat2(
             directory.as_raw_fd(),
             source_name.as_ptr(),
             directory.as_raw_fd(),
@@ -498,7 +520,7 @@ fn rename_directory_entry_noreplace(
     let result = unsafe {
         // SAFETY: both descriptors and NUL-terminated component names remain
         // live for the syscall. RENAME_NOREPLACE is one atomic boundary.
-        libc::renameat2(
+        linux_renameat2(
             source_parent.as_raw_fd(),
             source_name.as_ptr(),
             destination_parent.as_raw_fd(),
@@ -732,7 +754,7 @@ pub(crate) fn exchange(source: &Path, destination: &Path) -> Result<()> {
     let result = unsafe {
         // SAFETY: the names are NUL terminated and relative to the live
         // directory descriptor. RENAME_EXCHANGE is one atomic kernel action.
-        libc::renameat2(
+        linux_renameat2(
             directory.as_raw_fd(),
             source_name.as_ptr(),
             directory.as_raw_fd(),
