@@ -5571,6 +5571,9 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        // Keep the crate-wide order URL_ENV_LOCK -> TEST_ENV_LOCK. This test
+        // redirects usage endpoints as well as the process-global profile home.
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());

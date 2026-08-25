@@ -389,19 +389,22 @@ mod tests {
 
     #[test]
     fn hidden_self_update_cleanup_keeps_every_exact_attestation() {
+        const DISPLACED: &str = r"C:\Program Files\.codex-switch-global-pace.exe.self-update-displaced-00112233445566778899aabbccddeeff";
+        const JOURNAL: &str =
+            r"C:\Program Files\.codex-switch-global-pace.exe.self-update-cleanup-journal";
         let cli = Cli::try_parse_from([
             "codex-switch-global-pace",
             "__cleanup-self-update",
             "--parent-pid",
             "42",
             "--displaced",
-            r"C:\Program Files\.codex-switch-global-pace.exe.self-update-displaced-00112233445566778899aabbccddeeff",
+            DISPLACED,
             "--expected-token",
             "1:2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--expected-executable-token",
             "3:4|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "--journal",
-            r"C:\Program Files\.codex-switch-global-pace.exe.self-update-cleanup-journal",
+            JOURNAL,
             "--expected-journal-token",
             "5:6|cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "--ready-nonce",
@@ -422,9 +425,7 @@ mod tests {
             panic!("expected self-update cleanup command");
         };
         assert_eq!(parent_pid, 42);
-        assert!(displaced.ends_with(
-            ".codex-switch-global-pace.exe.self-update-displaced-00112233445566778899aabbccddeeff"
-        ));
+        assert_eq!(displaced, std::path::PathBuf::from(DISPLACED));
         assert_eq!(
             expected_token,
             "1:2|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -433,7 +434,7 @@ mod tests {
             expected_executable_token,
             "3:4|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
-        assert!(journal.ends_with(".codex-switch-global-pace.exe.self-update-cleanup-journal"));
+        assert_eq!(journal, std::path::PathBuf::from(JOURNAL));
         assert_eq!(
             expected_journal_token,
             "5:6|cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
