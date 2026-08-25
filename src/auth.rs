@@ -146,7 +146,7 @@ fn validate_existing_directory_components(name: &str, path: &Path) -> Result<()>
     #[cfg(unix)]
     if encountered_missing && let Some((existing_parent, metadata)) = parent {
         use std::os::unix::fs::MetadataExt as _;
-        if metadata.mode() & 0o022 != 0 && metadata.mode() & libc::S_ISVTX == 0 {
+        if metadata.mode() & 0o022 != 0 && !unix_mode_is_sticky(metadata.mode()) {
             anyhow::bail!(
                 "{name} would create a private entry in a group- or other-writable non-sticky directory: {}",
                 existing_parent.display()
@@ -171,7 +171,7 @@ fn validate_unix_directory_component(
     if let Some((parent_path, parent_metadata)) = parent {
         let parent_mode = parent_metadata.mode();
         if parent_mode & 0o022 != 0 {
-            if parent_mode & libc::S_ISVTX == 0 {
+            if !unix_mode_is_sticky(parent_mode) {
                 anyhow::bail!(
                     "{name} crosses a group- or other-writable non-sticky directory that can replace private path entries: {}",
                     parent_path.display()
@@ -201,6 +201,11 @@ fn validate_unix_directory_component(
         );
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn unix_mode_is_sticky(mode: u32) -> bool {
+    mode & u32::from(libc::S_ISVTX) != 0
 }
 
 fn metadata_lookup_requires_parent(error: &std::io::Error) -> bool {
@@ -2094,13 +2099,23 @@ pub(crate) fn atomic_write_private_if_unchanged(
 }
 
 #[cfg(windows)]
-fn windows_current_user_sid_string(path: &Path) -> Result<String> {
+#[derive(Debug)]
+struct WindowsTokenOwnership {
+    user_sid: String,
+    default_owner_sid: String,
+}
+
+#[cfg(windows)]
+fn windows_current_token_ownership(path: &Path) -> Result<WindowsTokenOwnership> {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, PSID, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+        TokenOwner, TokenUser,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     struct OwnedHandle(HANDLE);
@@ -2123,56 +2138,93 @@ fn windows_current_user_sid_string(path: &Path) -> Result<String> {
         )
     };
 
+    fn token_information(
+        token: HANDLE,
+        class: TOKEN_INFORMATION_CLASS,
+        description: &str,
+        path: &Path,
+    ) -> Result<Vec<usize>> {
+        let mut bytes = 0;
+        let probe_ok = unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut bytes) };
+        let probe_error = std::io::Error::last_os_error();
+        if probe_ok != 0
+            || bytes == 0
+            || probe_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+        {
+            anyhow::bail!(
+                "GetTokenInformation({description}) size failed for {}: {probe_error}",
+                path.display()
+            );
+        }
+        let words = (bytes as usize).div_ceil(std::mem::size_of::<usize>());
+        let mut information = vec![0usize; words];
+        if unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                information.as_mut_ptr().cast(),
+                bytes,
+                &mut bytes,
+            )
+        } == 0
+        {
+            anyhow::bail!(
+                "GetTokenInformation({description}) failed for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(information)
+    }
+
+    fn sid_string(sid: PSID, description: &str, path: &Path) -> Result<String> {
+        if sid.is_null() {
+            anyhow::bail!(
+                "GetTokenInformation({description}) returned a null SID for {}",
+                path.display()
+            );
+        }
+        let mut string_sid = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut string_sid) } == 0 {
+            anyhow::bail!(
+                "ConvertSidToStringSidW({description}) failed for {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        let _string_sid = LocalAllocation(string_sid.cast());
+        let mut sid_len = 0;
+        while unsafe { *string_sid.add(sid_len) } != 0 {
+            sid_len += 1;
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, sid_len) }).with_context(
+            || {
+                format!(
+                    "decoding ConvertSidToStringSidW({description}) output for {}",
+                    path.display()
+                )
+            },
+        )
+    }
+
     let mut token = null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(last_error("OpenProcessToken"));
     }
     let _token = OwnedHandle(token);
-    let mut token_user_bytes = 0;
-    let probe_ok =
-        unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut token_user_bytes) };
-    let probe_error = std::io::Error::last_os_error();
-    if probe_ok != 0
-        || token_user_bytes == 0
-        || probe_error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
-    {
-        anyhow::bail!(
-            "GetTokenInformation(TokenUser size) failed for {}: {probe_error}",
-            path.display()
-        );
-    }
-    let words = (token_user_bytes as usize).div_ceil(std::mem::size_of::<usize>());
-    let mut token_user = vec![0usize; words];
-    if unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            token_user.as_mut_ptr().cast(),
-            token_user_bytes,
-            &mut token_user_bytes,
-        )
-    } == 0
-    {
-        return Err(last_error("GetTokenInformation(TokenUser)"));
-    }
+    let token_user = token_information(token, TokenUser, "TokenUser", path)?;
+    let token_owner = token_information(token, TokenOwner, "TokenOwner", path)?;
     let user_sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
-    let mut string_sid = null_mut();
-    if unsafe { ConvertSidToStringSidW(user_sid, &mut string_sid) } == 0 {
-        return Err(last_error("ConvertSidToStringSidW"));
-    }
-    let _string_sid = LocalAllocation(string_sid.cast());
-    let mut sid_len = 0;
-    while unsafe { *string_sid.add(sid_len) } != 0 {
-        sid_len += 1;
-    }
-    String::from_utf16(unsafe { std::slice::from_raw_parts(string_sid, sid_len) }).with_context(
-        || {
-            format!(
-                "decoding ConvertSidToStringSidW output for {}",
-                path.display()
-            )
-        },
-    )
+    let default_owner_sid = unsafe { (*(token_owner.as_ptr().cast::<TOKEN_OWNER>())).Owner };
+    Ok(WindowsTokenOwnership {
+        user_sid: sid_string(user_sid, "TokenUser", path)?,
+        default_owner_sid: sid_string(default_owner_sid, "TokenOwner", path)?,
+    })
+}
+
+#[cfg(windows)]
+fn windows_current_user_sid_string(path: &Path) -> Result<String> {
+    Ok(windows_current_token_ownership(path)?.user_sid)
 }
 
 #[cfg(windows)]
@@ -2234,15 +2286,28 @@ fn require_windows_path_owner(path: &Path, description: &str) -> Result<()> {
     }
     let owner_sid =
         String::from_utf16(unsafe { std::slice::from_raw_parts(owner_string, owner_len) })?;
-    let current_sid = windows_current_user_sid_string(path)?;
-    if owner_sid != current_sid {
+    let token_ownership = windows_current_token_ownership(path)?;
+    if !windows_owner_sid_matches_token(
+        &owner_sid,
+        &token_ownership.user_sid,
+        &token_ownership.default_owner_sid,
+    ) {
         anyhow::bail!(
-            "{description} must be owned by the current Windows user: {} is owned by SID {}",
+            "{description} must be owned by the current Windows token user or its default owner: {} is owned by SID {}",
             path.display(),
             owner_sid
         );
     }
     Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_owner_sid_matches_token(
+    owner_sid: &str,
+    user_sid: &str,
+    default_owner_sid: &str,
+) -> bool {
+    owner_sid == user_sid || owner_sid == default_owner_sid
 }
 
 #[cfg(any(windows, test))]
@@ -3402,6 +3467,28 @@ mod tests {
             !sddl.contains("S-1-1-0"),
             "the exact DACL path must not preserve unknown explicit ACEs"
         );
+    }
+
+    #[test]
+    fn windows_private_owner_accepts_only_the_token_user_or_default_owner() {
+        let user = "S-1-5-21-1-2-3-1001";
+        let default_owner = "S-1-5-32-544";
+
+        assert!(super::windows_owner_sid_matches_token(
+            user,
+            user,
+            default_owner
+        ));
+        assert!(super::windows_owner_sid_matches_token(
+            default_owner,
+            user,
+            default_owner
+        ));
+        assert!(!super::windows_owner_sid_matches_token(
+            "S-1-5-21-9-9-9-1002",
+            user,
+            default_owner
+        ));
     }
 
     #[test]

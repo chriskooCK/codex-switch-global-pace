@@ -4518,7 +4518,7 @@ mod tests {
         let target = temp.path().join("running-self-updater.exe");
         let candidate = temp.path().join("replacement-candidate.exe");
         fs::copy(&source, &target).expect("copy running updater image");
-        fs::hard_link(&source, &candidate).expect("link replacement candidate fixture");
+        fs::copy(&source, &candidate).expect("copy replacement candidate fixture");
         let target = fs::canonicalize(target).expect("resolve copied updater image");
         let candidate = fs::canonicalize(candidate).expect("resolve first update candidate");
         let crash_holder_exit_sentinel = temp.path().join("crash-holder-exited");

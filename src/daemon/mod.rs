@@ -4098,7 +4098,7 @@ mod tests {
     }
 
     #[test]
-    fn installer_capture_accepts_the_same_file_through_a_symlinked_ancestor() {
+    fn installer_capture_rejects_the_same_file_through_a_symlinked_ancestor() {
         use std::os::unix::fs::symlink;
 
         let home = tempfile::tempdir().expect("temp identity root");
@@ -4111,8 +4111,17 @@ mod tests {
         symlink(&real_root, &alias_root).expect("create ancestor symlink");
         let installer_bound = alias_root.join("bin/codex-switch-global-pace");
 
-        super::validate_running_daemon_executable(&installer_bound, 4242, &running)
-            .expect("an ancestor alias that resolves to the same direct file must be accepted");
+        let error = super::validate_running_daemon_executable(&installer_bound, 4242, &running)
+            .expect_err("an ancestor symlink must not bypass direct executable binding");
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("opening direct transaction directory component"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(&alias_root.display().to_string()),
+            "{detail}"
+        );
     }
 
     #[test]

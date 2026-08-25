@@ -1753,11 +1753,13 @@ mod tests {
         assert!(failures.is_empty());
     }
 
-    // Process-global auth paths are serialized by TEST_ENV_LOCK. This test uses
-    // a current-thread runtime, and no awaited task tries to reacquire it.
+    // Endpoint variables and auth paths are both process-global. Always acquire
+    // URL_ENV_LOCK before TEST_ENV_LOCK so mixed URL/home fixtures cannot race
+    // and tests needing both locks have one deadlock-free ordering.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
     async fn auth_read_finishing_after_the_budget_does_not_open_a_rotation() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
         let _env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
