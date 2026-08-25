@@ -1,6 +1,6 @@
 # Changelog
 
-## v20260825.1.0 — 2026-08-25
+## v20260826.1.0 — 2026-08-26
 
 - **One credential-operation boundary** — Usage refresh, model discovery,
   warmup, reset-card redemption, and known-profile re-login now hold one
