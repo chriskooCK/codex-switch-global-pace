@@ -969,7 +969,8 @@ cleanup_install_exit() {
 }
 
 cleanup_installer_temp_directory() {
-  local observed_parent observed_parent_identity observed_identity
+  local observed_parent observed_physical_parent
+  local observed_parent_identity observed_identity
   [ -n "${TMP_DIR:-}" ] || return 0
   case "$TMP_DIR" in
     /*) ;;
@@ -990,6 +991,14 @@ cleanup_installer_temp_directory() {
       return 1
       ;;
   esac
+  observed_physical_parent="$(CDPATH= cd -P "$observed_parent" && pwd -P)" || {
+    TMP_CLEANUP_ERROR="could not resolve recorded temporary parent ${observed_parent}"
+    return 1
+  }
+  if [ "$observed_physical_parent" != "${TMP_DIR_PARENT:-}" ]; then
+    TMP_CLEANUP_ERROR="temporary parent is no longer the recorded physical path; preserved ${TMP_DIR}"
+    return 1
+  fi
   observed_parent_identity="$(file_identity "$observed_parent" 2>/dev/null)" || {
     TMP_CLEANUP_ERROR="could not identify recorded temporary parent ${observed_parent}"
     return 1
@@ -1257,6 +1266,80 @@ file_identity() (
     error "Failed to identify ${path}."
   fi
 )
+
+create_direct_installer_temp_directory() {
+  local probe logical_parent physical_parent physical_probe
+  local probe_identity physical_probe_identity
+  local observed_physical_parent observed_parent_identity
+
+  # Let mktemp select the platform's native root, but never put artifacts in
+  # a spelling that contains an aliased ancestor.
+  probe="$(mktemp -d)" \
+    || error "Could not discover the operating-system temporary directory."
+  case "$probe" in
+    /*) ;;
+    *)
+      error "mktemp returned a relative discovery path; it was preserved and will not be used as an installer root: ${probe}"
+      ;;
+  esac
+  [ ! -L "$probe" ] && [ -d "$probe" ] \
+    || error "mktemp did not create a direct discovery directory; preserved ${probe}."
+  probe_identity="$(file_identity "$probe")" \
+    || error "Could not identify temporary-root discovery directory ${probe}; it was preserved."
+
+  logical_parent="$(dirname "$probe")"
+  physical_parent="$(CDPATH= cd -P "$logical_parent" && pwd -P)" \
+    || error "Could not resolve the physical temporary root selected at ${logical_parent}; preserved ${probe}."
+  [ ! -L "$physical_parent" ] && [ -d "$physical_parent" ] \
+    || error "The resolved temporary root is not a direct directory; preserved ${probe}."
+
+  physical_probe="${physical_parent%/}/$(basename "$probe")"
+  physical_probe_identity="$(file_identity "$physical_probe")" \
+    || error "Could not bind the physical discovery directory ${physical_probe}; preserved ${probe}."
+  [ "$physical_probe_identity" = "$probe_identity" ] \
+    || error "The temporary-root discovery directory changed identity; preserved ${probe}."
+  TMP_DIR_PARENT="$physical_parent"
+  TMP_DIR_PARENT_IDENTITY="$(file_identity "$TMP_DIR_PARENT")" \
+    || error "Could not identify physical installer temporary root ${TMP_DIR_PARENT}; preserved ${probe}."
+  rmdir "$physical_probe" \
+    || error "Could not remove the verified empty temporary-root discovery directory ${physical_probe}."
+  if [ -e "$probe" ] || [ -L "$probe" ] \
+    || [ -e "$physical_probe" ] || [ -L "$physical_probe" ]
+  then
+    error "The verified temporary-root discovery directory still exists after removal: ${physical_probe}"
+  fi
+
+  observed_physical_parent="$(CDPATH= cd -P "$TMP_DIR_PARENT" && pwd -P)" \
+    || error "Could not re-resolve physical installer temporary root ${TMP_DIR_PARENT}."
+  if [ "$observed_physical_parent" != "$TMP_DIR_PARENT" ]; then
+    error "Physical installer temporary root became an alias after discovery: ${TMP_DIR_PARENT}"
+  fi
+  observed_parent_identity="$(file_identity "$TMP_DIR_PARENT")" \
+    || error "Could not re-identify physical installer temporary root ${TMP_DIR_PARENT}."
+  if [ "$observed_parent_identity" != "$TMP_DIR_PARENT_IDENTITY" ]; then
+    error "Physical installer temporary root changed after discovery: ${TMP_DIR_PARENT}"
+  fi
+  TMP_DIR="$(mktemp -d "${TMP_DIR_PARENT%/}/.${BINARY_NAME}.XXXXXXXXXX")" \
+    || error "Could not create an installer temporary directory below ${TMP_DIR_PARENT}."
+  if [ "$(dirname "$TMP_DIR")" != "$TMP_DIR_PARENT" ]; then
+    error "Installer temporary directory is not a direct child of its physical root; preserved ${TMP_DIR}."
+  fi
+  observed_physical_parent="$(CDPATH= cd -P "$TMP_DIR_PARENT" && pwd -P)" \
+    || error "Could not resolve physical installer temporary root after creation; preserved ${TMP_DIR}."
+  if [ "$observed_physical_parent" != "$TMP_DIR_PARENT" ]; then
+    error "Physical installer temporary root became an alias during creation; preserved ${TMP_DIR}."
+  fi
+  observed_parent_identity="$(file_identity "$TMP_DIR_PARENT")" \
+    || error "Could not re-identify physical installer temporary root ${TMP_DIR_PARENT}; preserved ${TMP_DIR}."
+  if [ "$observed_parent_identity" != "$TMP_DIR_PARENT_IDENTITY" ]; then
+    error "Physical installer temporary root changed during creation; preserved ${TMP_DIR}."
+  fi
+  [ ! -L "$TMP_DIR" ] && [ -d "$TMP_DIR" ] \
+    || error "mktemp did not create a direct installer temporary directory; preserved ${TMP_DIR}."
+  TMP_DIR_IDENTITY="$(file_identity "$TMP_DIR")" \
+    || error "Could not identify installer temporary directory ${TMP_DIR}; it was preserved."
+  TMP_CLEANUP_ERROR=""
+}
 
 render_profile_without_managed_path_block() {
   local source="$1" destination="$2"
@@ -2337,32 +2420,10 @@ fi
 info "Detected: ${PLATFORM}/${ARCH_NAME}"
 info "Downloading: ${DOWNLOAD_URL}"
 
-# Download, verify, and extract. Record both the direct directory and its
-# direct parent's identity before placing any artifact inside it; EXIT cleanup
-# refuses to recurse if either identity changes.
-TMP_DIR="$(mktemp -d)" || error "Could not create an installer temporary directory."
-case "$TMP_DIR" in
-  /*) ;;
-  *)
-    rmdir "$TMP_DIR" 2>/dev/null \
-      || error "mktemp returned a relative path and its empty directory could not be removed: ${TMP_DIR}"
-    error "mktemp returned a relative path; refusing recursive cleanup: ${TMP_DIR}"
-    ;;
-esac
-TMP_DIR_PARENT="$(dirname "$TMP_DIR")"
-case "$TMP_DIR" in
-  "${TMP_DIR_PARENT%/}/"*) ;;
-  *) error "Installer temporary directory is not below its direct recorded root: ${TMP_DIR}" ;;
-esac
-[ ! -L "$TMP_DIR_PARENT" ] && [ -d "$TMP_DIR_PARENT" ] \
-  || error "Installer temporary parent is not a direct directory: ${TMP_DIR_PARENT}"
-TMP_DIR_PARENT_IDENTITY="$(file_identity "$TMP_DIR_PARENT")" \
-  || error "Could not identify installer temporary parent ${TMP_DIR_PARENT}."
-[ ! -L "$TMP_DIR" ] && [ -d "$TMP_DIR" ] \
-  || error "mktemp did not create a direct temporary directory: ${TMP_DIR}"
-TMP_DIR_IDENTITY="$(file_identity "$TMP_DIR")" \
-  || error "Could not identify installer temporary directory ${TMP_DIR}."
-TMP_CLEANUP_ERROR=""
+# Download, verify, and extract. Resolve the platform-selected temporary root
+# before creating any directory that will hold release artifacts. Cleanup later
+# refuses to recurse if the exact physical parent or final directory identity
+# changes.
 INSTALL_STAGE="${INSTALL_DIR}/${INSTALL_STAGE_NAME}"
 INSTALL_BACKUP="${INSTALL_DIR}/${INSTALL_BACKUP_NAME}"
 INSTALL_STAGE_OWNED=false
@@ -2390,8 +2451,14 @@ LEGACY_ORIGINAL_TOKEN=""
 UNINSTALL_HOLD=""
 UNINSTALL_STAGE=""
 reset_managed_path_transaction
+TMP_DIR=""
+TMP_DIR_PARENT=""
+TMP_DIR_PARENT_IDENTITY=""
+TMP_DIR_IDENTITY=""
+TMP_CLEANUP_ERROR=""
 trap 'cleanup_install_exit' EXIT
 trap 'exit 130' INT
+create_direct_installer_temp_directory
 
 curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" || error "Download failed. Check the URL or your network."
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
