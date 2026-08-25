@@ -53,6 +53,7 @@ impl ShutdownRequestOutcome {
         &self.target
     }
 
+    #[cfg(target_os = "windows")]
     pub(crate) fn target_is_running(&self) -> Result<bool> {
         Ok(running_generation_checked()?.as_ref() == Some(&self.target))
     }

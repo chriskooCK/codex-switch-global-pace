@@ -1224,6 +1224,7 @@ fn require_service_snapshot(path: &Path, expected: Option<&ServiceFileSnapshot>)
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn definition_snapshot_matches(current: Option<&[u8]>, expected: Option<&[u8]>) -> bool {
     match (current, expected) {
         (Some(current), Some(expected)) => current == expected,
@@ -1512,10 +1513,6 @@ struct ServiceFilePublication {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 impl ServiceFilePublication {
-    fn had_previous(&self) -> bool {
-        self.displaced.is_some()
-    }
-
     fn commit(&mut self) -> Result<()> {
         match self.state {
             ServiceFileTransactionState::Pending => {}
@@ -3327,7 +3324,7 @@ fn rollback_systemd_install(
             &["enable", SYSTEMD_UNIT_NAME],
             "restore enabled service state",
         )?;
-    } else if publication.had_previous() {
+    } else if publication.displaced.is_some() {
         systemctl_require(
             &["disable", SYSTEMD_UNIT_NAME],
             "restore disabled service state",
