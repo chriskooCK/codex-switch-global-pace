@@ -2914,6 +2914,7 @@ fn promote_import_stage(
             alias
         )
     })?;
+    #[cfg(windows)]
     let destination_token = creation.token().clone();
     if matches!(
         creation,
