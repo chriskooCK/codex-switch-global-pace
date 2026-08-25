@@ -677,6 +677,7 @@ impl PublicationRecoveryOwner {
         }
     }
 
+    #[cfg(target_os = "windows")]
     fn pending_mut(&mut self) -> &mut PendingReplacement {
         self.pending
             .as_mut()
