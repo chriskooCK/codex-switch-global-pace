@@ -107,7 +107,7 @@ fn validate_nearest_existing_directory(name: &str, path: &Path) -> Result<()> {
                 }
                 return Ok(());
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if metadata_lookup_requires_parent(&error) => continue,
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("inspecting {name} component {}", component.display())
@@ -118,6 +118,13 @@ fn validate_nearest_existing_directory(name: &str, path: &Path) -> Result<()> {
     anyhow::bail!(
         "{name} has no existing directory ancestor: {}",
         path.display()
+    )
+}
+
+fn metadata_lookup_requires_parent(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
     )
 }
 
@@ -444,7 +451,7 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
                 }
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if metadata_lookup_requires_parent(&error) => {
                 missing.push(cursor.to_path_buf());
                 cursor = cursor.parent().ok_or_else(|| {
                     anyhow::anyhow!(
