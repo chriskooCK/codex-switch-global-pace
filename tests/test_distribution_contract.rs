@@ -199,6 +199,8 @@ fn ci_covers_dev_and_all_supported_hosts() {
         "ubuntu-latest",
         "macos-latest",
         "windows-latest",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-musl",
     ] {
         assert!(
             workflow.contains(required),
@@ -218,6 +220,8 @@ fn ci_runs_build_test_lint_format_audit_and_script_parsers() {
         "cargo fmt --check",
         "cargo audit",
         "bash -n scripts/install.sh",
+        "cargo build --release --locked --target x86_64-unknown-linux-musl",
+        "cross build --release --locked --target aarch64-unknown-linux-musl",
     ] {
         assert!(
             workflow.contains(command),
@@ -3655,11 +3659,22 @@ fn unix_installer_aborts_if_profile_inode_changes() {
 
 #[test]
 fn release_build_installs_cross_with_locked_dependencies() {
-    let workflow = repo_file(".github/workflows/release.yml");
+    let release = repo_file(".github/workflows/release.yml");
+    let ci = repo_file(".github/workflows/ci.yml");
+    let install = "cargo install cross --locked --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a";
 
-    assert!(workflow.contains(
-        "cargo install cross --locked --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a"
-    ));
+    assert!(release.contains(install));
+    assert!(ci.contains(install));
+}
+
+#[test]
+fn linux_atomic_rename_binding_is_shared_by_gnu_and_musl() {
+    let source = repo_file("src/fs_ops.rs");
+
+    assert!(source.contains("libc::syscall("));
+    assert!(source.contains("libc::SYS_renameat2"));
+    assert_eq!(source.matches("linux_renameat2(").count(), 4);
+    assert!(!source.contains("libc::renameat2("));
 }
 
 #[test]

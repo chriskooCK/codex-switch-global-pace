@@ -36,6 +36,25 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  linux-release-targets:
+    name: Build Linux release targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch head 2026-07-16
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - name: Install Linux target tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          cargo install cross --locked --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a
+      - name: Build Linux AMD64 release target
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Build Linux ARM64 release target
+        run: cross build --release --locked --target aarch64-unknown-linux-musl
+
   test:
     name: Test (${{ matrix.host }})
     strategy:

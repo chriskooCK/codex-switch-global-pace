@@ -86,7 +86,9 @@
   PATH, and service mutations among independent child commands. Unix installers
   resolve the operating system's selected temporary root before creating the
   artifact directory, so aliased roots such as macOS `/var` cannot bypass or
-  conflict with direct-path validation. Stable release
+  conflict with direct-path validation. Linux atomic renames now use one kernel
+  syscall binding on both GNU and musl targets, and branch CI compiles both Linux
+  distribution targets before a release tag can move. Stable release
   candidates use one deterministic tag per release; interrupted drafts are
   discovered through the authenticated paginated release list, rejected when
   duplicate, and reverified by release ID before cleanup. Mismatched remote state
