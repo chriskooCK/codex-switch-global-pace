@@ -777,7 +777,7 @@ mod tests {
         );
         assert_eq!(
             color_for(Some(100.0), Some(now + crate::usage::WINDOW_7D_SECS / 2)),
-            Some(C_RED)
+            Some(C_YELLOW)
         );
         assert_eq!(color_for(Some(20.0), None), Some(DIM));
 
@@ -790,7 +790,7 @@ mod tests {
             quota_window_lines(&full, "7d", crate::usage::WINDOW_7D_SECS)[0]
                 .spans
                 .iter()
-                .all(|span| span.content.as_ref() != "┃")
+                .any(|span| span.content.as_ref() == "┃")
         );
 
         let missing = WindowUsage {

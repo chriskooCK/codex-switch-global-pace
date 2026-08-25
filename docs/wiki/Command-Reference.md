@@ -14,7 +14,7 @@ applies when the Windows executable is launched directly.
 | `list [-f]` | Show profiles, usage, and availability; `-f` / `--force` bypasses the cache. |
 | `use [alias] [--consume-card]` | Switch explicitly, or omit the alias to auto-select with the unified scoring algorithm. When the pool is exhausted, `--consume-card` consumes the earliest-expiring reset card to revive an account (auto-select only; ignored when an alias is given). |
 | `reset-card <alias> [-y]` | Consume the earliest-expiring reset card for a profile after confirmation; `-y` / `--yes` skips the prompt. |
-| `warmup [alias]` | Send a minimal request to activate the quota-window countdown for one or all profiles. |
+| `warmup [alias]` | Send a minimal request to activate the quota-window countdown for one or all profiles. Supports the global `--json` mode with per-profile results and a top-level `ok` field. |
 | `rename <old> <new>` | Rename a saved profile. |
 | `delete <alias> [-y]` | Move an inactive profile into recoverable deleted storage; `-y` / `--yes` skips the prompt. |
 | `daemon start [--foreground]` | Start the Beta daemon, detached by default; `--foreground` is for service managers. |
@@ -29,7 +29,7 @@ applies when the Windows executable is launched directly.
 
 | Option | Environment variable | Behavior |
 |---|---|---|
-| `--json` | — | Compact structured output (supported by `list`, `use`, `reset-card`, `rename`, `delete`, `login`, `import`, `self-update`, `daemon status`). |
+| `--json` | — | Compact structured output (supported by `list`, `use`, `reset-card`, `warmup`, `rename`, `delete`, `login`, `import`, `self-update`, `daemon status`). |
 | `--json-pretty` | — | Indented structured output. |
 | `--proxy <URL>` | `CS_PROXY` | Override proxy configuration for this process; supports `http(s)://`, `socks4://`, `socks5://`, and `socks5h://` (remote DNS). |
 | `--color <auto\|always\|never>` | `CS_COLOR` | Control terminal color. `NO_COLOR` disables color regardless of this option. |
@@ -48,6 +48,7 @@ Examples:
 ```bash
 codex-switch-global-pace --json list
 codex-switch-global-pace --json use work
+codex-switch-global-pace --json warmup
 codex-switch-global-pace self-update --check
 ```
 
@@ -63,7 +64,7 @@ codex-switch-global-pace self-update --check
 | `r` | Refresh visible accounts |
 | `a` | Add a new account |
 | `t` | Toggle auto-refresh |
-| `W` | Toggle auto-warmup for accounts whose 5h window has expired |
+| `W` | Toggle auto-warmup for paid accounts whose primary 5h window, or Free accounts whose weekly window, has expired |
 | `i` | Toggle the compact quota panel on the main view |
 | `s` | Cycle sort order (name / quota / status) |
 | `Space` | Mark or unmark an account |

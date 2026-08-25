@@ -6,19 +6,23 @@ mod commands;
 mod config;
 mod daemon;
 mod error;
+mod fs_ops;
+mod installer_fs;
+mod installer_registry;
 mod jwt;
 mod logging;
 mod login;
 mod output;
 mod profile;
 mod signals;
+mod task_batch;
 mod tui;
 mod update;
 mod usage;
 mod warmup;
 mod workspace;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands};
 use output::{MessageMode, print_error, user_println};
@@ -49,16 +53,61 @@ fn should_report_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<OutputAlreadyReported>().is_none()
 }
 
-/// The post-command profile re-sync (see `dispatch`) is best-effort: most failures
-/// (profile deleted mid-command, unreadable auth.json, IO errors) are expected and stay
-/// silent, same as before. The one case that must not be silent is
-/// `ensure_live_not_older` refusing to overwrite a profile with older/unstamped live
-/// credentials — that guard is protecting a single-use refresh token from being
-/// destroyed, and its own error message already carries both timestamps and the
-/// actionable next step, so surfacing it is just choosing to show information already
-/// computed.
-fn is_resync_freshness_guard_rejection(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<profile::StaleLiveAuth>().is_some()
+/// Post-command re-sync is best-effort so the command's result remains intact,
+/// but every failure is surfaced. Silent I/O, identity, or freshness failures
+/// can otherwise leave a newly-rotated profile credential out of sync with the
+/// live Codex credential without giving the user a way to diagnose it.
+fn format_post_command_sync_warning(error: &anyhow::Error) -> String {
+    format!("Warning: post-command profile sync did not fully complete: {error:#}")
+}
+
+fn preserve_command_result_after_sync<T>(
+    command_result: Result<T>,
+    sync_result: Result<()>,
+    mut report_sync_error: impl FnMut(&anyhow::Error),
+) -> Result<T> {
+    if let Err(error) = &sync_result {
+        report_sync_error(error);
+    }
+    command_result
+}
+
+fn confirmed_sync_marker(alias: &str) -> Result<profile::CurrentMarkerSnapshot> {
+    let marker = profile::read_current_marker_snapshot_checked()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "current profile marker disappeared after profile '{alias}' was synchronized"
+        )
+    })?;
+    if marker.alias() != alias {
+        anyhow::bail!(
+            "current profile marker changed from synchronized profile '{alias}' to '{}'",
+            marker.alias()
+        );
+    }
+    Ok(marker)
+}
+
+fn resync_profile_after_command(expected_marker: &profile::CurrentMarkerSnapshot) -> Result<()> {
+    profile::ensure_current_marker_unchanged(expected_marker)?;
+    let live_path = auth::codex_auth_path()?;
+    match profile::find_matching_profile_checked(&live_path)? {
+        Some(actual) if actual == expected_marker.alias() => {
+            profile::ensure_current_marker_unchanged(expected_marker)?;
+        }
+        Some(actual) => {
+            anyhow::bail!(
+                "live auth now belongs to profile '{actual}' instead of the startup-synchronized profile '{}'; no profile was guessed or overwritten",
+                expected_marker.alias()
+            );
+        }
+        None => {
+            profile::update_profile_from_live_if_current_marker(
+                expected_marker.alias(),
+                expected_marker,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Build the confirmation prompt for syncing live `auth.json` credentials back into a
@@ -82,6 +131,19 @@ fn read_last_refresh(path: Result<std::path::PathBuf>) -> Option<String> {
     val.get("last_refresh")?.as_str().map(str::to_string)
 }
 
+fn read_live_account_label() -> Result<String> {
+    let path = auth::codex_auth_path().context("resolving the live auth path for display")?;
+    let value = auth::read_auth(&path).with_context(|| {
+        format!(
+            "reading live auth account information at {}",
+            path.display()
+        )
+    })?;
+    Ok(profile::extract_identity(&value)
+        .email
+        .unwrap_or_else(|| "unknown".to_string()))
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -93,6 +155,54 @@ async fn main() {
         if let Err(error) = update::hold_update_lock_from_env() {
             eprintln!("Error: {error:#}");
             std::process::exit(1);
+        }
+        return;
+    }
+
+    // Keep the direct installer's daemon lifecycle authority in one
+    // process from the pre-replacement stop through an explicit commit or
+    // rollback acknowledgement. Protocol markers are the only stdout output.
+    if let Some(Commands::HoldDaemonUpdateBoundary {
+        initial_executable,
+        replacement_executable,
+    }) = &cli.command
+    {
+        output::set_message_mode(MessageMode::Silent);
+        let result = daemon::hold_installer_daemon_update_boundary(
+            initial_executable.clone(),
+            replacement_executable.clone(),
+        );
+        if let Err(error) = result {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // The release-verified direct installer uses this hidden boundary for one
+    // explicit file at a time. Keep it ahead of all application initialization.
+    if let Some(Commands::InstallerFileOp {
+        operation,
+        source,
+        destination,
+        displaced,
+        expected_token,
+        expected_destination_token,
+    }) = &cli.command
+    {
+        match installer_fs::execute(
+            *operation,
+            source.as_deref(),
+            destination.as_deref(),
+            displaced.as_deref(),
+            expected_token.as_deref(),
+            expected_destination_token.as_deref(),
+        ) {
+            Ok(result) => println!("{result}"),
+            Err(error) => {
+                eprintln!("Error: {error:#}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -151,7 +261,13 @@ async fn main() {
     } else if std::env::var_os("RUST_LOG").is_some() {
         EnvFilter::from_default_env()
     } else if matches!(&cli.command, Some(Commands::Daemon(_))) {
-        let level = config::daemon_log_level();
+        let level = config::daemon_log_level().unwrap_or_else(|error| {
+            eprintln!(
+                "{}",
+                color::error(&format!("Error: failed to read daemon log level: {error}"))
+            );
+            std::process::exit(1);
+        });
         EnvFilter::new(format!("codex_switch_global_pace={level}"))
     } else {
         EnvFilter::new("codex_switch_global_pace=error")
@@ -184,7 +300,16 @@ async fn main() {
     for warning in config::startup_warnings() {
         eprintln!("{}", color::warn(&format!("Warning: {warning}")));
     }
-    config::set_cli_proxy(cli.proxy.clone());
+    if let Some(proxy) = cli.proxy.clone()
+        && let Err(error) = config::set_cli_proxy(proxy)
+    {
+        if use_json {
+            print_error(&error.to_string());
+        } else {
+            eprintln!("{}", color::error(&format!("Error: {error}")));
+        }
+        std::process::exit(1);
+    }
 
     let result = dispatch(cli.command, use_json).await;
 
@@ -273,47 +398,91 @@ mod error_reporting_tests {
 
 #[cfg(test)]
 mod resync_reporting_tests {
-    use super::{format_resync_confirm_prompt, is_resync_freshness_guard_rejection};
+    use super::{
+        Commands, dispatch, format_post_command_sync_warning, format_resync_confirm_prompt,
+        preserve_command_result_after_sync,
+    };
 
-    #[test]
-    fn freshness_guard_rejection_for_older_live_is_reported() {
-        let error = anyhow::Error::from(crate::profile::StaleLiveAuth {
-            alias: "acme".to_string(),
-            live: "2026-01-01T00:00:00Z".to_string(),
-            profile: "2026-02-01T00:00:00Z".to_string(),
-        });
-        assert!(is_resync_freshness_guard_rejection(&error));
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 
     #[test]
-    fn freshness_guard_rejection_survives_added_context() {
-        // The re-sync path may wrap the refusal before it reaches the reporter;
-        // downcast has to see through that, which a message-prefix match would not.
-        let error = anyhow::Error::from(crate::profile::StaleLiveAuth {
-            alias: "acme".to_string(),
-            live: "no last_refresh".to_string(),
-            profile: "2026-02-01T00:00:00Z".to_string(),
-        })
-        .context("syncing profile 'acme' after the command");
-        assert!(is_resync_freshness_guard_rejection(&error));
+    fn every_resync_failure_is_reported_without_changing_the_command_result() {
+        let error = anyhow::anyhow!("authenticated account does not match profile 'acme'");
+        let warning = format_post_command_sync_warning(&error);
+        assert!(warning.contains("Warning: post-command profile sync did not fully complete"));
+        assert!(warning.contains("authenticated account does not match"));
     }
 
     #[test]
-    fn a_message_that_merely_looks_like_the_guard_is_not_treated_as_one() {
-        // Before this was typed, any error whose text began with "live auth.json"
-        // was reported as the guard firing.
-        let lookalike = anyhow::anyhow!("live auth.json could not be read: permission denied");
-        assert!(!is_resync_freshness_guard_rejection(&lookalike));
+    fn command_errors_remain_primary_after_a_post_sync_error() {
+        let command_error = anyhow::anyhow!("command failed after a credential rotation");
+        let sync_error = anyhow::anyhow!("current marker changed");
+        let mut reported = None;
+
+        let result: anyhow::Result<()> =
+            preserve_command_result_after_sync(Err(command_error), Err(sync_error), |error| {
+                reported = Some(error.to_string())
+            });
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "command failed after a credential rotation"
+        );
+        assert_eq!(reported.as_deref(), Some("current marker changed"));
+
+        let mut success_warning = None;
+        let success = preserve_command_result_after_sync(
+            Ok(7),
+            Err(anyhow::anyhow!("marker disappeared")),
+            |error| success_warning = Some(error.to_string()),
+        )
+        .unwrap();
+        assert_eq!(success, 7);
+        assert_eq!(success_warning.as_deref(), Some("marker disappeared"));
     }
 
-    #[test]
-    fn unrelated_resync_errors_stay_silent() {
-        let identity_mismatch =
-            anyhow::anyhow!("authenticated account does not match profile 'acme'");
-        assert!(!is_resync_freshness_guard_rejection(&identity_mismatch));
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn dispatch_fails_before_running_a_command_when_auth_detection_errors() {
+        crate::config::init_defaults_for_tests();
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", "relative-auth-home");
 
-        let missing_profile = anyhow::anyhow!("profile 'acme' does not exist");
-        assert!(!is_resync_freshness_guard_rejection(&missing_profile));
+        let error = dispatch(Some(Commands::List { force: false }), false)
+            .await
+            .expect_err("a live-auth path error must stop command dispatch");
+        let detail = format!("{error:#}");
+        assert!(detail.contains("checking live auth changes"), "{detail}");
+        assert!(
+            detail.contains("CODEX_HOME must be an absolute path"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -350,68 +519,63 @@ async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
                 | Some(Commands::Daemon(_))
         );
         if should_check {
-            check_auth_change()
+            check_auth_change()?
         } else {
             AuthCheckResult::NoChange
         }
     } else {
         AuthCheckResult::NoChange
     };
-    let auth_handled = !matches!(auth_check, AuthCheckResult::NoChange);
+    let auth_handled = !matches!(&auth_check, AuthCheckResult::NoChange);
 
-    match cmd {
-        Some(Commands::HoldUpdateLock) => {
-            anyhow::bail!("internal update-lock command reached normal command dispatch")
-        }
+    let command_result = match cmd {
+        Some(Commands::HoldUpdateLock) => Err(anyhow::anyhow!(
+            "internal update-lock command reached normal command dispatch"
+        )),
+        Some(Commands::HoldDaemonUpdateBoundary { .. }) => Err(anyhow::anyhow!(
+            "internal installer daemon-boundary command reached normal command dispatch"
+        )),
+        Some(Commands::InstallerFileOp { .. }) => Err(anyhow::anyhow!(
+            "internal installer file command reached normal command dispatch"
+        )),
         Some(Commands::Use {
             alias,
             consume_card,
-        }) => commands::use_cmd(alias.as_deref(), json, consume_card).await?,
-        Some(Commands::List { force }) => commands::list_cmd(force, json, auth_handled).await?,
+        }) => commands::use_cmd(alias.as_deref(), json, consume_card).await,
+        Some(Commands::List { force }) => commands::list_cmd(force, json, auth_handled).await,
         Some(Commands::ResetCard { alias, yes }) => {
-            commands::reset_card_cmd(&alias, yes, json).await?
+            commands::reset_card_cmd(&alias, yes, json).await
         }
-        Some(Commands::Rename { old, new }) => commands::rename_cmd(&old, &new, json)?,
-        Some(Commands::Delete { alias, yes }) => commands::delete_cmd(&alias, yes, json)?,
+        Some(Commands::Rename { old, new }) => commands::rename_cmd(&old, &new, json),
+        Some(Commands::Delete { alias, yes }) => commands::delete_cmd(&alias, yes, json),
         Some(Commands::Login { alias, device }) => {
-            commands::login_cmd(alias.as_deref(), device, json).await?
+            commands::login_cmd(alias.as_deref(), device, json).await
         }
         Some(Commands::Import { path, alias }) => {
-            commands::import_cmd(&path, alias.as_deref(), json).await?
+            commands::import_cmd(&path, alias.as_deref(), json).await
         }
         Some(Commands::SelfUpdate {
             check,
             version,
             dev,
             stable,
-        }) => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
-        Some(Commands::Warmup { alias }) => commands::warmup_cmd(alias.as_deref(), json).await?,
-        Some(Commands::Open) => commands::open_cmd()?,
-        Some(Commands::Daemon(sub)) => daemon::dispatch(sub, json).await?,
-        None => tui::run_tui().await?,
-    }
+        }) => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await,
+        Some(Commands::Warmup { alias }) => commands::warmup_cmd(alias.as_deref(), json).await,
+        Some(Commands::Open) => commands::open_cmd(),
+        Some(Commands::Daemon(sub)) => daemon::dispatch(sub, json).await,
+        None => tui::run_tui().await,
+    };
 
-    // If startup check actually synced the profile, re-sync after command execution
-    // to capture any token refreshes that happened during the command.
-    if matches!(auth_check, AuthCheckResult::Synced) {
-        let current = profile::read_current();
-        if !current.is_empty()
-            && auth::codex_auth_path()
-                .ok()
-                .as_ref()
-                .and_then(|p| profile::find_matching_profile(p))
-                .is_none()
-            && let Err(e) = profile::update_profile_from_live(&current)
-            && is_resync_freshness_guard_rejection(&e)
-        {
-            eprintln!(
-                "{}",
-                color::warn(&format!("Warning: post-command profile sync skipped: {e}"))
-            );
-        }
-    }
-
-    Ok(())
+    // Run this even when the command failed: a request may have rotated a
+    // single-use credential before a later step returned the command error.
+    // The original command result remains authoritative.
+    let sync_result = match &auth_check {
+        AuthCheckResult::Synced(expected_marker) => resync_profile_after_command(expected_marker),
+        AuthCheckResult::NoChange | AuthCheckResult::Detected => Ok(()),
+    };
+    preserve_command_result_after_sync(command_result, sync_result, |error| {
+        eprintln!("{}", color::warn(&format_post_command_sync_warning(error)));
+    })
 }
 
 // ── startup auth change detection ────────────────────────
@@ -420,25 +584,23 @@ async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
 enum AuthCheckResult {
     NoChange,
     Detected, // change detected but not synced (non-interactive or user declined)
-    Synced,   // change detected and user accepted the sync
+    /// Change detected and synchronized to this exact app-owned marker.
+    Synced(profile::CurrentMarkerSnapshot),
 }
 
-fn check_auth_change() -> AuthCheckResult {
+fn check_auth_change() -> Result<AuthCheckResult> {
     use std::io::{self, IsTerminal};
 
-    let change = profile::detect_auth_change();
+    let change = profile::detect_auth_change().context("checking live auth changes")?;
     if matches!(change, profile::AuthChange::NoChange) {
-        return AuthCheckResult::NoChange;
+        return Ok(AuthCheckResult::NoChange);
     }
 
     // Non-interactive stdin — don't prompt, don't silently mutate state
     if !io::stdin().is_terminal() {
         match &change {
             profile::AuthChange::NewAccount => {
-                let info = auth::codex_auth_path()
-                    .map(|p| auth::read_account_info(&p))
-                    .unwrap_or_default();
-                let label = info.email.as_deref().unwrap_or("unknown");
+                let label = read_live_account_label()?;
                 user_println(&format!(
                     "Detected new account ({label}) in auth.json (use `codex-switch-global-pace list` interactively to save)."
                 ));
@@ -450,17 +612,14 @@ fn check_auth_change() -> AuthCheckResult {
             }
             profile::AuthChange::NoChange => unreachable!(),
         }
-        return AuthCheckResult::Detected;
+        return Ok(AuthCheckResult::Detected);
     }
 
-    let mut synced = false;
+    let mut synced_alias: Option<String> = None;
 
     match change {
         profile::AuthChange::NewAccount => {
-            let info = auth::codex_auth_path()
-                .map(|p| auth::read_account_info(&p))
-                .unwrap_or_default();
-            let label = info.email.as_deref().unwrap_or("unknown");
+            let label = read_live_account_label()?;
             user_println(&format!(
                 "Detected new account ({label}) in auth.json — not in any saved profile."
             ));
@@ -468,17 +627,14 @@ fn check_auth_change() -> AuthCheckResult {
                 match profile::cmd_save(None) {
                     Ok(action) => {
                         user_println(&format!("Profile {}: {}", action.action(), action.alias()));
-                        synced = true;
+                        synced_alias = Some(action.alias().to_string());
                     }
                     Err(e) => eprintln!("{}", color::error(&format!("Failed to save: {e}"))),
                 }
             }
         }
         profile::AuthChange::TokensUpdated { alias } => {
-            let info = auth::codex_auth_path()
-                .map(|p| auth::read_account_info(&p))
-                .unwrap_or_default();
-            let label = info.email.as_deref().unwrap_or("unknown");
+            let label = read_live_account_label()?;
             user_println(&format!(
                 "auth.json credentials changed for account '{alias}' ({label})."
             ));
@@ -490,7 +646,7 @@ fn check_auth_change() -> AuthCheckResult {
                 match profile::update_profile_from_live(&alias) {
                     Ok(()) => {
                         user_println(&format!("Profile '{alias}' updated."));
-                        synced = true;
+                        synced_alias = Some(alias);
                     }
                     Err(e) => eprintln!("{}", color::error(&format!("Failed to update: {e}"))),
                 }
@@ -499,9 +655,19 @@ fn check_auth_change() -> AuthCheckResult {
         profile::AuthChange::NoChange => unreachable!(),
     }
 
-    if synced {
-        AuthCheckResult::Synced
-    } else {
-        AuthCheckResult::Detected
-    }
+    let Some(alias) = synced_alias else {
+        return Ok(AuthCheckResult::Detected);
+    };
+    Ok(match confirmed_sync_marker(&alias) {
+        Ok(marker) => AuthCheckResult::Synced(marker),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                color::error(&format!(
+                    "Failed to confirm the synchronized profile marker: {error:#}"
+                ))
+            );
+            AuthCheckResult::Detected
+        }
+    })
 }

@@ -39,6 +39,10 @@ Accounts are added by logging in with `codex-switch-global-pace login` or by imp
 | `$CODEX_SWITCH_HOME/*.lock` | Cross-process coordination files. |
 
 Unset variables default to `~/.codex` and `~/.codex-switch` respectively (`%USERPROFILE%\.codex-switch` on Windows).
+Each resolved state directory, or its nearest existing parent when the state
+directory has not been created yet, must be an ordinary directory rather than a
+symbolic link, Windows junction, or other reparse point. The same rule is
+checked at startup and at the private-write boundary.
 
 ## Settings
 
@@ -53,25 +57,33 @@ no_proxy = "localhost,127.0.0.1"
 ttl = 300                          # usage cache TTL in seconds
 
 [network]
-max_concurrent = 20                # concurrent usage requests; 0 is normalized to 1
+max_concurrent = 20                # 1 through the Tokio semaphore runtime limit
 
 [tui]
-auto_refresh_interval_secs = 120   # minimum 30; lower values are raised to 30
+auto_refresh_interval_secs = 120   # minimum 30 seconds
 
 [use]
 safety_margin_7d = 20              # 7d headroom % below which scoring penalizes
 team_priority = true               # prefer Team-plan accounts during selection
 
 [daemon]
-poll_interval_secs = 60            # usage poll; 0 is normalized to 60
-switch_threshold = 80              # 5h usage % that triggers an auto-switch
-cache_refresh_interval_secs = 300  # all-profile cache refresh; 0 is normalized to 300
+poll_interval_secs = 60            # usage poll; minimum 1 second
+switch_threshold = 80              # primary usage % that starts candidate search; secondary if no primary
+cache_refresh_interval_secs = 300  # all-profile cache refresh; minimum 1 second
 auto_warmup = false                # warm inactive quota windows during cache refresh
-token_check_interval_secs = 300    # proactive token refresh; 0 is normalized to 300
+token_check_interval_secs = 300    # proactive token refresh; minimum 1 second
 notify = false                     # desktop notification on switch
-log_level = "error"                # daemon log level; empty is normalized to "error"
+log_level = "error"                # non-empty tracing filter level
 defer_switch_while_codex_running = true  # hold a pending switch during interactive Codex sessions
 ```
+
+Configuration is validated once at startup and invalid values stop the command;
+they are not replaced with guessed defaults. `safety_margin_7d` and
+`switch_threshold` must be finite percentages from 0 through 100. Concurrency
+must fit the runtime semaphore, and every interval must fit the runtime timer;
+the poll interval validation includes its maximum 16× failure backoff. Unknown
+tables or keys are rejected so a misspelling cannot silently select a default,
+and a configured proxy URL is parsed at this same startup boundary.
 
 The legacy `[use] mode` and `[use] min_remaining` keys are ignored and produce a startup warning; the unified scoring algorithm replaced the old selection modes.
 The removed `[launch]` table is also ignored with a startup warning and can be deleted from existing configuration files.
@@ -80,8 +92,8 @@ The removed `[launch]` table is also ignored with a startup warning and can be d
 
 | Variable | Effect |
 |---|---|
-| `CODEX_HOME` | Codex's own home; `auth.json` and Codex's `config.toml` live here (default `~/.codex`). Paths containing `..` are rejected. |
-| `CODEX_SWITCH_HOME` | Relocates codex-switch-global-pace state (default `~/.codex-switch`); an empty value is ignored. |
+| `CODEX_HOME` | Codex's own home; `auth.json` and Codex's `config.toml` live here (default `~/.codex`). A non-empty override must be absolute, contain no `..`, must not be a filesystem root, and its nearest existing directory must not be a link or reparse point. |
+| `CODEX_SWITCH_HOME` | Relocates codex-switch-global-pace state (default `~/.codex-switch`); an empty value is ignored, and a non-empty override must be absolute, contain no `..`, must not be a filesystem root, and its nearest existing directory must not be a link or reparse point. |
 | `CS_PROXY` | Proxy URL; same as `--proxy`. |
 | `CS_COLOR` | Color mode; same as `--color`. |
 | `NO_COLOR` | Disables color output regardless of other settings. |

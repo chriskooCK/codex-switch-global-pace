@@ -400,7 +400,7 @@ fn release_preserves_an_exact_dev_bundle_without_mutating_github_releases() {
 
     for required in [
         "concurrency:",
-        "group: release-${{ github.ref }}",
+        "group: ${{ github.workflow }}-publication",
         "cancel-in-progress: false",
         "Prepare release verifiers",
         "Verify exact local release asset set",
@@ -434,7 +434,7 @@ fn release_preserves_an_exact_dev_bundle_without_mutating_github_releases() {
         .split("- name: Confirm exact dev tag before artifact upload")
         .nth(1)
         .and_then(|tail| {
-            tail.split("- name: Confirm release tag still targets this source before publish")
+            tail.split("- name: Acquire shared remote publication lock")
                 .next()
         })
         .expect("isolated development bundle path");
@@ -458,15 +458,170 @@ fn release_preserves_an_exact_dev_bundle_without_mutating_github_releases() {
 }
 
 #[test]
+fn stable_and_local_publication_share_one_exact_remote_lock() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    let publisher = repo_file("scripts/publish-dev.ps1");
+    let release_docs = repo_file("docs/RELEASE.md");
+    let lock_tag = "codex-switch-publish-dev-lock";
+
+    assert!(workflow.contains(&format!("lock_tag=\"{lock_tag}\"")));
+    assert!(publisher.contains(&format!("$RemoteLockTag = '{lock_tag}'")));
+    assert_before(
+        &workflow,
+        "Acquire shared remote publication lock",
+        "Confirm release tag still targets this source before publish",
+    );
+    assert_before(
+        &workflow,
+        "Acquire shared remote publication lock",
+        "Inspect an existing exact-tag release",
+    );
+    assert_before(
+        &workflow,
+        "Acquire shared remote publication lock",
+        "Create isolated candidate draft",
+    );
+
+    let acquire = workflow
+        .split("- name: Acquire shared remote publication lock")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("- name: Confirm release tag still targets this source before publish")
+                .next()
+        })
+        .expect("shared stable publication lock acquisition step");
+    for required in [
+        "id: publication_lock",
+        "if: needs.meta.outputs.is_dev != 'true'",
+        "git/ref/tags/${lock_tag}",
+        "Shared publication lock ${lock_ref} already exists; it was not acquired or removed.",
+        "Shared publication lock absence could not be established; no ownership was claimed.",
+        "od -An -N16 -tx1 /dev/urandom",
+        "codex-switch-global-pace publish-dev lock v1|repo=",
+        "repos/${GITHUB_REPOSITORY}/git/tags",
+        "repos/${GITHUB_REPOSITORY}/git/refs",
+        "acquisition failed or its response was lost; exact candidate cleanup will inspect the fixed ref before removing anything",
+        "echo \"tag_object_sha=${tag_object_sha}\"",
+        "echo \"source_sha=${source_sha}\"",
+        "echo \"transaction=${transaction}\"",
+        "echo \"message=${message}\"",
+        "echo \"cleanup_candidate=true\"",
+    ] {
+        assert!(
+            acquire.contains(required),
+            "stable shared-lock acquisition must contain `{required}`"
+        );
+    }
+    assert_before(
+        acquire,
+        "shared-publication-lock-existing-error",
+        "shared-publication-lock-tag.json",
+    );
+    assert_before(
+        acquire,
+        "shared-publication-lock-tag-error",
+        "shared-publication-lock-ref.json",
+    );
+    assert_before(
+        acquire,
+        "echo \"message=${message}\"",
+        "echo \"cleanup_candidate=true\"",
+    );
+    assert_before(
+        acquire,
+        "echo \"cleanup_candidate=true\"",
+        "shared-publication-lock-ref.json",
+    );
+    assert!(!acquire.contains("--method DELETE"));
+    assert!(!acquire.contains("owned=true"));
+
+    let release_lock = workflow
+        .split("- name: Recover or release exact shared remote publication lock")
+        .nth(1)
+        .expect("shared stable publication lock release step");
+    for required in [
+        "if: always() && needs.meta.outputs.is_dev != 'true' && steps.publication_lock.outputs.cleanup_candidate == 'true'",
+        "LOCK_TAG_OBJECT_SHA: ${{ steps.publication_lock.outputs.tag_object_sha }}",
+        "LOCK_SOURCE_SHA: ${{ steps.publication_lock.outputs.source_sha }}",
+        "LOCK_TRANSACTION: ${{ steps.publication_lock.outputs.transaction }}",
+        "LOCK_MESSAGE: ${{ steps.publication_lock.outputs.message }}",
+        "shared-publication-lock-release-ref-error",
+        "shared-publication-lock-release-tag-error",
+        "Shared publication lock ${expected_ref} was never created or is already absent.",
+        "Shared publication lock ref changed identity; it was preserved.",
+        "Shared publication lock object changed identity; it was preserved.",
+        "--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}",
+        "shared-publication-lock-after-delete-error",
+        "The shared publication lock changed identity during leased deletion; the new ref was preserved.",
+        "Shared publication lock deletion state is ambiguous; deletion was not retried.",
+        "Released exact shared publication lock ${expected_ref}.",
+    ] {
+        assert!(
+            release_lock.contains(required),
+            "stable shared-lock release must contain `{required}`"
+        );
+    }
+    assert_before(
+        release_lock,
+        "shared-publication-lock-release-ref-error",
+        "shared-publication-lock-release-tag-error",
+    );
+    assert_before(
+        release_lock,
+        "shared-publication-lock-release-tag-error",
+        "--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}",
+    );
+    assert_before(
+        release_lock,
+        "--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}",
+        "shared-publication-lock-after-delete-error",
+    );
+    assert!(!release_lock.contains("--method DELETE"));
+    assert_before(
+        &workflow,
+        "Remove only this run's incomplete candidate",
+        "Recover or release exact shared remote publication lock",
+    );
+
+    for required in [
+        "historical name and v1 annotated-tag identity format are",
+        "intentionally retained: renaming the tag would let stable publication overlook",
+        "shared remote lease additionally serializes stable Actions publication",
+        "with the local development publisher",
+        "The stable job persists its",
+        "before it asks",
+        "Its final `always()` step",
+        "also runs when",
+        "request fails or its response is lost",
+        "treats an absent ref as a",
+        "exact Git `--force-with-lease`",
+        "It does not retry,",
+        "force-delete a different ref, or infer ownership from later visibility",
+        "an ambiguous local",
+        "ref-create response remains a manual-recovery case",
+    ] {
+        assert!(
+            release_docs.contains(required),
+            "release docs must state the shared lock contract: `{required}`"
+        );
+    }
+}
+
+#[test]
 fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     let workflow = repo_file(".github/workflows/release.yml");
 
     for required in [
         "if: needs.meta.outputs.is_dev != 'true'",
+        "Acquire shared remote publication lock",
         "Confirm release tag still targets this source before publish",
         "Inspect an existing exact-tag release",
         "Create isolated candidate draft",
         "candidate_tag=\"release-candidate-${final_tag}\"",
+        "gh api --paginate --slurp",
+        "releases?per_page=100",
+        "Found ${candidate_release_count} releases for candidate tag ${candidate_tag}; refusing ambiguous recovery.",
+        "repos/${GITHUB_REPOSITORY}/releases/${prior_release_id}",
         "Removed verified interrupted candidate release ${prior_release_id}.",
         "Existing candidate ${candidate_tag} does not exactly belong to this release; it was preserved.",
         "Candidate ref ${candidate_tag} exists without its verified draft; refusing to delete or reuse it.",
@@ -604,11 +759,136 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     assert!(!workflow.contains("Roll back an incomplete dev cutover"));
     assert!(!workflow.contains("release-${RELEASE_ID}.removed"));
     assert!(!workflow.contains("release-candidate-${GITHUB_RUN_ID}"));
+    assert!(workflow.contains("group: ${{ github.workflow }}-publication"));
+    assert!(!workflow.contains("group: release-${{ github.ref }}"));
+    let candidate_creation = workflow
+        .split("- name: Create isolated candidate draft")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("- name: Upload and verify isolated candidate assets")
+                .next()
+        })
+        .expect("candidate draft creation and interrupted-run recovery step");
+    assert!(
+        !candidate_creation.contains("releases/tags/${candidate_tag}"),
+        "draft recovery must use the authenticated paginated release list because the tag endpoint only returns published releases"
+    );
     assert_before(
-        &workflow,
-        "git/refs/tags/${candidate_tag}",
+        candidate_creation,
+        "releases?per_page=100",
         "releases/${prior_release_id}",
     );
+    let release_page_validation = r#"if ! jq -e '
+            (type == "array")
+            and (length > 0)
+            and all(.[];
+              (type == "array")
+              and all(.[];
+                (type == "object")
+                and (.id | (type == "number") and (. > 0) and (floor == .))
+                and (.tag_name | type == "string")
+                and (.tag_name | length > 0)
+              )
+            )
+          ' "$candidate_releases" > /dev/null"#;
+    assert!(
+        candidate_creation.contains(release_page_validation),
+        "candidate recovery must keep the complete fail-closed paginated release validator"
+    );
+    assert_before(
+        candidate_creation,
+        release_page_validation,
+        "candidate_release_count=$(jq \\",
+    );
+    assert_before(
+        candidate_creation,
+        "releases/${prior_release_id}",
+        "prior-candidate-release-assets\" subset",
+    );
+    assert_before(
+        candidate_creation,
+        "git/refs/tags/${candidate_tag}",
+        "prior_release_again=$(gh api \\",
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn stable_release_pagination_validator_executes_fail_closed() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let workflow = repo_file(".github/workflows/release.yml");
+    let filter = workflow
+        .split("if ! jq -e '\n")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("\n          ' \"$candidate_releases\" > /dev/null; then")
+                .next()
+        })
+        .expect("paginated release jq filter");
+
+    let accepts = |fixture: &str| {
+        let mut child = Command::new("jq")
+            .args(["-e", filter])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("release validation requires jq on its Linux runner");
+        child
+            .stdin
+            .take()
+            .expect("jq stdin")
+            .write_all(fixture.as_bytes())
+            .expect("write jq fixture");
+        child.wait().expect("wait for jq fixture").success()
+    };
+
+    assert!(accepts(
+        r#"[[],[{"id":1,"tag_name":"release-candidate-v1"}]]"#
+    ));
+    for malformed in [
+        "[]",
+        "{}",
+        "[{}]",
+        "[[null]]",
+        r#"[[{"id":"1","tag_name":"candidate"}]]"#,
+        r#"[[{"id":1.5,"tag_name":"candidate"}]]"#,
+        r#"[[{"id":1}]]"#,
+        r#"[[{"id":1,"tag_name":""}]]"#,
+    ] {
+        assert!(
+            !accepts(malformed),
+            "paginated release validator accepted malformed input: {malformed}"
+        );
+    }
+}
+
+#[test]
+fn stable_release_recovery_states_the_external_writer_boundary() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    let release_docs = repo_file("docs/RELEASE.md");
+
+    for required in [
+        "Release deletion APIs have no conditional version precondition",
+        "atomic compare-and-delete against an external administrator",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "workflow must state its non-cooperating writer boundary: `{required}`"
+        );
+    }
+    for required in [
+        "These guarantees serialize participating workflow runs.",
+        "this is not an atomic compare-and-delete against a repository administrator",
+        "Administrators must not manually change candidate refs or Releases",
+    ] {
+        assert!(
+            release_docs.contains(required),
+            "release docs must state their external-writer boundary: `{required}`"
+        );
+    }
 }
 
 #[test]
@@ -1028,7 +1308,8 @@ fn unix_installer_verifies_checksum_before_extracting() {
         "SYSTEM_INSTALL_DIR=\"/usr/local/bin\"",
         "--system",
         "LEGACY_BIN",
-        "install -m 0755",
+        "capture_installer_file_copy",
+        "move_installer_file_noreplace",
         "stage_and_replace_binary",
         "rollback_installed_binary",
     ] {
@@ -1118,6 +1399,8 @@ fn unix_installer_checks_homebrew_ownership_for_every_install_mode() {
 #[test]
 fn unix_installer_preserves_daemon_state_for_every_direct_upgrade() {
     let script = repo_file("scripts/install.sh");
+    let daemon = repo_file("src/daemon/mod.rs");
+    let service = repo_file("src/daemon/service.rs");
     let install = script
         .split("# Download, verify, and extract")
         .nth(1)
@@ -1125,10 +1408,12 @@ fn unix_installer_preserves_daemon_state_for_every_direct_upgrade() {
     for required in [
         "prepare_daemon_upgrade",
         "read_checked_daemon_status",
-        "stop_and_confirm_daemon_absent",
-        "restart_daemon_after_upgrade",
+        "start_daemon_update_boundary",
+        "request_daemon_update_boundary_new_state",
+        "restore_daemon_update_boundary_old_state",
+        "finish_daemon_update_boundary",
+        "release_daemon_update_boundary",
         "abort_install_upgrade",
-        "ensure_previous_daemon_running",
         "preserve_install_backup",
     ] {
         assert!(
@@ -1143,13 +1428,46 @@ fn unix_installer_preserves_daemon_state_for_every_direct_upgrade() {
     );
     assert_before(
         install,
-        "restart_daemon_after_upgrade",
+        "start_daemon_update_boundary",
+        "stage_and_replace_binary",
+    );
+    assert_before(
+        install,
+        "request_daemon_update_boundary_new_state",
         "commit_installed_binary",
     );
     assert_before(
         install,
         "hold_legacy_install_for_commit",
-        "commit_installed_binary",
+        "request_daemon_update_boundary_new_state",
+    );
+    assert_before(
+        install,
+        "commit_managed_path_changes",
+        "request_daemon_update_boundary_new_state",
+    );
+    let final_confirmation = install
+        .rfind("! finish_daemon_update_boundary")
+        .expect("final daemon confirmation");
+    let executable_commit = install
+        .rfind("! commit_installed_binary")
+        .expect("executable recovery cleanup");
+    let artifact_cleanup = install
+        .rfind("! cleanup_install_artifacts")
+        .expect("fixed transaction artifact cleanup");
+    let authority_release = install
+        .rfind("! release_daemon_update_boundary")
+        .expect("daemon authority release");
+    assert!(
+        final_confirmation < executable_commit
+            && executable_commit < artifact_cleanup
+            && artifact_cleanup < authority_release,
+        "success must verify the daemon, clean exact recovery material, then release lifecycle authority"
+    );
+    assert!(
+        install.rfind("release_daemon_update_boundary").unwrap()
+            < install.rfind("release_update_locks").unwrap(),
+        "the success path must release update locks only after final daemon authority release"
     );
     assert!(
         !script.contains("service_definition_references_binary"),
@@ -1158,15 +1476,200 @@ fn unix_installer_preserves_daemon_state_for_every_direct_upgrade() {
     for required in [
         "check_candidate_uninstall_owner \"$INSTALL_DEST\"",
         "check_candidate_uninstall_owner \"$LEGACY_BIN\"",
-        "check_candidate_uninstall_owner \"$DAEMON_PREVIOUS_BIN\"",
-        "--expected-existing-executable \"$LEGACY_BIN\"",
-        "--expected-existing-executable \"$INSTALL_DEST\"",
     ] {
         assert!(
             script.contains(required),
             "missing exact Rust service-owner boundary `{required}`"
         );
     }
+    for required in [
+        "fn capture_for_executable(",
+        "pidfile::running_identity_checked()?",
+        "validate_running_daemon_executable(&executable",
+        "crate::fs_ops::token_for_path(expected_executable)",
+        "crate::fs_ops::token_for_path(running_executable)",
+        "service::install_for_executable_locked(",
+        "reacquire_absence_after_foreground_contenders",
+        "DaemonAbsenceAcquireFor::Contended",
+    ] {
+        assert!(
+            daemon.contains(required),
+            "missing retained Rust lifecycle boundary `{required}`"
+        );
+    }
+    assert!(service.contains("pub(crate) fn install_for_executable_locked("));
+    for removed in [
+        "restart_daemon_after_upgrade()",
+        "ensure_previous_daemon_running()",
+        "stop_restarted_daemon_for_rollback()",
+    ] {
+        assert!(
+            !script.contains(removed),
+            "obsolete split daemon lifecycle helper remains: `{removed}`"
+        );
+    }
+}
+
+#[test]
+fn unix_installer_lifecycle_holder_covers_fresh_publish_and_exit_cleanup_order() {
+    let script = repo_file("scripts/install.sh");
+    let cli = repo_file("src/cli.rs");
+    let main = repo_file("src/main.rs");
+    let daemon = repo_file("src/daemon/mod.rs");
+    let service = repo_file("src/daemon/service.rs");
+    assert!(cli.contains("name = \"__hold-daemon-update-boundary\""));
+    assert!(script.contains("\"$candidate\" __hold-daemon-update-boundary"));
+    assert_before(
+        &main,
+        "Some(Commands::HoldDaemonUpdateBoundary",
+        "// The release-verified direct installer uses this hidden boundary",
+    );
+    let hidden_dispatch = main
+        .split("Some(Commands::HoldDaemonUpdateBoundary")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("// The release-verified direct installer uses this hidden boundary")
+                .next()
+        })
+        .expect("hidden daemon-boundary dispatch");
+    assert_before(
+        hidden_dispatch,
+        "output::set_message_mode(MessageMode::Silent)",
+        "daemon::hold_installer_daemon_update_boundary(",
+    );
+    assert!(
+        !service.contains(".status()"),
+        "service-manager child processes must capture stdout/stderr instead of inheriting the holder's marker-only stdout"
+    );
+    for command in ["plutil", "systemd-analyze", "systemctl"] {
+        let command_section = service
+            .split(&format!("Command::new(\"{command}\")"))
+            .nth(1)
+            .expect("service-manager command invocation");
+        assert!(
+            command_section
+                .split(';')
+                .next()
+                .expect("service-manager command expression")
+                .contains(".output()"),
+            "{command} must capture child output so the lifecycle FIFO remains marker-only"
+        );
+    }
+    assert_eq!(
+        daemon
+            .matches("codex-switch-global-pace daemon update boundary")
+            .count(),
+        1,
+        "Rust wire-protocol prefix must have one definition"
+    );
+    assert_eq!(
+        script.matches("DAEMON_BOUNDARY_PROTOCOL_PREFIX=").count(),
+        1,
+        "shell wire-protocol prefix must have one definition"
+    );
+    let prepare = script
+        .split("prepare_daemon_upgrade() {")
+        .nth(1)
+        .and_then(|section| section.split("abort_install_upgrade() {").next())
+        .expect("daemon preflight implementation");
+    assert!(
+        prepare.contains("DAEMON_PREVIOUS_BIN=\"$INSTALL_DEST\""),
+        "fresh installs must bind the lifecycle holder to the future public path"
+    );
+
+    let transaction = script
+        .split("\nSYSTEM_MARKER_CREATED=false\n")
+        .nth(1)
+        .expect("Unix install transaction section");
+    assert_before(
+        transaction,
+        "start_daemon_update_boundary",
+        "stage_and_replace_binary",
+    );
+    assert_before(
+        transaction,
+        "stage_and_replace_binary",
+        "request_daemon_update_boundary_new_state",
+    );
+    assert_before(
+        transaction,
+        "request_daemon_update_boundary_new_state",
+        "finish_daemon_update_boundary",
+    );
+    assert_before(
+        transaction,
+        "finish_daemon_update_boundary",
+        "commit_installed_binary",
+    );
+    let holder = daemon
+        .split("pub(crate) fn hold_installer_daemon_update_boundary(")
+        .nth(1)
+        .and_then(|section| section.split("pub(crate) fn print_installer_state").next())
+        .expect("Unix installer daemon holder");
+    assert_before(
+        holder,
+        "let mut phase = InstallerBoundaryPhase::Stopping;",
+        "catch_installer_boundary_unwind(||",
+    );
+    assert_before(
+        holder,
+        "catch_installer_boundary_unwind(||",
+        "transaction.stop_before_update_inner()?;",
+    );
+    assert_before(
+        holder,
+        "transaction.stop_before_update_inner()?;",
+        "phase = InstallerBoundaryPhase::Stopped;",
+    );
+    assert_before(
+        holder,
+        "phase = InstallerBoundaryPhase::Stopped;",
+        "run_installer_daemon_boundary_protocol(",
+    );
+    assert_before(
+        holder,
+        "run_installer_daemon_boundary_protocol(",
+        "finalize_installer_boundary_result(boundary_result",
+    );
+    assert!(holder.contains("transaction.finalize_installer_boundary_error("));
+
+    let protocol = daemon
+        .split("fn run_installer_daemon_boundary_protocol")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("pub(crate) fn hold_installer_daemon_update_boundary")
+                .next()
+        })
+        .expect("phase-aware installer daemon protocol");
+    assert_before(protocol, "ready {}", "transaction.verify_final_state()?;");
+    assert!(daemon.contains(
+        "InstallerBoundaryPhase::Stopping => InstallerBoundaryFinalization::RestoreFailedStop"
+    ));
+    assert!(daemon.contains("InstallerBoundaryFinalization::ReestablishStopped"));
+    assert!(daemon.contains("InstallerBoundaryFinalization::ClassifyUninstall"));
+
+    let exit_cleanup = script
+        .split("cleanup_install_exit() {")
+        .nth(1)
+        .and_then(|section| section.split("cleanup_installer_temp_directory() {").next())
+        .expect("Unix installer EXIT cleanup");
+    assert_before(
+        exit_cleanup,
+        "cleanup_daemon_update_boundary_on_exit",
+        "cleanup_install_artifacts",
+    );
+    assert_before(
+        exit_cleanup,
+        "cleanup_install_artifacts",
+        "cleanup_update_locks_on_exit",
+    );
+    assert_before(
+        exit_cleanup,
+        "cleanup_update_locks_on_exit",
+        "cleanup_installer_temp_directory",
+    );
 }
 
 #[test]
@@ -1197,7 +1700,7 @@ fn unix_installer_accepts_only_the_candidate_exact_state_tuple() {
 fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
     let script = repo_file("scripts/install.sh");
     let transaction = script
-        .split("\nSYSTEM_MARKER_CREATED=false\nBINARY_REPLACED=false\n")
+        .split("\nSYSTEM_MARKER_CREATED=false\n")
         .nth(1)
         .expect("Unix install transaction section");
     for required in [
@@ -1243,10 +1746,8 @@ fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
         "the success path must clean transaction backups before releasing the lock"
     );
     assert!(
-        transaction
-            .rfind("Added ${USER_INSTALL_DIR} to PATH")
-            .unwrap()
-            < transaction.rfind("release_update_locks").unwrap(),
+        transaction.rfind("commit_managed_path_changes").unwrap()
+            < transaction.rfind("commit_installed_binary").unwrap(),
         "the install lock must cover the managed PATH mutation"
     );
 
@@ -1292,6 +1793,101 @@ fn unix_installer_uses_fixed_fail_closed_transaction_residue() {
 }
 
 #[test]
+fn unix_installer_binds_recovery_files_and_keeps_upgrade_cutover_atomic() {
+    let script = repo_file("scripts/install.sh");
+    let publication = script
+        .split("stage_and_replace_binary() {")
+        .nth(1)
+        .and_then(|section| section.split("commit_installed_binary() {").next())
+        .expect("Unix binary publication transaction");
+    let rollback = script
+        .split("rollback_installed_binary() {")
+        .nth(1)
+        .and_then(|section| section.split("stage_and_replace_binary() {").next())
+        .expect("Unix binary rollback transaction");
+
+    for required in [
+        "capture_installer_file_token() {",
+        "installer_file_token_matches() {",
+        "capture_installer_file_copy() {",
+        "exchange_installer_files() {",
+        "INSTALL_STAGE_TOKEN",
+        "INSTALL_ORIGINAL_TOKEN",
+        "INSTALL_PUBLISHED_TOKEN",
+        "UNINSTALL_HOLD_TOKEN",
+        "LEGACY_ORIGINAL_TOKEN",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing recovery binding `{required}`"
+        );
+    }
+    assert!(publication.contains("capture_installer_file_copy \\"));
+    assert!(publication.contains("exchange_installer_files \\"));
+    assert!(publication.contains("move_installer_file_noreplace \\"));
+    assert!(!publication.contains(" ln "));
+    assert!(!publication.contains("mv -f"));
+    assert!(
+        !publication.contains("run_install_fs rm \"$INSTALL_DEST\""),
+        "an upgrade must not create a gap at the executable path"
+    );
+    assert!(rollback.contains("installer_file_token_matches \\"));
+    assert!(rollback.contains("exchange_installer_files \\"));
+    assert!(rollback.contains("remove_installer_file_owned \\"));
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_binary_transaction_never_removes_a_foreign_replacement() {
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script.split("# Parse arguments").next().unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let install_dir = temp.path().join("bin");
+    fs::create_dir(&install_dir).unwrap();
+    let candidate = temp.path().join("candidate");
+    fs::write(&candidate, "candidate-bytes").unwrap();
+    let installed = install_dir.join("codex-switch-global-pace");
+    fs::write(&installed, "original-bytes").unwrap();
+
+    let harness = format!(
+        r#"{definitions}
+INSTALL_DIR="$1"
+INSTALL_DEST="$INSTALL_DIR/$BINARY_NAME"
+INSTALL_STAGE="$INSTALL_DIR/$INSTALL_STAGE_NAME"
+INSTALL_BACKUP="$INSTALL_DIR/$INSTALL_BACKUP_NAME"
+CANDIDATE_BIN="$3"
+INSTALL_WITH_SUDO=false
+INSTALL_STAGE_OWNED=false
+INSTALL_STAGE_TOKEN=""
+BINARY_REPLACED=false
+CANDIDATE_ERROR=""
+stage_and_replace_binary "$2"
+printf '%s' foreign-bytes > "$INSTALL_DEST.foreign"
+mv -f "$INSTALL_DEST.foreign" "$INSTALL_DEST"
+if commit_installed_binary; then exit 70; fi
+if rollback_installed_binary; then exit 71; fi
+[ "$(cat "$INSTALL_DEST")" = foreign-bytes ]
+[ "$(cat "$INSTALL_BACKUP")" = original-bytes ]
+"#
+    );
+    let output = Command::new("bash")
+        .args(["-c", &harness, "installer-test"])
+        .arg(&install_dir)
+        .arg(&candidate)
+        .arg(env!("CARGO_BIN_EXE_codex-switch-global-pace"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallback() {
     let script = repo_file("scripts/install.sh");
     let uninstall = script
@@ -1303,12 +1899,14 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
         "start_update_lock \"$CANDIDATE_BIN\" \"$BIN_PATH\" 8",
         "check_candidate_uninstall_owner \"$BIN_PATH\"",
         "prepare_managed_path_removals",
-        "capture_uninstall_daemon_state",
         "begin_uninstall_file_transaction",
-        "commit_managed_path_removals",
+        "start_daemon_update_boundary",
+        "commit_managed_path_changes",
         "hold_uninstall_binary_for_commit",
-        "--expected-executable \"$BIN_PATH\" 8>&- 9>&-",
+        "request_daemon_update_boundary_uninstall_state",
         "commit_uninstall_file_transaction",
+        "finish_daemon_update_boundary",
+        "release_daemon_update_boundary",
         "UNINSTALL_SYSTEM_MARKER_PRESENT=true",
         "target parent ${BIN_DIR} does not exist",
         "release_update_locks",
@@ -1331,12 +1929,32 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
     assert_before(
         uninstall,
         "prepare_managed_path_removals",
-        "capture_uninstall_daemon_state",
+        "start_daemon_update_boundary",
     );
     assert_before(
         uninstall,
-        "commit_managed_path_removals",
+        "commit_managed_path_changes",
         "hold_uninstall_binary_for_commit",
+    );
+    assert_before(
+        uninstall,
+        "hold_uninstall_binary_for_commit",
+        "request_daemon_update_boundary_uninstall_state",
+    );
+    assert_before(
+        uninstall,
+        "request_daemon_update_boundary_uninstall_state",
+        "commit_uninstall_file_transaction",
+    );
+    assert_before(
+        uninstall,
+        "finish_daemon_update_boundary",
+        "commit_uninstall_file_transaction",
+    );
+    assert_before(
+        uninstall,
+        "commit_uninstall_file_transaction",
+        "release_daemon_update_boundary",
     );
     assert_before(
         uninstall,
@@ -1348,7 +1966,7 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
         "manual systemd cleanup must not turn a failed reload into success"
     );
     assert!(
-        uninstall.rfind("commit_managed_path_removals").unwrap()
+        uninstall.rfind("commit_managed_path_changes").unwrap()
             < uninstall.rfind("release_update_locks").unwrap(),
         "the successful uninstall must hold its lock through PATH cleanup"
     );
@@ -1364,6 +1982,10 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
     assert!(script.contains("This uninstaller is not bound to a GitHub Release"));
     assert!(script.contains("--expected-executable \"$1\" --check-owner"));
     assert!(script.contains("Kept shared update lock:"));
+    assert!(
+        !uninstall.contains("\"$CANDIDATE_BIN\" daemon uninstall"),
+        "service removal must be executed by the persistent lifecycle holder, not a second child"
+    );
 }
 
 #[cfg(unix)]
@@ -1446,27 +2068,57 @@ case "$1" in
   __hold-update-lock)
     [ "$CS_UPDATE_LOCK_TARGET" = "$UNINSTALL_TARGET" ] || exit 60
     : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.codex-switch-global-pace.self-update.lock"
-    : > "$LOCK_HELD"
+    : > "$UPDATE_LOCK_HELD"
     printf 'codex-switch-global-pace update lock ready\n'
     cat >/dev/null
-    rm -f "$LOCK_HELD"
+    rm -f "$UPDATE_LOCK_HELD"
+    ;;
+  __hold-daemon-update-boundary)
+    [ "$2" = --initial-executable ] || exit 61
+    [ "$3" = "$UNINSTALL_TARGET" ] || exit 62
+    [ "$4" = --replacement-executable ] || exit 63
+    [ "$5" = "$UNINSTALL_TARGET" ] || exit 64
+    : > "$LIFECYCLE_HELD"
+    printf 'codex-switch-global-pace daemon update boundary ready running=false service_installed=false\n'
+    while IFS= read -r command; do
+      case "$command" in
+        uninstall)
+          [ -f "$UPDATE_LOCK_HELD" ] || exit 65
+          [ -f "$LIFECYCLE_HELD" ] || exit 66
+          [ -e "$UNINSTALL_TARGET" ] || exit 67
+          printf 'daemon-uninstalled\n' > "$UNINSTALL_LOG"
+          printf 'codex-switch-global-pace daemon update boundary uninstall state ready\n'
+          ;;
+        finish)
+          [ -f "$UPDATE_LOCK_HELD" ] || exit 68
+          [ -f "$LIFECYCLE_HELD" ] || exit 69
+          : > "$FINAL_CONFIRMED"
+          printf 'codex-switch-global-pace daemon update boundary final state confirmed\n'
+          ;;
+        release)
+          [ -f "$UPDATE_LOCK_HELD" ] || exit 70
+          [ -f "$LIFECYCLE_HELD" ] || exit 71
+          [ -f "$FINAL_CONFIRMED" ] || exit 72
+          [ ! -e "$UNINSTALL_TARGET" ] || exit 73
+          printf 'codex-switch-global-pace daemon update boundary lifecycle authority released\n'
+          rm -f "$LIFECYCLE_HELD"
+          exit 0
+          ;;
+        *) exit 74 ;;
+      esac
+    done
+    exit 70
+    ;;
+  __installer-file-op)
+    exec "$REAL_INSTALLER_HELPER" "$@"
     ;;
   daemon)
-    if [ "$2" = status ]; then
-      [ "$3" = --installer-state ] || exit 61
-      printf 'running=false service_installed=false\n'
-      exit 0
-    fi
-    [ "$2" = uninstall ] || exit 62
-    [ -f "$LOCK_HELD" ] || exit 63
-    [ "$3" = --expected-executable ] || exit 64
-    [ "$4" = "$UNINSTALL_TARGET" ] || exit 65
-    if [ "${5:-}" != --check-owner ]; then
-      [ ! -e "$UNINSTALL_TARGET" ] || exit 66
-      printf 'daemon-uninstalled\n' > "$UNINSTALL_LOG"
-    fi
+    [ "$2" = uninstall ] || exit 71
+    [ "$3" = --expected-executable ] || exit 72
+    [ "$4" = "$UNINSTALL_TARGET" ] || exit 73
+    [ "${5:-}" = --check-owner ] || exit 74
     ;;
-  *) exit 67 ;;
+  *) exit 75 ;;
 esac
 "#,
     )
@@ -1484,8 +2136,14 @@ esac
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
+        .env(
+            "REAL_INSTALLER_HELPER",
+            env!("CARGO_BIN_EXE_codex-switch-global-pace"),
+        )
         .env("UNINSTALL_TARGET", &binary)
-        .env("LOCK_HELD", &held)
+        .env("UPDATE_LOCK_HELD", &held)
+        .env("LIFECYCLE_HELD", home.path().join("lifecycle-held"))
+        .env("FINAL_CONFIRMED", home.path().join("final-confirmed"))
         .env("UNINSTALL_LOG", &log)
         .env("TEST_OS", unix_installer_os())
         .env("PATH", "/usr/bin:/bin")
@@ -1499,6 +2157,8 @@ esac
     );
     assert!(!binary.exists());
     assert!(!held.exists());
+    assert!(!home.path().join("lifecycle-held").exists());
+    assert!(home.path().join("final-confirmed").exists());
     assert_eq!(fs::read_to_string(log).unwrap(), "daemon-uninstalled\n");
     assert!(
         install_dir
@@ -1542,22 +2202,39 @@ case "$1" in
     printf 'codex-switch-global-pace update lock ready\n'
     cat >/dev/null
     ;;
-  daemon)
-    if [ "$2" = status ]; then
-      [ "$3" = --installer-state ] || exit 71
-      printf 'running=false service_installed=false\n'
-      exit 0
-    fi
-    [ "$2" = uninstall ] || exit 72
-    [ "$3" = --expected-executable ] || exit 73
-    [ "$4" = "$UNINSTALL_TARGET" ] || exit 74
-    if [ "${5:-}" != --check-owner ]; then
-      [ ! -e "$UNINSTALL_TARGET" ] || exit 75
-      : > "$SERVICE_ATTEMPTED"
-      exit 76
-    fi
+  __hold-daemon-update-boundary)
+    [ "$2" = --initial-executable ] || exit 71
+    [ "$3" = "$UNINSTALL_TARGET" ] || exit 72
+    [ "$4" = --replacement-executable ] || exit 73
+    [ "$5" = "$UNINSTALL_TARGET" ] || exit 74
+    printf 'codex-switch-global-pace daemon update boundary ready running=false service_installed=false\n'
+    while IFS= read -r command; do
+      case "$command" in
+        uninstall)
+          [ -e "$UNINSTALL_TARGET" ] || exit 75
+          : > "$SERVICE_ATTEMPTED"
+          printf 'codex-switch-global-pace daemon update boundary uninstall state failed\n'
+          ;;
+        rollback)
+          [ -e "$UNINSTALL_TARGET" ] || exit 76
+          printf 'codex-switch-global-pace daemon update boundary old state restored\n'
+          exit 0
+          ;;
+        *) exit 77 ;;
+      esac
+    done
+    exit 78
     ;;
-  *) exit 77 ;;
+  __installer-file-op)
+    exec "$REAL_INSTALLER_HELPER" "$@"
+    ;;
+  daemon)
+    [ "$2" = uninstall ] || exit 79
+    [ "$3" = --expected-executable ] || exit 80
+    [ "$4" = "$UNINSTALL_TARGET" ] || exit 81
+    [ "${5:-}" = --check-owner ] || exit 82
+    ;;
+  *) exit 83 ;;
 esac
 "#,
     )
@@ -1571,6 +2248,10 @@ esac
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
+        .env(
+            "REAL_INSTALLER_HELPER",
+            env!("CARGO_BIN_EXE_codex-switch-global-pace"),
+        )
         .env("UNINSTALL_TARGET", &binary)
         .env("SERVICE_ATTEMPTED", &attempted)
         .env("TEST_OS", unix_installer_os())
@@ -2245,12 +2926,12 @@ fn unix_installer_preserves_migration_and_path_lifecycle() {
 
     for required in [
         "*/fish)",
-        "PROFILE_FILE=\"${HOME}/.config/fish/config.fish\"",
+        "profile_file=\"${HOME}/.config/fish/config.fish\"",
         "# >>> codex-switch-global-pace PATH >>>",
         "# <<< codex-switch-global-pace PATH <<<",
         "prepare_managed_path_removals",
-        "commit_managed_path_removals",
-        "rollback_managed_path_removals",
+        "commit_managed_path_changes",
+        "rollback_managed_path_changes",
         "${profile_target}.${BINARY_NAME}.install",
         "!seen_begin || !seen_end || inside",
     ] {
@@ -2283,18 +2964,26 @@ fn unix_installer_rewrites_shell_profiles_atomically() {
 
     for required in [
         "prepare_path_block_removal() {",
-        "commit_managed_path_removals() {",
-        "rollback_managed_path_removals() {",
+        "commit_managed_path_changes() {",
+        "rollback_managed_path_changes() {",
         "resolve_path_target() (",
         "file_identity() (",
         "while [ -L \"$profile_target\" ]",
+        "SYMLINK_RESOLUTION_MAX_HOPS",
         "link_target=\"$(readlink \"$profile_target\")\"",
         "cd -P \"$(dirname \"$profile_target\")\" && pwd -P",
         "profile_stage=\"${profile_target}.${BINARY_NAME}.install\"",
-        "cp -p \"$profile_target\" \"$original\"",
+        "capture_installer_file_copy \\",
         "current_target=\"$(resolve_path_target \"$logical\")\"",
-        "current_identity=\"$(file_identity \"$current_target\")\"",
-        "mv -f \"$stage\" \"$target\"",
+        "capture_installer_file_token \"$current_target\" false current_identity",
+        "exchange_installer_files \\",
+        "move_installer_file_noreplace \"$stage\" \"$target\"",
+        "PATH_TRANSACTION_IDENTITY",
+        "PATH_TRANSACTION_STAGE_TOKEN",
+        "PATH_TRANSACTION_COMMITTED_IDENTITY",
+        "capture_installer_file_copy \\",
+        "the exact displaced original remains at ${stage}",
+        "remove_installer_file_owned \"$stage\"",
     ] {
         assert!(
             script.contains(required),
@@ -2305,6 +2994,158 @@ fn unix_installer_rewrites_shell_profiles_atomically() {
         !script.contains("cat \"$tmp_file\" > \"$profile_file\""),
         "Unix installer must not truncate a live shell profile in place"
     );
+}
+
+#[test]
+fn unix_installer_bounds_symlink_resolution_and_binds_recursive_temp_cleanup() {
+    let script = repo_file("scripts/install.sh");
+    for required in [
+        "SYMLINK_RESOLUTION_MAX_HOPS=40",
+        "[ \"$link_hops\" -le \"$SYMLINK_RESOLUTION_MAX_HOPS\" ]",
+        "cleanup_installer_temp_directory() {",
+        "TMP_DIR_PARENT_IDENTITY",
+        "TMP_DIR_IDENTITY",
+        "temporary directory identity changed; preserved",
+        "rm -rf -- \"$TMP_DIR\"",
+        "local original_status=$? cleanup_status=0",
+        "Installer EXIT cleanup failed",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing bounded Unix cleanup contract `{required}`"
+        );
+    }
+    assert_eq!(script.matches("rm -rf -- \"$TMP_DIR\"").count(), 1);
+}
+
+#[test]
+fn unix_installer_routes_privileged_file_operations_through_one_hidden_boundary() {
+    let script = repo_file("scripts/install.sh");
+    let helper = script
+        .split("run_installer_file_op() {")
+        .nth(1)
+        .and_then(|section| section.split("installer_file_token() {").next())
+        .expect("Unix installer file-op adapter");
+    assert!(helper.contains("sudo \"$CANDIDATE_BIN\" __installer-file-op \"$@\""));
+    assert!(helper.contains("\"$CANDIDATE_BIN\" __installer-file-op \"$@\""));
+
+    let owned_removal = script
+        .split("remove_installer_file_owned() {")
+        .nth(1)
+        .and_then(|section| section.split("file_token_digest() {").next())
+        .expect("Unix installer token-bound removal adapter");
+    assert!(owned_removal.contains("removed-namespace-durability-unconfirmed)"));
+    assert!(owned_removal.contains(
+        "the exact owned file at ${source} was removed, but parent-directory namespace durability was not confirmed"
+    ));
+    assert!(owned_removal.contains("return 1"));
+    assert!(!owned_removal.contains("warn \"Removed the exact owned file"));
+
+    let install = script
+        .split("stage_and_replace_binary() {")
+        .nth(1)
+        .and_then(|section| section.split("commit_installed_binary() {").next())
+        .unwrap();
+    for required in [
+        "capture_installer_file_copy \\",
+        "exchange_installer_files \\",
+        "move_installer_file_noreplace \\",
+        "\"$INSTALL_WITH_SUDO\"",
+    ] {
+        assert!(install.contains(required), "install omits `{required}`");
+    }
+
+    let uninstall = script
+        .split("begin_uninstall_file_transaction() {")
+        .nth(1)
+        .and_then(|section| section.split("hold_uninstall_binary_for_commit() {").next())
+        .unwrap();
+    for required in [
+        "capture_installer_file_copy \\",
+        "capture_empty_installer_file \\",
+        "remove_installer_file_owned \\",
+        "\"$UNINSTALL_WITH_SUDO\"",
+    ] {
+        assert!(uninstall.contains(required), "uninstall omits `{required}`");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_symlink_cycle_and_temp_identity_checks_execute_fail_closed() {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script.split("# Parse arguments").next().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+
+    let first = directory.path().join("first-link");
+    let second = directory.path().join("second-link");
+    symlink(&second, &first).unwrap();
+    symlink(&first, &second).unwrap();
+    let cycle_harness = directory.path().join("cycle.sh");
+    fs::write(
+        &cycle_harness,
+        format!("{definitions}\nSYMLINK_RESOLUTION_MAX_HOPS=4\nresolve_path_target \"$1\"\n"),
+    )
+    .unwrap();
+    let cycle = Command::new("bash")
+        .arg(&cycle_harness)
+        .arg(&first)
+        .env("HOME", directory.path())
+        .output()
+        .unwrap();
+    assert!(!cycle.status.success());
+    assert!(
+        String::from_utf8_lossy(&cycle.stderr).contains("exceeded 4 hops"),
+        "{}",
+        String::from_utf8_lossy(&cycle.stderr)
+    );
+
+    let cleanup_harness = directory.path().join("cleanup.sh");
+    fs::write(
+        &cleanup_harness,
+        format!(
+            r#"{definitions}
+TMP_DIR="$1/owned"
+mkdir -p "$TMP_DIR/nested"
+printf payload > "$TMP_DIR/nested/file"
+TMP_DIR_PARENT="$(dirname "$TMP_DIR")"
+TMP_DIR_PARENT_IDENTITY="$(file_identity "$TMP_DIR_PARENT")"
+TMP_DIR_IDENTITY="$(file_identity "$TMP_DIR")"
+TMP_CLEANUP_ERROR=""
+cleanup_installer_temp_directory
+[ ! -e "$TMP_DIR" ]
+
+TMP_DIR="$1/replaced"
+mkdir "$TMP_DIR"
+TMP_DIR_PARENT="$(dirname "$TMP_DIR")"
+TMP_DIR_PARENT_IDENTITY="$(file_identity "$TMP_DIR_PARENT")"
+TMP_DIR_IDENTITY="$(file_identity "$TMP_DIR")"
+mv "$TMP_DIR" "$1/original-held"
+mkdir "$TMP_DIR"
+if cleanup_installer_temp_directory; then
+  exit 21
+fi
+[ -d "$TMP_DIR" ]
+"#
+        ),
+    )
+    .unwrap();
+    let cleanup = Command::new("bash")
+        .arg(&cleanup_harness)
+        .arg(directory.path())
+        .env("HOME", directory.path())
+        .output()
+        .unwrap();
+    assert!(
+        cleanup.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&cleanup.stdout),
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
+    assert!(directory.path().join("replaced").is_dir());
 }
 
 #[cfg(unix)]
@@ -2334,7 +3175,7 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_removals\n"
+            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
@@ -2365,6 +3206,94 @@ fn unix_installer_preserves_multi_level_profile_symlinks() {
         fs::read_to_string(&real_profile).unwrap(),
         "export KEEP=1\n"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_path_addition_uses_the_shared_transaction_and_rolls_back_exactly() {
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script.split("# Parse arguments").next().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let profile = home.path().join(".profile");
+    fs::write(&profile, "export KEEP=1\n").unwrap();
+    let harness = format!(
+        r#"{definitions}
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+PLATFORM=linux
+reset_managed_path_transaction
+prepare_managed_path_addition
+commit_managed_path_changes
+grep -F "$PATH_BLOCK_BEGIN" "$HOME/.profile" >/dev/null
+rollback_managed_path_changes
+[ "$(cat "$HOME/.profile")" = 'export KEEP=1' ]
+[ ! -e "$HOME/.profile.$BINARY_NAME.install" ]
+"#
+    );
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("HOME", home.path())
+        .env("SHELL", "/bin/bash")
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(profile).unwrap(), "export KEEP=1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_path_rollback_preserves_a_fixed_original_when_the_profile_is_replaced() {
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script.split("# Parse arguments").next().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let profile = home.path().join(".profile");
+    let recovery = home
+        .path()
+        .join(".profile.codex-switch-global-pace.install");
+    fs::write(&profile, "export KEEP=1\n").unwrap();
+    let harness = format!(
+        r#"{definitions}
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+PLATFORM=linux
+reset_managed_path_transaction
+prepare_managed_path_addition
+commit_managed_path_changes
+printf '%s\n' 'foreign profile' > "$HOME/replacement-profile"
+mv -f "$HOME/replacement-profile" "$HOME/.profile"
+if rollback_managed_path_changes; then
+  exit 1
+fi
+[ "$PATH_TRANSACTION_ERROR" = "could not safely restore $HOME/.profile; the exact pre-transaction profile is preserved at $HOME/.profile.$BINARY_NAME.install for manual recovery" ]
+[ "$(cat "$HOME/.profile")" = 'foreign profile' ]
+[ "$(cat "$HOME/.profile.$BINARY_NAME.install")" = 'export KEEP=1' ]
+"#
+    );
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("HOME", home.path())
+        .env("SHELL", "/bin/bash")
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(profile).unwrap(), "foreign profile\n");
+    assert_eq!(fs::read_to_string(recovery).unwrap(), "export KEEP=1\n");
 }
 
 #[cfg(unix)]
@@ -2403,7 +3332,7 @@ fn unix_installer_aborts_if_profile_symlink_changes_during_rewrite() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_removals\n"
+            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
@@ -2467,7 +3396,7 @@ fn unix_installer_aborts_if_profile_parent_symlink_changes() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_removals\n"
+            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
@@ -2524,7 +3453,7 @@ fn unix_installer_aborts_if_profile_inode_changes() {
     fs::write(
         &harness,
         format!(
-            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_removals\n"
+            "{function_prefix}\nTMP_DIR=\"$(mktemp -d)\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\nreset_managed_path_transaction\nprepare_path_block_removal \"$1\"\ncommit_managed_path_changes\n"
         ),
     )
     .unwrap();
@@ -2558,9 +3487,10 @@ fn unix_installer_records_and_cleans_explicit_system_install_intent() {
     for required in [
         "SYSTEM_INSTALL_MARKER",
         ".codex-switch-global-pace-system-install-v1",
-        "run_install_fs install -m 0644 /dev/null \"$SYSTEM_INSTALL_MARKER\"",
+        "capture_empty_installer_file \\",
+        "\"$SYSTEM_INSTALL_MARKER\" \"$INSTALL_WITH_SUDO\" SYSTEM_MARKER_CREATED_TOKEN",
         "commit_held_legacy_install",
-        "run_legacy_fs rm -f \"$SYSTEM_INSTALL_MARKER\"",
+        "remove_installer_file_owned \\",
     ] {
         assert!(
             script.contains(required),
@@ -2580,7 +3510,7 @@ fn unix_installer_records_and_cleans_explicit_system_install_intent() {
     assert_before(
         created_marker,
         "if [ \"${BINARY_REPLACED:-false}\" = false ]; then",
-        "run_install_fs rm -f \"$SYSTEM_INSTALL_MARKER\"",
+        "remove_installer_file_owned \\",
     );
     assert!(created_marker.contains(
         "the new system-install marker was preserved because the replacement system binary remains installed"
@@ -2604,7 +3534,161 @@ fn windows_installer_verifies_checksum_before_extracting() {
         "Windows installer must fail clearly on checksum mismatch"
     );
     assert!(script.contains("$env:LOCALAPPDATA"));
-    assert!(script.contains("SetEnvironmentVariable(\"Path\", $NewPath, \"User\")"));
+    assert!(script.contains("Set-ExactUserPathTransition"));
+}
+
+#[test]
+fn windows_user_path_updates_use_one_exact_compare_and_swap_contract() {
+    let script = repo_file("scripts/install.ps1");
+    let registry = repo_file("src/installer_registry.rs");
+
+    for required in [
+        "function Set-ExactUserPathTransition",
+        "function Restore-ExactUserPathTransition",
+        "function Invoke-ExactProcessPathTransition",
+        "function Restore-ExactProcessPathTransition",
+        "Test-ProcessPathSnapshotEqual",
+        "[System.StringComparer]::OrdinalIgnoreCase.Equals",
+        "[System.StringSplitOptions]::None",
+        "SetEnvironmentVariable(\"Path\", $RequestedValue, \"Process\")",
+        "Windows environment notification failed",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing User PATH CAS step `{required}`"
+        );
+    }
+    for required in [
+        "RegOpenKeyTransactedW",
+        "RegQueryValueExW",
+        "RegSetValueExW",
+        "transaction.commit(\"registry\")?",
+        "SendMessageTimeoutW",
+        "WM_SETTINGCHANGE",
+        "ENVIRONMENT_NOTIFICATION",
+        "path-transition|{}|{notification}",
+        "serde(deny_unknown_fields)",
+        "before != after || before != final_path",
+    ] {
+        assert!(
+            registry.contains(required),
+            "missing native User PATH boundary `{required}`"
+        );
+    }
+    assert!(!script.contains("SetEnvironmentVariable(\"Path\", $Requested, \"User\")"));
+    assert!(!script.contains("GetEnvironmentVariable(\"Path\", \"User\")"));
+    assert_eq!(
+        script.matches("Set-ExactUserPathTransition `").count(),
+        2,
+        "install and uninstall must share the exact mutation helper"
+    );
+    assert_eq!(
+        script.matches("Restore-ExactUserPathTransition `").count(),
+        2,
+        "install and uninstall must share the exact rollback helper"
+    );
+    assert!(script.starts_with("# codex-switch-global-pace installer"));
+    assert!(script.contains("\n& {\n$ErrorActionPreference = \"Stop\""));
+    assert!(
+        script
+            .lines()
+            .all(|line| !line.trim_start().starts_with("exit ")),
+        "the irm | iex installer must propagate errors without exiting its caller host"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_process_path_transform_preserves_unrelated_raw_segments() {
+    use std::process::Command;
+
+    let installer = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/install.ps1");
+    let command = r#"
+$Source = [IO.File]::ReadAllText($env:INSTALLER_UNDER_TEST)
+$Entrypoint = $Source.IndexOf('# Detect architecture', [StringComparison]::Ordinal)
+if ($Entrypoint -lt 0) { throw 'entrypoint marker missing' }
+$Definitions = $Source.Substring(0, $Entrypoint)
+$Definitions = ([regex]'(?m)^& \{\r?\n').Replace($Definitions, '', 1)
+Invoke-Expression $Definitions
+function Present([string]$Value) { [pscustomobject]@{ Present = $true; Value = $Value } }
+$Empty = Get-RequestedProcessPathSnapshot -Current (Present '') -Action add -Entry 'Entry'
+$Normal = Get-RequestedProcessPathSnapshot -Current (Present 'A') -Action add -Entry 'Entry'
+$Trailing = Get-RequestedProcessPathSnapshot -Current (Present 'A;') -Action add -Entry 'Entry'
+$Removed = Get-RequestedProcessPathSnapshot -Current (Present 'A;;B') -Action remove -Entry 'a'
+$RemovedOnly = Get-RequestedProcessPathSnapshot -Current (Present 'A') -Action remove -Entry 'a'
+$Existing = Get-RequestedProcessPathSnapshot -Current (Present 'C:\Tool;;B') -Action add -Entry 'c:\tool'
+if ($Empty.Value -cne 'Entry' -or
+    $Normal.Value -cne 'A;Entry' -or
+    $Trailing.Value -cne 'A;;Entry' -or
+    $Removed.Value -cne ';B' -or
+    $RemovedOnly.Present -or
+    $Existing.Value -cne 'C:\Tool;;B') {
+    throw 'process PATH transform did not preserve the explicit empty-segment policy'
+}
+'process-path-transform-ok'
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .env("INSTALLER_UNDER_TEST", installer)
+        .output()
+        .unwrap();
+    let diagnostic = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{diagnostic}");
+    assert!(
+        diagnostic.contains("process-path-transform-ok"),
+        "{diagnostic}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_installer_never_exits_the_irm_iex_caller_host() {
+    use std::process::Command;
+
+    let installer = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/install.ps1");
+    let command = r#"$ErrorActionPreference = 'Continue'; $Repo = 'caller-sentinel'; function New-InstallerRecoveryPath { 'caller-sentinel' }; $Source = [IO.File]::ReadAllText($env:INSTALLER_UNDER_TEST); try { Invoke-Expression $Source } catch { 'installer-error-caught' }; if ($ErrorActionPreference -cne 'Continue') { throw 'caller ErrorActionPreference leaked' }; if ($Repo -cne 'caller-sentinel') { throw 'caller variable leaked' }; if ((New-InstallerRecoveryPath) -cne 'caller-sentinel') { throw 'caller function leaked' }; 'caller-host-alive'"#;
+    let iex = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .env("INSTALLER_UNDER_TEST", &installer)
+        .env_remove("CS_VERSION")
+        .env_remove("CS_DEV")
+        .env_remove("CS_UNINSTALL")
+        .output()
+        .unwrap();
+    let iex_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&iex.stdout),
+        String::from_utf8_lossy(&iex.stderr)
+    );
+    assert!(iex.status.success(), "{iex_output}");
+    assert!(
+        iex_output.contains("installer-error-caught"),
+        "{iex_output}"
+    );
+    assert!(iex_output.contains("caller-host-alive"), "{iex_output}");
+
+    let standalone = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&installer)
+        .env_remove("CS_VERSION")
+        .env_remove("CS_DEV")
+        .env_remove("CS_UNINSTALL")
+        .output()
+        .unwrap();
+    assert!(
+        !standalone.status.success(),
+        "a standalone installer failure must produce a failing process status"
+    );
 }
 
 #[test]
@@ -2621,6 +3705,9 @@ fn windows_installer_rejects_reparse_paths_and_incomplete_transactions() {
         "An incomplete previous installer transaction was found",
         "$LegacyTransactionPattern = '^\\.' + [regex]::Escape($Stem) + '\\.(install|rollback|failed)-[0-9A-Fa-f]{32}\\.exe$'",
         "$_.Name -cmatch $LegacyTransactionPattern",
+        "$CurrentRecoveryPattern = '^\\.' + [regex]::Escape($Stem) + '\\.(displaced|failed)-[0-9a-f]{32}\\.exe$'",
+        "[System.Security.Cryptography.RandomNumberGenerator]::Create()",
+        "$RecoveryNameCollisionLimit",
         "Assert-NoInstallTransactionResidue -Path $InstallDir -Binary $BinaryName",
         "$DevVersionPattern = '\\A[0-9]+\\.[0-9]+\\.[0-9]+-dev",
         "$PackagedReleaseVersion -cmatch $DevVersionPattern",
@@ -2645,7 +3732,7 @@ fn windows_installer_rejects_reparse_paths_and_incomplete_transactions() {
             >= 2,
         "install and uninstall must both revalidate their directory after acquiring the lock"
     );
-    assert!(!script.contains("[Guid]::NewGuid"));
+    assert!(script.contains("[Guid]::NewGuid().ToString('N')"));
     assert!(!script.contains("Move-Item -LiteralPath $InstalledBin -Destination $BackupBin"));
     assert!(
         !script
@@ -2656,277 +3743,208 @@ fn windows_installer_rejects_reparse_paths_and_incomplete_transactions() {
 #[cfg(windows)]
 #[test]
 fn windows_installer_transaction_helpers_execute_fail_closed() {
-    use std::process::Command;
+    use std::process::{Command, Output};
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let temp = tempfile::tempdir().unwrap();
-    let harness = temp.path().join("installer-transaction-harness.ps1");
-    fs::write(
-        &harness,
-        r##"param(
-    [Parameter(Mandatory = $true)][string]$InstallerPath,
-    [Parameter(Mandatory = $true)][string]$FixtureDir
-)
-
-$ErrorActionPreference = "Stop"
-Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
-$Source = Get-Content -LiteralPath $InstallerPath -Raw -Encoding UTF8
-$Marker = "# Detect architecture"
-$Entrypoint = $Source.IndexOf($Marker, [System.StringComparison]::Ordinal)
-if ($Entrypoint -lt 0) {
-    throw "installer entrypoint marker was not found"
-}
-Invoke-Expression $Source.Substring(0, $Entrypoint)
-
-function Write-FixtureFile {
-    param([string]$Path, [string]$Value)
-    [System.IO.File]::WriteAllBytes($Path, [System.Text.Encoding]::UTF8.GetBytes($Value))
-}
-
-$Installed = Join-Path $FixtureDir "installed.exe"
-$Staged = Join-Path $FixtureDir "staged.exe"
-$Backup = Join-Path $FixtureDir "rollback.exe"
-$Failed = Join-Path $FixtureDir "failed.exe"
-Write-FixtureFile $Installed "previous"
-Write-FixtureFile $Staged "candidate"
-$PreviousSha = Get-DirectFileSha256 -Path $Installed
-$StagedSha = Get-DirectFileSha256 -Path $Staged
-
-$Publication = Invoke-AtomicUpgradePublication `
-    -StagedPath $Staged `
-    -InstalledPath $Installed `
-    -BackupPath $Backup `
-    -FailedPath $Failed `
-    -StagedSha256 $StagedSha `
-    -PreviousSha256 $PreviousSha
-if ($Publication.State -cne "Published" -or $null -ne $Publication.OperationError) {
-    throw "exact publication did not succeed: $($Publication | ConvertTo-Json -Compress)"
-}
-
-$MissingFailed = Join-Path (Join-Path $FixtureDir "missing") "failed.exe"
-$UnchangedRollback = Invoke-AtomicUpgradeRollback `
-    -InstalledPath $Installed `
-    -BackupPath $Backup `
-    -FailedPath $MissingFailed `
-    -StagedSha256 $StagedSha `
-    -PreviousSha256 $PreviousSha
-if ($UnchangedRollback.State -cne "Unchanged" -or $null -eq $UnchangedRollback.OperationError) {
-    throw "failed rollback was not classified as unchanged: $($UnchangedRollback | ConvertTo-Json -Compress)"
-}
-
-$Rollback = Invoke-AtomicUpgradeRollback `
-    -InstalledPath $Installed `
-    -BackupPath $Backup `
-    -FailedPath $Failed `
-    -StagedSha256 $StagedSha `
-    -PreviousSha256 $PreviousSha
-if ($Rollback.State -cne "Restored" -or $null -ne $Rollback.OperationError) {
-    throw "exact rollback did not succeed: $($Rollback | ConvertTo-Json -Compress)"
-}
-if ((Get-DirectFileSha256 -Path $Installed) -cne $PreviousSha -or
-    (Get-DirectFileSha256 -Path $Failed) -cne $StagedSha) {
-    throw "rollback bytes were not preserved exactly"
-}
-
-$UninstallInstalled = Join-Path $FixtureDir "uninstall-installed.exe"
-$UninstallBackup = Join-Path $FixtureDir "uninstall-backup.exe"
-Write-FixtureFile $UninstallInstalled "uninstall-original"
-$UninstallSha = Get-DirectFileSha256 -Path $UninstallInstalled
-$UninstallStaging = Invoke-AtomicUninstallStaging `
-    -InstalledPath $UninstallInstalled `
-    -BackupPath $UninstallBackup `
-    -InstalledSha256 $UninstallSha
-if ($UninstallStaging.State -cne "Staged" -or
-    $null -ne (Get-DirectFileSha256 -Path $UninstallInstalled) -or
-    (Get-DirectFileSha256 -Path $UninstallBackup) -cne $UninstallSha) {
-    throw "uninstall staging did not preserve the exact bytes: $($UninstallStaging | ConvertTo-Json -Compress)"
-}
-
-$UninstallBackupHandle = [System.IO.File]::Open(
-    $UninstallBackup,
-    [System.IO.FileMode]::Open,
-    [System.IO.FileAccess]::Read,
-    [System.IO.FileShare]::Read
-)
-try {
-    $BlockedUninstallCommit = Invoke-AtomicUninstallCommit `
-        -InstalledPath $UninstallInstalled `
-        -BackupPath $UninstallBackup `
-        -InstalledSha256 $UninstallSha
-    if ($BlockedUninstallCommit.State -cne "Unchanged" -or
-        $null -eq $BlockedUninstallCommit.OperationError -or
-        (Get-DirectFileSha256 -Path $UninstallBackup) -cne $UninstallSha) {
-        throw "blocked uninstall commit did not remain exactly recoverable: $($BlockedUninstallCommit | ConvertTo-Json -Compress)"
+    fn helper(candidate: &Path, arguments: &[&str], paths: &[&Path]) -> Output {
+        let mut command = Command::new(candidate);
+        command.arg("__installer-file-op");
+        for argument in arguments {
+            command.arg(argument);
+        }
+        for path in paths {
+            command.arg(path);
+        }
+        command.output().unwrap()
     }
-} finally {
-    $UninstallBackupHandle.Dispose()
-}
 
-$UninstallRestore = Invoke-AtomicUninstallRestore `
-    -InstalledPath $UninstallInstalled `
-    -BackupPath $UninstallBackup `
-    -InstalledSha256 $UninstallSha
-if ($UninstallRestore.State -cne "Restored" -or
-    (Get-DirectFileSha256 -Path $UninstallInstalled) -cne $UninstallSha -or
-    $null -ne (Get-DirectFileSha256 -Path $UninstallBackup)) {
-    throw "blocked uninstall commit could not be rolled back exactly: $($UninstallRestore | ConvertTo-Json -Compress)"
-}
-
-$CommittedUninstallStaging = Invoke-AtomicUninstallStaging `
-    -InstalledPath $UninstallInstalled `
-    -BackupPath $UninstallBackup `
-    -InstalledSha256 $UninstallSha
-$CommittedUninstall = Invoke-AtomicUninstallCommit `
-    -InstalledPath $UninstallInstalled `
-    -BackupPath $UninstallBackup `
-    -InstalledSha256 $UninstallSha
-if ($CommittedUninstallStaging.State -cne "Staged" -or
-    $CommittedUninstall.State -cne "Committed" -or
-    $null -ne $CommittedUninstall.OperationError -or
-    $null -ne (Get-DirectFileSha256 -Path $UninstallInstalled) -or
-    $null -ne (Get-DirectFileSha256 -Path $UninstallBackup)) {
-    throw "uninstall commit did not remove only the verified staged bytes: $($CommittedUninstall | ConvertTo-Json -Compress)"
-}
-
-$UnchangedInstalled = Join-Path $FixtureDir "unchanged-installed.exe"
-$UnchangedStaged = Join-Path $FixtureDir "unchanged-staged.exe"
-Write-FixtureFile $UnchangedInstalled "old"
-Write-FixtureFile $UnchangedStaged "new"
-$Unchanged = Invoke-AtomicUpgradePublication `
-    -StagedPath $UnchangedStaged `
-    -InstalledPath $UnchangedInstalled `
-    -BackupPath (Join-Path (Join-Path $FixtureDir "missing") "backup.exe") `
-    -FailedPath (Join-Path $FixtureDir "unchanged-failed.exe") `
-    -StagedSha256 (Get-DirectFileSha256 -Path $UnchangedStaged) `
-    -PreviousSha256 (Get-DirectFileSha256 -Path $UnchangedInstalled)
-if ($Unchanged.State -cne "Unchanged" -or $null -eq $Unchanged.OperationError) {
-    throw "failed publication was not classified as unchanged: $($Unchanged | ConvertTo-Json -Compress)"
-}
-
-$AmbiguousInstalled = Join-Path $FixtureDir "ambiguous-installed.exe"
-$AmbiguousStaged = Join-Path $FixtureDir "ambiguous-staged.exe"
-$AmbiguousBackup = Join-Path $FixtureDir "ambiguous-backup.exe"
-Write-FixtureFile $AmbiguousInstalled "old-ambiguous"
-Write-FixtureFile $AmbiguousBackup "unexpected"
-$Ambiguous = Invoke-AtomicUpgradePublication `
-    -StagedPath $AmbiguousStaged `
-    -InstalledPath $AmbiguousInstalled `
-    -BackupPath $AmbiguousBackup `
-    -FailedPath (Join-Path $FixtureDir "ambiguous-failed.exe") `
-    -StagedSha256 "missing-candidate-sha" `
-    -PreviousSha256 (Get-DirectFileSha256 -Path $AmbiguousInstalled)
-if ($Ambiguous.State -cne "Ambiguous" -or $null -eq $Ambiguous.InspectionError) {
-    throw "mixed publication state was not classified as ambiguous: $($Ambiguous | ConvertTo-Json -Compress)"
-}
-
-$LockedStage = Join-Path $FixtureDir "locked-stage.exe"
-Write-FixtureFile $LockedStage "locked"
-$LockedHandle = [System.IO.File]::Open(
-    $LockedStage,
-    [System.IO.FileMode]::Open,
-    [System.IO.FileAccess]::Read,
-    [System.IO.FileShare]::Read
-)
-try {
-    $LockedCleanupError = Remove-StagedCandidate -Path $LockedStage
-    if ($null -eq $LockedCleanupError -or $null -eq (Get-DirectFileSha256 -Path $LockedStage)) {
-        throw "locked staged candidate cleanup did not preserve and report the residue"
+    fn token(candidate: &Path, path: &Path) -> String {
+        let output = helper(candidate, &["token", "--source"], &[path]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
-} finally {
-    $LockedHandle.Dispose()
-}
-$UnlockedCleanupError = Remove-StagedCandidate -Path $LockedStage
-if ($null -ne $UnlockedCleanupError -or $null -ne (Get-DirectFileSha256 -Path $LockedStage)) {
-    throw "unlocked staged candidate cleanup did not remove the residue"
-}
 
-$ResidueDir = Join-Path $FixtureDir "residue"
-[void][System.IO.Directory]::CreateDirectory($ResidueDir)
-Write-FixtureFile (Join-Path $ResidueDir ".tool.rollback.exe") "fixed"
-$FixedRejected = $false
-try {
-    Assert-NoInstallTransactionResidue -Path $ResidueDir -Binary "tool.exe"
-} catch {
-    $FixedRejected = $true
-}
-if (-not $FixedRejected) {
-    throw "fixed transaction residue was accepted"
-}
-Remove-Item -LiteralPath (Join-Path $ResidueDir ".tool.rollback.exe") -Force
-Write-FixtureFile (Join-Path $ResidueDir ".tool.uninstall.exe") "fixed-uninstall"
-$UninstallResidueRejected = $false
-try {
-    Assert-NoInstallTransactionResidue -Path $ResidueDir -Binary "tool.exe"
-} catch {
-    $UninstallResidueRejected = $true
-}
-if (-not $UninstallResidueRejected) {
-    throw "fixed uninstall transaction residue was accepted"
-}
-Remove-Item -LiteralPath (Join-Path $ResidueDir ".tool.uninstall.exe") -Force
-Write-FixtureFile (Join-Path $ResidueDir ".tool.install-0123456789abcdef0123456789ABCDEF.exe") "legacy"
-$LegacyRejected = $false
-try {
-    Assert-NoInstallTransactionResidue -Path $ResidueDir -Binary "tool.exe"
-} catch {
-    $LegacyRejected = $true
-}
-if (-not $LegacyRejected) {
-    throw "legacy transaction residue was accepted"
-}
+    fn operation_diagnostic(output: &Output) -> String {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
 
-$JunctionTarget = Join-Path $FixtureDir "junction-target"
-$JunctionPath = Join-Path $FixtureDir "junction"
-[void][System.IO.Directory]::CreateDirectory($JunctionTarget)
-[void](New-Item -ItemType Junction -Path $JunctionPath -Target $JunctionTarget)
-$JunctionRejected = $false
-try {
-    [void](Test-DirectInstallDirectory -Path $JunctionPath)
-} catch {
-    $JunctionRejected = $true
-}
-if (-not $JunctionRejected) {
-    throw "install-directory junction was accepted"
-}
+    let candidate = Path::new(env!("CARGO_BIN_EXE_codex-switch-global-pace"));
+    let directory = tempfile::tempdir().unwrap();
 
-if ("1.2.3-dev" -cnotmatch $DevVersionPattern -or
-    "1.2.3-dev.4" -cnotmatch $DevVersionPattern -or
-    "1.2.3-dev+build" -cnotmatch $DevVersionPattern -or
-    "1.2.3-DEV" -cmatch $DevVersionPattern -or
-    "1.2.3-alpha-dev" -cmatch $DevVersionPattern) {
-    throw "development version classification is not case-sensitive and prefix-exact"
-}
-"installer transaction runtime checks passed"
-"##,
-    )
-    .unwrap();
-
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&harness)
-        .args(["-InstallerPath"])
-        .arg(root.join("scripts/install.ps1"))
-        .args(["-FixtureDir"])
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    let diagnostic = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let source = directory.path().join("source.exe");
+    let staged = directory.path().join("staged.exe");
+    fs::write(&source, b"verified candidate").unwrap();
+    let source_token = token(candidate, &source);
+    let copy = helper(
+        candidate,
+        &[
+            "copy-exclusive",
+            "--source",
+            source.to_str().unwrap(),
+            "--destination",
+            staged.to_str().unwrap(),
+            "--expected-token",
+            &source_token,
+        ],
+        &[],
     );
+    assert!(copy.status.success(), "{}", operation_diagnostic(&copy));
+    let staged_token = String::from_utf8(copy.stdout)
+        .unwrap()
+        .trim()
+        .strip_prefix("created|")
+        .expect("explicit creation outcome")
+        .to_string();
+    assert_eq!(fs::read(&staged).unwrap(), b"verified candidate");
+    assert_eq!(token(candidate, &staged), staged_token);
 
-    assert!(output.status.success(), "{diagnostic}");
+    let occupied = directory.path().join("occupied.exe");
+    fs::write(&occupied, b"foreign writer").unwrap();
+    let refused_copy = helper(
+        candidate,
+        &[
+            "copy-exclusive",
+            "--source",
+            source.to_str().unwrap(),
+            "--destination",
+            occupied.to_str().unwrap(),
+            "--expected-token",
+            &source_token,
+        ],
+        &[],
+    );
+    assert!(!refused_copy.status.success());
+    assert_eq!(fs::read(&occupied).unwrap(), b"foreign writer");
+
+    let move_source = directory.path().join("move-source.exe");
+    fs::write(&move_source, b"move candidate").unwrap();
+    let move_token = token(candidate, &move_source);
+    let refused_move = helper(
+        candidate,
+        &[
+            "move-noreplace",
+            "--source",
+            move_source.to_str().unwrap(),
+            "--destination",
+            occupied.to_str().unwrap(),
+            "--expected-token",
+            &move_token,
+        ],
+        &[],
+    );
+    assert!(!refused_move.status.success());
+    assert_eq!(fs::read(&move_source).unwrap(), b"move candidate");
+    assert_eq!(fs::read(&occupied).unwrap(), b"foreign writer");
+
+    let installed = directory.path().join("installed.exe");
+    let replacement = directory.path().join("replacement.exe");
+    let displaced = directory.path().join(".installed.displaced-test.exe");
+    let failed = directory.path().join(".installed.failed-test.exe");
+    fs::write(&installed, b"previous").unwrap();
+    fs::write(&replacement, b"candidate").unwrap();
+    let previous_token = token(candidate, &installed);
+    let replacement_token = token(candidate, &replacement);
+    let publication = helper(
+        candidate,
+        &[
+            "replace-with-displaced",
+            "--source",
+            replacement.to_str().unwrap(),
+            "--destination",
+            installed.to_str().unwrap(),
+            "--displaced",
+            displaced.to_str().unwrap(),
+            "--expected-token",
+            &replacement_token,
+            "--expected-destination-token",
+            &previous_token,
+        ],
+        &[],
+    );
     assert!(
-        diagnostic.contains("installer transaction runtime checks passed"),
-        "{diagnostic}"
+        publication.status.success(),
+        "{}",
+        operation_diagnostic(&publication)
     );
+    assert_eq!(
+        String::from_utf8_lossy(&publication.stdout).trim(),
+        "replaced"
+    );
+    assert_eq!(fs::read(&installed).unwrap(), b"candidate");
+    assert_eq!(fs::read(&displaced).unwrap(), b"previous");
+    assert!(!replacement.exists());
+
+    let rollback = helper(
+        candidate,
+        &[
+            "replace-with-displaced",
+            "--source",
+            displaced.to_str().unwrap(),
+            "--destination",
+            installed.to_str().unwrap(),
+            "--displaced",
+            failed.to_str().unwrap(),
+            "--expected-token",
+            &previous_token,
+            "--expected-destination-token",
+            &replacement_token,
+        ],
+        &[],
+    );
+    assert!(
+        rollback.status.success(),
+        "{}",
+        operation_diagnostic(&rollback)
+    );
+    assert_eq!(fs::read(&installed).unwrap(), b"previous");
+    assert_eq!(fs::read(&failed).unwrap(), b"candidate");
+    assert!(!displaced.exists());
+
+    let wrong_removal = helper(
+        candidate,
+        &[
+            "remove-owned",
+            "--source",
+            installed.to_str().unwrap(),
+            "--expected-token",
+            &replacement_token,
+        ],
+        &[],
+    );
+    assert!(!wrong_removal.status.success());
+    assert_eq!(fs::read(&installed).unwrap(), b"previous");
+
+    for (path, expected) in [(&installed, &previous_token), (&failed, &replacement_token)] {
+        let removal = helper(
+            candidate,
+            &[
+                "remove-owned",
+                "--source",
+                path.to_str().unwrap(),
+                "--expected-token",
+                expected,
+            ],
+            &[],
+        );
+        assert!(
+            removal.status.success(),
+            "{}",
+            operation_diagnostic(&removal)
+        );
+        assert_eq!(String::from_utf8_lossy(&removal.stdout).trim(), "removed");
+        assert!(!path.exists());
+    }
+
+    let help = Command::new(candidate).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("__installer-file-op"));
 }
 
 #[test]
@@ -2938,60 +3956,40 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
         .expect("Windows install transaction");
 
     for required in [
-        "$DaemonWasRunning",
-        "$DaemonServiceInstalled",
-        "$StagedBin",
-        "$BackupBin",
-        "$FailedBin",
-        "$OriginalUserPath",
-        "$OldBinaryBackedUp",
-        "$NewBinaryPublished",
-        "$PathMutationAttempted",
-        "$DaemonRestarted",
-        "$DaemonRestartAttempted",
-        "function Get-CheckedDaemonStatus",
-        "daemon status --installer-state",
-        "running=true service_installed=true",
-        "running=false service_installed=false",
-        "function Stop-And-ConfirmDaemonAbsent",
-        "$After = Get-CheckedDaemonStatus -CandidatePath $CandidatePath",
+        "function Start-DaemonLifecycleHolder",
+        "__hold-daemon-update-boundary --initial-executable",
+        "$StartInfo.RedirectStandardInput = $true",
+        "$StartInfo.RedirectStandardOutput = $true",
+        "$StartInfo.RedirectStandardError = $false",
+        "$DaemonBoundaryPrefix ready running=true service_installed=true",
+        "$DaemonBoundaryPrefix ready running=false service_installed=false",
+        "function Invoke-DaemonLifecycleCommand",
+        "replacement daemon state was rejected; exact daemon absence was retained for rollback",
+        "daemon lifecycle holder PID $($Holder.Process.Id) did not exit after stdin EOF",
+        "$InstallLifecycleHolder = Start-DaemonLifecycleHolder",
+        "$DaemonWasRunning = $InstallLifecycleHolder.Running",
+        "$DaemonServiceInstalled = $InstallLifecycleHolder.ServiceInstalled",
+        "Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command \"new\"",
+        "-Command \"rollback\"",
+        "-Command \"finish\"",
+        "-Command \"release\"",
         "$DaemonSafeForBinaryRollback",
         "automatic binary rollback was refused",
         ".$BinaryStem.install.exe",
         ".$BinaryStem.rollback.exe",
-        ".$BinaryStem.failed.exe",
+        "New-InstallerRecoveryPath -Directory $InstallDir -Stem $BinaryStem -Role \"failed\"",
         "$AmbiguousBinaryState",
-        "function Remove-StagedCandidate",
-        "staged candidate remains preserved at",
-        "function Invoke-AtomicUpgradePublication",
-        "[System.IO.File]::Replace($StagedPath, $InstalledPath, $BackupPath, $true)",
-        "$Publication = Invoke-AtomicUpgradePublication",
-        "-FailedPath $FailedBin",
-        "function Invoke-AtomicUpgradeRollback",
-        "[System.IO.File]::Replace($BackupPath, $InstalledPath, $FailedPath, $true)",
-        "$Rollback = Invoke-AtomicUpgradeRollback",
-        "Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin",
-        "& $InstalledBin daemon start",
-        "& $CandidatePath daemon stop --expected-service-executable $BinPath",
-        "& $CandidateBin daemon start --expected-executable $InstalledBin",
-        "function Assert-CandidateServiceOwner",
-        "The existing daemon could not be stopped safely",
-        "$CandidateVersionOutput = & $CandidateBin --version",
-        "$StagedVersionOutput = & $StagedBin --version",
-        "the existing installation was not changed",
-        "$RollbackErrors",
-        "Restarting the previous daemon after rollback",
+        "function Remove-InstallerArtifactIfOwned",
+        "function Invoke-ClassifiedInstallerReplace",
+        "$Publication = Invoke-ClassifiedInstallerReplace",
+        "$Rollback = Invoke-ClassifiedInstallerReplace",
+        "$InstallPostCommitErrors",
     ] {
         assert!(
             script.contains(required),
             "Windows installer must contain the daemon-upgrade safeguard `{required}`"
         );
     }
-    assert_before(
-        install_transaction,
-        "$DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
-        "$Publication = Invoke-AtomicUpgradePublication",
-    );
     assert_before(
         &script,
         "$CandidateVersionOutput = & $CandidateBin --version",
@@ -3000,21 +3998,17 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
     assert_before(
         install_transaction,
         "$StagedVersionOutput = & $StagedBin --version",
-        "$DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
+        "$InstallLifecycleHolder = Start-DaemonLifecycleHolder",
     );
     assert_before(
         install_transaction,
-        "$DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
-        "Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin",
-    );
-    assert_before(
-        install_transaction,
-        "Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin",
-        "$Publication = Invoke-AtomicUpgradePublication",
+        "$InstallLifecycleHolder = Start-DaemonLifecycleHolder",
+        "$Publication = Invoke-ClassifiedInstallerReplace",
     );
     assert!(
-        script.contains("if ($DaemonWasRunning -or $DaemonServiceInstalled)"),
-        "an installed but currently stopped task must still be ended before its executable is replaced"
+        !script.contains("function Stop-And-ConfirmDaemonAbsent")
+            && !script.contains("function Get-CheckedDaemonStatus"),
+        "split status/stop helpers must not survive the persistent holder transition"
     );
 
     let rollback_start = install_transaction
@@ -3024,32 +4018,35 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
     assert_before(
         successful_transaction,
         "$InstalledVersionLine =",
-        "Remove-Item -LiteralPath $BackupBin -Force",
+        "Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command \"new\"",
     );
     assert_before(
         successful_transaction,
-        "$DaemonRestarted = $true",
-        "Remove-Item -LiteralPath $BackupBin -Force",
+        "Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command \"new\"",
+        "if ($InstallPostCommitErrors.Count -eq 0 -and $OldBinaryBackedUp) {",
+    );
+    assert_before(
+        successful_transaction,
+        "Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command \"finish\"",
+        "if ($InstallPostCommitErrors.Count -eq 0 -and $OldBinaryBackedUp) {",
+    );
+    assert_before(
+        successful_transaction,
+        "if ($InstallPostCommitErrors.Count -eq 0 -and $OldBinaryBackedUp) {",
+        "Invoke-DaemonLifecycleCommand -Holder $InstallLifecycleHolder -Command \"release\"",
     );
     let rollback = &install_transaction[rollback_start..];
     assert_before(
         rollback,
-        "Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin",
-        "elseif ($NewBinaryPublished -and $OldBinaryBackedUp)",
-    );
-    assert!(rollback.contains(
-        "$DaemonWasRunning -and $DaemonSafeForBinaryRollback -and $PreviousBinaryRestored"
-    ));
-    assert_before(
-        rollback,
-        "$Rollback = Invoke-AtomicUpgradeRollback",
-        "Restarting the previous daemon after rollback",
+        "$Rollback = Invoke-ClassifiedInstallerReplace",
+        "-Command \"rollback\"",
     );
     assert_before(
         rollback,
-        "SetEnvironmentVariable(\"Path\", $OriginalUserPath, \"User\")",
-        "Restarting the previous daemon after rollback",
+        "Restore-ExactUserPathTransition `",
+        "-Command \"rollback\"",
     );
+    assert!(!script.contains("$Holder.Process.Kill()"));
 }
 
 #[test]
@@ -3072,7 +4069,8 @@ fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
         "[System.IO.Directory]::CreateDirectory($InstallDir)",
         "function Complete-UpdateLockHolder",
         "$LockProcess.StandardInput.Close()",
-        "$LockProcess.WaitForExit(10000)",
+        "$UpdateLockReleaseExitTimeoutMilliseconds = 10000",
+        "$LockProcess.WaitForExit($UpdateLockReleaseExitTimeoutMilliseconds)",
         "$LockProcess.ExitCode -ne 0",
         "lock-holder PID $($LockProcess.Id) did not exit after stdin EOF",
         "$TransactionSucceeded = $true",
@@ -3090,17 +4088,17 @@ fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
     assert_before(
         install_transaction,
         "$UpdateLockHolder = Start-UpdateLockHolder",
-        "$OriginalUserPath = [Environment]::GetEnvironmentVariable(\"Path\", \"User\")",
+        "$OriginalUserPathSnapshot = Invoke-RequiredInstallerFileOperation",
     );
     assert_before(
         install_transaction,
         "$UpdateLockHolder = Start-UpdateLockHolder",
-        "$DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
+        "$InstallLifecycleHolder = Start-DaemonLifecycleHolder",
     );
     assert_before(
         install_transaction,
-        "$DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
-        "$Publication = Invoke-AtomicUpgradePublication",
+        "$InstallLifecycleHolder = Start-DaemonLifecycleHolder",
+        "$Publication = Invoke-ClassifiedInstallerReplace",
     );
     assert_before(
         install_transaction,
@@ -3109,11 +4107,11 @@ fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
     );
     assert_before(
         install_transaction,
-        "Remove-Item -LiteralPath $BackupBin -Force",
+        "if ($OldBinaryBackedUp) {",
         "Complete-UpdateLockHolder -LockProcess $UpdateLockHolder",
     );
     let transaction_finally = install_transaction
-        .find("} finally {\n    $LockReleaseError = $null")
+        .find("} finally {\n    $LifecycleReleaseError = $null")
         .expect("Windows installer must release its lock from the transaction finally block");
     assert!(
         install_transaction[transaction_finally..]
@@ -3131,14 +4129,15 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
         .expect("Windows uninstall transaction");
 
     for required in [
-        "function Invoke-AtomicUninstallStaging",
-        "[System.IO.File]::Move($InstalledPath, $BackupPath)",
-        "function Invoke-AtomicUninstallRestore",
-        "[System.IO.File]::Move($BackupPath, $InstalledPath)",
-        "function Invoke-AtomicUninstallCommit",
-        "[System.IO.File]::Delete($BackupPath)",
-        "function Restore-UninstallRunningState",
-        ".$Stem.uninstall.exe",
+        "function Invoke-ClassifiedInstallerReplace",
+        "function New-InstallerEmptyFileExclusive",
+        "function Copy-InstallerFileExclusive",
+        "function Remove-InstallerOwnedFile",
+        "-Operation \"replace-with-displaced\"",
+        "-Operation \"remove-owned\"",
+        "function Start-DaemonLifecycleHolder",
+        "function Invoke-DaemonLifecycleCommand",
+        ".$BinaryStem.uninstall.exe",
     ] {
         assert!(
             script.contains(required),
@@ -3150,26 +4149,30 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
         "-CandidatePath $CandidateBin",
         "-DestinationPath $InstalledBin",
         "$UninstallBackupBin",
-        "$UninstallIsNoOp",
-        "codex-switch-global-pace is already uninstalled",
-        "$OriginalBinarySha256",
-        "$OriginalUserPath",
+        "$OriginalBinaryToken",
+        "$UninstallHoldToken",
+        "$UninstallPlaceholderToken",
+        "$OriginalUserPathSnapshot",
+        "$OriginalProcessPathSnapshot",
         "$PathMutationAttempted",
-        "$DaemonStopAttempted",
+        "$ProcessPathMutationAttempted",
+        "$UninstallMutationAttempted",
         "$UninstallCommitted",
         "$PostCommitCleanupError",
         "Assert-CandidateServiceOwner",
-        "& $CandidateBin daemon uninstall --expected-executable $InstalledBin",
-        "& $CandidateBin daemon stop",
-        "Invoke-AtomicUninstallStaging",
-        "Invoke-AtomicUninstallCommit",
-        "Invoke-AtomicUninstallRestore",
-        "Restore-UninstallRunningState",
+        "$UninstallLifecycleHolder = Start-DaemonLifecycleHolder",
+        "Invoke-DaemonLifecycleCommand -Holder $UninstallLifecycleHolder -Command \"uninstall\"",
+        "$Staging = Invoke-ClassifiedInstallerReplace",
+        "$Restore = Invoke-ClassifiedInstallerReplace",
+        "Remove-InstallerOwnedFile `",
+        "-Command \"rollback\"",
+        "-Command \"finish\"",
+        "-Command \"release\"",
         "The uninstall did not commit, and the exact pre-uninstall binary, PATH, and running state were restored",
         "Uninstall committed, but post-commit cleanup could not be confirmed",
         "Recovery residue path: $UninstallBackupBin",
-        "SetEnvironmentVariable(\"Path\", $RequestedUserPath, \"User\")",
-        "SetEnvironmentVariable(\"Path\", $OriginalUserPath, \"User\")",
+        "Set-ExactUserPathTransition `",
+        "Restore-ExactUserPathTransition `",
         "Complete-UpdateLockHolder -LockProcess $UninstallLockHolder",
     ] {
         assert!(
@@ -3179,13 +4182,8 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
     }
     assert_before(
         uninstall,
-        "if ($UninstallIsNoOp)",
-        "[void][System.IO.Directory]::CreateDirectory($InstallDir)",
-    );
-    assert_before(
-        uninstall,
         "$UninstallLockHolder = Start-UpdateLockHolder",
-        "$OriginalBinarySha256 = if ($InstalledBinaryWasPresent)",
+        "$OriginalBinaryToken = if ($InstalledBinaryWasPresent)",
     );
     assert_before(
         uninstall,
@@ -3195,41 +4193,46 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
     assert_before(
         uninstall,
         "Assert-CandidateServiceOwner `",
-        "$DaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
+        "$UninstallLifecycleHolder = Start-DaemonLifecycleHolder",
     );
     assert_before(
         uninstall,
-        "Stop-And-ConfirmDaemonAbsent -BinPath $InstalledBin -CandidatePath $CandidateBin",
-        "SetEnvironmentVariable(\"Path\", $RequestedUserPath, \"User\")",
+        "$UninstallLifecycleHolder = Start-DaemonLifecycleHolder",
+        "Set-ExactUserPathTransition `",
     );
     assert_before(
         uninstall,
-        "SetEnvironmentVariable(\"Path\", $RequestedUserPath, \"User\")",
-        "$Staging = Invoke-AtomicUninstallStaging",
+        "Set-ExactUserPathTransition `",
+        "$Staging = Invoke-ClassifiedInstallerReplace",
     );
     assert_before(
         uninstall,
-        "$Staging = Invoke-AtomicUninstallStaging",
-        "$DaemonCleanupOutput = (& $CandidateBin daemon uninstall --expected-executable $InstalledBin 2>&1",
+        "$Staging = Invoke-ClassifiedInstallerReplace",
+        "Invoke-DaemonLifecycleCommand -Holder $UninstallLifecycleHolder -Command \"uninstall\"",
     );
     assert_before(
         uninstall,
-        "$DaemonCleanupOutput = (& $CandidateBin daemon uninstall --expected-executable $InstalledBin 2>&1",
-        "$CommittedDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
-    );
-    assert_before(
-        uninstall,
-        "$CommittedDaemonStatus = Get-CheckedDaemonStatus -CandidatePath $CandidateBin",
+        "Invoke-DaemonLifecycleCommand -Holder $UninstallLifecycleHolder -Command \"uninstall\"",
         "$UninstallCommitted = $true",
     );
     assert_before(
         uninstall,
         "$UninstallCommitted = $true",
-        "$Commit = Invoke-AtomicUninstallCommit",
+        "-Command \"finish\"",
     );
     assert_before(
         uninstall,
-        "$Commit = Invoke-AtomicUninstallCommit",
+        "-Command \"finish\"",
+        "Remove-InstallerOwnedFile `",
+    );
+    assert_before(
+        uninstall,
+        "Remove-InstallerOwnedFile `",
+        "-Command \"release\"",
+    );
+    assert_before(
+        uninstall,
+        "-Command \"release\"",
         "Complete-UpdateLockHolder -LockProcess $UninstallLockHolder",
     );
     let rollback = uninstall
@@ -3238,18 +4241,19 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
         .expect("Windows uninstall rollback branch");
     assert_before(
         rollback,
-        "$Restore = Invoke-AtomicUninstallRestore",
-        "SetEnvironmentVariable(\"Path\", $OriginalUserPath, \"User\")",
+        "$Restore = Invoke-ClassifiedInstallerReplace",
+        "Restore-ExactUserPathTransition `",
     );
     assert_before(
         rollback,
-        "SetEnvironmentVariable(\"Path\", $OriginalUserPath, \"User\")",
-        "Restore-UninstallRunningState",
+        "Restore-ExactUserPathTransition `",
+        "-Command \"rollback\"",
     );
     assert!(!uninstall.contains("Remove-Item -LiteralPath $InstalledBin -Force"));
     assert!(!uninstall.contains("daemon install"));
     assert!(!uninstall.contains("Get-ScheduledTask"));
     assert!(!uninstall.contains("schtasks.exe"));
+    assert!(!uninstall.contains("& $CandidateBin daemon stop"));
 }
 
 #[test]
@@ -3329,9 +4333,13 @@ fn daemon_service_installations_stage_validate_and_rollback() {
         "the fixed service identity must not use a CODEX_SWITCH_HOME-scoped operation lease"
     );
     let launchd_install = service
-        .split("fn install_launchd(expected_existing_executable: Option<&Path>)")
+        .split("fn install_launchd(executable: &Path, expected_existing_executable: Option<&Path>)")
         .nth(1)
-        .and_then(|section| section.split("fn start_launchd()").next())
+        .and_then(|section| {
+            section
+                .split("fn start_launchd(expected_executable: &Path)")
+                .next()
+        })
         .expect("LaunchAgent install implementation");
     assert_before(
         launchd_install,
@@ -3340,16 +4348,17 @@ fn daemon_service_installations_stage_validate_and_rollback() {
     );
     assert!(
         launchd_install.contains("validate_launchd_definition_owner(")
-            && launchd_install
-                .matches("require_service_file_snapshot(")
-                .count()
-                >= 2,
+            && launchd_install.matches("require_service_snapshot(").count() >= 2,
         "LaunchAgent install must prove owner and revalidate its exact snapshot before replacement"
     );
     let systemd_install = service
-        .split("fn install_systemd(expected_existing_executable: Option<&Path>)")
+        .split("fn install_systemd(executable: &Path, expected_existing_executable: Option<&Path>)")
         .nth(1)
-        .and_then(|section| section.split("fn start_systemd()").next())
+        .and_then(|section| {
+            section
+                .split("fn start_systemd(expected_executable: &Path)")
+                .next()
+        })
         .expect("systemd install implementation");
     assert_before(
         systemd_install,
@@ -3358,10 +4367,7 @@ fn daemon_service_installations_stage_validate_and_rollback() {
     );
     assert!(
         systemd_install.contains("validate_systemd_definition_owner(")
-            && systemd_install
-                .matches("require_service_file_snapshot(")
-                .count()
-                >= 2,
+            && systemd_install.matches("require_service_snapshot(").count() >= 2,
         "systemd install must prove owner and revalidate its exact snapshot before replacement"
     );
     let task_install = service
@@ -3372,30 +4378,38 @@ fn daemon_service_installations_stage_validate_and_rollback() {
     assert_before(
         task_install,
         "create_scheduled_task(&stage_name",
-        "stop_scheduled_daemon_for_rollback().context(",
+        "let preparation = (|| -> Result<()> {",
     );
     assert!(
         task_install.contains("validate_task_scheduler_definition_owner(")
-            && task_install.contains("require_task_definition_snapshot("),
+            && task_install.contains("require_task_definition_snapshot(")
+            && task_install.contains("transaction_error_with_restoration("),
         "Task Scheduler install must prove owner and guard its exact definition snapshot"
     );
     assert!(service.contains("reload systemd user units after uninstall"));
     assert!(service.contains("systemd service uninstall failed and rollback was incomplete"));
+    let service_runtime = service
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("service runtime implementation");
     assert!(
-        !service.contains("path.exists()"),
+        !service_runtime.contains("path.exists()"),
         "service lifecycle must not collapse metadata errors into a missing definition"
-    );
-    assert_before(
-        &service,
-        "std::fs::remove_file(&path)",
-        "reload systemd user units after uninstall",
     );
     let systemd_uninstall = service
         .split("fn uninstall_systemd(expected_executable: &Path)")
         .nth(1)
         .and_then(|section| section.split("// -- Windows Task Scheduler --").next())
         .expect("systemd uninstall implementation");
-    assert!(systemd_uninstall.contains("let Some(previous) = optional_file_contents(&path)? else"));
+    assert!(
+        systemd_uninstall
+            .contains("let Some(previous) = optional_service_file_snapshot(&path)? else")
+    );
+    assert_before(
+        systemd_uninstall,
+        "begin_service_file_removal(&path, &previous)?",
+        "reload systemd user units after uninstall",
+    );
     assert!(
         !systemd_uninstall.contains("path.exists()"),
         "systemd uninstall must not collapse metadata errors into a missing service"
@@ -3449,7 +4463,208 @@ fn self_update_gates_markerless_system_installs_before_network_checks() {
     assert_before(
         locked,
         "ensure_system_install_migrated(use_dev, version, json)?;",
-        "SelfUpdateDaemonRestart::capture()",
+        "SelfUpdateDaemonBoundaryClient::start()",
+    );
+}
+
+#[test]
+fn self_update_daemon_restart_holds_both_lifecycle_authorities_through_commit() {
+    let daemon = repo_file("src/daemon/mod.rs");
+    let command = repo_file("src/commands/update.rs");
+    let pidfile = repo_file("src/daemon/pidfile.rs");
+    let service = repo_file("src/daemon/service.rs");
+    let transaction = daemon
+        .split("pub struct SelfUpdateDaemonRestart")
+        .nth(1)
+        .and_then(|tail| tail.split("pub(crate) fn print_installer_state").next())
+        .expect("self-update daemon restart transaction");
+
+    for required in [
+        "initial_executable: std::path::PathBuf",
+        "initial_generation: Option<pidfile::DaemonGeneration>",
+        "initial_service_snapshot: service::ServiceStateSnapshot",
+        "expected_service_snapshot: service::ServiceStateSnapshot",
+        "executable: std::path::PathBuf",
+        "service_executable: std::path::PathBuf",
+        "service_lease: service::ServiceOperationLease",
+        "absence_lease: Option<pidfile::DaemonAbsenceLease>",
+        "service::capture_service_state_snapshot(&executable, initial_pid)?",
+        "classify_initial_launch_mechanism(initial_pid, initial_service_snapshot.manager_pid())?",
+        "service::stop_installed_manager_observed_locked(",
+        "service::start_installed_locked(&self.initial_executable, &self.service_lease)?",
+        "service::start_installed_locked(&previous_service_executable, &self.service_lease)",
+        "start_detached_executable_locked(&self.initial_executable, &self.service_lease)?",
+        "start_detached_executable_locked(replacement_executable, &self.service_lease)",
+        "self.reacquire_absence_after_foreground_contenders(self.initial_generation.clone())",
+        "self.record_expected_service_snapshot_after_restart(restarted_pid)?",
+        "pub fn verify_final_state(&mut self)",
+    ] {
+        assert!(
+            transaction.contains(required),
+            "daemon restart must retain the explicit public executable path through replacement: `{required}`"
+        );
+    }
+    assert!(!transaction.contains("service::start_installed()?"));
+    assert!(!transaction.contains("start_detached()?"));
+    assert_before(
+        transaction,
+        "validate_running_daemon_executable(&executable",
+        "service::capture_service_state_snapshot(&executable, initial_pid)?",
+    );
+    assert_before(
+        transaction,
+        "service::capture_service_state_snapshot(&executable, initial_pid)?",
+        "service::stop_installed_manager_observed_locked(",
+    );
+    let capture = transaction
+        .split("fn capture_for_executable(executable: std::path::PathBuf)")
+        .nth(1)
+        .and_then(|tail| tail.split("fn stop_before_update_inner").next())
+        .expect("self-update daemon capture");
+    assert_before(
+        capture,
+        "service::acquire_service_operation_lease()?",
+        "pidfile::running_identity_checked()?",
+    );
+    let client = daemon
+        .split("pub(crate) struct SelfUpdateDaemonBoundaryClient")
+        .nth(1)
+        .and_then(|tail| tail.split("enum InstallerUninstallTransition").next())
+        .expect("independent self-update daemon lifecycle client");
+    for required in [
+        "__hold-daemon-update-boundary",
+        ".stdin(std::process::Stdio::piped())",
+        ".stdout(std::process::Stdio::piped())",
+        "impl Drop for SelfUpdateDaemonBoundaryClient",
+        "self.input.take();",
+        "child.wait()",
+        "pub(crate) fn stop_replacement_for_rollback",
+        "isolate_lifecycle_holder_from_terminal_interrupt(&mut command)",
+    ] {
+        assert!(
+            client.contains(required),
+            "the async self-update client must retain an independent phase-aware holder: `{required}`"
+        );
+    }
+    assert!(daemon.contains("command.process_group(0)"));
+    assert!(daemon.contains("CREATE_NEW_PROCESS_GROUP"));
+    assert!(daemon.contains("CREATE_NO_WINDOW"));
+    assert!(daemon.contains("lifecycle_holder_survives_parent_process_group_interrupt"));
+    assert_before(
+        &command,
+        "SelfUpdateDaemonBoundaryClient::start()",
+        "update::self_update_dev(show_progress",
+    );
+    let synchronous_finish = command
+        .split("fn finish_self_update_result_inner")
+        .nth(1)
+        .and_then(|tail| tail.split("pub(crate) async fn self_update_cmd").next())
+        .expect("synchronous self-update commit boundary");
+    assert_before(
+        synchronous_finish,
+        "daemon_boundary.restart_replacement()",
+        ".verify_replacement_before_commit()",
+    );
+    assert_before(
+        synchronous_finish,
+        ".verify_replacement_before_commit()",
+        ".commit_replacement()",
+    );
+    assert_before(
+        synchronous_finish,
+        ".commit_replacement()",
+        ".release_verified_replacement()",
+    );
+    let interruption_recovery = command
+        .split("fn recover_interrupted_self_update")
+        .nth(1)
+        .and_then(|tail| tail.split("fn panic_payload_message").next())
+        .expect("phase-aware self-update interruption recovery");
+    assert_before(
+        interruption_recovery,
+        "boundary.stop_replacement_for_rollback()?",
+        ".rollback_replacement()",
+    );
+    assert_before(
+        interruption_recovery,
+        ".rollback_replacement()",
+        ".restore_prior()",
+    );
+    assert!(command.contains("std::panic::catch_unwind"));
+    assert!(transaction.contains("fn stop_lifecycle_generation"));
+    assert!(transaction.contains("request.settle_for_lifecycle()"));
+    assert!(transaction.contains("wait_for_requested_generation_to_settle("));
+    assert!(
+        !transaction.contains("stop_daemon_generation(pid)?"),
+        "lifecycle transactions must not use the ordinary finite CLI stop wait"
+    );
+    assert!(pidfile.contains("pub(crate) struct DaemonAbsenceLease"));
+    assert!(pidfile.contains("write_pidfile_exclusive"));
+
+    let detached_start = daemon
+        .split("// All CLI-initiated detached starts share the service-operation lease.")
+        .nth(1)
+        .and_then(|tail| tail.split("async fn run_foreground").next())
+        .expect("normal detached-start lifecycle boundary");
+    assert_before(
+        detached_start,
+        "service::acquire_service_operation_lease()?",
+        "pidfile::running_pid_checked()?",
+    );
+    assert!(detached_start.contains("start_detached_executable_locked("));
+
+    let normal_stop = daemon
+        .split("fn stop(expected_service_executable:")
+        .nth(1)
+        .and_then(|tail| tail.split("fn stop_windows_installer_owned").next())
+        .expect("normal daemon-stop lifecycle boundary");
+    assert_before(
+        normal_stop,
+        "service::acquire_service_operation_lease()?",
+        "pidfile::running_pid_checked()?",
+    );
+    assert!(normal_stop.contains("stop_detached_locked(&service_lease)"));
+
+    for required in [
+        "return start_launchd(expected_executable)",
+        "return start_systemd(expected_executable)",
+        "fn start_launchd(expected_executable: &Path)",
+        "validate_launchd_definition_owner(&contents, expected_executable)?",
+        "fn start_systemd(expected_executable: &Path)",
+        "validate_systemd_definition_owner(&contents, expected_executable)?",
+    ] {
+        assert!(
+            service.contains(required),
+            "Unix service restart must not rediscover the renamed running executable: `{required}`"
+        );
+    }
+}
+
+#[test]
+fn windows_self_update_recovery_names_are_random_and_transaction_owned() {
+    let update = repo_file("src/update.rs");
+    assert!(update.contains("WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT"));
+    assert!(update.contains("let mut nonce = [0_u8; 16]"));
+    assert!(update.contains("rand::rng().fill_bytes(&mut nonce)"));
+    assert!(update.contains("\"failed candidate executable\""));
+
+    let windows_replace = update
+        .split("#[cfg(windows)]\nfn replace_candidate_inner(")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("#[cfg(windows)]\nfn rollback_windows_replacement(")
+                .next()
+        })
+        .expect("Windows replacement transaction");
+    assert_eq!(
+        windows_replace
+            .matches("random_windows_recovery_sibling_path(")
+            .count(),
+        2,
+        "both ReplaceFileW recovery operands must use independent randomized sibling names"
+    );
+    assert!(
+        windows_replace.contains("replace_file_windows(executable, &staged, &displaced_previous)")
     );
 }
 
@@ -3548,48 +4763,46 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
          instead of force-killing it"
     );
 
-    let uninstall_start = daemon.find("fn uninstall(expected_executable:").unwrap();
-    let uninstall_end = daemon[uninstall_start..].find("async fn start").unwrap() + uninstall_start;
-    let uninstall = &daemon[uninstall_start..uninstall_end];
-    assert!(
-        uninstall.matches("pidfile::running_pid_checked()?").count() >= 2,
-        "Windows uninstall must check the PID-lock authority before graceful shutdown and again \
-         immediately before Task Scheduler may force-stop the daemon"
-    );
-
-    let stop_start = daemon
-        .find("fn stop(expected_service_executable:")
-        .expect("daemon stop must keep one explicit service-executable authority boundary");
-    let stop_end = daemon[stop_start..].find("fn stop_detached").unwrap() + stop_start;
-    let stop = &daemon[stop_start..stop_end];
-    assert!(
-        stop.contains("pidfile::running_pid_checked()?"),
-        "Windows stop must use the checked PID-lock authority before Task Scheduler may use /End"
-    );
     assert!(
         !daemon.contains("service::is_installed()"),
         "daemon mutation paths must not fold scheduler or service-marker errors into detached mode"
     );
-    let detached_start = daemon.find("fn stop_detached()").unwrap();
+    let detached_start = daemon.find("fn stop_detached_locked(").unwrap();
     let detached_end = daemon[detached_start..]
-        .find("fn wait_until_stopped(")
+        .find("struct DaemonGenerationStopRequest")
         .unwrap()
         + detached_start;
     let detached = &daemon[detached_start..detached_end];
+    let request_start = daemon
+        .find("impl DaemonGenerationStopRequest")
+        .expect("generation stop must expose one typed request boundary");
+    let request_end = daemon[request_start..]
+        .find("fn stop_daemon_generation(")
+        .unwrap()
+        + request_start;
+    let request = &daemon[request_start..request_end];
     assert!(
-        detached.contains("pidfile::running_pid_checked()?")
-            && detached.contains("pidfile::request_shutdown(pid)?"),
-        "a live daemon must be selected by its held PID lock and stopped with its generation-bound request"
+        detached.contains("pidfile::running_generation_checked()?")
+            && detached.contains("stop_daemon_generation(target)?")
+            && request.contains("pidfile::request_shutdown(&target)?")
+            && request.contains("self.shutdown_request.target_is_running()"),
+        "a live daemon must carry one exact generation token from selection through shutdown delivery"
     );
     assert!(
         !detached.contains("let _ = pidfile::cleanup_pidfile();"),
         "Windows graceful-stop completion must propagate a locked PID-file cleanup failure"
     );
-    assert!(
-        detached.contains("wait_until_stopped(Some(pid))")
-            && detached.contains("pidfile::cleanup_pidfile()?"),
-        "detached stop must confirm that the selected PID generation exited before cleaning its PID file"
-    );
+    assert!(detached.contains("pidfile::cleanup_pidfile()?"));
+    let lifecycle_settle = daemon
+        .split("fn wait_for_requested_generation_to_settle(")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("fn wait_for_requested_generation_to_settle_with")
+                .next()
+        })
+        .expect("lifecycle generation settlement");
+    assert!(lifecycle_settle.contains("running_generation_checked()?"));
+    assert!(lifecycle_settle.contains("authority remains held"));
 
     assert!(
         pidfile.contains("generation: identity.generation"),
@@ -3609,26 +4822,21 @@ fn windows_daemon_stop_never_force_kills_a_trusted_process() {
     let scheduled_stop_start = service
         .find("fn stop_scheduled_daemon_for_rollback()")
         .unwrap();
-    let scheduled_stop_end = service[scheduled_stop_start..]
-        .find("fn uninstall_task_scheduler(")
-        .unwrap()
-        + scheduled_stop_start;
-    let scheduled_stop = &service[scheduled_stop_start..scheduled_stop_end];
+    let scheduled_stop = &service[scheduled_stop_start..];
     assert!(
-        scheduled_stop.contains("crate::daemon::pidfile::request_shutdown(pid)"),
+        scheduled_stop.contains("crate::daemon::pidfile::request_shutdown(&target)"),
         "scheduled-daemon rollback must request shutdown from the generation selected by the PID lock"
     );
     assert!(
-        scheduled_stop
-            .matches("crate::daemon::pidfile::running_pid_checked()")
-            .count()
-            >= 3,
-        "scheduled-daemon rollback must wait for checked lock release and recheck immediately before /End"
+        scheduled_stop.contains("stop_exact_scheduled_daemon_generation_with(")
+            && scheduled_stop.contains(".target_is_running()")
+            && scheduled_stop.contains("let finalization = finalize();"),
+        "scheduled-daemon rollback must settle one exact generation before its single scheduler finalization"
     );
     assert_before(
         scheduled_stop,
-        "crate::daemon::pidfile::request_shutdown(pid)",
-        "\"/End\"",
+        "crate::daemon::pidfile::request_shutdown(&target)",
+        "fn finalize_scheduled_daemon_rollback_stop()",
     );
 
     let service_uninstall_start = service.find("fn uninstall_task_scheduler(").unwrap();

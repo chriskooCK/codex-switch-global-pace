@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use axum::{
@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 /// Env vars are process-global; serialize every test that touches them.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static CONFIG_INIT: Once = Once::new();
 
 struct EnvVarGuard {
     key: &'static str,
@@ -57,6 +58,17 @@ impl Drop for EnvVarGuard {
             }
         }
     }
+}
+
+fn init_test_config() {
+    CONFIG_INIT.call_once(|| {
+        let home = tempfile::tempdir().expect("test config home must be created");
+        let _home = EnvVarGuard::set(
+            "CODEX_SWITCH_HOME",
+            home.path().to_string_lossy().into_owned(),
+        );
+        codex_switch::config::init().expect("default test configuration must initialize");
+    });
 }
 
 #[derive(Clone)]
@@ -160,6 +172,22 @@ impl HeldTokenRequests {
     fn release_all(&self) {
         self.release.add_permits(64);
     }
+}
+
+/// Replace a file only after the mock has irreversibly accepted `count`
+/// refresh tokens, while their responses are still parked. This puts local
+/// persistence failure at the exact post-authorization boundary the tests are
+/// meant to exercise.
+async fn replace_file_after_rotations(
+    held: &mut HeldTokenRequests,
+    count: usize,
+    path: &Path,
+) -> Vec<String> {
+    let presented = held.wait_for(count).await;
+    std::fs::remove_file(path).unwrap();
+    std::fs::create_dir(path).unwrap();
+    held.release_all();
+    presented
 }
 
 #[derive(Default)]
@@ -434,6 +462,7 @@ struct Fixture {
 }
 
 fn env_guards(server: &MockServer, home: &Path) -> Vec<EnvVarGuard> {
+    init_test_config();
     vec![
         EnvVarGuard::set("CODEX_SWITCH_HOME", home.display().to_string()),
         EnvVarGuard::set("CODEX_HOME", home.join("codex").display().to_string()),
@@ -447,33 +476,6 @@ fn fixture(server: &MockServer, alias: &str, access_token: &str) -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let guards = env_guards(server, home.path());
     let profile_path = write_profile(home.path(), alias, "old_id", access_token, "refresh_old");
-    Fixture {
-        profile_path,
-        _guards: guards,
-        _home: home,
-    }
-}
-
-/// Same as [`fixture`], except the profile's own `auth.json` — the path the
-/// persist step derives from the alias — is occupied by a *directory*, so every
-/// attempt to save rotated tokens fails deterministically on unix and Windows
-/// alike (no permission-bit semantics involved).
-///
-/// The tokens the fetch starts from are staged in a separate readable file, so
-/// the run reaches a successful refresh first. That reproduces the production
-/// window this guards: the profile is read fine, the auth server then rotates
-/// the credentials, and only the write back fails (disk full, permissions
-/// revoked, path clobbered).
-fn fixture_with_unwritable_profile(
-    server: &MockServer,
-    alias: &str,
-    access_token: &str,
-) -> Fixture {
-    let home = tempfile::tempdir().unwrap();
-    let guards = env_guards(server, home.path());
-    let profile_path = home.path().join("staged").join("auth.json");
-    write_auth_file(&profile_path, "old_id", access_token, "refresh_old");
-    std::fs::create_dir_all(home.path().join("profiles").join(alias).join("auth.json")).unwrap();
     Fixture {
         profile_path,
         _guards: guards,
@@ -820,11 +822,18 @@ async fn refresh_that_cannot_be_saved_fails_the_account_instead_of_reporting_suc
         vec![rotation(1)],
     )
     .await;
-    let fx = fixture_with_unwritable_profile(&server, "team6", "old_access");
+    let fx = fixture(&server, "team6", "old_access");
+    let mut held = server.hold_token_requests();
+    let profile_path = fx.profile_path.clone();
 
-    let err = codex_switch::usage::fetch_usage_retried_force("team6", &fx.profile_path)
-        .await
+    let (result, presented) = tokio::join!(
+        codex_switch::usage::fetch_usage_retried_force("team6", &fx.profile_path),
+        replace_file_after_rotations(&mut held, 1, &profile_path),
+    );
+    let err = result
         .expect_err("a rotated token that never reached disk must not be reported as success");
+
+    assert_eq!(presented, vec!["refresh_old".to_string()]);
 
     assert!(
         err.summary.contains("not saved"),
@@ -888,12 +897,17 @@ async fn refresh_that_cannot_be_saved_does_not_burn_another_rotation() {
         vec![rotation(1), rotation(2), rotation(3)],
     )
     .await;
-    let fx = fixture_with_unwritable_profile(&server, "team7", "old_access");
+    let fx = fixture(&server, "team7", "old_access");
+    let mut held = server.hold_token_requests();
+    let profile_path = fx.profile_path.clone();
 
-    let _ = codex_switch::usage::fetch_usage_retried_force("team7", &fx.profile_path).await;
+    let (_result, presented) = tokio::join!(
+        codex_switch::usage::fetch_usage_retried_force("team7", &fx.profile_path),
+        replace_file_after_rotations(&mut held, 1, &profile_path),
+    );
 
     assert_eq!(
-        server.token_calls(),
+        presented,
         vec!["refresh_old".to_string()],
         "a token that could not be saved must not be followed by another rotation"
     );
@@ -906,12 +920,14 @@ async fn refresh_that_cannot_be_saved_does_not_burn_another_rotation() {
 }
 
 /// Two profiles whose access tokens are already past expiry, so opportunistic
-/// refresh picks both up. The stale marker claims `blocked` is active while
-/// live `$CODEX_HOME/auth.json` is occupied by a directory. Neither profile may
-/// trust that marker as a fallback: both save their profile copy, then report
-/// that live-auth ownership could not be determined safely.
+/// refresh picks both up. `blocked` is exactly active when each refresh is
+/// authorized. The tests replace live auth only after both rotations reach the
+/// mock, exercising the post-response compare-and-swap without weakening its
+/// pre-network authorization.
 struct OpportunisticFixture {
     keeper_profile: PathBuf,
+    blocked_profile: PathBuf,
+    live_auth_path: PathBuf,
     _guards: Vec<EnvVarGuard>,
     _home: tempfile::TempDir,
 }
@@ -919,24 +935,34 @@ struct OpportunisticFixture {
 fn opportunistic_fixture(server: &MockServer) -> OpportunisticFixture {
     let home = tempfile::tempdir().unwrap();
     let guards = env_guards(server, home.path());
+    let keeper_access = expired_jwt();
     let keeper_profile = write_profile(
         home.path(),
         "keeper",
         "old_id",
-        &expired_jwt(),
+        &keeper_access,
         "refresh_keeper",
     );
-    write_profile(
+    let blocked_access = expired_jwt();
+    let blocked_profile = write_profile(
         home.path(),
         "blocked",
         "old_id",
-        &expired_jwt(),
+        &blocked_access,
         "refresh_blocked",
     );
     std::fs::write(home.path().join("current"), "blocked").unwrap();
-    std::fs::create_dir_all(home.path().join("codex").join("auth.json")).unwrap();
+    let live_auth_path = home.path().join("codex").join("auth.json");
+    write_auth_file(
+        &live_auth_path,
+        "old_id",
+        &blocked_access,
+        "refresh_blocked",
+    );
     OpportunisticFixture {
         keeper_profile,
+        blocked_profile,
+        live_auth_path,
         _guards: guards,
         _home: home,
     }
@@ -970,58 +996,68 @@ fn opportunistic_server_replies() -> Vec<(String, Reply)> {
 }
 
 /// D7: opportunistic refresh spends the same single-use rotation as any other
-/// refresh, and the daemon runs it on a timer. If live-auth ownership cannot be
-/// read, every rotated profile must fail closed after preserving its own copy;
-/// the stale current marker must not nominate one profile as active.
+/// refresh, and the daemon runs it on a timer. If exact active-auth publication
+/// fails after rotation, the rotated profile must remain saved and the partial
+/// commit must be attributed to that active alias.
 #[tokio::test]
-async fn opportunistic_refresh_reports_the_profile_whose_token_could_not_be_saved() {
+async fn opportunistic_refresh_reports_active_profile_sync_failure() {
     let _lock = ENV_LOCK.lock().await;
     let server = MockServer::start_keyed_by_refresh_token(opportunistic_server_replies()).await;
-    let _fx = opportunistic_fixture(&server);
+    let fx = opportunistic_fixture(&server);
+    let mut held = server.hold_token_requests();
 
-    let failures = codex_switch::usage::refresh_expiring_tokens().await;
-
-    let mut failed_aliases = failures
-        .iter()
-        .map(|failure| failure.alias.as_str())
-        .collect::<Vec<_>>();
-    failed_aliases.sort_unstable();
+    let (failures, mut presented) = tokio::join!(
+        codex_switch::usage::refresh_expiring_tokens(),
+        replace_file_after_rotations(&mut held, 2, &fx.live_auth_path),
+    );
+    presented.sort_unstable();
     assert_eq!(
-        failed_aliases,
-        vec!["blocked", "keeper"],
-        "all profiles whose live-auth ownership could not be verified must be reported"
+        presented,
+        vec!["refresh_blocked".to_string(), "refresh_keeper".to_string()],
+        "both rotations must have crossed the irreversible server boundary"
     );
-    let detail = &failures[0].error.detail;
+
+    assert_eq!(
+        failures.len(),
+        1,
+        "only the exact active profile requires live-auth synchronization: {failures:?}"
+    );
+    assert_eq!(failures[0].alias, "blocked");
+    assert_eq!(
+        stored_refresh_token(&fx.blocked_profile),
+        "refresh_blocked_new",
+        "the spent rotation must remain preserved in its profile"
+    );
+    let error = &failures[0].error;
     assert!(
-        detail.contains("were saved in the profile")
-            && detail.contains("live Codex auth could not be synchronized safely"),
-        "detail must distinguish a saved profile from incomplete live-auth sync: {detail}"
+        error.summary.contains("commit incomplete"),
+        "summary must name the partial credential commit: {}",
+        error.summary
     );
     assert!(
-        detail.contains("reading") && detail.contains("auth.json"),
-        "detail must carry the underlying IO/permission cause: {detail}"
-    );
-    assert!(
-        failures[0]
-            .error
-            .summary
-            .contains("live auth sync incomplete"),
-        "summary must name the incomplete live-auth synchronization: {}",
-        failures[0].error.summary
+        error.detail.contains("visible in the profile")
+            && error.detail.contains("live Codex auth synchronization")
+            && error.detail.contains("auth.json"),
+        "detail must distinguish saved profile bytes from failed live sync: {}",
+        error.detail
     );
     server.shutdown();
 }
 
-/// D7b: opportunistic refresh is a batch. One profile that cannot be written
-/// must not cost the others their refresh — they would each keep an expiring
-/// token and hit the same cliff later.
+/// D7b: opportunistic refresh is a batch. One profile whose active-auth sync
+/// fails must not cost the others their refresh — they would each keep an
+/// expiring token and hit the same cliff later.
 #[tokio::test]
-async fn opportunistic_refresh_keeps_going_after_one_profile_fails_to_save() {
+async fn opportunistic_refresh_keeps_going_after_active_profile_sync_fails() {
     let _lock = ENV_LOCK.lock().await;
     let server = MockServer::start_keyed_by_refresh_token(opportunistic_server_replies()).await;
     let fx = opportunistic_fixture(&server);
+    let mut held = server.hold_token_requests();
 
-    let failures = codex_switch::usage::refresh_expiring_tokens().await;
+    let (failures, mut seen) = tokio::join!(
+        codex_switch::usage::refresh_expiring_tokens(),
+        replace_file_after_rotations(&mut held, 2, &fx.live_auth_path),
+    );
 
     assert_eq!(
         stored_refresh_token(&fx.keeper_profile),
@@ -1032,7 +1068,6 @@ async fn opportunistic_refresh_keeps_going_after_one_profile_fails_to_save() {
             .map(|f| f.alias.as_str())
             .collect::<Vec<_>>()
     );
-    let mut seen = server.token_calls();
     seen.sort();
     assert_eq!(
         seen,

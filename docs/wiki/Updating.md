@@ -27,7 +27,16 @@ a moved tag or unusable package leaves the installed binary unchanged.
 A current [GitHub CLI](https://cli.github.com/) with attestation support is
 required. If a daemon is running, self-update stops it before replacement and
 restarts it afterwards. On Windows, an in-flight credential rotation is never
-force-killed merely to complete an update.
+force-killed merely to complete an update. Self-update holds the shared daemon
+lifecycle lease from the initial snapshot through restart and executable commit.
+After stop, it also retains the existing `daemon.pid.lock` until the controlled
+restart handoff; this keeps an initially stopped daemon stopped and rejects a
+direct foreground start during replacement. A foreground command that wins the
+short restart handoff is classified by its published PID generation, stopped,
+and followed by reacquisition of exact absence before rollback. Normal CLI
+start, stop, and service operations use the same lifecycle lease. Direct, non-cooperating
+`systemctl`/`launchctl`/`schtasks` mutations are outside that serialization
+contract and are not described as protected.
 
 ## Channels
 
@@ -59,9 +68,53 @@ it with the new user binary before removing the old one. An installed but
 inactive legacy service is left untouched with explicit uninstall/reinstall
 instructions because silently starting it would change the user's service state.
 
+On Windows, macOS, and Linux, the verified installer candidate acquires the
+shared update lock first, then retains the daemon service-operation lease
+continuously from the pre-mutation state capture through an explicit commit or
+rollback. It also owns `daemon.pid.lock` as an absence lease while the daemon is
+stopped. This applies to fresh installs, upgrades, and uninstall: a foreground
+daemon cannot enter after first publication or before service removal and
+survive a later PATH/file rollback. If a foreground start wins the short PID
+handoff while the intended daemon is being restarted, the holder stops that
+exact published PID generation and reacquires absence before rollback; it does
+not release the transaction on an unclassified contender. Replacement or
+uninstall PID/service state is revalidated before executable recovery copies
+are removed and again before the lifecycle lease is released. Direct,
+non-cooperating service-manager mutations remain outside this serialization
+contract.
+
 Before downloading, self-update confirms that the current executable directory
 can accept a replacement. Permission failures therefore surface before any
-archive is fetched.
+archive is fetched. An independent copy of the previous executable and the
+actual file displaced by publication remain beside the installed path until the
+replacement and any previously running daemon are healthy. If that daemon
+cannot restart, self-update first proves the failed process stopped, restores
+the exact displaced executable, and restarts the previous daemon state.
+
+Linux and macOS publish with one atomic name exchange, so the public executable
+name is never temporarily absent. Windows uses `ReplaceFileW` with a separate
+displaced-file path. The Windows displaced and failed-candidate recovery names
+each contain a CSPRNG-generated 128-bit nonce; allocation retries a named,
+bounded number of collisions, and `ReplaceFileW` is never given a fixed or
+guessable backup name. The pending transaction retains both exact random paths,
+and manual-recovery errors print them rather than trying to rediscover them.
+Both platforms identify the public, candidate, displaced, and backup files
+again after the operating-system call; cleanup and rollback only touch a file
+whose identity and digest still match the transaction. A
+non-cooperating writer can still change the public name between observations,
+so self-update does not claim a strict content compare-and-swap. When the
+post-state proves which file was displaced, that actual writer is restored;
+otherwise every recovery entry is preserved and the command fails closed with
+their exact paths. Existing transaction residue is never guessed or
+overwritten. Linux and macOS also sync the containing directory after namespace
+changes and retry that same durability boundary when a verified post-state shows
+that a namespace call applied before reporting an error. Windows flushes and
+rebinds each recovery file, uses `MOVEFILE_WRITE_THROUGH` where that Win32 API
+supports it, and verifies every resulting name. Windows does not expose a
+supported directory-fsync contract for `ReplaceFileW`, so the updater does not
+claim power-loss durability for that directory entry beyond those Win32
+guarantees. Unsupported atomic primitives are rejected rather than replaced by
+a weaker fallback.
 
 ## Uninstall
 

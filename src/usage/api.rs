@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -133,7 +134,11 @@ async fn remember_terminal_verdict(
     let Some(refresh_token) = refresh_token else {
         return;
     };
-    crate::cache::put_auth_failure_async(alias, refresh_token, error).await;
+    if let Err(cache_error) =
+        crate::cache::put_auth_failure_async(alias, refresh_token, error).await
+    {
+        warn!("[{alias}] could not record the terminal auth verdict in cache: {cache_error:#}");
+    }
 }
 
 fn format_refresh_error(code: &str, message: Option<&str>) -> String {
@@ -223,7 +228,8 @@ pub(crate) async fn fetch_usage_retried_with_existing_lease(
     refresh: Refresh,
     lease: &crate::profile::ProfileLease,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    if let Some(cached) = usage_cache_hit(alias, refresh).await {
+    ensure_usage_configuration()?;
+    if let Some(cached) = usage_cache_hit(alias, refresh).await? {
         return Ok(cached);
     }
     fetch_usage_retried_with_lease(alias, profile_path, refresh, lease).await
@@ -237,12 +243,14 @@ pub(crate) async fn fetch_usage_retried_with_existing_lease(
 /// failure rather than something to warn about and walk past.
 fn persist_refreshed_tokens(
     lease: &crate::profile::ProfileLease,
+    authorization: crate::profile::FreshCredentialsActivationAuthorization,
     presented_refresh_token: &str,
     new_tokens: &RefreshedTokens,
 ) -> std::result::Result<(), UsageError> {
     let alias = lease.alias();
     let update = crate::profile::update_profile_tokens_if_refresh_matches_leased(
         lease,
+        authorization,
         presented_refresh_token,
         &new_tokens.id_token,
         &new_tokens.access_token,
@@ -354,7 +362,8 @@ async fn fetch_usage_retried_inner(
     profile_path: &Path,
     refresh: Refresh,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    if let Some(cached) = usage_cache_hit(alias, refresh).await {
+    ensure_usage_configuration()?;
+    if let Some(cached) = usage_cache_hit(alias, refresh).await? {
         return Ok(cached);
     }
 
@@ -367,19 +376,36 @@ async fn fetch_usage_retried_inner(
     fetch_usage_retried_with_lease(alias, profile_path, refresh, &lease).await
 }
 
-async fn usage_cache_hit(alias: &str, refresh: Refresh) -> Option<UsageInfo> {
+fn ensure_usage_configuration() -> std::result::Result<(), UsageError> {
+    crate::config::try_get()
+        .map(|_| ())
+        .map_err(|error| UsageError {
+            summary: "configuration unavailable".to_string(),
+            detail: format!("usage request cannot start: {error:#}"),
+        })
+}
+
+async fn usage_cache_hit(
+    alias: &str,
+    refresh: Refresh,
+) -> std::result::Result<Option<UsageInfo>, UsageError> {
     if refresh.skips_usage_cache() {
         debug!("{alias}: {refresh:?} refresh, bypassing the usage cache");
-        return None;
+        return Ok(None);
     }
-    match crate::cache::get_async(alias).await {
+    match crate::cache::get_async(alias)
+        .await
+        .map_err(|error| UsageError {
+            summary: "usage cache unreadable".to_string(),
+            detail: format!("[{alias}] failed to read usage cache: {error:#}"),
+        })? {
         Some(cached) => {
             debug!("{alias}: cache hit");
-            Some(cached)
+            Ok(Some(cached))
         }
         None => {
             debug!("{alias}: cache miss, fetching from API");
-            None
+            Ok(None)
         }
     }
 }
@@ -419,10 +445,22 @@ async fn fetch_usage_retried_with_lease(
     // explicit user force skips this — see [`Refresh`].
     if !refresh.may_re_present_a_rejected_credential()
         && let Some(rt) = refresh_token.as_deref()
-        && let Some(known) = crate::cache::get_auth_failure_async(alias, rt).await
     {
-        debug!("{alias}: credential already rejected by the auth server, not retrying");
-        return Err(known);
+        match crate::cache::get_auth_failure_async(alias, rt).await {
+            Ok(Some(known)) => {
+                debug!("{alias}: credential already rejected by the auth server, not retrying");
+                return Err(known);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(UsageError {
+                    summary: "auth cache unreadable".to_string(),
+                    detail: format!(
+                        "[{alias}] could not safely decide whether this credential was already rejected: {error:#}"
+                    ),
+                });
+            }
+        }
     }
 
     let mut at = match access_token {
@@ -476,11 +514,28 @@ async fn fetch_usage_retried_with_lease(
         }
 
         let mut rotated_tokens = None;
+        let mut authorization_failure = None;
         let mut persist_failure = None;
         let result = {
+            let mut authorize_rotation = || {
+                crate::profile::authorize_fresh_credentials_activation(lease).map_err(|error| {
+                    let error = UsageError::refresh_authorization_failed(alias, &error);
+                    let detail = error.detail.clone();
+                    authorization_failure = Some(error);
+                    anyhow::anyhow!(detail)
+                })
+            };
             let mut persist_before_follow_up =
-                |presented: &str, tokens: RefreshedTokens| -> Result<()> {
-                    match persist_refreshed_tokens(lease, presented, &tokens) {
+                |activation_authorization: crate::profile::FreshCredentialsActivationAuthorization,
+                 presented: &str,
+                 tokens: RefreshedTokens|
+                 -> Result<()> {
+                    match persist_refreshed_tokens(
+                        lease,
+                        activation_authorization,
+                        presented,
+                        &tokens,
+                    ) {
                         Ok(()) => {
                             rotated_tokens = Some(tokens);
                             Ok(())
@@ -492,18 +547,25 @@ async fn fetch_usage_retried_with_lease(
                         }
                     }
                 };
-            fetch_usage_with_refresh(
+            fetch_usage_with_refresh_transactional(
                 alias,
                 &at,
                 id_token.as_deref(),
                 refresh_token.as_deref(),
                 account_id.as_deref(),
                 is_fedramp,
+                &mut authorize_rotation,
                 &mut persist_before_follow_up,
             )
             .await
         };
 
+        // Authorization runs immediately before the refresh endpoint. A local
+        // failure therefore spends no token and must not be retried as a
+        // network failure.
+        if let Some(error) = authorization_failure {
+            return Err(error);
+        }
         // Persistence is invoked synchronously from the successful refresh
         // branch, before that branch can send its follow-up usage GET. A failed
         // write is terminal for this call: retrying would spend another
@@ -519,7 +581,9 @@ async fn fetch_usage_retried_with_lease(
 
         match result {
             Ok(usage) => {
-                crate::cache::put_async(alias, &usage).await;
+                if let Err(error) = crate::cache::put_async(alias, &usage).await {
+                    warn!("[{alias}] usage succeeded, but caching the result failed: {error:#}");
+                }
                 return Ok(usage);
             }
             Err(e) => {
@@ -581,6 +645,43 @@ pub async fn fetch_usage_with_refresh<F>(
 where
     F: FnMut(&str, RefreshedTokens) -> Result<()>,
 {
+    let mut authorize_rotation = || Ok(());
+    let mut persist_authorized = |(): (), presented: &str, tokens: RefreshedTokens| -> Result<()> {
+        persist_rotation(presented, tokens)
+    };
+    fetch_usage_with_refresh_transactional(
+        alias,
+        access_token,
+        id_token,
+        refresh_token,
+        account_id,
+        is_fedramp,
+        &mut authorize_rotation,
+        &mut persist_authorized,
+    )
+    .await
+}
+
+/// Internal variant that obtains a commit authorization immediately before
+/// each refresh request and carries that exact value to the persistence step.
+/// Ordinary usage GETs therefore remain independent of live-auth filesystem
+/// state, while no single-use refresh token can be spent without a prepared
+/// conditional publication boundary.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_usage_with_refresh_transactional<A, F, T>(
+    alias: &str,
+    access_token: &str,
+    id_token: Option<&str>,
+    refresh_token: Option<&str>,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    authorize_rotation: &mut A,
+    persist_rotation: &mut F,
+) -> Result<UsageInfo>
+where
+    A: FnMut() -> Result<T>,
+    F: FnMut(T, &str, RefreshedTokens) -> Result<()>,
+{
     let client = auth::build_http_client()?;
     let usage_url = usage_url();
     let mut rejected_refresh: Option<anyhow::Error> = None;
@@ -592,10 +693,11 @@ where
     {
         info!("[{alias}] token expiring soon, proactively refreshing");
 
+        let authorization = authorize_rotation()?;
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
                 let bearer = new_tokens.access_token.clone();
-                persist_rotation(rt, new_tokens)?;
+                persist_rotation(authorization, rt, new_tokens)?;
 
                 let resp = apply_account_routing_headers(
                     client
@@ -687,10 +789,11 @@ where
     {
         info!("[{alias}] got HTTP {status}, attempting token refresh");
 
+        let authorization = authorize_rotation()?;
         match do_refresh_token(alias, &client, id_token, Some(access_token), rt).await {
             Ok(new_tokens) => {
                 let bearer = new_tokens.access_token.clone();
-                persist_rotation(rt, new_tokens)?;
+                persist_rotation(authorization, rt, new_tokens)?;
 
                 let resp2 = apply_account_routing_headers(
                     client
@@ -940,6 +1043,40 @@ const OPPORTUNISTIC_REFRESH_CONCURRENCY: usize = 2;
 /// one — see [`refresh_expiring_tokens_within`].
 const OPPORTUNISTIC_START_BUDGET: std::time::Duration = std::time::Duration::from_secs(8);
 
+fn opportunistic_worker_join_error(alias: &str, error: &tokio::task::JoinError) -> UsageError {
+    let outcome = crate::task_batch::join_failure_outcome(error);
+    UsageError {
+        summary: "token refresh outcome unknown".to_string(),
+        detail: format!(
+            "[{alias}] the opportunistic token-refresh worker {outcome} before its result could be \
+             collected. It may already have sent the single-use refresh token to the auth server, \
+             so credential rotation and local persistence cannot be confirmed. Inspect this \
+             profile before retrying and sign in again if its credential no longer works."
+        ),
+    }
+}
+
+fn record_opportunistic_worker_result(
+    joined: std::result::Result<(tokio::task::Id, Option<UsageError>), tokio::task::JoinError>,
+    task_aliases: &mut HashMap<tokio::task::Id, String>,
+    failures: &mut Vec<TokenPersistFailure>,
+) {
+    let task_id = match &joined {
+        Ok((task_id, _)) => *task_id,
+        Err(error) => error.id(),
+    };
+    let alias = task_aliases
+        .remove(&task_id)
+        .expect("every opportunistic refresh task is registered before it can be joined");
+    let error = match joined {
+        Ok((_, error)) => error,
+        Err(error) => Some(opportunistic_worker_join_error(&alias, &error)),
+    };
+    if let Some(error) = error {
+        failures.push(TokenPersistFailure { alias, error });
+    }
+}
+
 fn profile_still_holds_refresh_token(profile_path: &Path, presented: &str) -> bool {
     auth::read_auth(profile_path)
         .ok()
@@ -982,7 +1119,9 @@ fn run_before_opportunistic_request_hook(deadline: tokio::time::Instant) {
 /// rejection is cached against the presented credential so the next background
 /// pass does not replay it. Failures to **save** a rotated token are returned
 /// instead: the old credential is already dead server-side, so a lost write
-/// silently bricks that profile and the caller has to tell someone.
+/// silently bricks that profile and the caller has to tell someone. A worker
+/// panic or cancellation is returned through the same channel because its
+/// server-side rotation and persistence outcome cannot be reconstructed.
 pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
     refresh_expiring_tokens_within(OPPORTUNISTIC_START_BUDGET).await
 }
@@ -1040,9 +1179,18 @@ pub async fn refresh_expiring_tokens_within(
         // rotated. Without this, every dead profile is refreshed again here —
         // after `list` has already printed its final screen, so the user waits
         // on a request whose answer is known and not even displayed.
-        if crate::cache::get_auth_failure(alias, &rt).is_some() {
-            debug!("[{alias}] skipping opportunistic refresh: credential already rejected");
-            continue;
+        match crate::cache::get_auth_failure(alias, &rt) {
+            Ok(Some(_)) => {
+                debug!("[{alias}] skipping opportunistic refresh: credential already rejected");
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    "[{alias}] skipping opportunistic refresh because the auth-failure cache could not be read: {error:#}"
+                );
+                continue;
+            }
         }
         let expiry = [
             crate::jwt::token_expires_at(&at),
@@ -1091,7 +1239,8 @@ pub async fn refresh_expiring_tokens_within(
     // an in-flight rotation is not cancellable without losing the credential.
     let deadline = tokio::time::Instant::now() + budget;
     let mut queued = candidates.into_iter();
-    let mut tasks = tokio::task::JoinSet::new();
+    let mut tasks: tokio::task::JoinSet<Option<UsageError>> = tokio::task::JoinSet::new();
+    let mut task_aliases = HashMap::new();
     let mut failures = Vec::new();
 
     loop {
@@ -1101,8 +1250,9 @@ pub async fn refresh_expiring_tokens_within(
             let Some((alias, path, rt, exp)) = queued.next() else {
                 break;
             };
+            let tracked_alias = alias.clone();
             let client = client.clone();
-            tasks.spawn(async move {
+            let task = tasks.spawn(async move {
                 let lease_control = crate::profile::ProfileLeaseAcquireControl::new();
                 let lease = match tokio::time::timeout_at(
                     deadline,
@@ -1161,6 +1311,13 @@ pub async fn refresh_expiring_tokens_within(
                 // boundary before an irreversible refresh-token rotation.
                 #[cfg(test)]
                 run_before_opportunistic_request_hook(deadline);
+                let activation_authorization =
+                    match crate::profile::authorize_fresh_credentials_activation(&lease) {
+                        Ok(authorization) => authorization,
+                        Err(error) => {
+                            return Some(UsageError::refresh_authorization_failed(&alias, &error));
+                        }
+                    };
                 if !opportunistic_start_budget_remaining(deadline) {
                     debug!(
                         "[{alias}] opportunistic refresh skipped: budget expired before request"
@@ -1176,7 +1333,12 @@ pub async fn refresh_expiring_tokens_within(
                 )
                 .await
                 {
-                    Ok(new_tokens) => match persist_refreshed_tokens(&lease, &rt, &new_tokens) {
+                    Ok(new_tokens) => match persist_refreshed_tokens(
+                        &lease,
+                        activation_authorization,
+                        &rt,
+                        &new_tokens,
+                    ) {
                         Ok(()) => {
                             info!("[{alias}] opportunistic token refresh succeeded");
                             None
@@ -1184,7 +1346,7 @@ pub async fn refresh_expiring_tokens_within(
                         // Report rather than abort: the remaining profiles still
                         // deserve their refresh, and this one is only recoverable
                         // once a human hears about it.
-                        Err(error) => Some(TokenPersistFailure { alias, error }),
+                        Err(error) => Some(error),
                     },
                     Err(e) => {
                         let detail = format!("{e:#}");
@@ -1212,17 +1374,19 @@ pub async fn refresh_expiring_tokens_within(
                     }
                 }
             });
+            let previous = task_aliases.insert(task.id(), tracked_alias);
+            debug_assert!(previous.is_none(), "JoinSet task IDs must be unique");
         }
 
         // No timeout here on purpose: this awaits requests the auth server has
         // already been told about.
-        let Some(joined) = tasks.join_next().await else {
+        let Some(joined) = tasks.join_next_with_id().await else {
             break;
         };
-        if let Ok(Some(failure)) = joined {
-            failures.push(failure);
-        }
+        record_opportunistic_worker_result(joined, &mut task_aliases, &mut failures);
     }
+
+    debug_assert!(task_aliases.is_empty());
 
     failures
 }
@@ -1261,6 +1425,12 @@ mod tests {
         }
     }
 
+    fn write_auth_durable(path: &Path, value: &serde_json::Value) {
+        crate::auth::write_auth(path, value)
+            .unwrap()
+            .assert_durably_published();
+    }
+
     fn jwt_with_exp(exp: i64) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::json!({"exp": exp}).to_string());
         format!("header.{payload}.signature")
@@ -1270,7 +1440,7 @@ mod tests {
     fn terminal_verdict_guard_rejects_a_superseded_refresh_token() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("auth.json");
-        crate::auth::write_auth(
+        write_auth_durable(
             &path,
             &json!({
                 "tokens": {
@@ -1279,8 +1449,7 @@ mod tests {
                     "refresh_token": "refresh_new"
                 }
             }),
-        )
-        .unwrap();
+        );
 
         assert!(!profile_still_holds_refresh_token(&path, "refresh_old"));
         assert!(profile_still_holds_refresh_token(&path, "refresh_new"));
@@ -1302,6 +1471,64 @@ mod tests {
         assert!(opportunistic_start_budget_remaining(
             now + std::time::Duration::from_secs(60)
         ));
+    }
+
+    #[tokio::test]
+    async fn opportunistic_refresh_surfaces_worker_panic_for_the_exact_alias() {
+        let mut tasks: tokio::task::JoinSet<Option<UsageError>> = tokio::task::JoinSet::new();
+        let task = tasks.spawn(async {
+            panic!("secret-refresh-token-must-not-be-rendered");
+        });
+        let mut task_aliases = HashMap::from([(task.id(), "alice".to_string())]);
+        let mut failures = Vec::new();
+
+        let joined = tasks.join_next_with_id().await.unwrap();
+        record_opportunistic_worker_result(joined, &mut task_aliases, &mut failures);
+
+        assert!(task_aliases.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].alias, "alice");
+        assert_eq!(failures[0].error.summary, "token refresh outcome unknown");
+        assert!(failures[0].error.detail.contains("panicked"));
+        assert!(
+            failures[0]
+                .error
+                .detail
+                .contains("single-use refresh token")
+        );
+        assert!(!failures[0].error.detail.contains("secret-refresh-token"));
+    }
+
+    #[tokio::test]
+    async fn opportunistic_refresh_surfaces_worker_cancellation_for_the_exact_alias() {
+        let mut tasks: tokio::task::JoinSet<Option<UsageError>> = tokio::task::JoinSet::new();
+        let task = tasks.spawn(std::future::pending());
+        let mut task_aliases = HashMap::from([(task.id(), "bob".to_string())]);
+        task.abort();
+        let mut failures = Vec::new();
+
+        let joined = tasks.join_next_with_id().await.unwrap();
+        record_opportunistic_worker_result(joined, &mut task_aliases, &mut failures);
+
+        assert!(task_aliases.is_empty());
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].alias, "bob");
+        assert_eq!(failures[0].error.summary, "token refresh outcome unknown");
+        assert!(failures[0].error.detail.contains("was cancelled"));
+    }
+
+    #[tokio::test]
+    async fn opportunistic_refresh_keeps_successful_none_outcome_failure_free() {
+        let mut tasks: tokio::task::JoinSet<Option<UsageError>> = tokio::task::JoinSet::new();
+        let task = tasks.spawn(async { None });
+        let mut task_aliases = HashMap::from([(task.id(), "carol".to_string())]);
+        let mut failures = Vec::new();
+
+        let joined = tasks.join_next_with_id().await.unwrap();
+        record_opportunistic_worker_result(joined, &mut task_aliases, &mut failures);
+
+        assert!(task_aliases.is_empty());
+        assert!(failures.is_empty());
     }
 
     // Process-global auth paths are serialized by TEST_ENV_LOCK. This test uses
@@ -1341,7 +1568,7 @@ mod tests {
         let profile_path = home.path().join("profiles/late/auth.json");
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
         let expiring = jwt_with_exp(crate::auth::now_unix_secs() - 60);
-        crate::auth::write_auth(
+        write_auth_durable(
             &profile_path,
             &json!({
                 "tokens": {
@@ -1350,8 +1577,7 @@ mod tests {
                     "refresh_token": "old-refresh"
                 }
             }),
-        )
-        .unwrap();
+        );
         set_before_opportunistic_request_hook(|deadline| {
             while tokio::time::Instant::now() < deadline {
                 std::hint::spin_loop();

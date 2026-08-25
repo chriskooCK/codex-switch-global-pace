@@ -8,6 +8,7 @@ use super::reset_credits::parse_reset_credits_summary;
 use super::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
 const SECS_7D: i64 = 7 * 86_400;
+const SECONDS_PER_MINUTE: i64 = 60;
 
 pub(super) fn parse_optional_u64(value: Option<&Value>) -> Option<u64> {
     match value? {
@@ -21,19 +22,37 @@ fn parse_window(val: &Value) -> Option<WindowUsage> {
     // Require used_percent to be present for meaningful scoring data.
     // A window with only resets_at but no used_percent would cause
     // has_5h_data=true with used_5h=0.0, incorrectly treating it as "fully available".
-    let used_percent = val.get("used_percent").and_then(|v| v.as_f64());
-    used_percent?;
+    let used_percent = val.get("used_percent").and_then(|v| v.as_f64())?;
+    if !used_percent.is_finite() || !(0.0..=100.0).contains(&used_percent) {
+        return None;
+    }
     let resets_at = val.get("reset_at").and_then(|v| v.as_i64());
-    let window_minutes = val
-        .get("limit_window_seconds")
-        .and_then(|v| v.as_i64())
-        .map(|seconds| seconds / 60);
+    let window_minutes = parse_window_minutes(val.get("limit_window_seconds"))?;
 
     Some(WindowUsage {
-        used_percent,
+        used_percent: Some(used_percent),
         resets_at,
         window_minutes,
     })
+}
+
+/// Convert the API's integer-second duration into `WindowUsage`'s whole-minute
+/// representation. A positive sub-minute remainder is deliberately truncated;
+/// requiring exact divisibility would invent an upstream schema constraint.
+fn parse_window_minutes(value: Option<&Value>) -> Option<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(value) => {
+            let seconds = value.as_i64()?;
+            if seconds < SECONDS_PER_MINUTE {
+                return None;
+            }
+            seconds
+                .checked_div(SECONDS_PER_MINUTE)
+                .filter(|minutes| *minutes > 0)
+                .map(Some)
+        }
+    }
 }
 
 /// Parse `additional_rate_limits[]`. Malformed entries (missing/non-object
@@ -114,6 +133,18 @@ fn rate_limit_reached_type(body: &Value) -> Option<String> {
 }
 
 pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
+    for (name, pointer) in [
+        ("primary_window", "/rate_limit/primary_window"),
+        ("secondary_window", "/rate_limit/secondary_window"),
+    ] {
+        if let Some(window) = body.pointer(pointer).filter(|value| !value.is_null())
+            && parse_window(window).is_none()
+        {
+            anyhow::bail!(
+                "usage response contains invalid {name}: used_percent must be from 0 through 100 and limit_window_seconds, when present, must be an integer of at least 60 seconds"
+            );
+        }
+    }
     let usage = parse_usage(body);
     let credits_has_data = body
         .get("credits")
@@ -166,7 +197,7 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
     } else {
         if secondary_raw.is_some() && secondary_parsed.is_none() {
             warn!(
-                "parse_usage: secondary_window present but failed to parse (missing used_percent?): {:?}",
+                "parse_usage: secondary_window present but failed validation: {:?}",
                 secondary_raw
             );
         }
@@ -534,6 +565,110 @@ mod tests {
         assert!(usage.account_limited);
         assert!(!usage.spend_control_reached);
         assert!(!crate::usage::is_available(&usage));
+    }
+
+    #[test]
+    fn checked_usage_rejects_out_of_range_percentages() {
+        for used_percent in [-0.01, 100.01] {
+            let body = json!({
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": used_percent,
+                        "limit_window_seconds": 18_000
+                    }
+                }
+            });
+            let error = parse_usage_checked(&body)
+                .expect_err("an invalid percentage must not become a scoring candidate");
+            assert!(
+                error.to_string().contains("invalid primary_window"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_usage_rejects_nonpositive_or_unrepresentable_window_durations() {
+        for seconds in [-60, 0, 59] {
+            let body = json!({
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 25,
+                        "limit_window_seconds": seconds
+                    }
+                }
+            });
+            assert!(
+                parse_usage_checked(&body).is_err(),
+                "{seconds} seconds cannot be represented as a positive whole-minute window"
+            );
+        }
+
+        let wrong_type = json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": "18000"
+                }
+            }
+        });
+        assert!(parse_usage_checked(&wrong_type).is_err());
+
+        let omitted_metadata = json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": null
+                }
+            }
+        });
+        assert!(parse_usage_checked(&omitted_metadata).is_ok());
+    }
+
+    #[test]
+    fn checked_usage_accepts_non_whole_minute_durations_with_explicit_truncation() {
+        for (seconds, expected_minutes) in [(60, 1), (61, 1), (119, 1), (120, 2)] {
+            let body = json!({
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 25,
+                        "limit_window_seconds": seconds
+                    }
+                }
+            });
+
+            let usage = parse_usage_checked(&body)
+                .unwrap_or_else(|error| panic!("{seconds} seconds must be accepted: {error:#}"));
+            assert_eq!(
+                usage
+                    .primary
+                    .as_ref()
+                    .and_then(|window| window.window_minutes),
+                Some(expected_minutes),
+                "the whole-minute model truncates only the sub-minute remainder"
+            );
+        }
+    }
+
+    #[test]
+    fn one_valid_window_does_not_mask_a_malformed_sibling() {
+        let body = json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": -20,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": {
+                    "used_percent": 40,
+                    "limit_window_seconds": 604_800
+                }
+            }
+        });
+
+        assert!(
+            parse_usage_checked(&body).is_err(),
+            "a malformed primary window must not be hidden by valid weekly data"
+        );
     }
 
     #[test]

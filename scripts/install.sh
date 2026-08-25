@@ -17,6 +17,7 @@ PACKAGED_RELEASE_VERSION=""
 USER_INSTALL_DIR="${HOME}/.local/bin"
 SYSTEM_INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="codex-switch-global-pace"
+DAEMON_BOUNDARY_PROTOCOL_PREFIX="${BINARY_NAME} daemon update boundary"
 DATA_DIR="${HOME}/.codex-switch"
 LEGACY_BIN="${SYSTEM_INSTALL_DIR}/${BINARY_NAME}"
 SYSTEM_INSTALL_MARKER="${SYSTEM_INSTALL_DIR}/.codex-switch-global-pace-system-install-v1"
@@ -24,8 +25,12 @@ PATH_BLOCK_BEGIN="# >>> codex-switch-global-pace PATH >>>"
 PATH_BLOCK_END="# <<< codex-switch-global-pace PATH <<<"
 INSTALL_STAGE_NAME=".${BINARY_NAME}.install"
 INSTALL_BACKUP_NAME=".${BINARY_NAME}.rollback"
+INSTALL_DISPLACED_NAME=".${BINARY_NAME}.displaced"
+INSTALL_FAILED_NAME=".${BINARY_NAME}.failed"
 UNINSTALL_HOLD_NAME=".${BINARY_NAME}.uninstall"
 LEGACY_HOLD_NAME=".${BINARY_NAME}.legacy"
+LEGACY_DISPLACED_NAME=".${BINARY_NAME}.legacy-displaced"
+SYMLINK_RESOLUTION_MAX_HOPS=40
 
 info()  { printf '\033[0;34m[info]\033[0m  %s\n' "$*"; }
 warn()  { printf '\033[0;33m[warn]\033[0m  %s\n' "$*" >&2; }
@@ -106,7 +111,10 @@ install_transaction_residue_exists() {
   for residue in \
     "${directory}/${INSTALL_STAGE_NAME}" \
     "${directory}/${INSTALL_BACKUP_NAME}" \
+    "${directory}/${INSTALL_DISPLACED_NAME}" \
+    "${directory}/${INSTALL_FAILED_NAME}" \
     "${directory}/${UNINSTALL_HOLD_NAME}" \
+    "${directory}/.${BINARY_NAME}.installer-quarantine-"* \
     "${directory}/.${BINARY_NAME}.install."* \
     "${directory}/.${BINARY_NAME}.backup."* \
     "${directory}/.${BINARY_NAME}.rollback."* \
@@ -124,6 +132,8 @@ legacy_transaction_residue_exists() {
   local residue
   for residue in \
     "${SYSTEM_INSTALL_DIR}/${LEGACY_HOLD_NAME}" \
+    "${SYSTEM_INSTALL_DIR}/${LEGACY_DISPLACED_NAME}" \
+    "${SYSTEM_INSTALL_DIR}/.${BINARY_NAME}.installer-quarantine-"* \
     "${SYSTEM_INSTALL_DIR}/.${BINARY_NAME}.legacy."*
   do
     if [ -e "$residue" ] || [ -L "$residue" ]; then
@@ -181,31 +191,6 @@ read_checked_daemon_status() {
   esac
 }
 
-stop_and_confirm_daemon_absent() {
-  local binary="$1"
-  if ! "$binary" daemon stop 8>&- 9>&-; then
-    DAEMON_STATUS_ERROR="daemon stop failed"
-    return 1
-  fi
-  if ! read_checked_daemon_status; then
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_RUNNING" = true ]; then
-    DAEMON_STATUS_ERROR="daemon still reports running after the stop boundary"
-    return 1
-  fi
-}
-
-confirm_daemon_running() {
-  if ! read_checked_daemon_status; then
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_RUNNING" != true ]; then
-    DAEMON_STATUS_ERROR="daemon did not report running after restart"
-    return 1
-  fi
-}
-
 verify_candidate_version() {
   local candidate="$1" expected="$2" output first_line
   if ! output="$("$candidate" --version 8>&- 9>&- 2>&1)"; then
@@ -221,71 +206,334 @@ verify_candidate_version() {
   return 0
 }
 
-run_install_fs() {
-  if [ "${INSTALL_WITH_SUDO:-false}" = true ]; then
-    sudo "$@"
+run_installer_file_op() {
+  local use_sudo="$1" output
+  shift
+  INSTALLER_FILE_OP_RESULT=""
+  INSTALLER_FILE_OP_ERROR=""
+  if [ "$use_sudo" = true ]; then
+    if ! output="$(sudo "$CANDIDATE_BIN" __installer-file-op "$@" 8>&- 9>&- 2>&1)"; then
+      INSTALLER_FILE_OP_ERROR="$output"
+      return 1
+    fi
   else
-    "$@"
+    if ! output="$("$CANDIDATE_BIN" __installer-file-op "$@" 8>&- 9>&- 2>&1)"; then
+      INSTALLER_FILE_OP_ERROR="$output"
+      return 1
+    fi
   fi
+  INSTALLER_FILE_OP_RESULT="$output"
 }
 
-run_legacy_fs() {
-  if [ "${LEGACY_NEEDS_SUDO:-false}" = true ]; then
-    sudo "$@"
-  else
-    "$@"
-  fi
+installer_file_token() {
+  local path="$1" use_sudo="$2" token
+  run_installer_file_op "$use_sudo" token --source "$path" || return 1
+  token="$INSTALLER_FILE_OP_RESULT"
+  [[ "$token" =~ ^[0-9]+:[0-9]+\|[0-9a-f]{64}$ ]] || {
+    INSTALLER_FILE_OP_ERROR="installer file helper returned an invalid token for ${path}: ${token}"
+    return 1
+  }
+  INSTALLER_FILE_OP_RESULT="$token"
+}
+
+copy_installer_file_exclusive() {
+  local source="$1" destination="$2" expected="$3" use_sudo="$4"
+  local outcome token cleanup_error
+  run_installer_file_op "$use_sudo" copy-exclusive \
+    --source "$source" --destination "$destination" --expected-token "$expected" || return 1
+  outcome="${INSTALLER_FILE_OP_RESULT%%|*}"
+  token="${INSTALLER_FILE_OP_RESULT#*|}"
+  [[ "$token" =~ ^[0-9]+:[0-9]+\|[0-9a-f]{64}$ ]] || {
+    INSTALLER_FILE_OP_ERROR="installer file helper returned an invalid copy token for ${destination}: ${token}"
+    return 1
+  }
+  INSTALLER_FILE_OP_RESULT="$token"
+  case "$outcome" in
+    created) return 0 ;;
+    created-namespace-durability-unconfirmed)
+      cleanup_error="copy creation reached ${destination}, but directory durability was not confirmed"
+      if ! remove_installer_file_owned "$destination" "$token" "$use_sudo"; then
+        cleanup_error="${cleanup_error}; exact cleanup failed: ${INSTALLER_FILE_OP_ERROR}"
+      fi
+      INSTALLER_FILE_OP_ERROR="$cleanup_error"
+      return 1
+      ;;
+    *)
+      INSTALLER_FILE_OP_ERROR="installer file helper returned an unknown copy outcome for ${destination}: ${outcome}"
+      return 1
+      ;;
+  esac
+}
+
+create_empty_installer_file_exclusive() {
+  local destination="$1" use_sudo="$2" outcome token cleanup_error
+  run_installer_file_op "$use_sudo" create-empty-exclusive \
+    --destination "$destination" || return 1
+  outcome="${INSTALLER_FILE_OP_RESULT%%|*}"
+  token="${INSTALLER_FILE_OP_RESULT#*|}"
+  [[ "$token" =~ ^[0-9]+:[0-9]+\|[0-9a-f]{64}$ ]] || {
+    INSTALLER_FILE_OP_ERROR="installer file helper returned an invalid empty-file token for ${destination}: ${token}"
+    return 1
+  }
+  INSTALLER_FILE_OP_RESULT="$token"
+  case "$outcome" in
+    created) return 0 ;;
+    created-namespace-durability-unconfirmed)
+      cleanup_error="empty-file creation reached ${destination}, but directory durability was not confirmed"
+      if ! remove_installer_file_owned "$destination" "$token" "$use_sudo"; then
+        cleanup_error="${cleanup_error}; exact cleanup failed: ${INSTALLER_FILE_OP_ERROR}"
+      fi
+      INSTALLER_FILE_OP_ERROR="$cleanup_error"
+      return 1
+      ;;
+    *)
+      INSTALLER_FILE_OP_ERROR="installer file helper returned an unknown empty-file outcome for ${destination}: ${outcome}"
+      return 1
+      ;;
+  esac
+}
+
+capture_installer_file_token() {
+  local path="$1" use_sudo="$2" output_name="$3"
+  installer_file_token "$path" "$use_sudo" || return 1
+  printf -v "$output_name" '%s' "$INSTALLER_FILE_OP_RESULT"
+}
+
+capture_installer_file_copy() {
+  local source="$1" destination="$2" expected="$3" use_sudo="$4" output_name="$5"
+  copy_installer_file_exclusive "$source" "$destination" "$expected" "$use_sudo" || return 1
+  printf -v "$output_name" '%s' "$INSTALLER_FILE_OP_RESULT"
+}
+
+capture_empty_installer_file() {
+  local destination="$1" use_sudo="$2" output_name="$3"
+  create_empty_installer_file_exclusive "$destination" "$use_sudo" || return 1
+  printf -v "$output_name" '%s' "$INSTALLER_FILE_OP_RESULT"
+}
+
+installer_file_token_matches() {
+  local path="$1" use_sudo="$2" expected="$3"
+  installer_file_token "$path" "$use_sudo" \
+    && [ "$INSTALLER_FILE_OP_RESULT" = "$expected" ]
+}
+
+move_installer_file_noreplace() {
+  local source="$1" destination="$2" expected="$3" use_sudo="$4" token
+  run_installer_file_op "$use_sudo" move-noreplace \
+    --source "$source" --destination "$destination" --expected-token "$expected" || return 1
+  token="$INSTALLER_FILE_OP_RESULT"
+  [ "$token" = "$expected" ] || {
+    INSTALLER_FILE_OP_ERROR="installer file helper returned an unexpected move token for ${destination}"
+    return 1
+  }
+}
+
+exchange_installer_files() {
+  local source="$1" destination="$2" expected_source="$3" expected_destination="$4"
+  local use_sudo="$5" result
+  run_installer_file_op "$use_sudo" exchange \
+    --source "$source" --destination "$destination" \
+    --expected-token "$expected_source" \
+    --expected-destination-token "$expected_destination" || return 1
+  result="$INSTALLER_FILE_OP_RESULT"
+  [ "$result" = "$expected_source" ] || {
+    INSTALLER_FILE_OP_ERROR="installer file helper returned an unexpected exchange result"
+    return 1
+  }
+}
+
+remove_installer_file_owned() {
+  local source="$1" expected="$2" use_sudo="$3" result
+  run_installer_file_op "$use_sudo" remove-owned \
+    --source "$source" --expected-token "$expected" || return 1
+  result="$INSTALLER_FILE_OP_RESULT"
+  case "$result" in
+    removed) return 0 ;;
+    removed-namespace-durability-unconfirmed)
+      INSTALLER_FILE_OP_ERROR="the exact owned file at ${source} was removed, but parent-directory namespace durability was not confirmed"
+      return 1
+      ;;
+    *)
+    INSTALLER_FILE_OP_ERROR="installer file helper returned an unexpected removal result for ${source}: ${result}"
+    return 1
+      ;;
+  esac
+}
+
+file_token_digest() {
+  local token="$1"
+  case "$token" in
+    *'|'*) printf '%s\n' "${token#*|}" ;;
+    *) return 1 ;;
+  esac
 }
 
 cleanup_install_artifacts() {
+  INSTALL_ARTIFACT_CLEANUP_ERROR=""
   if [ "${INSTALL_STAGE_OWNED:-false}" = true ] \
     && [ -n "${INSTALL_STAGE:-}" ] \
     && { [ -e "$INSTALL_STAGE" ] || [ -L "$INSTALL_STAGE" ]; }
   then
-    if ! run_install_fs rm -f "$INSTALL_STAGE" >/dev/null 2>&1; then
-      warn "Staged installer candidate remains at ${INSTALL_STAGE}; the fixed residue will block later transactions until it is inspected."
-      return
+    if [ -z "${INSTALL_STAGE_TOKEN:-}" ]; then
+      INSTALL_ARTIFACT_CLEANUP_ERROR="staged installer path ${INSTALL_STAGE} has no recorded token and was preserved"
+      return 1
+    fi
+    if ! remove_installer_file_owned \
+      "$INSTALL_STAGE" "$INSTALL_STAGE_TOKEN" "${INSTALL_WITH_SUDO:-false}" >/dev/null
+    then
+      INSTALL_ARTIFACT_CLEANUP_ERROR="staged installer candidate could not be removed through its token-bound quarantine: ${INSTALLER_FILE_OP_ERROR}; fixed residue at ${INSTALL_STAGE} requires inspection"
+      return 1
     fi
   fi
   INSTALL_STAGE_OWNED=false
+  INSTALL_STAGE_TOKEN=""
+  return 0
 }
 
 rollback_installed_binary() {
+  local restored_token
   if [ "${INSTALL_DEST_EXISTED:-false}" = true ]; then
-    [ ! -L "$INSTALL_BACKUP" ] && [ -f "$INSTALL_BACKUP" ] || return 1
-    run_install_fs mv -f "$INSTALL_BACKUP" "$INSTALL_DEST" || return 1
+    installer_file_token_matches \
+      "$INSTALL_STAGE" "$INSTALL_WITH_SUDO" "$INSTALL_ORIGINAL_TOKEN" || return 1
+    installer_file_token_matches \
+      "$INSTALL_DEST" "$INSTALL_WITH_SUDO" "$INSTALL_PUBLISHED_TOKEN" || return 1
+    exchange_installer_files \
+      "$INSTALL_STAGE" "$INSTALL_DEST" "$INSTALL_ORIGINAL_TOKEN" \
+      "$INSTALL_PUBLISHED_TOKEN" "$INSTALL_WITH_SUDO" \
+      || return 1
+    capture_installer_file_token \
+      "$INSTALL_DEST" "$INSTALL_WITH_SUDO" restored_token || return 1
+    [ "$restored_token" = "$INSTALL_ORIGINAL_TOKEN" ] || return 1
+    INSTALL_STAGE_TOKEN="$INSTALL_PUBLISHED_TOKEN"
+    remove_installer_file_owned \
+      "$INSTALL_STAGE" "$INSTALL_STAGE_TOKEN" "$INSTALL_WITH_SUDO" || return 1
+    INSTALL_STAGE_OWNED=false
+    INSTALL_STAGE_TOKEN=""
+    remove_installer_file_owned \
+      "$INSTALL_BACKUP" "$INSTALL_BACKUP_TOKEN" "$INSTALL_WITH_SUDO" || return 1
+    INSTALL_BACKUP_TOKEN=""
   else
-    run_install_fs rm -f "$INSTALL_DEST" || return 1
+    installer_file_token_matches \
+      "$INSTALL_DEST" "$INSTALL_WITH_SUDO" "$INSTALL_PUBLISHED_TOKEN" || return 1
+    remove_installer_file_owned \
+      "$INSTALL_DEST" "$INSTALL_PUBLISHED_TOKEN" "$INSTALL_WITH_SUDO" || return 1
+    if [ -e "$INSTALL_BACKUP" ] || [ -L "$INSTALL_BACKUP" ]; then
+      return 1
+    fi
   fi
+  INSTALL_PUBLISHED_TOKEN=""
   return 0
 }
 
 stage_and_replace_binary() {
-  local candidate="$1"
+  local candidate="$1" candidate_token stage_after destination_after published_token boundary_error
   INSTALL_DEST="${INSTALL_DIR}/${BINARY_NAME}"
   INSTALL_DEST_EXISTED=false
+  INSTALL_ORIGINAL_TOKEN=""
+  INSTALL_BACKUP_TOKEN=""
+  INSTALL_PUBLISHED_TOKEN=""
 
+  if [ -e "$INSTALL_STAGE" ] || [ -L "$INSTALL_STAGE" ] \
+    || [ -e "$INSTALL_BACKUP" ] || [ -L "$INSTALL_BACKUP" ]
+  then
+    CANDIDATE_ERROR="a fixed installer transaction path appeared before staging"
+    return 1
+  fi
   if [ -L "$INSTALL_DEST" ]; then
     CANDIDATE_ERROR="refusing to replace symbolic-link install target ${INSTALL_DEST}"
     return 1
   fi
+  capture_installer_file_token "$candidate" false candidate_token || {
+    CANDIDATE_ERROR="could not bind the verified candidate to the file helper: ${INSTALLER_FILE_OP_ERROR}"
+    return 1
+  }
+  capture_installer_file_copy \
+    "$candidate" "$INSTALL_STAGE" "$candidate_token" "$INSTALL_WITH_SUDO" \
+    INSTALL_STAGE_TOKEN || {
+    CANDIDATE_ERROR="exclusive candidate staging failed: ${INSTALLER_FILE_OP_ERROR}"
+    return 1
+  }
   INSTALL_STAGE_OWNED=true
-  run_install_fs install -m 0755 "$candidate" "$INSTALL_STAGE" || return 1
 
+  INSTALL_PUBLISHED_TOKEN="$INSTALL_STAGE_TOKEN"
   if [ -e "$INSTALL_DEST" ]; then
     INSTALL_DEST_EXISTED=true
-    run_install_fs cp -p "$INSTALL_DEST" "$INSTALL_BACKUP" || return 1
+    capture_installer_file_token \
+      "$INSTALL_DEST" "$INSTALL_WITH_SUDO" INSTALL_ORIGINAL_TOKEN || return 1
+    capture_installer_file_copy \
+      "$INSTALL_DEST" "$INSTALL_BACKUP" "$INSTALL_ORIGINAL_TOKEN" \
+      "$INSTALL_WITH_SUDO" INSTALL_BACKUP_TOKEN || return 1
+    if ! exchange_installer_files \
+      "$INSTALL_STAGE" "$INSTALL_DEST" "$INSTALL_STAGE_TOKEN" \
+      "$INSTALL_ORIGINAL_TOKEN" "$INSTALL_WITH_SUDO"
+    then
+      boundary_error="$INSTALLER_FILE_OP_ERROR"
+      stage_after=""
+      destination_after=""
+      capture_installer_file_token \
+        "$INSTALL_STAGE" "$INSTALL_WITH_SUDO" stage_after 2>/dev/null || true
+      capture_installer_file_token \
+        "$INSTALL_DEST" "$INSTALL_WITH_SUDO" destination_after 2>/dev/null || true
+      if [ "$stage_after" = "$INSTALL_ORIGINAL_TOKEN" ] \
+        && [ "$destination_after" = "$INSTALL_PUBLISHED_TOKEN" ]
+      then
+        INSTALL_STAGE_TOKEN="$INSTALL_ORIGINAL_TOKEN"
+        INSTALL_STAGE_OWNED=false
+        BINARY_REPLACED=true
+        CANDIDATE_ERROR="exchange reached the published state but its durability boundary failed: ${boundary_error}"
+      else
+        CANDIDATE_ERROR="atomic exchange failed and its operands were preserved for classification: ${boundary_error}"
+      fi
+      return 1
+    fi
+    INSTALL_STAGE_TOKEN="$INSTALL_ORIGINAL_TOKEN"
+    INSTALL_STAGE_OWNED=false
+    BINARY_REPLACED=true
+  else
+    if ! move_installer_file_noreplace \
+      "$INSTALL_STAGE" "$INSTALL_DEST" "$INSTALL_STAGE_TOKEN" "$INSTALL_WITH_SUDO"
+    then
+      boundary_error="$INSTALLER_FILE_OP_ERROR"
+      destination_after=""
+      capture_installer_file_token \
+        "$INSTALL_DEST" "$INSTALL_WITH_SUDO" destination_after 2>/dev/null || true
+      if [ "$destination_after" = "$INSTALL_PUBLISHED_TOKEN" ] \
+        && [ ! -e "$INSTALL_STAGE" ] && [ ! -L "$INSTALL_STAGE" ]
+      then
+        INSTALL_STAGE_OWNED=false
+        INSTALL_STAGE_TOKEN=""
+        BINARY_REPLACED=true
+      fi
+      CANDIDATE_ERROR="no-replace publication failed or its durability boundary was not confirmed: ${boundary_error}"
+      return 1
+    fi
+    BINARY_REPLACED=true
+    INSTALL_STAGE_OWNED=false
+    INSTALL_STAGE_TOKEN=""
   fi
-
-  run_install_fs mv -f "$INSTALL_STAGE" "$INSTALL_DEST" || return 1
-  INSTALL_STAGE_OWNED=false
+  capture_installer_file_token \
+    "$INSTALL_DEST" "$INSTALL_WITH_SUDO" published_token || return 1
+  [ "$published_token" = "$INSTALL_PUBLISHED_TOKEN" ] || return 1
+  if [ "$INSTALL_DEST_EXISTED" = true ]; then
+    installer_file_token_matches \
+      "$INSTALL_BACKUP" "$INSTALL_WITH_SUDO" "$INSTALL_BACKUP_TOKEN" || return 1
+    installer_file_token_matches \
+      "$INSTALL_STAGE" "$INSTALL_WITH_SUDO" "$INSTALL_ORIGINAL_TOKEN" || return 1
+  fi
   return 0
 }
 
 commit_installed_binary() {
+  installer_file_token_matches \
+    "$INSTALL_DEST" "$INSTALL_WITH_SUDO" "$INSTALL_PUBLISHED_TOKEN" || return 1
   if [ "$INSTALL_DEST_EXISTED" = true ]; then
-    [ ! -L "$INSTALL_BACKUP" ] && [ -f "$INSTALL_BACKUP" ] || return 1
-    run_install_fs rm -f "$INSTALL_BACKUP" || return 1
+    remove_installer_file_owned \
+      "$INSTALL_STAGE" "$INSTALL_ORIGINAL_TOKEN" "$INSTALL_WITH_SUDO" || return 1
+    INSTALL_STAGE_OWNED=false
+    INSTALL_STAGE_TOKEN=""
+    remove_installer_file_owned \
+      "$INSTALL_BACKUP" "$INSTALL_BACKUP_TOKEN" "$INSTALL_WITH_SUDO" || return 1
+    INSTALL_BACKUP_TOKEN=""
   elif [ -e "$INSTALL_BACKUP" ] || [ -L "$INSTALL_BACKUP" ]; then
     return 1
   fi
@@ -298,45 +546,480 @@ preserve_install_backup() {
 }
 
 hold_legacy_install_for_commit() {
+  local boundary_error legacy_after displaced_after
   [ "$MIGRATE_LEGACY" = true ] || return 0
-  [ ! -e "$LEGACY_HOLD" ] && [ ! -L "$LEGACY_HOLD" ] || return 1
-  run_legacy_fs mv "$LEGACY_BIN" "$LEGACY_HOLD" || return 1
+  [ ! -e "$LEGACY_HOLD" ] && [ ! -L "$LEGACY_HOLD" ] \
+    && [ ! -e "$LEGACY_DISPLACED" ] && [ ! -L "$LEGACY_DISPLACED" ] \
+    || return 1
+  capture_installer_file_token \
+    "$LEGACY_BIN" "$LEGACY_NEEDS_SUDO" LEGACY_ORIGINAL_TOKEN || return 1
+  capture_installer_file_copy \
+    "$LEGACY_BIN" "$LEGACY_HOLD" "$LEGACY_ORIGINAL_TOKEN" \
+    "$LEGACY_NEEDS_SUDO" LEGACY_HOLD_TOKEN || return 1
+  capture_empty_installer_file \
+    "$LEGACY_DISPLACED" "$LEGACY_NEEDS_SUDO" LEGACY_PLACEHOLDER_TOKEN || return 1
+  LEGACY_DISPLACED_TOKEN="$LEGACY_PLACEHOLDER_TOKEN"
   LEGACY_HELD=true
+  if ! exchange_installer_files \
+    "$LEGACY_DISPLACED" "$LEGACY_BIN" "$LEGACY_PLACEHOLDER_TOKEN" \
+    "$LEGACY_ORIGINAL_TOKEN" "$LEGACY_NEEDS_SUDO"
+  then
+    boundary_error="$INSTALLER_FILE_OP_ERROR"
+    legacy_after=""
+    displaced_after=""
+    capture_installer_file_token \
+      "$LEGACY_BIN" "$LEGACY_NEEDS_SUDO" legacy_after 2>/dev/null || true
+    capture_installer_file_token \
+      "$LEGACY_DISPLACED" "$LEGACY_NEEDS_SUDO" displaced_after 2>/dev/null || true
+    if [ "$legacy_after" = "$LEGACY_PLACEHOLDER_TOKEN" ] \
+      && [ "$displaced_after" = "$LEGACY_ORIGINAL_TOKEN" ]
+    then
+      LEGACY_DISPLACED_TOKEN="$LEGACY_ORIGINAL_TOKEN"
+    fi
+    INSTALLER_FILE_OP_ERROR="$boundary_error"
+    return 1
+  fi
+  LEGACY_DISPLACED_TOKEN="$LEGACY_ORIGINAL_TOKEN"
 }
 
 restore_held_legacy_install() {
+  local legacy_token displaced_token
   [ "${LEGACY_HELD:-false}" = true ] || return 0
-  run_legacy_fs mv "$LEGACY_HOLD" "$LEGACY_BIN" || return 1
+  capture_installer_file_token \
+    "$LEGACY_BIN" "$LEGACY_NEEDS_SUDO" legacy_token || return 1
+  capture_installer_file_token \
+    "$LEGACY_DISPLACED" "$LEGACY_NEEDS_SUDO" displaced_token || return 1
+  if [ "$legacy_token" = "$LEGACY_PLACEHOLDER_TOKEN" ] \
+    && [ "$displaced_token" = "$LEGACY_ORIGINAL_TOKEN" ]
+  then
+    exchange_installer_files \
+      "$LEGACY_DISPLACED" "$LEGACY_BIN" "$LEGACY_ORIGINAL_TOKEN" \
+      "$LEGACY_PLACEHOLDER_TOKEN" "$LEGACY_NEEDS_SUDO" || return 1
+    LEGACY_DISPLACED_TOKEN="$LEGACY_PLACEHOLDER_TOKEN"
+  elif [ "$legacy_token" != "$LEGACY_ORIGINAL_TOKEN" ] \
+    || [ "$displaced_token" != "$LEGACY_PLACEHOLDER_TOKEN" ]
+  then
+    return 1
+  fi
+  remove_installer_file_owned \
+    "$LEGACY_DISPLACED" "$LEGACY_PLACEHOLDER_TOKEN" "$LEGACY_NEEDS_SUDO" || return 1
+  LEGACY_DISPLACED_TOKEN=""
+  remove_installer_file_owned \
+    "$LEGACY_HOLD" "$LEGACY_HOLD_TOKEN" "$LEGACY_NEEDS_SUDO" || return 1
   LEGACY_HELD=false
 }
 
 commit_held_legacy_install() {
   [ "${LEGACY_HELD:-false}" = true ] || return 0
+  installer_file_token_matches \
+    "$LEGACY_BIN" "$LEGACY_NEEDS_SUDO" "$LEGACY_PLACEHOLDER_TOKEN" || return 1
+  installer_file_token_matches \
+    "$LEGACY_DISPLACED" "$LEGACY_NEEDS_SUDO" "$LEGACY_ORIGINAL_TOKEN" || return 1
   if [ -e "$SYSTEM_INSTALL_MARKER" ]; then
-    run_legacy_fs rm -f "$SYSTEM_INSTALL_MARKER" || return 1
+    [ -n "${SYSTEM_MARKER_ORIGINAL_TOKEN:-}" ] \
+      || return 1
+    remove_installer_file_owned \
+      "$SYSTEM_INSTALL_MARKER" "$SYSTEM_MARKER_ORIGINAL_TOKEN" "$LEGACY_NEEDS_SUDO" \
+      || return 1
   fi
-  run_legacy_fs rm -f "$LEGACY_HOLD" || return 1
+  remove_installer_file_owned \
+    "$LEGACY_BIN" "$LEGACY_PLACEHOLDER_TOKEN" "$LEGACY_NEEDS_SUDO" || return 1
+  remove_installer_file_owned \
+    "$LEGACY_HOLD" "$LEGACY_HOLD_TOKEN" "$LEGACY_NEEDS_SUDO" || return 1
+  remove_installer_file_owned \
+    "$LEGACY_DISPLACED" "$LEGACY_DISPLACED_TOKEN" "$LEGACY_NEEDS_SUDO" || return 1
+  LEGACY_DISPLACED_TOKEN=""
   LEGACY_HELD=false
 }
 
-cleanup_update_locks_on_exit() {
-  exec 9>&- 8>&-
-  if [ -n "${UPDATE_LOCK_PID_9:-}" ]; then
-    wait "$UPDATE_LOCK_PID_9" >/dev/null 2>&1 || true
-    UPDATE_LOCK_PID_9=""
+close_daemon_update_boundary_channels() {
+  exec 7>&- 6<&-
+}
+
+wait_daemon_update_boundary() {
+  local expected_success="$1" wait_status=0
+  close_daemon_update_boundary_channels
+  if [ -n "${DAEMON_BOUNDARY_PID:-}" ]; then
+    if wait "$DAEMON_BOUNDARY_PID"; then
+      wait_status=0
+    else
+      wait_status=$?
+    fi
   fi
-  if [ -n "${UPDATE_LOCK_PID_8:-}" ]; then
-    wait "$UPDATE_LOCK_PID_8" >/dev/null 2>&1 || true
-    UPDATE_LOCK_PID_8=""
+  DAEMON_BOUNDARY_PID=""
+  DAEMON_BOUNDARY_ACTIVE=false
+  DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+  if [ "$expected_success" = true ] && [ "$wait_status" -ne 0 ]; then
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited with status ${wait_status}"
+    return 1
+  fi
+  if [ "$expected_success" = false ] && [ "$wait_status" -eq 0 ]; then
+    DAEMON_BOUNDARY_ERROR="abandoned daemon lifecycle holder accepted an incomplete transaction"
+    return 1
+  fi
+  return 0
+}
+
+close_failed_daemon_update_boundary() {
+  local primary_error="$1" holder_error
+  if wait_daemon_update_boundary false; then
+    DAEMON_BOUNDARY_ERROR="$primary_error"
+  else
+    holder_error="$DAEMON_BOUNDARY_ERROR"
+    DAEMON_BOUNDARY_ERROR="${primary_error}; ${holder_error}"
   fi
 }
 
-cleanup_install_exit() {
-  cleanup_update_locks_on_exit
-  cleanup_install_artifacts
-  if [ -n "${TMP_DIR:-}" ]; then
-    rm -rf "$TMP_DIR"
+start_daemon_update_boundary() {
+  local candidate="$1" initial_executable="$2" replacement_executable="$3"
+  local control="${TMP_DIR}/daemon-update-boundary.control"
+  local status="${TMP_DIR}/daemon-update-boundary.status"
+  local marker pid
+
+  DAEMON_BOUNDARY_ERROR=""
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = false ] || {
+    DAEMON_BOUNDARY_ERROR="a daemon lifecycle holder is already active"
+    return 1
+  }
+  mkfifo "$control" "$status" || {
+    DAEMON_BOUNDARY_ERROR="could not create private daemon lifecycle channels"
+    return 1
+  }
+  (
+    # Terminal Ctrl+C targets the installer's process group. Keep the authority
+    # holder alive so the parent's EXIT cleanup can close stdin and let the
+    # holder run its phase-aware EOF finalizer before the update locks close.
+    trap '' INT QUIT
+    exec "$candidate" __hold-daemon-update-boundary \
+      --initial-executable "$initial_executable" \
+      --replacement-executable "$replacement_executable" \
+      6>&- 7>&- 8>&- 9>&- < "$control" > "$status"
+  ) &
+  pid=$!
+  DAEMON_BOUNDARY_PID="$pid"
+  exec 7>"$control"
+  exec 6<"$status"
+
+  if ! IFS= read -r marker <&6; then
+    DAEMON_BOUNDARY_ERROR="candidate did not establish the daemon lifecycle boundary"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
   fi
+  case "$marker" in
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} ready running=true service_installed=true")
+      DAEMON_WAS_RUNNING=true
+      DAEMON_SERVICE_INSTALLED=true
+      ;;
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} ready running=true service_installed=false")
+      DAEMON_WAS_RUNNING=true
+      DAEMON_SERVICE_INSTALLED=false
+      ;;
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} ready running=false service_installed=true")
+      DAEMON_WAS_RUNNING=false
+      DAEMON_SERVICE_INSTALLED=true
+      ;;
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} ready running=false service_installed=false")
+      DAEMON_WAS_RUNNING=false
+      DAEMON_SERVICE_INSTALLED=false
+      ;;
+    *)
+      DAEMON_BOUNDARY_ERROR="candidate returned an invalid daemon lifecycle readiness marker"
+      close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+      return 1
+      ;;
+  esac
+  if ! kill -0 "$pid" 2>/dev/null; then
+    DAEMON_BOUNDARY_ERROR="candidate exited instead of retaining daemon lifecycle authority"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+
+  DAEMON_BOUNDARY_ACTIVE=true
+  DAEMON_BOUNDARY_ROLLBACK_SAFE=true
+  DAEMON_BOUNDARY_PHASE=stopped
+  if [ "$DAEMON_SERVICE_INSTALLED" = true ] \
+    && [ "$initial_executable" != "$replacement_executable" ]
+  then
+    if [ "$DAEMON_WAS_RUNNING" != true ]; then
+      DAEMON_BOUNDARY_ERROR="the installed daemon service is stopped and cannot be migrated without changing its prior state"
+      return 1
+    fi
+  fi
+  DAEMON_STATE_CAPTURED=true
+  return 0
+}
+
+request_daemon_update_boundary_new_state() {
+  local marker
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && [ "${DAEMON_BOUNDARY_PHASE:-}" = stopped ] || {
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not in its stopped replacement phase"
+    return 1
+  }
+  if ! printf 'new\n' >&7 || ! IFS= read -r marker <&6; then
+    DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited while publishing the replacement state"
+    return 1
+  fi
+  case "$marker" in
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} new state ready")
+      DAEMON_BOUNDARY_PHASE=new
+      DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+      return 0
+      ;;
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} new state failed")
+      DAEMON_BOUNDARY_ERROR="replacement daemon state was rejected; daemon absence was re-established for rollback"
+      return 1
+      ;;
+    *)
+      DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+      DAEMON_BOUNDARY_ERROR="daemon lifecycle holder returned an invalid replacement-state marker"
+      return 1
+      ;;
+  esac
+}
+
+request_daemon_update_boundary_uninstall_state() {
+  local marker
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && [ "${DAEMON_BOUNDARY_PHASE:-}" = stopped ] || {
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not in its stopped uninstall phase"
+    return 1
+  }
+  if ! printf 'uninstall\n' >&7 || ! IFS= read -r marker <&6; then
+    DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited while applying the uninstall state"
+    return 1
+  fi
+  case "$marker" in
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} uninstall state ready")
+      DAEMON_BOUNDARY_PHASE=uninstall
+      DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+      return 0
+      ;;
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} uninstall state failed")
+      DAEMON_BOUNDARY_ERROR="daemon uninstall state was rejected; exact stopped state was retained for rollback"
+      return 1
+      ;;
+    *)
+      DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+      DAEMON_BOUNDARY_ERROR="daemon lifecycle holder returned an invalid uninstall-state marker"
+      return 1
+      ;;
+  esac
+}
+
+restore_daemon_update_boundary_old_state() {
+  local marker
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && [ "${DAEMON_BOUNDARY_PHASE:-}" = stopped ] \
+    && [ "${DAEMON_BOUNDARY_ROLLBACK_SAFE:-false}" = true ] || {
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle rollback authority was not retained"
+    return 1
+  }
+  if ! printf 'rollback\n' >&7 || ! IFS= read -r marker <&6; then
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before restoring the old state"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+  case "$marker" in
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} old state restored")
+      DAEMON_BOUNDARY_PHASE=restored
+      wait_daemon_update_boundary true
+      ;;
+    "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} old state failed")
+      DAEMON_BOUNDARY_ERROR="the prior daemon could not be restarted; exact daemon absence was re-established"
+      close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+      return 1
+      ;;
+    *)
+      DAEMON_BOUNDARY_ERROR="daemon lifecycle holder returned an invalid rollback marker"
+      close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+      return 1
+      ;;
+  esac
+}
+
+finish_daemon_update_boundary() {
+  local marker
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && { [ "${DAEMON_BOUNDARY_PHASE:-}" = new ] \
+      || [ "${DAEMON_BOUNDARY_PHASE:-}" = uninstall ]; } || {
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not ready for final commit"
+    return 1
+  }
+  if ! printf 'finish\n' >&7 || ! IFS= read -r marker <&6; then
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before final state confirmation"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+  if [ "$marker" != "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} final state confirmed" ]; then
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder returned an invalid final-state marker"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+  DAEMON_BOUNDARY_PHASE=confirmed
+}
+
+release_daemon_update_boundary() {
+  local marker
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && [ "${DAEMON_BOUNDARY_PHASE:-}" = confirmed ] || {
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not ready to release final authority"
+    return 1
+  }
+  if ! printf 'release\n' >&7 || ! IFS= read -r marker <&6; then
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before authority release confirmation"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+  if [ "$marker" != "${DAEMON_BOUNDARY_PROTOCOL_PREFIX} lifecycle authority released" ]; then
+    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder returned an invalid authority-release marker"
+    close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+  DAEMON_BOUNDARY_PHASE=released
+  wait_daemon_update_boundary true
+}
+
+abandon_daemon_update_boundary() {
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] || return 0
+  wait_daemon_update_boundary false
+}
+
+cleanup_daemon_update_boundary_on_exit() {
+  DAEMON_BOUNDARY_EXIT_CLEANUP_ERROR=""
+  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] || return 0
+  if ! abandon_daemon_update_boundary; then
+    DAEMON_BOUNDARY_EXIT_CLEANUP_ERROR="$DAEMON_BOUNDARY_ERROR"
+    return 1
+  fi
+  DAEMON_BOUNDARY_EXIT_CLEANUP_ERROR="daemon lifecycle transaction ended without an explicit finish or rollback; its PID/service authority was released fail-closed"
+  return 1
+}
+
+cleanup_update_locks_on_exit() {
+  local wait_status
+  UPDATE_LOCK_EXIT_CLEANUP_ERROR=""
+  exec 9>&- 8>&-
+  if [ -n "${UPDATE_LOCK_PID_9:-}" ]; then
+    if wait "$UPDATE_LOCK_PID_9" >/dev/null 2>&1; then
+      :
+    else
+      wait_status=$?
+      UPDATE_LOCK_EXIT_CLEANUP_ERROR="lock-holder PID ${UPDATE_LOCK_PID_9} exited with status ${wait_status} during EXIT cleanup"
+    fi
+    UPDATE_LOCK_PID_9=""
+  fi
+  if [ -n "${UPDATE_LOCK_PID_8:-}" ]; then
+    if wait "$UPDATE_LOCK_PID_8" >/dev/null 2>&1; then
+      :
+    else
+      wait_status=$?
+      if [ -n "$UPDATE_LOCK_EXIT_CLEANUP_ERROR" ]; then
+        UPDATE_LOCK_EXIT_CLEANUP_ERROR="${UPDATE_LOCK_EXIT_CLEANUP_ERROR}; lock-holder PID ${UPDATE_LOCK_PID_8} exited with status ${wait_status} during EXIT cleanup"
+      else
+        UPDATE_LOCK_EXIT_CLEANUP_ERROR="lock-holder PID ${UPDATE_LOCK_PID_8} exited with status ${wait_status} during EXIT cleanup"
+      fi
+    fi
+    UPDATE_LOCK_PID_8=""
+  fi
+  [ -z "$UPDATE_LOCK_EXIT_CLEANUP_ERROR" ]
+}
+
+cleanup_install_exit() {
+  local original_status=$? cleanup_status=0 cleanup_errors=""
+  trap - EXIT
+  # Lock order is update -> daemon/service. End the inner lifecycle holder
+  # before cleanup. Keep the outer update locks through exact fixed-stage
+  # cleanup so another installer cannot enter those public transaction slots.
+  if ! cleanup_daemon_update_boundary_on_exit; then
+    cleanup_errors="$DAEMON_BOUNDARY_EXIT_CLEANUP_ERROR"
+  fi
+  if ! cleanup_install_artifacts; then
+    if [ -n "$cleanup_errors" ]; then
+      cleanup_errors="${cleanup_errors}; ${INSTALL_ARTIFACT_CLEANUP_ERROR}"
+    else
+      cleanup_errors="$INSTALL_ARTIFACT_CLEANUP_ERROR"
+    fi
+  fi
+  if ! cleanup_update_locks_on_exit; then
+    if [ -n "$cleanup_errors" ]; then
+      cleanup_errors="${cleanup_errors}; ${UPDATE_LOCK_EXIT_CLEANUP_ERROR}"
+    else
+      cleanup_errors="$UPDATE_LOCK_EXIT_CLEANUP_ERROR"
+    fi
+  fi
+  if ! cleanup_installer_temp_directory; then
+    if [ -n "$cleanup_errors" ]; then
+      cleanup_errors="${cleanup_errors}; ${TMP_CLEANUP_ERROR}"
+    else
+      cleanup_errors="$TMP_CLEANUP_ERROR"
+    fi
+  fi
+  if [ -n "$cleanup_errors" ]; then
+    printf '\033[0;31m[error]\033[0m Installer EXIT cleanup failed: %s\n' \
+      "$cleanup_errors" >&2
+    cleanup_status=1
+  fi
+  if [ "$original_status" -ne 0 ]; then
+    exit "$original_status"
+  fi
+  exit "$cleanup_status"
+}
+
+cleanup_installer_temp_directory() {
+  local observed_parent observed_parent_identity observed_identity
+  [ -n "${TMP_DIR:-}" ] || return 0
+  case "$TMP_DIR" in
+    /*) ;;
+    *)
+      TMP_CLEANUP_ERROR="recorded temporary path is not absolute: ${TMP_DIR}"
+      return 1
+      ;;
+  esac
+  observed_parent="$(dirname "$TMP_DIR")"
+  if [ "$observed_parent" != "${TMP_DIR_PARENT:-}" ]; then
+    TMP_CLEANUP_ERROR="recorded temporary parent changed: ${TMP_DIR}"
+    return 1
+  fi
+  case "$TMP_DIR" in
+    "${TMP_DIR_PARENT%/}/"*) ;;
+    *)
+      TMP_CLEANUP_ERROR="temporary path is not a direct descendant of its recorded root: ${TMP_DIR}"
+      return 1
+      ;;
+  esac
+  observed_parent_identity="$(file_identity "$observed_parent" 2>/dev/null)" || {
+    TMP_CLEANUP_ERROR="could not identify recorded temporary parent ${observed_parent}"
+    return 1
+  }
+  if [ "$observed_parent_identity" != "${TMP_DIR_PARENT_IDENTITY:-}" ]; then
+    TMP_CLEANUP_ERROR="temporary parent identity changed; preserved ${TMP_DIR}"
+    return 1
+  fi
+  if [ -L "$TMP_DIR" ] || [ ! -d "$TMP_DIR" ]; then
+    TMP_CLEANUP_ERROR="temporary path is no longer the direct directory created by this installer: ${TMP_DIR}"
+    return 1
+  fi
+  observed_identity="$(file_identity "$TMP_DIR" 2>/dev/null)" || {
+    TMP_CLEANUP_ERROR="could not identify installer temporary directory ${TMP_DIR}"
+    return 1
+  }
+  if [ "$observed_identity" != "${TMP_DIR_IDENTITY:-}" ]; then
+    TMP_CLEANUP_ERROR="temporary directory identity changed; preserved ${TMP_DIR}"
+    return 1
+  fi
+  if ! rm -rf -- "$TMP_DIR"; then
+    TMP_CLEANUP_ERROR="recursive removal failed for verified temporary directory ${TMP_DIR}"
+    return 1
+  fi
+  if [ -e "$TMP_DIR" ] || [ -L "$TMP_DIR" ]; then
+    TMP_CLEANUP_ERROR="verified temporary directory still exists after removal: ${TMP_DIR}"
+    return 1
+  fi
+  TMP_DIR=""
+  return 0
 }
 
 start_update_lock() {
@@ -396,6 +1079,10 @@ start_install_update_locks() {
 
 release_update_locks() {
   local failed=false
+  if [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ]; then
+    UPDATE_LOCK_ERROR="refusing to release update locks while the daemon lifecycle holder is active"
+    return 1
+  fi
   exec 9>&- 8>&-
   if [ -n "${UPDATE_LOCK_PID_9:-}" ]; then
     wait "$UPDATE_LOCK_PID_9" || failed=true
@@ -416,9 +1103,6 @@ prepare_daemon_upgrade() {
   DAEMON_STATE_CAPTURED=false
   DAEMON_WAS_RUNNING=false
   DAEMON_SERVICE_INSTALLED=false
-  DAEMON_SERVICE_REWRITE=false
-  DAEMON_RESTART_ATTEMPTED=false
-  DAEMON_SERVICE_REWRITE_ATTEMPTED=false
   DAEMON_STATUS_ERROR=""
 
   if [ -x "$INSTALL_DEST" ] && [ ! -L "$INSTALL_DEST" ]; then
@@ -426,6 +1110,11 @@ prepare_daemon_upgrade() {
   elif [ "$MIGRATE_LEGACY" = true ] && [ -x "$LEGACY_BIN" ] && [ ! -L "$LEGACY_BIN" ]; then
     DAEMON_PREVIOUS_BIN="$LEGACY_BIN"
   else
+    # A fresh publication still needs the PID absence lease: without it a
+    # foreground daemon can enter after publication and survive a later PATH
+    # or marker rollback. The explicit path may not exist yet; service/PID
+    # state is captured authoritatively by the holder below.
+    DAEMON_PREVIOUS_BIN="$INSTALL_DEST"
     return 0
   fi
 
@@ -447,7 +1136,6 @@ prepare_daemon_upgrade() {
         && check_candidate_uninstall_owner "$LEGACY_BIN"
       then
         DAEMON_PREVIOUS_BIN="$LEGACY_BIN"
-        DAEMON_SERVICE_REWRITE=true
         if [ "$DAEMON_WAS_RUNNING" != true ]; then
           DAEMON_STATUS_ERROR="The installed daemon service is owned by ${LEGACY_BIN}, but it is not running. Uninstall that service before migrating the executable so its stopped state is not changed."
           return 1
@@ -464,65 +1152,20 @@ prepare_daemon_upgrade() {
     fi
   fi
 
-  if [ "$DAEMON_WAS_RUNNING" = true ] || [ "$DAEMON_SERVICE_INSTALLED" = true ]; then
-    info "Stopping the existing daemon before replacing ${DAEMON_PREVIOUS_BIN}..."
-    if ! stop_and_confirm_daemon_absent "$DAEMON_PREVIOUS_BIN"; then
-      DAEMON_STATUS_ERROR="The existing daemon could not be stopped safely: ${DAEMON_STATUS_ERROR}"
-      return 1
-    fi
-  fi
-}
-
-ensure_previous_daemon_running() {
-  [ "$DAEMON_WAS_RUNNING" = true ] || return 0
-  if read_checked_daemon_status && [ "$DAEMON_STATUS_RUNNING" = true ]; then
-    return 0
-  fi
-  if ! "$DAEMON_PREVIOUS_BIN" daemon start 8>&- 9>&-; then
-    DAEMON_STATUS_ERROR="could not restart the previous daemon"
-    return 1
-  fi
-  confirm_daemon_running
-}
-
-stop_restarted_daemon_for_rollback() {
-  [ "$DAEMON_RESTART_ATTEMPTED" = true ] || return 0
-  if ! read_checked_daemon_status; then
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_RUNNING" = true ]; then
-    stop_and_confirm_daemon_absent "$INSTALL_DEST"
-  fi
 }
 
 abort_install_upgrade() {
-  local reason="$1" rollback_errors="" service_restored=false
+  local reason="$1" rollback_errors=""
 
-  if ! stop_restarted_daemon_for_rollback; then
-    rollback_errors="${rollback_errors} could not prove the replacement daemon was stopped: ${DAEMON_STATUS_ERROR};"
+  if [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && { [ "${DAEMON_BOUNDARY_PHASE:-}" != stopped ] \
+      || [ "${DAEMON_BOUNDARY_ROLLBACK_SAFE:-false}" != true ]; }
+  then
+    rollback_errors="${rollback_errors} daemon lifecycle rollback authority was lost (${DAEMON_BOUNDARY_ERROR});"
   fi
 
   if [ -z "$rollback_errors" ] && ! restore_held_legacy_install; then
     rollback_errors="${rollback_errors} could not restore the legacy executable;"
-  fi
-
-  if [ -z "$rollback_errors" ] && [ "$DAEMON_SERVICE_REWRITE_ATTEMPTED" = true ]; then
-    if check_candidate_uninstall_owner "$DAEMON_PREVIOUS_BIN" \
-      && confirm_daemon_running \
-      && [ "$DAEMON_STATUS_SERVICE_INSTALLED" = true ]
-    then
-      service_restored=true
-    elif check_candidate_uninstall_owner "$INSTALL_DEST" \
-      && "$DAEMON_PREVIOUS_BIN" daemon install \
-        --expected-existing-executable "$INSTALL_DEST" 8>&- 9>&- \
-      && check_candidate_uninstall_owner "$DAEMON_PREVIOUS_BIN" \
-      && confirm_daemon_running \
-      && [ "$DAEMON_STATUS_SERVICE_INSTALLED" = true ]
-    then
-      service_restored=true
-    else
-      rollback_errors="${rollback_errors} could not restore and verify the previous daemon service: ${DAEMON_STATUS_ERROR};"
-    fi
   fi
 
   if [ -z "$rollback_errors" ] && [ "${BINARY_REPLACED:-false}" = true ]; then
@@ -541,26 +1184,42 @@ abort_install_upgrade() {
 
   if [ "${SYSTEM_MARKER_CREATED:-false}" = true ]; then
     if [ "${BINARY_REPLACED:-false}" = false ]; then
-      if run_install_fs rm -f "$SYSTEM_INSTALL_MARKER"; then
+      if remove_installer_file_owned \
+        "$SYSTEM_INSTALL_MARKER" "$SYSTEM_MARKER_CREATED_TOKEN" "$INSTALL_WITH_SUDO"
+      then
         SYSTEM_MARKER_CREATED=false
+        SYSTEM_MARKER_CREATED_TOKEN=""
       else
-        rollback_errors="${rollback_errors} could not remove the new system-install marker;"
+        rollback_errors="${rollback_errors} could not prove and remove the new system-install marker;"
       fi
     else
       rollback_errors="${rollback_errors} the new system-install marker was preserved because the replacement system binary remains installed;"
     fi
   fi
 
-  if [ -z "$rollback_errors" ] && [ "$service_restored" = false ]; then
-    if ! ensure_previous_daemon_running; then
-      rollback_errors="${rollback_errors} ${DAEMON_STATUS_ERROR};"
+  if [ -z "$rollback_errors" ] && ! rollback_managed_path_changes; then
+    rollback_errors="${rollback_errors} ${PATH_TRANSACTION_ERROR};"
+  fi
+
+  if [ -z "$rollback_errors" ] \
+    && [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && ! restore_daemon_update_boundary_old_state
+  then
+    rollback_errors="${rollback_errors} could not restore and verify the prior daemon state: ${DAEMON_BOUNDARY_ERROR};"
+  fi
+
+  if [ -n "$rollback_errors" ] && [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ]; then
+    if ! abandon_daemon_update_boundary; then
+      rollback_errors="${rollback_errors} lifecycle holder shutdown was not confirmed: ${DAEMON_BOUNDARY_ERROR};"
     fi
   fi
 
   if [ -n "$rollback_errors" ]; then
     preserve_install_backup
   fi
-  cleanup_install_artifacts
+  if ! cleanup_install_artifacts; then
+    rollback_errors="${rollback_errors} ${INSTALL_ARTIFACT_CLEANUP_ERROR};"
+  fi
   if ! release_update_locks; then
     rollback_errors="${rollback_errors} ${UPDATE_LOCK_ERROR};"
   fi
@@ -570,64 +1229,13 @@ abort_install_upgrade() {
   error "${reason} The previous executable and daemon state were restored."
 }
 
-restart_daemon_after_upgrade() {
-  if [ "$DAEMON_SERVICE_REWRITE" = true ]; then
-    DAEMON_RESTART_ATTEMPTED=true
-    DAEMON_SERVICE_REWRITE_ATTEMPTED=true
-    info "Moving the running daemon service to ${INSTALL_DEST}..."
-    if ! "$INSTALL_DEST" daemon install \
-      --expected-existing-executable "$LEGACY_BIN" 8>&- 9>&-; then
-      DAEMON_STATUS_ERROR="new daemon service installation failed"
-      return 1
-    fi
-    if ! check_candidate_uninstall_owner "$INSTALL_DEST"; then
-      DAEMON_STATUS_ERROR="new daemon service is not exactly owned by ${INSTALL_DEST}: ${SERVICE_OWNER_ERROR}"
-      return 1
-    fi
-    if ! confirm_daemon_running; then
-      return 1
-    fi
-    if [ "$DAEMON_STATUS_SERVICE_INSTALLED" != true ]; then
-      DAEMON_STATUS_ERROR="new daemon status did not report the service as installed"
-      return 1
-    fi
-    return 0
-  fi
-
-  if [ "$DAEMON_WAS_RUNNING" = true ]; then
-    DAEMON_RESTART_ATTEMPTED=true
-    info "Restarting the previously running daemon with ${INSTALL_DEST}..."
-    if ! "$INSTALL_DEST" daemon start 8>&- 9>&-; then
-      DAEMON_STATUS_ERROR="daemon restart failed"
-      return 1
-    fi
-    if ! confirm_daemon_running; then
-      return 1
-    fi
-  elif [ "$DAEMON_STATE_CAPTURED" = true ]; then
-    if ! read_checked_daemon_status; then
-      return 1
-    fi
-    if [ "$DAEMON_STATUS_RUNNING" = true ]; then
-      DAEMON_STATUS_ERROR="an existing stopped daemon unexpectedly started during upgrade"
-      return 1
-    fi
-  fi
-
-  if [ "$DAEMON_STATE_CAPTURED" = true ] \
-    && [ "$DAEMON_STATUS_SERVICE_INSTALLED" != "$DAEMON_SERVICE_INSTALLED" ]
-  then
-    DAEMON_STATUS_ERROR="daemon service-installed state changed during upgrade"
-    return 1
-  fi
-}
-
 resolve_path_target() (
   local profile_target="$1"
   local link_target link_hops=0 physical_dir
   while [ -L "$profile_target" ]; do
     link_hops=$((link_hops + 1))
-    [ "$link_hops" -le 40 ] || error "Too many symbolic links while resolving $1."
+    [ "$link_hops" -le "$SYMLINK_RESOLUTION_MAX_HOPS" ] \
+      || error "Symbolic-link resolution exceeded ${SYMLINK_RESOLUTION_MAX_HOPS} hops for $1."
     link_target="$(readlink "$profile_target")" || error "Failed to resolve symbolic link $1."
     case "$link_target" in
       /*) ;;
@@ -676,34 +1284,84 @@ reset_managed_path_transaction() {
   PATH_TRANSACTION_LOGICAL=()
   PATH_TRANSACTION_TARGET=()
   PATH_TRANSACTION_IDENTITY=()
-  PATH_TRANSACTION_ORIGINAL=()
+  PATH_TRANSACTION_ORIGINAL_EXISTS=()
   PATH_TRANSACTION_UPDATED=()
   PATH_TRANSACTION_STAGE=()
+  PATH_TRANSACTION_STAGE_TOKEN=()
   PATH_TRANSACTION_COMMITTED_IDENTITY=()
+  PATH_TRANSACTION_ACTION=()
   PATH_TRANSACTION_COUNT=0
   PATH_TRANSACTION_COMMITTED=0
+  PATH_TRANSACTION_PROFILE_SELECTED=false
+  PATH_TRANSACTION_CREATED_PARENT=()
+  PATH_TRANSACTION_CREATED_PARENT_IDENTITY=()
+  PATH_TRANSACTION_CREATED_PARENT_COUNT=0
   PATH_TRANSACTION_ERROR=""
 }
 
-assert_no_profile_transaction_residue() {
-  local profile_file="$1" profile_target profile_stage
-  if [ ! -e "$profile_file" ] && [ ! -L "$profile_file" ]; then
-    profile_stage="${profile_file}.${BINARY_NAME}.install"
-    if [ -e "$profile_stage" ] || [ -L "$profile_stage" ]; then
-      PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains at ${profile_stage}"
+create_profile_parent_chain() {
+  local required_parent="$1" ancestor parent identity index
+  local missing=()
+  ancestor="$required_parent"
+  while [ ! -e "$ancestor" ] && [ ! -L "$ancestor" ]; do
+    missing[${#missing[@]}]="$ancestor"
+    parent="$(dirname "$ancestor")"
+    [ "$parent" != "$ancestor" ] || {
+      PATH_TRANSACTION_ERROR="could not find an existing ancestor for ${required_parent}"
+      return 1
+    }
+    ancestor="$parent"
+  done
+  [ ! -L "$ancestor" ] && [ -d "$ancestor" ] || {
+    PATH_TRANSACTION_ERROR="profile ancestor is not a direct directory: ${ancestor}"
+    return 1
+  }
+
+  index=${#missing[@]}
+  while [ "$index" -gt 0 ]; do
+    index=$((index - 1))
+    parent="${missing[$index]}"
+    if ! mkdir "$parent"; then
+      PATH_TRANSACTION_ERROR="failed to create profile directory ${parent} without adopting another writer's path"
       return 1
     fi
+    identity="$(file_identity "$parent")" || {
+      if rmdir "$parent"; then
+        PATH_TRANSACTION_ERROR="failed to identify new profile directory ${parent}; its exact empty directory was removed"
+      else
+        PATH_TRANSACTION_ERROR="failed to identify new profile directory ${parent}; exact empty-directory cleanup also failed and the path was preserved"
+      fi
+      return 1
+    }
+    PATH_TRANSACTION_CREATED_PARENT[$PATH_TRANSACTION_CREATED_PARENT_COUNT]="$parent"
+    PATH_TRANSACTION_CREATED_PARENT_IDENTITY[$PATH_TRANSACTION_CREATED_PARENT_COUNT]="$identity"
+    PATH_TRANSACTION_CREATED_PARENT_COUNT=$((PATH_TRANSACTION_CREATED_PARENT_COUNT + 1))
+  done
+}
+
+assert_no_profile_transaction_residue() {
+  local profile_file="$1" profile_target residue suffix
+  for suffix in install displaced failed; do
+    residue="${profile_file}.${BINARY_NAME}.${suffix}"
+    if [ -e "$residue" ] || [ -L "$residue" ]; then
+      PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains at ${residue}"
+      return 1
+    fi
+  done
+  if [ ! -e "$profile_file" ] && [ ! -L "$profile_file" ]; then
     return 0
   fi
   if ! profile_target="$(resolve_path_target "$profile_file")"; then
     PATH_TRANSACTION_ERROR="failed to resolve ${profile_file} while checking transaction residue"
     return 1
   fi
-  profile_stage="${profile_target}.${BINARY_NAME}.install"
-  if [ -e "$profile_stage" ] || [ -L "$profile_stage" ]; then
-    PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains at ${profile_stage}"
-    return 1
-  fi
+  for suffix in install displaced failed; do
+    residue="${profile_target}.${BINARY_NAME}.${suffix}"
+    if [ -e "$residue" ] || [ -L "$residue" ]; then
+      PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains at ${residue}"
+      return 1
+    fi
+  done
 }
 
 assert_no_managed_path_transaction_residue() {
@@ -719,7 +1377,8 @@ assert_no_managed_path_transaction_residue() {
 }
 
 prepare_path_block_removal() {
-  local profile_file="$1" profile_target profile_identity original updated profile_stage
+  local profile_file="$1" profile_target profile_identity original original_token updated
+  local profile_stage profile_displaced profile_failed
   local index existing_index
   [ -f "$profile_file" ] || return 0
   if ! grep -F "$PATH_BLOCK_BEGIN" "$profile_file" >/dev/null 2>&1 \
@@ -744,7 +1403,7 @@ prepare_path_block_removal() {
     existing_index=$((existing_index + 1))
   done
 
-  if ! profile_identity="$(file_identity "$profile_target")"; then
+  if ! capture_installer_file_token "$profile_target" false profile_identity; then
     PATH_TRANSACTION_ERROR="failed to identify ${profile_file}"
     return 1
   fi
@@ -752,12 +1411,18 @@ prepare_path_block_removal() {
   original="${TMP_DIR}/path-${index}.original"
   updated="${TMP_DIR}/path-${index}.updated"
   profile_stage="${profile_target}.${BINARY_NAME}.install"
-  if [ -e "$profile_stage" ] || [ -L "$profile_stage" ]; then
-    PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains at ${profile_stage}"
+  profile_displaced="${profile_target}.${BINARY_NAME}.displaced"
+  profile_failed="${profile_target}.${BINARY_NAME}.failed"
+  if [ -e "$profile_stage" ] || [ -L "$profile_stage" ] \
+    || [ -e "$profile_displaced" ] || [ -L "$profile_displaced" ] \
+    || [ -e "$profile_failed" ] || [ -L "$profile_failed" ]
+  then
+    PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains beside ${profile_target}"
     return 1
   fi
-  if ! cp -p "$profile_target" "$original" \
-    || ! cp -p "$profile_target" "$updated"
+  if ! capture_installer_file_copy \
+    "$profile_target" "$original" "$profile_identity" false original_token \
+    || ! cp -p "$original" "$updated"
   then
     PATH_TRANSACTION_ERROR="failed to stage ${profile_file} for PATH removal"
     return 1
@@ -770,10 +1435,12 @@ prepare_path_block_removal() {
   PATH_TRANSACTION_LOGICAL[$index]="$profile_file"
   PATH_TRANSACTION_TARGET[$index]="$profile_target"
   PATH_TRANSACTION_IDENTITY[$index]="$profile_identity"
-  PATH_TRANSACTION_ORIGINAL[$index]="$original"
+  PATH_TRANSACTION_ORIGINAL_EXISTS[$index]=true
   PATH_TRANSACTION_UPDATED[$index]="$updated"
   PATH_TRANSACTION_STAGE[$index]="$profile_stage"
+  PATH_TRANSACTION_STAGE_TOKEN[$index]=""
   PATH_TRANSACTION_COMMITTED_IDENTITY[$index]=""
+  PATH_TRANSACTION_ACTION[$index]="Removed codex-switch-global-pace PATH entry from ${profile_file}."
   PATH_TRANSACTION_COUNT=$((PATH_TRANSACTION_COUNT + 1))
 }
 
@@ -791,26 +1458,138 @@ prepare_managed_path_removals() {
   done
 }
 
-commit_managed_path_removals() {
-  local index logical target expected_identity current_target current_identity stage committed_identity
+prepare_managed_path_addition() {
+  local profile_file path_line profile_parent profile_target profile_identity
+  local original original_token updated profile_stage profile_displaced profile_failed validation index=0
+  reset_managed_path_transaction
+  assert_no_managed_path_transaction_residue || return 1
+  case ":${PATH}:" in
+    *":${USER_INSTALL_DIR}:"*) return 0 ;;
+  esac
+  case "${SHELL:-}" in
+    */zsh)
+      profile_file="${HOME}/.zprofile"
+      path_line='export PATH="$HOME/.local/bin:$PATH"'
+      ;;
+    */bash)
+      if [ "$PLATFORM" = "darwin" ]; then
+        profile_file="${HOME}/.bash_profile"
+      else
+        profile_file="${HOME}/.profile"
+      fi
+      path_line='export PATH="$HOME/.local/bin:$PATH"'
+      ;;
+    */fish)
+      profile_file="${HOME}/.config/fish/config.fish"
+      path_line='fish_add_path "$HOME/.local/bin"'
+      ;;
+    *) return 0 ;;
+  esac
+  PATH_TRANSACTION_PROFILE_SELECTED=true
+  profile_parent="$(dirname "$profile_file")"
+  create_profile_parent_chain "$profile_parent" || return 1
+  [ ! -L "$profile_parent" ] && [ -d "$profile_parent" ] || {
+    PATH_TRANSACTION_ERROR="profile parent is not a direct directory: ${profile_parent}"
+    return 1
+  }
+
+  original="${TMP_DIR}/path-${index}.original"
+  updated="${TMP_DIR}/path-${index}.updated"
+  if [ -e "$profile_file" ] || [ -L "$profile_file" ]; then
+    profile_target="$(resolve_path_target "$profile_file")" || {
+      PATH_TRANSACTION_ERROR="failed to resolve ${profile_file}"
+      return 1
+    }
+    [ ! -L "$profile_target" ] && [ -f "$profile_target" ] || {
+      PATH_TRANSACTION_ERROR="${profile_file} does not resolve to a regular profile file"
+      return 1
+    }
+    if grep -F "$PATH_BLOCK_BEGIN" "$profile_target" >/dev/null 2>&1 \
+      || grep -F "$PATH_BLOCK_END" "$profile_target" >/dev/null 2>&1
+    then
+      validation="${TMP_DIR}/path-${index}.validation"
+      render_profile_without_managed_path_block "$profile_target" "$validation" || {
+        PATH_TRANSACTION_ERROR="${profile_file} contains an invalid managed PATH block"
+        return 1
+      }
+      return 0
+    fi
+    capture_installer_file_token "$profile_target" false profile_identity || {
+      PATH_TRANSACTION_ERROR="failed to identify ${profile_file}"
+      return 1
+    }
+    capture_installer_file_copy \
+      "$profile_target" "$original" "$profile_identity" false original_token \
+      && cp -p "$original" "$updated" || {
+      PATH_TRANSACTION_ERROR="failed to stage ${profile_file} for PATH addition"
+      return 1
+      }
+    PATH_TRANSACTION_ORIGINAL_EXISTS[$index]=true
+  else
+    profile_target="$(resolve_path_target "$profile_file")" || {
+      PATH_TRANSACTION_ERROR="failed to resolve new profile path ${profile_file}"
+      return 1
+    }
+    profile_identity=""
+    original=""
+    : > "$updated" || {
+      PATH_TRANSACTION_ERROR="failed to stage new profile ${profile_file}"
+      return 1
+    }
+    PATH_TRANSACTION_ORIGINAL_EXISTS[$index]=false
+  fi
+  profile_stage="${profile_target}.${BINARY_NAME}.install"
+  profile_displaced="${profile_target}.${BINARY_NAME}.displaced"
+  profile_failed="${profile_target}.${BINARY_NAME}.failed"
+  [ ! -e "$profile_stage" ] && [ ! -L "$profile_stage" ] \
+    && [ ! -e "$profile_displaced" ] && [ ! -L "$profile_displaced" ] \
+    && [ ! -e "$profile_failed" ] && [ ! -L "$profile_failed" ] || {
+    PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains beside ${profile_target}"
+    return 1
+  }
+  printf '\n%s\n%s\n%s\n' "$PATH_BLOCK_BEGIN" "$path_line" "$PATH_BLOCK_END" \
+    >> "$updated" || {
+      PATH_TRANSACTION_ERROR="failed to render managed PATH addition for ${profile_file}"
+      return 1
+    }
+
+  PATH_TRANSACTION_LOGICAL[$index]="$profile_file"
+  PATH_TRANSACTION_TARGET[$index]="$profile_target"
+  PATH_TRANSACTION_IDENTITY[$index]="$profile_identity"
+  PATH_TRANSACTION_UPDATED[$index]="$updated"
+  PATH_TRANSACTION_STAGE[$index]="$profile_stage"
+  PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+  PATH_TRANSACTION_COMMITTED_IDENTITY[$index]=""
+  PATH_TRANSACTION_ACTION[$index]="Added ${USER_INSTALL_DIR} to PATH in ${profile_file}; restart your shell to apply it."
+  PATH_TRANSACTION_COUNT=1
+}
+
+commit_managed_path_changes() {
+  local index logical target expected_identity original_exists current_target
+  local stage stage_token updated_token committed_identity stage_after target_after boundary_error
   index=0
   while [ "$index" -lt "$PATH_TRANSACTION_COUNT" ]; do
     logical="${PATH_TRANSACTION_LOGICAL[$index]}"
     target="${PATH_TRANSACTION_TARGET[$index]}"
     expected_identity="${PATH_TRANSACTION_IDENTITY[$index]}"
+    original_exists="${PATH_TRANSACTION_ORIGINAL_EXISTS[$index]}"
     stage="${PATH_TRANSACTION_STAGE[$index]}"
     if [ -e "$stage" ] || [ -L "$stage" ]; then
       PATH_TRANSACTION_ERROR="transaction stage ${stage} appeared before ${logical} could be committed"
       return 1
     fi
-    if ! cp -p "${PATH_TRANSACTION_UPDATED[$index]}" "$stage"; then
-      PATH_TRANSACTION_ERROR="failed to create the fixed PATH transaction stage ${stage}"
-      return 1
-    fi
-    [ ! -L "$stage" ] && [ -f "$stage" ] || {
-      PATH_TRANSACTION_ERROR="PATH transaction stage ${stage} is not a regular file"
+    capture_installer_file_token \
+      "${PATH_TRANSACTION_UPDATED[$index]}" false updated_token || {
+      PATH_TRANSACTION_ERROR="failed to bind the rendered PATH update for ${logical}"
       return 1
     }
+    capture_installer_file_copy \
+      "${PATH_TRANSACTION_UPDATED[$index]}" "$stage" "$updated_token" false \
+      stage_token || {
+      PATH_TRANSACTION_ERROR="failed to create the fixed PATH transaction stage ${stage}: ${INSTALLER_FILE_OP_ERROR}"
+      return 1
+    }
+    PATH_TRANSACTION_STAGE_TOKEN[$index]="$stage_token"
     if ! current_target="$(resolve_path_target "$logical")"; then
       PATH_TRANSACTION_ERROR="failed to re-resolve ${logical} before commit"
       return 1
@@ -819,64 +1598,184 @@ commit_managed_path_removals() {
       PATH_TRANSACTION_ERROR="profile link changed while updating ${logical}"
       return 1
     fi
-    if ! current_identity="$(file_identity "$current_target")"; then
-      PATH_TRANSACTION_ERROR="failed to re-identify ${logical} before commit"
-      return 1
-    fi
-    if [ "$current_identity" != "$expected_identity" ]; then
-      PATH_TRANSACTION_ERROR="profile file changed while updating ${logical}; newer contents were left unchanged"
-      return 1
-    fi
-    if ! mv -f "$stage" "$target"; then
-      PATH_TRANSACTION_ERROR="failed to atomically replace ${logical}"
-      return 1
+    PATH_TRANSACTION_COMMITTED_IDENTITY[$index]="$stage_token"
+    if [ "$original_exists" = true ]; then
+      if ! exchange_installer_files \
+        "$stage" "$target" "$stage_token" "$expected_identity" false
+      then
+        boundary_error="$INSTALLER_FILE_OP_ERROR"
+        stage_after=""
+        target_after=""
+        capture_installer_file_token "$stage" false stage_after 2>/dev/null || true
+        capture_installer_file_token "$target" false target_after 2>/dev/null || true
+        if [ "$stage_after" = "$expected_identity" ] \
+          && [ "$target_after" = "$stage_token" ]
+        then
+          PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+          PATH_TRANSACTION_COMMITTED=$((index + 1))
+          PATH_TRANSACTION_ERROR="profile exchange reached its published state but did not confirm durability: ${boundary_error}"
+        else
+          PATH_TRANSACTION_ERROR="profile exchange failed without overwriting another writer: ${boundary_error}"
+        fi
+        return 1
+      fi
+      PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+    else
+      if ! move_installer_file_noreplace "$stage" "$target" "$stage_token" false; then
+        boundary_error="$INSTALLER_FILE_OP_ERROR"
+        target_after=""
+        capture_installer_file_token "$target" false target_after 2>/dev/null || true
+        if [ "$target_after" = "$stage_token" ] \
+          && [ ! -e "$stage" ] && [ ! -L "$stage" ]
+        then
+          PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+          PATH_TRANSACTION_COMMITTED=$((index + 1))
+        fi
+        PATH_TRANSACTION_ERROR="failed to publish new profile ${logical} without replacing another writer: ${boundary_error}"
+        return 1
+      fi
+      PATH_TRANSACTION_STAGE_TOKEN[$index]=""
     fi
     PATH_TRANSACTION_COMMITTED=$((index + 1))
-    if ! committed_identity="$(file_identity "$target")"; then
+    if ! capture_installer_file_token "$target" false committed_identity; then
       PATH_TRANSACTION_ERROR="failed to identify committed profile ${logical}"
       return 1
     fi
-    PATH_TRANSACTION_COMMITTED_IDENTITY[$index]="$committed_identity"
-    info "Removed codex-switch-global-pace PATH entry from ${logical}."
+    if [ "$committed_identity" != "${PATH_TRANSACTION_COMMITTED_IDENTITY[$index]}" ]; then
+      PATH_TRANSACTION_ERROR="committed profile changed while updating ${logical}"
+      return 1
+    fi
+    info "${PATH_TRANSACTION_ACTION[$index]}"
     index=$((index + 1))
   done
 }
 
-rollback_managed_path_removals() {
-  local index logical target expected_identity current_target current_identity stage failed=false
+rollback_managed_path_changes() {
+  local index logical target expected_identity original_identity original_exists
+  local current_target current_identity stage stage_after target_after failed=false
   index="$PATH_TRANSACTION_COMMITTED"
   while [ "$index" -gt 0 ]; do
     index=$((index - 1))
     logical="${PATH_TRANSACTION_LOGICAL[$index]}"
     target="${PATH_TRANSACTION_TARGET[$index]}"
     expected_identity="${PATH_TRANSACTION_COMMITTED_IDENTITY[$index]}"
+    original_identity="${PATH_TRANSACTION_IDENTITY[$index]}"
+    original_exists="${PATH_TRANSACTION_ORIGINAL_EXISTS[$index]}"
     stage="${PATH_TRANSACTION_STAGE[$index]}"
-    if [ -z "$expected_identity" ] \
+    if [ "$original_exists" = true ]; then
+      if [ -z "$expected_identity" ] \
+        || ! current_target="$(resolve_path_target "$logical")" \
+        || [ "$current_target" != "$target" ] \
+        || ! capture_installer_file_token "$current_target" false current_identity \
+        || [ "$current_identity" != "$expected_identity" ] \
+        || ! installer_file_token_matches "$stage" false "$original_identity"
+      then
+        failed=true
+        PATH_TRANSACTION_ERROR="could not safely restore ${logical}; the exact displaced original remains at ${stage}"
+      else
+        if ! exchange_installer_files \
+          "$stage" "$target" "$original_identity" "$expected_identity" false
+        then
+          stage_after=""
+          target_after=""
+          capture_installer_file_token "$stage" false stage_after 2>/dev/null || true
+          capture_installer_file_token "$target" false target_after 2>/dev/null || true
+          failed=true
+          if [ "$stage_after" = "$expected_identity" ] \
+            && [ "$target_after" = "$original_identity" ]
+          then
+            PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+            PATH_TRANSACTION_COMMITTED="$index"
+            PATH_TRANSACTION_ERROR="restored ${logical}, but rollback durability was not confirmed; the failed candidate remains at ${stage}"
+          else
+            PATH_TRANSACTION_ERROR="could not atomically restore ${logical}; all exchange operands were preserved"
+          fi
+        else
+          PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+          if ! installer_file_token_matches "$target" false "$original_identity"; then
+            failed=true
+            PATH_TRANSACTION_ERROR="restored profile identity did not match the captured ${logical}"
+          elif ! remove_installer_file_owned "$stage" "$expected_identity" false; then
+            failed=true
+            PATH_TRANSACTION_ERROR="restored ${logical}, but the failed candidate remains at ${stage}"
+          else
+            PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+            PATH_TRANSACTION_COMMITTED="$index"
+          fi
+        fi
+      fi
+    elif [ -z "$expected_identity" ] \
       || ! current_target="$(resolve_path_target "$logical")" \
       || [ "$current_target" != "$target" ] \
-      || ! current_identity="$(file_identity "$current_target")" \
-      || [ "$current_identity" != "$expected_identity" ] \
-      || [ -e "$stage" ] || [ -L "$stage" ] \
-      || ! cp -p "${PATH_TRANSACTION_ORIGINAL[$index]}" "$stage" \
-      || [ -L "$stage" ] || [ ! -f "$stage" ] \
-      || ! mv -f "$stage" "$target"
+      || ! capture_installer_file_token "$current_target" false current_identity \
+      || [ "$current_identity" != "$expected_identity" ]
     then
       failed=true
-      PATH_TRANSACTION_ERROR="could not safely restore ${logical}; inspect the fixed transaction paths before retrying"
+      PATH_TRANSACTION_ERROR="could not safely remove the profile created at ${logical}; a different path was left unchanged"
     else
-      PATH_TRANSACTION_COMMITTED="$index"
+      if ! remove_installer_file_owned "$target" "$expected_identity" false; then
+        failed=true
+        PATH_TRANSACTION_ERROR="could not safely remove the profile created at ${logical}"
+      else
+        PATH_TRANSACTION_COMMITTED="$index"
+      fi
     fi
   done
   index=0
   while [ "$index" -lt "$PATH_TRANSACTION_COUNT" ]; do
     stage="${PATH_TRANSACTION_STAGE[$index]}"
     if [ -e "$stage" ] || [ -L "$stage" ]; then
-      failed=true
-      PATH_TRANSACTION_ERROR="PATH transaction residue remains at ${stage}"
+      if [ "${PATH_TRANSACTION_ORIGINAL_EXISTS[$index]}" = true ] \
+        && [ "$index" -lt "$PATH_TRANSACTION_COMMITTED" ]
+      then
+        failed=true
+        PATH_TRANSACTION_ERROR="exact displaced profile remains at ${stage}"
+      elif [ -n "${PATH_TRANSACTION_STAGE_TOKEN[$index]}" ] \
+        && remove_installer_file_owned \
+          "$stage" "${PATH_TRANSACTION_STAGE_TOKEN[$index]}" false
+      then
+        PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+      else
+        failed=true
+        PATH_TRANSACTION_ERROR="PATH transaction residue remains at ${stage}"
+      fi
     fi
     index=$((index + 1))
   done
+  index="$PATH_TRANSACTION_CREATED_PARENT_COUNT"
+  while [ "$index" -gt 0 ]; do
+    index=$((index - 1))
+    if [ "$(file_identity "${PATH_TRANSACTION_CREATED_PARENT[$index]}" 2>/dev/null || true)" \
+        = "${PATH_TRANSACTION_CREATED_PARENT_IDENTITY[$index]}" ] \
+      && rmdir "${PATH_TRANSACTION_CREATED_PARENT[$index]}" 2>/dev/null
+    then
+      PATH_TRANSACTION_CREATED_PARENT_COUNT="$index"
+    else
+      failed=true
+      PATH_TRANSACTION_ERROR="could not safely remove new profile directory ${PATH_TRANSACTION_CREATED_PARENT[$index]}"
+      break
+    fi
+  done
   [ "$failed" = false ]
+}
+
+finalize_managed_path_changes() {
+  local index stage token
+  index=0
+  while [ "$index" -lt "$PATH_TRANSACTION_COUNT" ]; do
+    if [ "${PATH_TRANSACTION_ORIGINAL_EXISTS[$index]}" = true ]; then
+      stage="${PATH_TRANSACTION_STAGE[$index]}"
+      token="${PATH_TRANSACTION_STAGE_TOKEN[$index]}"
+      if [ -z "$token" ] \
+        || ! remove_installer_file_owned "$stage" "$token" false
+      then
+        PATH_TRANSACTION_ERROR="committed PATH recovery file could not be removed safely: ${stage}"
+        return 1
+      fi
+      PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+    fi
+    index=$((index + 1))
+  done
 }
 
 managed_path_block_exists() {
@@ -910,146 +1809,175 @@ check_candidate_uninstall_owner() {
     --expected-executable "$1" --check-owner 8>&- 9>&- 2>&1)"
 }
 
-capture_uninstall_daemon_state() {
-  UNINSTALL_DAEMON_WAS_RUNNING=false
-  UNINSTALL_SERVICE_PRESENT=false
-  UNINSTALL_RESTART_REQUIRED=false
-  if ! read_checked_daemon_status; then
-    UNINSTALL_TRANSACTION_ERROR="could not capture daemon state with the release-verified candidate: ${DAEMON_STATUS_ERROR}"
-    return 1
-  fi
-  UNINSTALL_DAEMON_WAS_RUNNING="$DAEMON_STATUS_RUNNING"
-  UNINSTALL_SERVICE_PRESENT="$DAEMON_STATUS_SERVICE_INSTALLED"
-
-  if [ "$UNINSTALL_BINARY_PRESENT" = true ] \
-    && [ "$UNINSTALL_DAEMON_WAS_RUNNING" = true ]
-  then
-    UNINSTALL_RESTART_REQUIRED=true
-    if ! stop_and_confirm_daemon_absent "$BIN_PATH"; then
-      UNINSTALL_TRANSACTION_ERROR="the locked installed daemon could not be stopped safely: ${DAEMON_STATUS_ERROR}"
-      return 1
-    fi
-    if [ "$DAEMON_STATUS_SERVICE_INSTALLED" != "$UNINSTALL_SERVICE_PRESENT" ]; then
-      UNINSTALL_TRANSACTION_ERROR="daemon service-installed state changed while stopping the locked installed daemon"
-      return 1
-    fi
-  fi
-}
-
-restore_uninstall_daemon_if_needed() {
-  [ "${UNINSTALL_RESTART_REQUIRED:-false}" = true ] || return 0
-  [ ! -L "$BIN_PATH" ] && [ -x "$BIN_PATH" ] || return 1
-  if ! read_checked_daemon_status; then
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_SERVICE_INSTALLED" != "$UNINSTALL_SERVICE_PRESENT" ]; then
-    DAEMON_STATUS_ERROR="daemon service-installed state changed during uninstall rollback"
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_RUNNING" = true ]; then
-    UNINSTALL_RESTART_REQUIRED=false
-    return 0
-  fi
-  if ! "$BIN_PATH" daemon start 8>&- 9>&-; then
-    DAEMON_STATUS_ERROR="daemon restart failed during uninstall rollback"
-    return 1
-  fi
-  if ! read_checked_daemon_status; then
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_RUNNING" != true ]; then
-    DAEMON_STATUS_ERROR="daemon did not report running after uninstall rollback"
-    return 1
-  fi
-  if [ "$DAEMON_STATUS_SERVICE_INSTALLED" != "$UNINSTALL_SERVICE_PRESENT" ]; then
-    DAEMON_STATUS_ERROR="daemon service-installed state was not restored after restart"
-    return 1
-  fi
-  UNINSTALL_RESTART_REQUIRED=false
-}
-
 begin_uninstall_file_transaction() {
   UNINSTALL_HOLD="${BIN_DIR}/${UNINSTALL_HOLD_NAME}"
-  [ ! -e "$UNINSTALL_HOLD" ] && [ ! -L "$UNINSTALL_HOLD" ] || {
-    UNINSTALL_TRANSACTION_ERROR="uninstall transaction residue already exists at ${UNINSTALL_HOLD}"
+  UNINSTALL_STAGE="${BIN_DIR}/${INSTALL_STAGE_NAME}"
+  [ ! -e "$UNINSTALL_HOLD" ] && [ ! -L "$UNINSTALL_HOLD" ] \
+    && [ ! -e "$UNINSTALL_STAGE" ] && [ ! -L "$UNINSTALL_STAGE" ] || {
+    UNINSTALL_TRANSACTION_ERROR="uninstall transaction residue already exists in ${BIN_DIR}"
     return 1
   }
-  UNINSTALL_FILE_TRANSACTION_OPEN=true
-  UNINSTALL_BINARY_HELD=false
+  UNINSTALL_FILE_TRANSACTION_OPEN=false
+  UNINSTALL_ORIGINAL_TOKEN=""
+  UNINSTALL_STAGE_TOKEN=""
+  UNINSTALL_PUBLIC_TOKEN=""
   if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
-    if ! run_install_fs cp -p "$BIN_PATH" "$UNINSTALL_HOLD"; then
-      UNINSTALL_TRANSACTION_ERROR="failed to create the fixed uninstall hold ${UNINSTALL_HOLD}"
+    capture_installer_file_token \
+      "$BIN_PATH" "$UNINSTALL_WITH_SUDO" UNINSTALL_ORIGINAL_TOKEN || {
+      UNINSTALL_TRANSACTION_ERROR="failed to identify ${BIN_PATH} before opening its uninstall transaction"
+      return 1
+    }
+    capture_installer_file_copy \
+      "$BIN_PATH" "$UNINSTALL_HOLD" "$UNINSTALL_ORIGINAL_TOKEN" \
+      "$UNINSTALL_WITH_SUDO" UNINSTALL_HOLD_TOKEN || {
+      UNINSTALL_TRANSACTION_ERROR="failed to create an independent fixed uninstall recovery copy: ${INSTALLER_FILE_OP_ERROR}"
+      return 1
+    }
+    [ "$(file_token_digest "$UNINSTALL_HOLD_TOKEN")" \
+      = "$(file_token_digest "$UNINSTALL_ORIGINAL_TOKEN")" ] || {
+      UNINSTALL_TRANSACTION_ERROR="the independent uninstall recovery copy does not match the captured binary"
+      return 1
+    }
+    if ! capture_empty_installer_file \
+      "$UNINSTALL_STAGE" "$UNINSTALL_WITH_SUDO" UNINSTALL_STAGE_TOKEN
+    then
+      local placeholder_error="${INSTALLER_FILE_OP_ERROR}"
+      if remove_installer_file_owned \
+        "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO"
+      then
+        UNINSTALL_TRANSACTION_ERROR="failed to create the fixed uninstall placeholder: ${placeholder_error}; the exact independent recovery copy was removed"
+      else
+        UNINSTALL_TRANSACTION_ERROR="failed to create the fixed uninstall placeholder: ${placeholder_error}; exact independent recovery cleanup also failed: ${INSTALLER_FILE_OP_ERROR}"
+      fi
       return 1
     fi
-  elif ! run_install_fs install -m 0600 /dev/null "$UNINSTALL_HOLD"; then
-    UNINSTALL_TRANSACTION_ERROR="failed to create the fixed uninstall boundary ${UNINSTALL_HOLD}"
-    return 1
+    UNINSTALL_PUBLIC_TOKEN="$UNINSTALL_STAGE_TOKEN"
+  else
+    capture_empty_installer_file \
+      "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" UNINSTALL_HOLD_TOKEN || {
+      UNINSTALL_TRANSACTION_ERROR="failed to create the fixed uninstall boundary: ${INSTALLER_FILE_OP_ERROR}"
+      return 1
+    }
   fi
-  if [ -L "$UNINSTALL_HOLD" ] || [ ! -f "$UNINSTALL_HOLD" ]; then
-    UNINSTALL_TRANSACTION_ERROR="fixed uninstall hold ${UNINSTALL_HOLD} is not a regular file"
-    return 1
-  fi
+  UNINSTALL_FILE_TRANSACTION_OPEN=true
 }
 
 hold_uninstall_binary_for_commit() {
+  local boundary_error binary_after stage_after
   [ "${UNINSTALL_FILE_TRANSACTION_OPEN:-false}" = true ] || return 1
-  [ ! -L "$UNINSTALL_HOLD" ] && [ -f "$UNINSTALL_HOLD" ] || return 1
+  installer_file_token_matches \
+    "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_HOLD_TOKEN" || return 1
   if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
-    UNINSTALL_BINARY_HELD=true
-    run_install_fs mv -f "$BIN_PATH" "$UNINSTALL_HOLD" || return 1
+    if ! exchange_installer_files \
+      "$UNINSTALL_STAGE" "$BIN_PATH" "$UNINSTALL_STAGE_TOKEN" \
+      "$UNINSTALL_ORIGINAL_TOKEN" "$UNINSTALL_WITH_SUDO"
+    then
+      boundary_error="$INSTALLER_FILE_OP_ERROR"
+      binary_after=""
+      stage_after=""
+      capture_installer_file_token \
+        "$BIN_PATH" "$UNINSTALL_WITH_SUDO" binary_after 2>/dev/null || true
+      capture_installer_file_token \
+        "$UNINSTALL_STAGE" "$UNINSTALL_WITH_SUDO" stage_after 2>/dev/null || true
+      if [ "$binary_after" = "$UNINSTALL_PUBLIC_TOKEN" ] \
+        && [ "$stage_after" = "$UNINSTALL_ORIGINAL_TOKEN" ]
+      then
+        UNINSTALL_STAGE_TOKEN="$UNINSTALL_ORIGINAL_TOKEN"
+      fi
+      UNINSTALL_TRANSACTION_ERROR="uninstall placeholder exchange failed or did not confirm durability: ${boundary_error}"
+      return 1
+    fi
+    UNINSTALL_STAGE_TOKEN="$UNINSTALL_ORIGINAL_TOKEN"
   fi
 }
 
 rollback_uninstall_file_transaction() {
+  local current_token stage_token restored_token restored_digest
   [ "${UNINSTALL_FILE_TRANSACTION_OPEN:-false}" = true ] || return 0
+  installer_file_token_matches \
+    "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_HOLD_TOKEN" || return 1
   if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
-    if [ "${UNINSTALL_BINARY_HELD:-false}" = true ]; then
-      if [ ! -e "$BIN_PATH" ] && [ ! -L "$BIN_PATH" ]; then
-        [ ! -L "$UNINSTALL_HOLD" ] && [ -f "$UNINSTALL_HOLD" ] \
-          && run_install_fs mv "$UNINSTALL_HOLD" "$BIN_PATH" \
-          || return 1
-      else
-        [ ! -L "$BIN_PATH" ] && [ -f "$BIN_PATH" ] \
-          && [ ! -L "$UNINSTALL_HOLD" ] && [ -f "$UNINSTALL_HOLD" ] \
-          && run_install_fs rm -f "$UNINSTALL_HOLD" \
-          || return 1
-      fi
-    else
-      [ ! -L "$BIN_PATH" ] && [ -f "$BIN_PATH" ] \
-        && [ ! -L "$UNINSTALL_HOLD" ] && [ -f "$UNINSTALL_HOLD" ] \
-        && run_install_fs rm -f "$UNINSTALL_HOLD" \
-        || return 1
+    capture_installer_file_token \
+      "$BIN_PATH" "$UNINSTALL_WITH_SUDO" current_token || return 1
+    capture_installer_file_token \
+      "$UNINSTALL_STAGE" "$UNINSTALL_WITH_SUDO" stage_token || return 1
+    if [ "$current_token" = "$UNINSTALL_PUBLIC_TOKEN" ] \
+      && [ "$stage_token" = "$UNINSTALL_ORIGINAL_TOKEN" ]
+    then
+      exchange_installer_files \
+        "$UNINSTALL_STAGE" "$BIN_PATH" "$UNINSTALL_ORIGINAL_TOKEN" \
+        "$UNINSTALL_PUBLIC_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
+      UNINSTALL_STAGE_TOKEN="$UNINSTALL_PUBLIC_TOKEN"
+    elif [ "$current_token" != "$UNINSTALL_ORIGINAL_TOKEN" ] \
+      || [ "$stage_token" != "$UNINSTALL_PUBLIC_TOKEN" ]
+    then
+      return 1
     fi
-  elif [ -e "$UNINSTALL_HOLD" ] || [ -L "$UNINSTALL_HOLD" ]; then
-    [ ! -L "$UNINSTALL_HOLD" ] && [ -f "$UNINSTALL_HOLD" ] \
-      && run_install_fs rm -f "$UNINSTALL_HOLD" \
-      || return 1
+    capture_installer_file_token \
+      "$BIN_PATH" "$UNINSTALL_WITH_SUDO" restored_token || return 1
+    [ "$restored_token" = "$UNINSTALL_ORIGINAL_TOKEN" ] || return 1
+    restored_digest="$(file_token_digest "$restored_token")" || return 1
+    [ "$restored_digest" = "$(file_token_digest "$UNINSTALL_HOLD_TOKEN")" ] || return 1
+    remove_installer_file_owned \
+      "$UNINSTALL_STAGE" "$UNINSTALL_PUBLIC_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
+  elif [ -e "$BIN_PATH" ] || [ -L "$BIN_PATH" ]; then
+    return 1
   fi
-  UNINSTALL_BINARY_HELD=false
+  remove_installer_file_owned \
+    "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
   UNINSTALL_FILE_TRANSACTION_OPEN=false
 }
 
 commit_uninstall_file_transaction() {
   [ "${UNINSTALL_FILE_TRANSACTION_OPEN:-false}" = true ] || return 1
-  [ ! -e "$BIN_PATH" ] && [ ! -L "$BIN_PATH" ] || return 1
-  [ ! -L "$UNINSTALL_HOLD" ] && [ -f "$UNINSTALL_HOLD" ] || return 1
-  if [ "$UNINSTALL_SYSTEM_MARKER_PRESENT" = true ]; then
-    run_install_fs rm -f "$SYSTEM_INSTALL_MARKER" || return 1
+  if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
+    installer_file_token_matches \
+      "$BIN_PATH" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_PUBLIC_TOKEN" || return 1
+    installer_file_token_matches \
+      "$UNINSTALL_STAGE" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_ORIGINAL_TOKEN" || return 1
+  else
+    [ ! -e "$BIN_PATH" ] && [ ! -L "$BIN_PATH" ] || return 1
   fi
-  run_install_fs rm -f "$UNINSTALL_HOLD" || return 1
+  if [ "$UNINSTALL_SYSTEM_MARKER_PRESENT" = true ]; then
+    remove_installer_file_owned \
+      "$SYSTEM_INSTALL_MARKER" "$UNINSTALL_SYSTEM_MARKER_TOKEN" "$UNINSTALL_WITH_SUDO" \
+      || return 1
+  fi
+  if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
+    remove_installer_file_owned \
+      "$BIN_PATH" "$UNINSTALL_PUBLIC_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
+  fi
+  remove_installer_file_owned \
+    "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
+  if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
+    remove_installer_file_owned \
+      "$UNINSTALL_STAGE" "$UNINSTALL_ORIGINAL_TOKEN" "$UNINSTALL_WITH_SUDO" \
+      || return 1
+  fi
   UNINSTALL_FILE_TRANSACTION_OPEN=false
 }
 
 abort_uninstall_transaction() {
   local reason="$1" rollback_errors=""
-  if ! rollback_managed_path_removals; then
+  if ! rollback_managed_path_changes; then
     rollback_errors="${rollback_errors} ${PATH_TRANSACTION_ERROR};"
   fi
   if ! rollback_uninstall_file_transaction; then
-    rollback_errors="${rollback_errors} could not safely restore ${BIN_PATH} from ${UNINSTALL_HOLD};"
+    rollback_errors="${rollback_errors} could not safely restore ${BIN_PATH} from its exact displaced/recovery files;"
   fi
-  if ! restore_uninstall_daemon_if_needed; then
-    rollback_errors="${rollback_errors} could not restore the previously running daemon with ${BIN_PATH}: ${DAEMON_STATUS_ERROR};"
+  if [ -z "$rollback_errors" ] \
+    && [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
+    && ! restore_daemon_update_boundary_old_state
+  then
+    rollback_errors="${rollback_errors} could not restore the prior daemon/service state: ${DAEMON_BOUNDARY_ERROR};"
+  elif [ -n "$rollback_errors" ] \
+    && [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ]
+  then
+    if ! abandon_daemon_update_boundary; then
+      rollback_errors="${rollback_errors} daemon lifecycle holder did not close cleanly: ${DAEMON_BOUNDARY_ERROR};"
+    else
+      rollback_errors="${rollback_errors} daemon was kept stopped because exact file/PATH rollback was not established;"
+    fi
   fi
   if ! release_update_locks; then
     rollback_errors="${rollback_errors} ${UPDATE_LOCK_ERROR};"
@@ -1184,12 +2112,16 @@ run_uninstall() {
     fi
 
     UNINSTALL_SYSTEM_MARKER_PRESENT=false
+    UNINSTALL_SYSTEM_MARKER_TOKEN=""
     if [ "$BIN_PATH" = "$LEGACY_BIN" ] \
       && { [ -e "$SYSTEM_INSTALL_MARKER" ] || [ -L "$SYSTEM_INSTALL_MARKER" ]; }
     then
       [ ! -L "$SYSTEM_INSTALL_MARKER" ] && [ -f "$SYSTEM_INSTALL_MARKER" ] \
         || error "The system-install marker is not a regular direct-installer file after locking; nothing was changed."
       UNINSTALL_SYSTEM_MARKER_PRESENT=true
+      capture_installer_file_token \
+        "$SYSTEM_INSTALL_MARKER" "$UNINSTALL_WITH_SUDO" UNINSTALL_SYSTEM_MARKER_TOKEN \
+        || error "The system-install marker could not be bound to this uninstall transaction; nothing was changed."
     fi
 
     if ! check_candidate_uninstall_owner "$BIN_PATH"; then
@@ -1208,14 +2140,19 @@ run_uninstall() {
     UNINSTALL_TRANSACTION_ERROR=""
     UNINSTALL_FILE_TRANSACTION_OPEN=false
     UNINSTALL_HOLD="${BIN_DIR}/${UNINSTALL_HOLD_NAME}"
-    if ! capture_uninstall_daemon_state; then
-      abort_uninstall_transaction "${UNINSTALL_TRANSACTION_ERROR}."
-    fi
     if ! begin_uninstall_file_transaction; then
       abort_uninstall_transaction "${UNINSTALL_TRANSACTION_ERROR}."
     fi
 
-    if [ "$SYSTEM_INSTALL" = false ] && ! commit_managed_path_removals; then
+    if ! start_daemon_update_boundary \
+      "$CANDIDATE_BIN" "$BIN_PATH" "$BIN_PATH"
+    then
+      abort_uninstall_transaction "The daemon lifecycle boundary could not be established: ${DAEMON_BOUNDARY_ERROR}."
+    fi
+    UNINSTALL_DAEMON_WAS_RUNNING="$DAEMON_WAS_RUNNING"
+    UNINSTALL_SERVICE_PRESENT="$DAEMON_SERVICE_INSTALLED"
+
+    if [ "$SYSTEM_INSTALL" = false ] && ! commit_managed_path_changes; then
       abort_uninstall_transaction "PATH cleanup failed: ${PATH_TRANSACTION_ERROR}."
     fi
 
@@ -1223,29 +2160,48 @@ run_uninstall() {
       abort_uninstall_transaction "The binary could not be moved to the fixed uninstall hold ${UNINSTALL_HOLD}."
     fi
 
-    if [ "$UNINSTALL_BINARY_PRESENT" = true ] \
-      || [ "$UNINSTALL_SERVICE_PRESENT" = true ]
-    then
-      if ! "$CANDIDATE_BIN" daemon uninstall \
-        --expected-executable "$BIN_PATH" 8>&- 9>&-
-      then
-        abort_uninstall_transaction "Daemon service cleanup failed."
+    if ! request_daemon_update_boundary_uninstall_state; then
+      if [ "${DAEMON_BOUNDARY_ROLLBACK_SAFE:-false}" = true ]; then
+        abort_uninstall_transaction "Daemon service cleanup failed: ${DAEMON_BOUNDARY_ERROR}."
       fi
+      local ambiguous_uninstall_error="$DAEMON_BOUNDARY_ERROR"
+      if ! abandon_daemon_update_boundary; then
+        ambiguous_uninstall_error="${ambiguous_uninstall_error}; lifecycle holder cleanup failed: ${DAEMON_BOUNDARY_ERROR}"
+      fi
+      release_update_locks \
+        || error "Daemon uninstall state became ambiguous (${ambiguous_uninstall_error}), and ${UPDATE_LOCK_ERROR}. Fixed recovery files were preserved."
+      error "Daemon uninstall state became ambiguous: ${ambiguous_uninstall_error}. Fixed recovery files were preserved."
+    fi
+    if [ "$UNINSTALL_SERVICE_PRESENT" = true ]; then
       info "Removed daemon service."
     elif [ "$UNINSTALL_DAEMON_WAS_RUNNING" = true ]; then
-      if ! stop_and_confirm_daemon_absent "$CANDIDATE_BIN"; then
-        abort_uninstall_transaction "Detached daemon cleanup failed: ${DAEMON_STATUS_ERROR}."
-      fi
-      if [ "$DAEMON_STATUS_SERVICE_INSTALLED" != false ]; then
-        abort_uninstall_transaction "A daemon service appeared during detached-daemon cleanup."
-      fi
       info "Stopped detached daemon."
     fi
 
-    if ! commit_uninstall_file_transaction; then
+    if ! finish_daemon_update_boundary; then
+      local final_confirmation_error="$DAEMON_BOUNDARY_ERROR"
       release_update_locks \
-        || error "Daemon service and PATH cleanup committed, the fixed binary hold remains at ${UNINSTALL_HOLD}, and ${UPDATE_LOCK_ERROR}."
-      error "Daemon service and PATH cleanup committed, but the fixed binary hold remains at ${UNINSTALL_HOLD}; inspect it before retrying."
+        || error "Daemon uninstall state finalization failed (${final_confirmation_error}), fixed recovery files were preserved, and ${UPDATE_LOCK_ERROR}."
+      error "Daemon uninstall state finalization failed: ${final_confirmation_error}. Fixed recovery files were preserved."
+    fi
+
+    if ! commit_uninstall_file_transaction; then
+      release_daemon_update_boundary \
+        || UNINSTALL_TRANSACTION_ERROR="${UNINSTALL_TRANSACTION_ERROR} daemon lifecycle authority release failed: ${DAEMON_BOUNDARY_ERROR};"
+      release_update_locks \
+        || error "Daemon service and PATH cleanup committed, the fixed binary hold remains at ${UNINSTALL_HOLD}, ${UNINSTALL_TRANSACTION_ERROR} and ${UPDATE_LOCK_ERROR}."
+      error "Daemon service and PATH cleanup committed, but the fixed binary hold remains at ${UNINSTALL_HOLD}; inspect it before retrying.${UNINSTALL_TRANSACTION_ERROR}"
+    fi
+    if [ "$SYSTEM_INSTALL" = false ] && ! finalize_managed_path_changes; then
+      UNINSTALL_TRANSACTION_ERROR="PATH recovery cleanup failed (${PATH_TRANSACTION_ERROR})"
+    fi
+    if ! release_daemon_update_boundary; then
+      UNINSTALL_TRANSACTION_ERROR="${UNINSTALL_TRANSACTION_ERROR:+${UNINSTALL_TRANSACTION_ERROR}; }daemon lifecycle authority release failed: ${DAEMON_BOUNDARY_ERROR}"
+    fi
+    if [ -n "$UNINSTALL_TRANSACTION_ERROR" ]; then
+      release_update_locks \
+        || error "The uninstall committed, ${UNINSTALL_TRANSACTION_ERROR}, and ${UPDATE_LOCK_ERROR}."
+      error "The uninstall committed, but ${UNINSTALL_TRANSACTION_ERROR}."
     fi
     if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
       info "Removed ${BIN_PATH}"
@@ -1381,19 +2337,61 @@ fi
 info "Detected: ${PLATFORM}/${ARCH_NAME}"
 info "Downloading: ${DOWNLOAD_URL}"
 
-# Download, verify, and extract
-TMP_DIR="$(mktemp -d)"
+# Download, verify, and extract. Record both the direct directory and its
+# direct parent's identity before placing any artifact inside it; EXIT cleanup
+# refuses to recurse if either identity changes.
+TMP_DIR="$(mktemp -d)" || error "Could not create an installer temporary directory."
+case "$TMP_DIR" in
+  /*) ;;
+  *)
+    rmdir "$TMP_DIR" 2>/dev/null \
+      || error "mktemp returned a relative path and its empty directory could not be removed: ${TMP_DIR}"
+    error "mktemp returned a relative path; refusing recursive cleanup: ${TMP_DIR}"
+    ;;
+esac
+TMP_DIR_PARENT="$(dirname "$TMP_DIR")"
+case "$TMP_DIR" in
+  "${TMP_DIR_PARENT%/}/"*) ;;
+  *) error "Installer temporary directory is not below its direct recorded root: ${TMP_DIR}" ;;
+esac
+[ ! -L "$TMP_DIR_PARENT" ] && [ -d "$TMP_DIR_PARENT" ] \
+  || error "Installer temporary parent is not a direct directory: ${TMP_DIR_PARENT}"
+TMP_DIR_PARENT_IDENTITY="$(file_identity "$TMP_DIR_PARENT")" \
+  || error "Could not identify installer temporary parent ${TMP_DIR_PARENT}."
+[ ! -L "$TMP_DIR" ] && [ -d "$TMP_DIR" ] \
+  || error "mktemp did not create a direct temporary directory: ${TMP_DIR}"
+TMP_DIR_IDENTITY="$(file_identity "$TMP_DIR")" \
+  || error "Could not identify installer temporary directory ${TMP_DIR}."
+TMP_CLEANUP_ERROR=""
 INSTALL_STAGE="${INSTALL_DIR}/${INSTALL_STAGE_NAME}"
 INSTALL_BACKUP="${INSTALL_DIR}/${INSTALL_BACKUP_NAME}"
 INSTALL_STAGE_OWNED=false
+INSTALL_STAGE_TOKEN=""
+INSTALL_BACKUP_TOKEN=""
+INSTALL_ORIGINAL_TOKEN=""
+INSTALL_PUBLISHED_TOKEN=""
 INSTALL_WITH_SUDO=false
 UPDATE_LOCK_PID_8=""
 UPDATE_LOCK_PID_9=""
 UPDATE_LOCK_ERROR=""
+DAEMON_BOUNDARY_PID=""
+DAEMON_BOUNDARY_ACTIVE=false
+DAEMON_BOUNDARY_ROLLBACK_SAFE=false
+DAEMON_BOUNDARY_PHASE=""
+DAEMON_BOUNDARY_ERROR=""
+DAEMON_BOUNDARY_EXIT_CLEANUP_ERROR=""
 LEGACY_HOLD="${SYSTEM_INSTALL_DIR}/${LEGACY_HOLD_NAME}"
+LEGACY_DISPLACED="${SYSTEM_INSTALL_DIR}/${LEGACY_DISPLACED_NAME}"
 LEGACY_HELD=false
+LEGACY_HOLD_TOKEN=""
+LEGACY_DISPLACED_TOKEN=""
+LEGACY_PLACEHOLDER_TOKEN=""
+LEGACY_ORIGINAL_TOKEN=""
 UNINSTALL_HOLD=""
+UNINSTALL_STAGE=""
+reset_managed_path_transaction
 trap 'cleanup_install_exit' EXIT
+trap 'exit 130' INT
 
 curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" || error "Download failed. Check the URL or your network."
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
@@ -1448,6 +2446,7 @@ else
 fi
 
 SYSTEM_MARKER_CREATED=false
+SYSTEM_MARKER_CREATED_TOKEN=""
 BINARY_REPLACED=false
 
 if ! start_install_update_locks "$CANDIDATE_BIN"; then
@@ -1461,29 +2460,72 @@ if [ "$MIGRATE_LEGACY" = true ]; then
 fi
 
 MARKER_WAS_PRESENT=false
+SYSTEM_MARKER_ORIGINAL_TOKEN=""
+MARKER_WITH_SUDO=false
+if [ "$INSTALL_WITH_SUDO" = true ] || [ "$LEGACY_NEEDS_SUDO" = true ]; then
+  MARKER_WITH_SUDO=true
+fi
 if [ -e "$SYSTEM_INSTALL_MARKER" ] || [ -L "$SYSTEM_INSTALL_MARKER" ]; then
   [ ! -L "$SYSTEM_INSTALL_MARKER" ] && [ -f "$SYSTEM_INSTALL_MARKER" ] \
     || error "The system-install marker is not a regular direct-installer file after locking; no service, binary, or PATH configuration was changed."
   MARKER_WAS_PRESENT=true
+  capture_installer_file_token \
+    "$SYSTEM_INSTALL_MARKER" "$MARKER_WITH_SUDO" SYSTEM_MARKER_ORIGINAL_TOKEN \
+    || error "The system-install marker could not be bound to this installer transaction; nothing was changed."
+fi
+
+if [ "$SYSTEM_INSTALL" = false ] && ! prepare_managed_path_addition; then
+  PATH_PREFLIGHT_ERROR="$PATH_TRANSACTION_ERROR"
+  if ! rollback_managed_path_changes; then
+    PATH_PREFLIGHT_ERROR="${PATH_PREFLIGHT_ERROR}; preparation cleanup was incomplete: ${PATH_TRANSACTION_ERROR}"
+  fi
+  if ! cleanup_install_artifacts; then
+    PATH_PREFLIGHT_ERROR="${PATH_PREFLIGHT_ERROR}; ${INSTALL_ARTIFACT_CLEANUP_ERROR}"
+  fi
+  release_update_locks \
+    || error "PATH preflight failed (${PATH_PREFLIGHT_ERROR}), and ${UPDATE_LOCK_ERROR}."
+  error "PATH preflight failed: ${PATH_PREFLIGHT_ERROR}."
 fi
 
 if ! prepare_daemon_upgrade; then
-  if [ "$DAEMON_STATE_CAPTURED" = true ]; then
-    abort_install_upgrade "$DAEMON_STATUS_ERROR"
+  if ! rollback_managed_path_changes; then
+    DAEMON_STATUS_ERROR="${DAEMON_STATUS_ERROR} PATH preparation cleanup was incomplete: ${PATH_TRANSACTION_ERROR}."
   fi
-  cleanup_install_artifacts
+  if ! cleanup_install_artifacts; then
+    DAEMON_STATUS_ERROR="${DAEMON_STATUS_ERROR} ${INSTALL_ARTIFACT_CLEANUP_ERROR}."
+  fi
   release_update_locks || error "${DAEMON_STATUS_ERROR} ${UPDATE_LOCK_ERROR}"
   error "$DAEMON_STATUS_ERROR"
+fi
+
+info "Holding the daemon lifecycle boundary while replacing ${DAEMON_PREVIOUS_BIN}..."
+if ! start_daemon_update_boundary \
+  "$CANDIDATE_BIN" "$DAEMON_PREVIOUS_BIN" "$INSTALL_DEST"
+then
+  if [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ]; then
+    abort_install_upgrade "The daemon lifecycle boundary could not be established: ${DAEMON_BOUNDARY_ERROR}."
+  fi
+  if ! rollback_managed_path_changes; then
+    DAEMON_BOUNDARY_ERROR="${DAEMON_BOUNDARY_ERROR}; PATH preparation cleanup was incomplete: ${PATH_TRANSACTION_ERROR}"
+  fi
+  if ! cleanup_install_artifacts; then
+    DAEMON_BOUNDARY_ERROR="${DAEMON_BOUNDARY_ERROR}; ${INSTALL_ARTIFACT_CLEANUP_ERROR}"
+  fi
+  release_update_locks \
+    || error "The daemon lifecycle boundary failed (${DAEMON_BOUNDARY_ERROR}), and ${UPDATE_LOCK_ERROR}."
+  error "The daemon lifecycle boundary failed before file replacement: ${DAEMON_BOUNDARY_ERROR}."
 fi
 
 CANDIDATE_ERROR=""
 if ! stage_and_replace_binary "$CANDIDATE_BIN"; then
   abort_install_upgrade "Failed to stage an atomic binary replacement. ${CANDIDATE_ERROR}"
 fi
-BINARY_REPLACED=true
 
-if [ "$SYSTEM_INSTALL" = true ] && ! run_install_fs install -m 0644 /dev/null "$SYSTEM_INSTALL_MARKER"; then
-  abort_install_upgrade "System install marker creation failed."
+if [ "$SYSTEM_INSTALL" = true ] && [ "$MARKER_WAS_PRESENT" = false ] \
+  && ! capture_empty_installer_file \
+    "$SYSTEM_INSTALL_MARKER" "$INSTALL_WITH_SUDO" SYSTEM_MARKER_CREATED_TOKEN
+then
+  abort_install_upgrade "System install marker creation failed: ${INSTALLER_FILE_OP_ERROR}."
 elif [ "$SYSTEM_INSTALL" = true ] && [ "$MARKER_WAS_PRESENT" = false ]; then
   SYSTEM_MARKER_CREATED=true
 fi
@@ -1492,72 +2534,70 @@ if ! verify_candidate_version "${INSTALL_DIR}/${BINARY_NAME}" "$EXPECTED_RELEASE
   abort_install_upgrade "Installed binary verification failed: ${CANDIDATE_ERROR}"
 fi
 
-if ! restart_daemon_after_upgrade; then
-  abort_install_upgrade "The new executable could not restore the previous daemon state: ${DAEMON_STATUS_ERROR}."
-fi
-
 if ! hold_legacy_install_for_commit; then
   abort_install_upgrade "The legacy direct install could not be staged for removal."
 fi
 
-if ! commit_installed_binary; then
-  abort_install_upgrade "The executable transaction could not remove its rollback backup."
-fi
-BINARY_REPLACED=false
-
-if ! commit_held_legacy_install; then
-  cleanup_install_artifacts
-  release_update_locks || error "The new install was committed, but legacy cleanup and update-lock release both failed: ${UPDATE_LOCK_ERROR}"
-  error "The new executable and daemon were committed, but the held legacy install could not be removed."
+if [ "$SYSTEM_INSTALL" = false ] && ! commit_managed_path_changes; then
+  abort_install_upgrade "PATH update failed: ${PATH_TRANSACTION_ERROR}."
 fi
 
-cleanup_install_artifacts
+if [ "$DAEMON_STATE_CAPTURED" = true ] \
+  && ! request_daemon_update_boundary_new_state
+then
+  abort_install_upgrade "The replacement daemon state could not be established: ${DAEMON_BOUNDARY_ERROR}."
+fi
+
+# The replacement daemon now owns the PID identity (or the initially stopped
+# daemon remains protected by its absence lease) while the service-operation
+# lease is still held. Confirm that final state before removing any exact
+# recovery material. A failed final confirmation preserves every fixed recovery
+# path for inspection instead of partially committing cleanup.
+POST_COMMIT_ERRORS=""
+if [ "$DAEMON_STATE_CAPTURED" = true ] && ! finish_daemon_update_boundary; then
+  POST_COMMIT_ERRORS="final daemon state confirmation failed: ${DAEMON_BOUNDARY_ERROR}"
+  preserve_install_backup
+else
+  if ! commit_installed_binary; then
+    POST_COMMIT_ERRORS="executable rollback-backup cleanup failed"
+    preserve_install_backup
+  fi
+  BINARY_REPLACED=false
+
+  if ! commit_held_legacy_install; then
+    POST_COMMIT_ERRORS="${POST_COMMIT_ERRORS}${POST_COMMIT_ERRORS:+; }held legacy-install cleanup failed"
+  fi
+
+  if [ "$SYSTEM_INSTALL" = false ] && ! finalize_managed_path_changes; then
+    POST_COMMIT_ERRORS="${POST_COMMIT_ERRORS}${POST_COMMIT_ERRORS:+; }PATH recovery cleanup failed: ${PATH_TRANSACTION_ERROR}"
+  fi
+
+  if ! cleanup_install_artifacts; then
+    POST_COMMIT_ERRORS="${POST_COMMIT_ERRORS}${POST_COMMIT_ERRORS:+; }${INSTALL_ARTIFACT_CLEANUP_ERROR}"
+  fi
+
+  if ! release_daemon_update_boundary; then
+    POST_COMMIT_ERRORS="${POST_COMMIT_ERRORS}${POST_COMMIT_ERRORS:+; }daemon lifecycle authority release failed: ${DAEMON_BOUNDARY_ERROR}"
+  fi
+fi
 
 if [ "$MIGRATE_LEGACY" = true ]; then
   info "Removed legacy install: ${LEGACY_BIN}"
 fi
 
-if [ "$SYSTEM_INSTALL" = false ]; then
-  case ":${PATH}:" in
-    *":${USER_INSTALL_DIR}:"*) ;;
-    *)
-      case "${SHELL:-}" in
-        */zsh)
-          PROFILE_FILE="${HOME}/.zprofile"
-          PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
-          ;;
-        */bash)
-          if [ "$PLATFORM" = "darwin" ]; then
-            PROFILE_FILE="${HOME}/.bash_profile"
-          else
-            PROFILE_FILE="${HOME}/.profile"
-          fi
-          PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
-          ;;
-        */fish)
-          PROFILE_FILE="${HOME}/.config/fish/config.fish"
-          PATH_LINE='fish_add_path "$HOME/.local/bin"'
-          mkdir -p "${HOME}/.config/fish"
-          ;;
-        *)
-          PROFILE_FILE=""
-          PATH_LINE=""
-          ;;
-      esac
-      if [ -n "$PROFILE_FILE" ]; then
-        if ! grep -F "$PATH_BLOCK_BEGIN" "$PROFILE_FILE" >/dev/null 2>&1; then
-          printf '\n%s\n%s\n%s\n' "$PATH_BLOCK_BEGIN" "$PATH_LINE" "$PATH_BLOCK_END" >> "$PROFILE_FILE"
-          info "Added ${USER_INSTALL_DIR} to PATH in ${PROFILE_FILE}; restart your shell to apply it."
-        fi
-      else
-        warn "Add ${USER_INSTALL_DIR} to your PATH to run codex-switch-global-pace by name."
-      fi
-      ;;
-  esac
+if [ "$SYSTEM_INSTALL" = false ] \
+  && [ "$PATH_TRANSACTION_PROFILE_SELECTED" = false ] \
+  && [[ ":${PATH}:" != *":${USER_INSTALL_DIR}:"* ]]
+then
+  warn "Add ${USER_INSTALL_DIR} to your PATH to run codex-switch-global-pace by name."
 fi
 
 if ! release_update_locks; then
-  error "$UPDATE_LOCK_ERROR"
+  POST_COMMIT_ERRORS="${POST_COMMIT_ERRORS}${POST_COMMIT_ERRORS:+; }${UPDATE_LOCK_ERROR}"
+fi
+
+if [ -n "$POST_COMMIT_ERRORS" ]; then
+  error "The new install was committed, but cleanup was incomplete: ${POST_COMMIT_ERRORS}."
 fi
 
 info "Installed: $(${INSTALL_DIR}/${BINARY_NAME} --version 8>&- 9>&-)"

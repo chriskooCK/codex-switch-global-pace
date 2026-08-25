@@ -43,7 +43,6 @@ reqwest = { version = "0.12", features = [
     # environment or --proxy) gets connection failures the browser does not.
     "macos-system-configuration",
 ], default-features = false }
-self-replace = "1"
 tempfile = "3"
 webbrowser = "1.2.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
@@ -66,11 +65,14 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_SystemInformation",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

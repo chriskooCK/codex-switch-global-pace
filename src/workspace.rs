@@ -169,7 +169,8 @@ pub(crate) async fn refresh_for_auth_if_needed(
     let Some(account_id) = info.account_id.as_deref() else {
         return Ok(None);
     };
-    if !force && let Some(resolved) = crate::cache::resolved_workspace_name_async(account_id).await
+    if !force
+        && let Some(resolved) = crate::cache::resolved_workspace_name_async(account_id).await?
     {
         return Ok(resolved);
     }

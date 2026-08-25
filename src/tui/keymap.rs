@@ -163,7 +163,7 @@ pub const KEYMAP: &[Binding] = &[
     Binding {
         keys: "W",
         section: Section::Global,
-        label: "toggle auto-warmup (auto-refresh + warm whenever 5h expires)",
+        label: "toggle auto-warmup (paid 5h / Free weekly)",
         in_status_bar: false,
     },
     Binding {

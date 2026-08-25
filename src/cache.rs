@@ -166,8 +166,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn ttl() -> u64 {
-    crate::config::get().cache.ttl
+fn ttl() -> Result<u64> {
+    Ok(crate::config::try_get()?.cache.ttl)
 }
 
 fn load_cache() -> CacheFile {
@@ -188,12 +188,24 @@ fn load_cache_checked_at(path: &std::path::Path) -> Result<CacheFile> {
     }
 }
 
+fn load_last_used_checked_at(path: &std::path::Path) -> Result<HashMap<String, i64>> {
+    Ok(load_cache_checked_at(path)?.last_used)
+}
+
 fn save_cache(cache: &CacheFile) -> Result<()> {
     let path = cache_path()?;
     save_cache_at(&path, cache)
 }
 
 fn save_cache_at(path: &std::path::Path, cache: &CacheFile) -> Result<()> {
+    let outcome = publish_cache_at(path, cache)?;
+    auth::require_durable_private_write(path, "usage cache", outcome)
+}
+
+fn publish_cache_at(
+    path: &std::path::Path,
+    cache: &CacheFile,
+) -> Result<auth::PrivateWriteOutcome> {
     let json = serde_json::to_string(cache).context("serializing cache")?;
     auth::atomic_write_private(path, json.as_bytes())
         .with_context(|| format!("writing cache file {}", path.display()))
@@ -261,34 +273,46 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
 }
 
 /// Get cached usage for an alias if within TTL.
-pub fn get(alias: &str) -> Option<UsageInfo> {
-    match with_cache_lock(|| {
-        let cache = load_cache();
-        let Some(entry) = cache.entries.get(alias) else {
-            return Ok(None);
-        };
-        if now_secs().saturating_sub(entry.ts) > ttl() {
-            return Ok(None);
-        }
-        Ok(Some(from_entry(entry)))
-    }) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!("Failed to read cache for {alias}: {err}");
-            None
-        }
-    }
+pub fn get(alias: &str) -> Result<Option<UsageInfo>> {
+    with_cache_lock(|| {
+        let cache = load_cache_checked()?;
+        let ttl = ttl()?;
+        Ok(fresh_usage(&cache, alias, now_secs(), ttl))
+    })
+}
+
+fn fresh_usage(cache: &CacheFile, alias: &str, now: u64, ttl: u64) -> Option<UsageInfo> {
+    let entry = cache.entries.get(alias)?;
+    (now.saturating_sub(entry.ts) <= ttl).then(|| from_entry(entry))
+}
+
+/// Read one consistent fresh-usage snapshot for a batch of aliases.
+///
+/// The TUI warmup preflight needs an all-or-nothing decision before it starts
+/// any credential-bearing task. Taking the cross-process cache lock once keeps
+/// that decision on one file snapshot and bounds lock contention to one wait per
+/// batch rather than one wait per account.
+pub(crate) fn get_many(aliases: &[String]) -> Result<HashMap<String, UsageInfo>> {
+    with_cache_lock(|| {
+        let cache = load_cache_checked()?;
+        let ttl = ttl()?;
+        let now = now_secs();
+        Ok(aliases
+            .iter()
+            .filter_map(|alias| {
+                fresh_usage(&cache, alias, now, ttl).map(|usage| (alias.clone(), usage))
+            })
+            .collect())
+    })
 }
 
 /// Store usage result in cache.
-pub fn put(alias: &str, usage: &UsageInfo) {
-    if let Err(err) = with_cache_lock(|| {
+pub fn put(alias: &str, usage: &UsageInfo) -> Result<()> {
+    with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
         cache.entries.insert(alias.to_string(), to_entry(usage));
         save_cache(&cache)
-    }) {
-        tracing::warn!("Failed to write cache: {err}");
-    }
+    })
 }
 
 fn credential_fingerprint(refresh_token: &str) -> String {
@@ -379,26 +403,22 @@ fn migrate_alias(cache: &mut CacheFile, old: &str, new: &str) -> bool {
 
 /// The auth server's standing refusal for `alias`, if it still concerns the
 /// credential the profile currently holds.
-pub fn get_auth_failure(alias: &str, refresh_token: &str) -> Option<UsageError> {
-    match with_cache_lock(|| {
+pub fn get_auth_failure(alias: &str, refresh_token: &str) -> Result<Option<UsageError>> {
+    with_cache_lock(|| {
         Ok(
-            auth_failure_for(&load_cache(), alias, refresh_token).map(|entry| UsageError {
-                summary: entry.summary.clone(),
-                detail: entry.detail.clone(),
+            auth_failure_for(&load_cache_checked()?, alias, refresh_token).map(|entry| {
+                UsageError {
+                    summary: entry.summary.clone(),
+                    detail: entry.detail.clone(),
+                }
             }),
         )
-    }) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!("Failed to read auth failure for {alias}: {err}");
-            None
-        }
-    }
+    })
 }
 
 /// Remember that the auth server refused `refresh_token` for good.
-pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) {
-    if let Err(err) = with_cache_lock(|| {
+pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) -> Result<()> {
+    with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
         record_auth_failure(
             &mut cache,
@@ -408,9 +428,7 @@ pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) {
             &error.detail,
         );
         save_cache(&cache)
-    }) {
-        tracing::warn!("Failed to record auth failure for {alias}: {err}");
-    }
+    })
 }
 
 pub fn get_workspace_name(account_id: &str) -> Option<String> {
@@ -504,20 +522,13 @@ fn resolved_workspace_name(cache: &CacheFile, account_id: &str) -> Option<Option
 /// "is it resolved" and "what is it" separately would take a cross-process
 /// lock twice per task on a tokio worker — and leave a window between them in
 /// which another process can change the answer.
-pub async fn resolved_workspace_name_async(account_id: &str) -> Option<Option<String>> {
+pub async fn resolved_workspace_name_async(account_id: &str) -> Result<Option<Option<String>>> {
     let account_id = account_id.to_string();
     tokio::task::spawn_blocking(move || {
-        match with_cache_lock(|| Ok(resolved_workspace_name(&load_cache(), &account_id))) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!("Failed to read cached workspace state: {err}");
-                None
-            }
-        }
+        with_cache_lock(|| Ok(resolved_workspace_name(&load_cache_checked()?, &account_id)))
     })
     .await
-    .ok()
-    .flatten()
+    .context("workspace-cache read worker failed")?
 }
 
 pub fn apply_workspace_name(info: &mut crate::jwt::AccountInfo) {
@@ -565,49 +576,76 @@ pub fn purge_profile(alias: &str) -> Result<()> {
 /// dedicated blocking thread so it never stalls a tokio worker. Use this on
 /// the high-concurrency usage-fetch path (up to `network.max_concurrent`
 /// tasks) instead of calling [`get`] directly inside an async task.
-pub async fn get_async(alias: &str) -> Option<UsageInfo> {
+pub async fn get_async(alias: &str) -> Result<Option<UsageInfo>> {
     let alias = alias.to_string();
-    tokio::task::spawn_blocking(move || get(&alias))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if TEST_PANIC_NEXT_CACHE_READ_WORKER.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            panic!("injected usage-cache worker panic");
+        }
+        get(&alias)
+    })
+    .await
+    .context("usage-cache read worker failed")?
 }
 
+#[cfg(test)]
+static TEST_PANIC_NEXT_CACHE_READ_WORKER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Async wrapper around [`put`]; see [`get_async`] for rationale.
-pub async fn put_async(alias: &str, usage: &UsageInfo) {
+pub async fn put_async(alias: &str, usage: &UsageInfo) -> Result<()> {
     let alias = alias.to_string();
     let usage = usage.clone();
-    let _ = tokio::task::spawn_blocking(move || put(&alias, &usage)).await;
+    tokio::task::spawn_blocking(move || put(&alias, &usage))
+        .await
+        .context("usage-cache write worker failed")?
 }
 
 /// Async wrapper around [`get_auth_failure`]; see [`get_async`] for rationale.
-pub async fn get_auth_failure_async(alias: &str, refresh_token: &str) -> Option<UsageError> {
+pub async fn get_auth_failure_async(
+    alias: &str,
+    refresh_token: &str,
+) -> Result<Option<UsageError>> {
     let alias = alias.to_string();
     let refresh_token = refresh_token.to_string();
-    tokio::task::spawn_blocking(move || get_auth_failure(&alias, &refresh_token))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if TEST_PANIC_NEXT_AUTH_FAILURE_CACHE_READ_WORKER
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            panic!("injected auth-failure cache worker panic");
+        }
+        get_auth_failure(&alias, &refresh_token)
+    })
+    .await
+    .context("auth-failure cache read worker failed")?
 }
 
+#[cfg(test)]
+static TEST_PANIC_NEXT_AUTH_FAILURE_CACHE_READ_WORKER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Async wrapper around [`put_auth_failure`]; see [`get_async`] for rationale.
-pub async fn put_auth_failure_async(alias: &str, refresh_token: &str, error: &UsageError) {
+pub async fn put_auth_failure_async(
+    alias: &str,
+    refresh_token: &str,
+    error: &UsageError,
+) -> Result<()> {
     let alias = alias.to_string();
     let refresh_token = refresh_token.to_string();
     let error = error.clone();
-    let _ =
-        tokio::task::spawn_blocking(move || put_auth_failure(&alias, &refresh_token, &error)).await;
+    tokio::task::spawn_blocking(move || put_auth_failure(&alias, &refresh_token, &error))
+        .await
+        .context("auth-failure cache write worker failed")?
 }
 
-/// Get the last-used timestamp for an alias (0 if never used).
-pub fn get_last_used(alias: &str) -> i64 {
-    match with_cache_lock(|| Ok(load_cache().last_used.get(alias).copied().unwrap_or(0))) {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!("Failed to read last-used cache for {alias}: {err}");
-            0
-        }
-    }
+/// Read a consistent snapshot of profile-selection history for automatic
+/// ranking. Malformed or unreadable cache state is an error: choosing an
+/// account with invented `0` timestamps would change the automatic-selection
+/// decision.
+pub(crate) fn last_used_snapshot_checked() -> Result<HashMap<String, i64>> {
+    with_cache_lock(|| load_last_used_checked_at(&cache_path()?))
 }
 
 /// Record a successful profile selection for scoring.
@@ -627,13 +665,26 @@ pub fn set_last_used(alias: &str) {
     }
 }
 
-pub fn rename(old: &str, new: &str) -> Result<()> {
+#[derive(Debug)]
+#[must_use = "a visibly-published cache rename must not be rolled back as though it failed"]
+pub(crate) enum RenameOutcome {
+    Unchanged,
+    DurablyRenamed,
+    VisibleDurabilityUnconfirmed { cause: anyhow::Error },
+}
+
+pub(crate) fn rename(old: &str, new: &str) -> Result<RenameOutcome> {
     with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
-        if migrate_alias(&mut cache, old, new) {
-            save_cache(&cache)?;
+        if !migrate_alias(&mut cache, old, new) {
+            return Ok(RenameOutcome::Unchanged);
         }
-        Ok(())
+        match publish_cache_at(&cache_path()?, &cache)? {
+            auth::PrivateWriteOutcome::DurablyPublished => Ok(RenameOutcome::DurablyRenamed),
+            auth::PrivateWriteOutcome::VisibleDurabilityUnconfirmed { cause } => {
+                Ok(RenameOutcome::VisibleDurabilityUnconfirmed { cause })
+            }
+        }
     })
 }
 
@@ -844,6 +895,19 @@ mod tests {
     }
 
     #[test]
+    fn automatic_ranking_history_rejects_malformed_cache_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.json");
+        std::fs::write(&path, "not-json").unwrap();
+
+        let error = load_last_used_checked_at(&path)
+            .expect_err("automatic ranking must not invent zero timestamps for corrupt state");
+
+        assert!(format!("{error:#}").contains("parsing cache file"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "not-json");
+    }
+
+    #[test]
     fn cache_mutation_load_treats_only_a_missing_file_as_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("missing-cache.json");
@@ -853,6 +917,35 @@ mod tests {
         assert!(cache.entries.is_empty());
         assert!(cache.last_used.is_empty());
         assert!(cache.auth_failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_cache_read_propagates_a_blocking_worker_join_failure() {
+        TEST_PANIC_NEXT_CACHE_READ_WORKER.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = get_async("worker-panic")
+            .await
+            .expect_err("a blocking worker panic must not become a cache miss");
+
+        assert!(
+            format!("{error:#}").contains("usage-cache read worker failed"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_auth_failure_read_propagates_a_blocking_worker_join_failure() {
+        TEST_PANIC_NEXT_AUTH_FAILURE_CACHE_READ_WORKER
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = get_auth_failure_async("worker-panic", "refresh")
+            .await
+            .expect_err("a blocking worker panic must not authorize another token request");
+
+        assert!(
+            format!("{error:#}").contains("auth-failure cache read worker failed"),
+            "{error:#}"
+        );
     }
 
     #[test]

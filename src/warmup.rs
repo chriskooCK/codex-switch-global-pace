@@ -534,12 +534,14 @@ async fn warmup_additional_models(
 /// only — batch drivers keep processing the rest.
 fn persist_refreshed_tokens(
     lease: &crate::profile::ProfileLease,
+    authorization: crate::profile::FreshCredentialsActivationAuthorization,
     presented_refresh_token: &str,
     refreshed: &crate::usage::RefreshedTokens,
 ) -> Result<()> {
     let alias = lease.alias();
     let update = crate::profile::update_profile_tokens_if_refresh_matches_leased(
         lease,
+        authorization,
         presented_refresh_token,
         &refreshed.id_token,
         &refreshed.access_token,
@@ -587,7 +589,7 @@ pub(crate) async fn warmup_account_leased(
             lease.alias()
         );
     }
-    let usage = match crate::cache::get(alias) {
+    let usage = match crate::cache::get(alias)? {
         Some(usage) => Some(usage),
         None => {
             match crate::usage::fetch_usage_retried_unattended_leased(alias, profile_path, lease)
@@ -617,7 +619,7 @@ pub(crate) async fn warmup_account_leased(
         .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
     let mut refresh_token = rt.filter(|s| !s.is_empty());
 
-    let info = crate::auth::read_account_info(profile_path);
+    let info = crate::auth::account_info_from_auth_value(&val);
     let account_id = info.account_id;
     let is_fedramp = info.is_fedramp;
 
@@ -634,6 +636,12 @@ pub(crate) async fn warmup_account_leased(
         && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
     {
         debug!("[{alias}] access_token expiring soon, refreshing before warmup");
+        let activation_authorization =
+            crate::profile::authorize_fresh_credentials_activation(lease).with_context(|| {
+                format!(
+                    "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
+                )
+            })?;
         match crate::usage::do_refresh_token(
             alias,
             &client,
@@ -644,7 +652,7 @@ pub(crate) async fn warmup_account_leased(
         .await
         {
             Ok(refreshed) => {
-                persist_refreshed_tokens(lease, rt, &refreshed)?;
+                persist_refreshed_tokens(lease, activation_authorization, rt, &refreshed)?;
                 access_token = refreshed.access_token;
                 id_token = Some(refreshed.id_token);
                 refresh_token = Some(refreshed.refresh_token);
@@ -775,6 +783,14 @@ pub(crate) async fn warmup_account_leased(
             // Retry once with refreshed token
             if let Some(ref rt) = refresh_token {
                 debug!("[{alias}] got {status}, attempting token refresh and retry");
+                let activation_authorization =
+                    crate::profile::authorize_fresh_credentials_activation(lease).with_context(
+                        || {
+                            format!(
+                                "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
+                            )
+                        },
+                    )?;
                 match crate::usage::do_refresh_token(
                     alias,
                     &client,
@@ -785,7 +801,7 @@ pub(crate) async fn warmup_account_leased(
                 .await
                 {
                     Ok(refreshed) => {
-                        persist_refreshed_tokens(lease, rt, &refreshed)?;
+                        persist_refreshed_tokens(lease, activation_authorization, rt, &refreshed)?;
                         let mut retry_resp = make_request(
                             &client,
                             &refreshed.access_token,
@@ -852,7 +868,7 @@ pub(crate) async fn fetch_models_for_profile_leased(
         .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
     let refresh_token = rt.filter(|s| !s.is_empty());
 
-    let info = crate::auth::read_account_info(profile_path);
+    let info = crate::auth::account_info_from_auth_value(&val);
     let account_id = info.account_id;
     let is_fedramp = info.is_fedramp;
 
@@ -861,6 +877,12 @@ pub(crate) async fn fetch_models_for_profile_leased(
     if let Some(ref rt) = refresh_token
         && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
     {
+        let activation_authorization =
+            crate::profile::authorize_fresh_credentials_activation(lease).with_context(|| {
+                format!(
+                    "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
+                )
+            })?;
         match crate::usage::do_refresh_token(
             alias,
             &client,
@@ -873,7 +895,7 @@ pub(crate) async fn fetch_models_for_profile_leased(
             Ok(refreshed) => {
                 // No degrade here: the refresh *worked*, so the old token this
                 // would fall back to has already been invalidated server-side.
-                persist_refreshed_tokens(lease, rt, &refreshed)?;
+                persist_refreshed_tokens(lease, activation_authorization, rt, &refreshed)?;
                 access_token = refreshed.access_token;
             }
             // Deliberate degrade: fall through and try /models with the
@@ -1441,6 +1463,12 @@ mod tests {
             }
         }
 
+        fn use_test_home(path: &std::path::Path) -> EnvVarGuard {
+            let guard = EnvVarGuard::set("CODEX_SWITCH_HOME", &path.display().to_string());
+            crate::config::init_defaults_for_tests();
+            guard
+        }
+
         fn make_jwt(claims: &serde_json::Value) -> String {
             use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
             let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
@@ -1461,7 +1489,9 @@ mod tests {
                     "refresh_token": refresh_token,
                 }
             });
-            crate::auth::write_auth(path, &val).unwrap();
+            crate::auth::write_auth(path, &val)
+                .unwrap()
+                .assert_durably_published();
         }
 
         /// Starts a mock server answering all three warmup-relevant endpoints and
@@ -1621,17 +1651,16 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "terminal-refresh-test";
             // Pre-populate the usage cache so `warmup_account` never calls the
             // (unrelated) usage-fetch path, which has its own independent
             // proactive-refresh call — that would inflate the auth-endpoint
             // call count for a reason this test isn't about.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
 
-            let profile_path = home.path().join("auth.json");
+            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
             write_test_auth(&profile_path, &expired_access_token(), "refresh-token-1");
 
             // Every refresh attempt is rejected as reused; the auth server never
@@ -1699,11 +1728,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "fetch-models-refresh-log-test";
-            let profile_path = home.path().join("auth.json");
+            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
             write_test_auth(&profile_path, &expired_access_token(), "refresh-token-2");
 
             // `fetch_models_for_profile` never sends a warmup ping, so the
@@ -1807,6 +1835,7 @@ mod tests {
         /// comes back.
         async fn start_rotating_mock_server(
             responses_statuses: Vec<StatusCode>,
+            break_profile_after_authorization: Option<std::path::PathBuf>,
         ) -> (Arc<AtomicUsize>, Vec<EnvVarGuard>) {
             let token_calls = Arc::new(AtomicUsize::new(0));
             let counter = token_calls.clone();
@@ -1817,8 +1846,14 @@ mod tests {
                     "/oauth/token",
                     post(move || {
                         let counter = counter.clone();
+                        let break_profile_after_authorization =
+                            break_profile_after_authorization.clone();
                         async move {
                             let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                            if let Some(path) = break_profile_after_authorization {
+                                std::fs::remove_file(&path).unwrap();
+                                std::fs::create_dir(&path).unwrap();
+                            }
                             (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
@@ -1889,6 +1924,13 @@ mod tests {
             );
         }
 
+        fn assert_reports_refresh_not_started(detail: &str) {
+            assert!(
+                detail.contains("token refresh was not started"),
+                "a local precondition failure must be reported before a single-use token is sent, got: {detail}"
+            );
+        }
+
         #[allow(clippy::await_holding_lock)]
         #[tokio::test]
         async fn warmup_aborts_when_pre_warmup_rotated_tokens_cannot_be_saved() {
@@ -1897,16 +1939,15 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-pre-warmup";
             // Keep the (independent) usage-fetch refresh path out of this test.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default());
-            let profile_path =
-                stage_unwritable_profile(home.path(), alias, &expired_access_token());
+            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
+            let profile_path = stage_writable_profile(home.path(), alias, &expired_access_token());
 
-            let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
+            let (_token_calls, _guards) =
+                start_rotating_mock_server(vec![StatusCode::OK], Some(profile_path.clone())).await;
 
             let result = warmup_account(alias, &profile_path).await;
 
@@ -1925,19 +1966,21 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-401-retry";
-            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
             // Not expiring, so only the 401 handler triggers a refresh.
-            let profile_path = stage_unwritable_profile(home.path(), alias, &live_access_token());
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
 
             // First warmup POST is unauthorized (drives the refresh), the retry
             // would have succeeded — which is precisely how the failure used to
             // exit zero.
-            let (_token_calls, _guards) =
-                start_rotating_mock_server(vec![StatusCode::UNAUTHORIZED, StatusCode::OK]).await;
+            let (_token_calls, _guards) = start_rotating_mock_server(
+                vec![StatusCode::UNAUTHORIZED, StatusCode::OK],
+                Some(profile_path.clone()),
+            )
+            .await;
 
             let result = warmup_account(alias, &profile_path).await;
 
@@ -1956,14 +1999,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-fetch-models";
-            let profile_path =
-                stage_unwritable_profile(home.path(), alias, &expired_access_token());
+            let profile_path = stage_writable_profile(home.path(), alias, &expired_access_token());
 
-            let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
+            let (_token_calls, _guards) =
+                start_rotating_mock_server(vec![StatusCode::OK], Some(profile_path.clone())).await;
 
             let lease = crate::profile::acquire_profile_lease_async(alias)
                 .await
@@ -1979,14 +2021,13 @@ mod tests {
 
         #[allow(clippy::await_holding_lock)]
         #[tokio::test]
-        async fn one_unsaveable_profile_does_not_abort_the_rest_of_the_warmup_batch() {
+        async fn one_unauthorizable_profile_does_not_abort_the_rest_of_the_warmup_batch() {
             let _lock = ENV_LOCK.lock().await;
             let _profile_env_lock = crate::profile::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
             let _codex_home = EnvVarGuard::set(
                 "CODEX_HOME",
                 &home.path().join("codex").display().to_string(),
@@ -1994,14 +2035,15 @@ mod tests {
 
             let broken = "batch-persist-broken";
             let healthy = "batch-persist-healthy";
-            crate::cache::put(broken, &crate::usage::UsageInfo::default());
-            crate::cache::put(healthy, &crate::usage::UsageInfo::default());
+            crate::cache::put(broken, &crate::usage::UsageInfo::default()).unwrap();
+            crate::cache::put(healthy, &crate::usage::UsageInfo::default()).unwrap();
             let broken_path =
                 stage_unwritable_profile(home.path(), broken, &expired_access_token());
             let healthy_path =
                 stage_writable_profile(home.path(), healthy, &expired_access_token());
 
-            let (_token_calls, _guards) = start_rotating_mock_server(vec![StatusCode::OK]).await;
+            let (_token_calls, _guards) =
+                start_rotating_mock_server(vec![StatusCode::OK], None).await;
 
             // Mirrors the batch driver in `commands::misc`: one task per alias,
             // outcomes collected independently.
@@ -2022,8 +2064,8 @@ mod tests {
             let broken_error = outcomes
                 .remove(broken)
                 .expect("the broken profile must produce an outcome")
-                .expect_err("the profile whose rotated tokens could not be saved must report");
-            assert_reports_persist_failure(&format!("{broken_error:#}"));
+                .expect_err("the profile whose refresh could not be authorized must report");
+            assert_reports_refresh_not_started(&format!("{broken_error:#}"));
 
             let healthy_result = outcomes
                 .remove(healthy)
@@ -2093,14 +2135,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             // Unique alias: MODEL_CACHE is process-global and outlives one test.
             let alias = "models-fetch-count-no-pools";
             // Cached usage with no `additional_limits`, so the usage-fetch path
             // stays out of this and there is no additional pool to warm.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
             let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
 
             let (models_calls, _guards) = start_models_counting_mock_server().await;
@@ -2128,8 +2169,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "models-fetch-count-with-pool";
             crate::cache::put(
@@ -2145,7 +2185,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            );
+            )
+            .unwrap();
             let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
 
             let (models_calls, _guards) = start_models_counting_mock_server().await;
@@ -2235,15 +2276,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let home = tempfile::tempdir().unwrap();
-            let _codex_switch_home =
-                EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
+            let _codex_switch_home = use_test_home(home.path());
 
             let alias = "models-cache-pool-set-changed";
             let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
             let (models_calls, responses_calls, _guards) = start_counting_mock_server().await;
 
             // First warmup: the account has no additional quota pool.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default());
+            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
             warmup_account(alias, &profile_path)
                 .await
                 .expect("the first warmup against a healthy mock server must succeed");
@@ -2267,7 +2307,8 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            );
+            )
+            .unwrap();
             warmup_account(alias, &profile_path)
                 .await
                 .expect("the second warmup against a healthy mock server must succeed");

@@ -1456,8 +1456,13 @@ mod tests {
             listener.local_addr().unwrap().port()
         }
 
+        fn init_test_config() {
+            crate::config::init_defaults_for_tests();
+        }
+
         #[tokio::test]
         async fn token_exchange_retries_until_the_transient_failure_clears() {
+            init_test_config();
             let _lock = TOKEN_URL_ENV_LOCK.lock().await;
             let request_count = Arc::new(AtomicUsize::new(0));
             let counter = request_count.clone();
@@ -1513,6 +1518,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_refused_connection_is_classified_as_retryable() {
+            init_test_config();
             let port = reserve_closed_port();
             let err = crate::auth::build_http_client()
                 .unwrap()
@@ -1534,6 +1540,7 @@ mod tests {
 
         #[tokio::test]
         async fn token_exchange_retries_connection_failures_before_giving_up() {
+            init_test_config();
             let _lock = TOKEN_URL_ENV_LOCK.lock().await;
             let port = reserve_closed_port();
             let _env = EnvVarGuard::set(&format!("http://127.0.0.1:{port}/oauth/token"));
@@ -1563,6 +1570,7 @@ mod tests {
 
         #[tokio::test]
         async fn token_exchange_fails_immediately_on_deterministic_bad_request() {
+            init_test_config();
             let _lock = TOKEN_URL_ENV_LOCK.lock().await;
             let request_count = Arc::new(AtomicUsize::new(0));
             let counter = request_count.clone();
@@ -1609,6 +1617,7 @@ mod tests {
 
         #[tokio::test]
         async fn token_exchange_surfaces_object_shaped_error_code_and_message() {
+            init_test_config();
             let _lock = TOKEN_URL_ENV_LOCK.lock().await;
 
             let app = Router::new().route(
