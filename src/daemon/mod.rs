@@ -984,6 +984,17 @@ enum RequestedGenerationObservation {
     Settled(Option<pidfile::DaemonGeneration>),
 }
 
+fn observe_requested_generation(
+    target: &pidfile::DaemonGeneration,
+) -> Result<RequestedGenerationObservation> {
+    let observed = pidfile::running_generation_checked()?;
+    if observed.as_ref() == Some(target) {
+        Ok(RequestedGenerationObservation::TargetRunning)
+    } else {
+        Ok(RequestedGenerationObservation::Settled(observed))
+    }
+}
+
 impl DaemonGenerationStopRequest {
     fn issue(target: pidfile::DaemonGeneration) -> Result<Self> {
         let shutdown_request = pidfile::request_shutdown(&target)?;
@@ -992,27 +1003,14 @@ impl DaemonGenerationStopRequest {
 
     fn wait(self) -> Result<()> {
         let pid = self.shutdown_request.target().pid();
-        let deadline = std::time::Instant::now() + DAEMON_TRANSITION_TIMEOUT;
-        let stopped = loop {
-            match self.shutdown_request.target_is_running() {
-                Ok(true) => {}
-                Ok(false) => match pidfile::running_pid_checked() {
-                    Ok(None) => break Ok(()),
-                    Ok(Some(current_pid)) => break Err(anyhow::anyhow!(
-                        "Daemon generation changed to PID {current_pid} while waiting for PID {pid} to stop"
-                    )),
-                    Err(error) => break Err(error),
-                },
-                Err(error) => break Err(error),
-            }
-            if std::time::Instant::now() >= deadline {
-                break Err(anyhow::anyhow!(
-                    "Daemon did not stop within {}s",
-                    DAEMON_TRANSITION_TIMEOUT.as_secs()
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+        let target = self.shutdown_request.target().clone();
+        let started = std::time::Instant::now();
+        let stopped = wait_for_requested_generation_stop_with(
+            pid,
+            || observe_requested_generation(&target),
+            || started.elapsed(),
+            std::thread::sleep,
+        )
         .map_err(|err| {
             anyhow::anyhow!(
                 "{err}. The daemon may still be finishing an in-flight credential rotation; \
@@ -1049,6 +1047,46 @@ fn stop_daemon_generation(target: pidfile::DaemonGeneration) -> Result<()> {
     DaemonGenerationStopRequest::issue(target)?.wait()
 }
 
+fn wait_for_requested_generation_stop_with<Observe, Elapsed, Sleep>(
+    pid: u32,
+    mut observe: Observe,
+    mut elapsed: Elapsed,
+    mut sleep: Sleep,
+) -> Result<()>
+where
+    Observe: FnMut() -> Result<RequestedGenerationObservation>,
+    Elapsed: FnMut() -> std::time::Duration,
+    Sleep: FnMut(std::time::Duration),
+{
+    let mut diagnostics = TransientDiagnostics::default();
+    loop {
+        match observe() {
+            Ok(RequestedGenerationObservation::Settled(None)) => return Ok(()),
+            Ok(RequestedGenerationObservation::Settled(Some(current))) => {
+                anyhow::bail!(
+                    "Daemon changed to a different generation while waiting for PID {pid} to stop (current PID {})",
+                    current.pid()
+                );
+            }
+            Ok(RequestedGenerationObservation::TargetRunning) => {}
+            Err(error) => diagnostics.record(format!(
+                "failed to inspect the already-requested daemon PID {pid}: {error:#}"
+            )),
+        }
+        if elapsed() >= DAEMON_TRANSITION_TIMEOUT {
+            let diagnostic = diagnostics
+                .into_summary("transient daemon-state observation failure")
+                .map(|summary| format!("; {summary}"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "Daemon did not stop within {}s{diagnostic}",
+                DAEMON_TRANSITION_TIMEOUT.as_secs()
+            );
+        }
+        sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn wait_for_requested_generation_to_settle(
     target: pidfile::DaemonGeneration,
 ) -> RequestedGenerationSettlement {
@@ -1056,14 +1094,7 @@ fn wait_for_requested_generation_to_settle(
     let started = std::time::Instant::now();
     wait_for_requested_generation_to_settle_with(
         pid,
-        || {
-            let observed = pidfile::running_generation_checked()?;
-            if observed.as_ref() == Some(&target) {
-                Ok(RequestedGenerationObservation::TargetRunning)
-            } else {
-                Ok(RequestedGenerationObservation::Settled(observed))
-            }
-        },
+        || observe_requested_generation(&target),
         || started.elapsed(),
         std::thread::sleep,
         |elapsed| {
@@ -2760,7 +2791,7 @@ mod installer_state_tests {
         finalize_prior_restart_restoration, installer_boundary_finalization, installer_state_line,
         publish_installer_daemon_boundary_state, require_captured_executable_state,
         validate_running_daemon_executable, wait_for_contending_daemon_resolution_with,
-        wait_for_requested_generation_to_settle_with,
+        wait_for_requested_generation_stop_with, wait_for_requested_generation_to_settle_with,
     };
 
     struct BrokenMarkerWriter;
@@ -2815,6 +2846,71 @@ mod installer_state_tests {
         let message = format!("{error:#}");
         assert!(message.contains("remains running"), "{message}");
         assert!(message.contains("earlier stop-observation"), "{message}");
+    }
+
+    #[test]
+    fn bounded_generation_stop_rechecks_a_transient_cleanup_observation() {
+        use std::cell::{Cell, RefCell};
+        use std::collections::VecDeque;
+
+        let samples = RefCell::new(VecDeque::from([
+            Ok(RequestedGenerationObservation::TargetRunning),
+            Err(anyhow::anyhow!(
+                "injected held-lock identity-removal transition"
+            )),
+            Ok(RequestedGenerationObservation::Settled(None)),
+        ]));
+        let elapsed = Cell::new(std::time::Duration::ZERO);
+        wait_for_requested_generation_stop_with(
+            4242,
+            || samples.borrow_mut().pop_front().unwrap(),
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        )
+        .expect("the exact stop must settle after the PID cleanup transition");
+
+        assert!(samples.borrow().is_empty());
+        assert_eq!(elapsed.get(), std::time::Duration::from_millis(200));
+    }
+
+    #[test]
+    fn bounded_generation_stop_retains_transient_diagnostics_at_its_deadline() {
+        let error = wait_for_requested_generation_stop_with(
+            4242,
+            || Err(anyhow::anyhow!("injected unreadable PID identity")),
+            || DAEMON_TRANSITION_TIMEOUT,
+            |_| panic!("a reached deadline must not sleep"),
+        )
+        .expect_err("an unclassified daemon state must never count as stopped");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("Daemon did not stop within"), "{message}");
+        assert!(
+            message.contains("injected unreadable PID identity"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn bounded_generation_stop_rejects_a_successor_immediately() {
+        let error = wait_for_requested_generation_stop_with(
+            4242,
+            || {
+                Ok(RequestedGenerationObservation::Settled(Some(
+                    crate::daemon::pidfile::DaemonGeneration {
+                        pid: 4242,
+                        generation: "successor".to_string(),
+                    },
+                )))
+            },
+            || panic!("a classified successor must return immediately"),
+            |_| panic!("a classified successor must not sleep"),
+        )
+        .expect_err("a successor generation must not be reported as stopped");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("different generation"), "{message}");
+        assert!(message.contains("current PID 4242"), "{message}");
     }
 
     #[test]
