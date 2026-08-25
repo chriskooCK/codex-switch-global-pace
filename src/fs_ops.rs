@@ -460,6 +460,10 @@ pub(crate) fn create_new_file(path: &Path, mode: libc::mode_t) -> Result<File> {
     let (parent, name) = direct_parent(path)?;
     let directory = open_direct_directory(&parent)?;
     let name = component_c_string(name, path)?;
+    // macOS mode_t is narrower than C's variadic integer slot, so Rust
+    // requires the default integer promotion to be explicit at this call.
+    #[cfg(target_os = "macos")]
+    let mode = libc::c_uint::from(mode);
     let descriptor = unsafe {
         // SAFETY: directory and name are valid for this openat call. O_EXCL and
         // O_NOFOLLOW ensure an existing file or link is never adopted.

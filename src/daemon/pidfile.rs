@@ -755,12 +755,14 @@ impl Drop for PidGuard {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::publish_pid_identity_at;
     use super::{
         ContendingDaemonIdentity, DaemonAbsenceAcquire, DaemonGeneration, PidIdentity,
         ShutdownRequest, acquire_daemon_absence_lease_at, acquire_pidfile_lock_at,
         classify_contending_daemon_identity, cleanup_pidfile_at, parse_pid_identity,
-        pidfile_lock_path_for, publish_pid_identity_at, read_pid_from_raw, running_pid_checked_at,
-        shutdown_request_matches, try_acquire_daemon_absence_lease_at,
+        pidfile_lock_path_for, read_pid_from_raw, running_pid_checked_at, shutdown_request_matches,
+        try_acquire_daemon_absence_lease_at,
     };
     use fs4::FileExt;
     use std::path::PathBuf;

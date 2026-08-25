@@ -840,9 +840,7 @@ fn stop(expected_service_executable: Option<std::path::PathBuf>) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
         if service::is_installed_checked()? {
-            let pid = pidfile::running_pid_checked()?;
             service::stop_installed_locked(&executable, &service_lease)?;
-            wait_until_stopped(pid)?;
             pidfile::cleanup_pidfile()?;
             return Ok(());
         }

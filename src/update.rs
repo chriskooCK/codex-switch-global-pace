@@ -1366,7 +1366,7 @@ fn replace_candidate_inner(
     // Construct the recovery owner before the only publication syscall. If
     // classification unwinds after exchange, its Drop retains the independent
     // backup and exact displaced path instead of losing recovery ownership.
-    let publication_owner = PublicationRecoveryOwner::new(
+    let mut publication_owner = PublicationRecoveryOwner::new(
         PendingReplacement {
             lease: Some(update_lease),
             state: ReplacementState::Pending,
