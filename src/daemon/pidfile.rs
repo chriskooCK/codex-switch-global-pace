@@ -808,7 +808,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn shutdown_request_published_after_pid_identity_is_never_deleted_by_startup() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let pid_path = dir.path().join("daemon.pid");
         let request_path = dir.path().join("daemon.shutdown");
         let stale = ShutdownRequest {
@@ -872,7 +872,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn malformed_shutdown_residue_is_preserved_before_pid_publication() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let pid_path = dir.path().join("daemon.pid");
         let request_path = dir.path().join("daemon.shutdown");
         std::fs::write(&request_path, b"not a shutdown request").unwrap();
@@ -895,7 +895,7 @@ mod tests {
 
     #[test]
     fn checked_running_pid_uses_the_lock_without_a_process_list_probe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let identity = PidIdentity {
             version: 2,
@@ -923,7 +923,7 @@ mod tests {
 
     #[test]
     fn checked_running_pid_treats_a_missing_state_directory_as_stopped_without_creating_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let state_dir = dir.path().join("missing-state");
         let path = state_dir.join("daemon.pid");
 
@@ -933,7 +933,7 @@ mod tests {
 
     #[test]
     fn checked_running_pid_never_folds_a_malformed_locked_file_into_stopped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         std::fs::write(&path, b"{not-valid-json").unwrap();
         let lock_path = pidfile_lock_path_for(&path);
@@ -954,7 +954,7 @@ mod tests {
 
     #[test]
     fn checked_running_pid_recognizes_an_unlocked_legacy_numeric_file_as_stale() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         std::fs::write(&path, b"4242").unwrap();
 
@@ -964,7 +964,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checked_running_pid_never_trusts_a_locked_legacy_numeric_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         std::fs::write(&path, b"4242").unwrap();
         let legacy_owner = std::fs::OpenOptions::new()
@@ -986,7 +986,7 @@ mod tests {
 
     #[test]
     fn held_lock_without_identity_is_transient_error_then_becomes_ready() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let owner = acquire_pidfile_lock_at(&path).unwrap();
 
@@ -1013,7 +1013,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prior_release_same_file_lock_remains_a_live_migration_authority() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let identity = PidIdentity {
             version: 1,
@@ -1039,7 +1039,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn prior_release_windows_same_file_lock_fails_closed_without_tasklist_fallback() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let identity = PidIdentity {
             version: 1,
@@ -1068,7 +1068,7 @@ mod tests {
 
     #[test]
     fn concurrent_start_is_rejected_without_waiting_to_become_a_second_daemon() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let identity = PidIdentity {
             version: 2,
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn self_update_absence_lease_blocks_foreground_start_until_commit_boundary() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let identity = PidIdentity {
             version: 2,
@@ -1144,7 +1144,7 @@ mod tests {
 
     #[test]
     fn fresh_install_absence_lease_blocks_first_foreground_generation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let absence = acquire_daemon_absence_lease_at(&path, None).unwrap();
         absence.verify().unwrap();
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn contender_exit_before_pid_publication_becomes_exact_absence() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let contender = acquire_pidfile_lock_at(&path).unwrap();
         assert!(matches!(
@@ -1189,7 +1189,7 @@ mod tests {
 
     #[test]
     fn self_update_absence_lease_preserves_a_different_stale_generation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon.pid");
         let identity = PidIdentity {
             version: 2,

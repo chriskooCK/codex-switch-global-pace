@@ -1,23 +1,15 @@
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-fn temp_home(name: &str) -> PathBuf {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("codex-switch-global-pace-{name}-{ts}-{id}"));
-    fs::create_dir_all(&path).unwrap();
-    path
+fn temp_home() -> support::TempDir {
+    support::tempdir()
 }
 
 fn jwt(payload: &Value) -> String {
@@ -127,7 +119,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
 
 #[test]
 fn spawned_binary_honors_app_home_override() {
-    let home = temp_home("app-home-override");
+    let home = temp_home();
     let app_home = home.join("isolated-app-home");
     let sample = home.join("sample-auth.json");
     write_json(
@@ -152,8 +144,6 @@ fn spawned_binary_honors_app_home_override() {
     let output = cmd.output().unwrap();
     assert!(output.status.success());
     assert!(app_home.join("profiles/override/auth.json").exists());
-
-    let _ = fs::remove_dir_all(home);
 }
 
 fn run(home: &Path, args: &[&str]) -> Output {
@@ -193,7 +183,7 @@ fn parse_stdout_json(output: &Output) -> Value {
 
 #[test]
 fn json_warmup_with_no_profiles_reports_a_complete_success_object() {
-    let home = temp_home("empty-json-warmup");
+    let home = temp_home();
 
     let output = run(&home, &["--json", "warmup"]);
 
@@ -202,7 +192,6 @@ fn json_warmup_with_no_profiles_reports_a_complete_success_object() {
         parse_stdout_json(&output),
         serde_json::json!({"ok": true, "results": []})
     );
-    let _ = fs::remove_dir_all(home);
 }
 
 fn quarantined_path_from_error(error: &str) -> PathBuf {
@@ -226,7 +215,7 @@ fn assert_error_names_recovered_file(error: &str, recovered: &Path) {
 
 #[test]
 fn json_use_keeps_stdout_machine_readable() {
-    let home = temp_home("json-use");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/alice/auth.json"),
         &auth_json("alice@example.com", "acct_alice"),
@@ -245,13 +234,11 @@ fn json_use_keeps_stdout_machine_readable() {
         serde_json::json!({"ok": true, "alias": "alice", "action": "switched"})
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("Switched to profile: alice"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn use_reports_success_after_the_profile_commit_even_if_selection_cache_is_malformed() {
-    let home = temp_home("use-malformed-selection-cache");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/alice/auth.json"),
         &auth_json("alice@example.com", "acct_alice"),
@@ -296,13 +283,11 @@ fn use_reports_success_after_the_profile_commit_even_if_selection_cache_is_malfo
         live.pointer("/tokens/account_id").and_then(Value::as_str),
         Some("acct_alice")
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_use_rejects_untracked_live_auth_without_prompting() {
-    let home = temp_home("json-use-untracked");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/alice/auth.json"),
         &auth_json("alice@example.com", "acct_alice"),
@@ -322,13 +307,11 @@ fn json_use_rejects_untracked_live_auth_without_prompting() {
         })
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_import_keeps_stdout_machine_readable() {
-    let home = temp_home("json-import");
+    let home = temp_home();
     let sample = home.join("sample-auth.json");
     write_json(
         &sample,
@@ -351,13 +334,11 @@ fn json_import_keeps_stdout_machine_readable() {
         parse_stdout_json(&output),
         serde_json::json!({"ok": true, "alias": "frank", "action": "created"})
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_skip_usage_validation_environment_variable_no_longer_bypasses_validation() {
-    let home = temp_home("import-no-skip-bypass");
+    let home = temp_home();
     let sample = home.join("sample-auth.json");
     write_json(
         &sample,
@@ -377,12 +358,11 @@ fn import_skip_usage_validation_environment_variable_no_longer_bypasses_validati
             .join(".codex-switch/profiles/victim/auth.json")
             .exists()
     );
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_reset_card_requires_explicit_yes() {
-    let home = temp_home("json-reset-card-confirm");
+    let home = temp_home();
 
     let output = run(&home, &["--json", "reset-card", "alice"]);
     assert!(!output.status.success());
@@ -393,13 +373,11 @@ fn json_reset_card_requires_explicit_yes() {
             "error": "confirmation required; rerun with --yes to consume a reset card"
         })
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_list_auto_track_keeps_stdout_machine_readable() {
-    let home = temp_home("json-list");
+    let home = temp_home();
     write_json(
         home.join(".codex/auth.json"),
         &auth_json("carol@example.com", "acct_carol"),
@@ -421,13 +399,11 @@ fn json_list_auto_track_keeps_stdout_machine_readable() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Saved profile: carol"));
     assert!(stderr.contains("Auto-saved current account as profile: carol"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn zero_max_concurrent_fails_instead_of_being_replaced() {
-    let home = temp_home("zero-max-concurrent");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/dave/auth.json"),
         &auth_json("dave@example.com", "acct_dave"),
@@ -450,13 +426,11 @@ fn zero_max_concurrent_fails_instead_of_being_replaced() {
             .contains("config.network.max_concurrent must be at least 1"),
         "{report}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn invalid_existing_config_fails_instead_of_using_defaults() {
-    let home = temp_home("invalid-config");
+    let home = temp_home();
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     fs::write(
         home.join(".codex-switch/config.toml"),
@@ -470,13 +444,11 @@ fn invalid_existing_config_fails_instead_of_using_defaults() {
     assert_eq!(report["ok"], false);
     assert!(report["error"].as_str().unwrap().contains("config.toml"));
     assert!(report["error"].as_str().unwrap().contains("parse"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn invalid_config_error_does_not_echo_proxy_credentials() {
-    let home = temp_home("invalid-config-secret");
+    let home = temp_home();
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     fs::write(
         home.join(".codex-switch/config.toml"),
@@ -495,13 +467,11 @@ fn invalid_config_error_does_not_echo_proxy_credentials() {
     assert!(stdout.contains("config.proxy.url"), "{stdout}");
     assert!(!stdout.contains("SENTINEL_PASSWORD"));
     assert!(!stderr.contains("SENTINEL_PASSWORD"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn invalid_cli_proxy_fails_before_dispatch_without_echoing_credentials() {
-    let home = temp_home("invalid-cli-proxy-secret");
+    let home = temp_home();
     let output = run(
         &home,
         &[
@@ -520,13 +490,11 @@ fn invalid_cli_proxy_fails_before_dispatch_without_echoing_credentials() {
     );
     assert!(!stdout.contains("SENTINEL_CLI_PROXY_PASSWORD"));
     assert!(!stderr.contains("SENTINEL_CLI_PROXY_PASSWORD"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn invalid_cli_proxy_preserves_json_error_contract() {
-    let home = temp_home("invalid-cli-proxy-json-secret");
+    let home = temp_home();
     let output = run(
         &home,
         &[
@@ -550,8 +518,6 @@ fn invalid_cli_proxy_preserves_json_error_contract() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stdout.contains("SENTINEL_JSON_PROXY_PASSWORD"));
     assert!(!stderr.contains("SENTINEL_JSON_PROXY_PASSWORD"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[cfg(unix)]
@@ -559,7 +525,7 @@ fn invalid_cli_proxy_preserves_json_error_contract() {
 fn dangling_config_symlink_fails_instead_of_using_defaults() {
     use std::os::unix::fs::symlink;
 
-    let home = temp_home("dangling-config-symlink");
+    let home = temp_home();
     fs::create_dir_all(home.join(".codex-switch")).unwrap();
     symlink(
         home.join("missing-config.toml"),
@@ -572,13 +538,11 @@ fn dangling_config_symlink_fails_instead_of_using_defaults() {
     let report = parse_stdout_json(&output);
     assert_eq!(report["ok"], false);
     assert!(report["error"].as_str().unwrap().contains("config.toml"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_delete_requires_explicit_yes_and_preserves_profile() {
-    let home = temp_home("delete-json-confirm");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/gina/auth.json"),
         &auth_json("gina@example.com", "acct_gina"),
@@ -594,13 +558,11 @@ fn json_delete_requires_explicit_yes_and_preserves_profile() {
         })
     );
     assert!(home.join(".codex-switch/profiles/gina/auth.json").exists());
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn non_interactive_delete_requires_explicit_yes_and_preserves_profile() {
-    let home = temp_home("delete-non-interactive-confirm");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/gina/auth.json"),
         &auth_json("gina@example.com", "acct_gina"),
@@ -615,13 +577,11 @@ fn non_interactive_delete_requires_explicit_yes_and_preserves_profile() {
             .contains("confirmation required; rerun with --yes to delete profile 'gina'")
     );
     assert!(home.join(".codex-switch/profiles/gina/auth.json").exists());
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn delete_with_yes_archives_inactive_profile_for_recovery() {
-    let home = temp_home("delete-yes");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/gina/auth.json"),
         &auth_json("gina@example.com", "acct_gina"),
@@ -648,13 +608,11 @@ fn delete_with_yes_archives_inactive_profile_for_recovery() {
             .starts_with("gina.backup-")
     );
     assert!(archived[0].join("auth.json").exists());
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn delete_rejects_active_profile() {
-    let home = temp_home("delete-active");
+    let home = temp_home();
     let active_auth = auth_json("gina@example.com", "acct_gina");
     write_json(
         home.join(".codex-switch/profiles/gina/auth.json"),
@@ -672,13 +630,11 @@ fn delete_rejects_active_profile() {
         fs::read_to_string(home.join(".codex-switch/current")).unwrap(),
         "gina"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_directory_recursively_validates_and_reports_results() {
-    let home = temp_home("import-dir");
+    let home = temp_home();
     let root = home.join("to-import");
     write_json(
         root.join("nested/valid-auth.json"),
@@ -718,13 +674,11 @@ fn import_directory_recursively_validates_and_reports_results() {
         .collect();
     assert!(skipped_stages.contains(&"file_format"));
     assert!(skipped_stages.contains(&"structure"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_directory_returns_nonzero_when_every_file_is_skipped() {
-    let home = temp_home("import-dir-all-skipped");
+    let home = temp_home();
     let root = home.join("to-import");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("broken.json"), "{invalid json").unwrap();
@@ -739,13 +693,11 @@ fn import_directory_returns_nonzero_when_every_file_is_skipped() {
     assert_eq!(report["ok"], false);
     assert_eq!(report["imported"].as_array().unwrap().len(), 0);
     assert_eq!(report["skipped"].as_array().unwrap().len(), 2);
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn non_json_all_skipped_import_reports_each_failure_before_exiting() {
-    let home = temp_home("import-dir-all-skipped-details");
+    let home = temp_home();
     let root = home.join("to-import");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("broken.json"), "{invalid json").unwrap();
@@ -762,13 +714,11 @@ fn non_json_all_skipped_import_reports_each_failure_before_exiting() {
         stdout.contains("invalid-structure.json [structure]"),
         "{stdout}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn automatic_use_without_profiles_explains_how_to_get_started() {
-    let home = temp_home("use-no-profiles");
+    let home = temp_home();
 
     let output = run(&home, &["--json", "use"]);
     assert!(!output.status.success());
@@ -779,13 +729,11 @@ fn automatic_use_without_profiles_explains_how_to_get_started() {
             "error": "no saved profiles; run `codex-switch-global-pace login` or `codex-switch-global-pace import <path>` first"
         })
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn list_propagates_a_saved_profile_read_error_instead_of_skipping_the_row() {
-    let home = temp_home("list-unreadable-profile");
+    let home = temp_home();
     let broken = home.join(".codex-switch/profiles/broken/auth.json");
     fs::create_dir_all(broken.parent().unwrap()).unwrap();
     fs::write(&broken, "{not-json").unwrap();
@@ -798,13 +746,11 @@ fn list_propagates_a_saved_profile_read_error_instead_of_skipping_the_row() {
         .unwrap()
         .to_string();
     assert!(error.contains("loading profile 'broken'"), "{error}");
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_list_uses_per_account_cached_refresh_time() {
-    let home = temp_home("json-list-cache-ts");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/ivy/auth.json"),
         &auth_json("ivy@example.com", "acct_ivy"),
@@ -832,13 +778,11 @@ fn json_list_uses_per_account_cached_refresh_time() {
         stdout["profiles"][0]["usage"]["fetched_at"],
         "2024-03-09T16:00:00Z"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn json_list_adds_global_weekly_without_changing_profile_items() {
-    let home = temp_home("json-list-global-weekly");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/pace/auth.json"),
         &auth_json("pace@example.com", "acct_pace"),
@@ -875,13 +819,11 @@ fn json_list_adds_global_weekly_without_changing_profile_items() {
     assert_eq!(stdout["global_weekly"]["next_reset_alias"], "pace");
     let pace = stdout["global_weekly"]["pace_percent"].as_f64().unwrap();
     assert!((99.9..=100.1).contains(&pace), "unexpected pace: {pace}");
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn non_interactive_stdin_does_not_save_new_account() {
-    let home = temp_home("non-interactive-new");
+    let home = temp_home();
     // Put an auth.json with no matching profile
     write_json(
         home.join(".codex/auth.json"),
@@ -908,13 +850,11 @@ fn non_interactive_stdin_does_not_save_new_account() {
         !profiles_dir.exists() || fs::read_dir(&profiles_dir).unwrap().count() == 0,
         "expected no profiles saved, but profiles dir has content"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn non_interactive_stdin_does_not_update_existing_profile() {
-    let home = temp_home("non-interactive-update");
+    let home = temp_home();
     // Create profile for alice
     write_json(
         home.join(".codex-switch/profiles/alice/auth.json"),
@@ -951,13 +891,11 @@ fn non_interactive_stdin_does_not_update_existing_profile() {
         profile_content["tokens"]["refresh_token"], "dummy-refresh",
         "profile refresh_token should not have been updated"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn list_progress_counts_only_stale_accounts() {
-    let home = temp_home("list-progress-stale-only");
+    let home = temp_home();
     write_json(
         home.join(".codex-switch/profiles/fresh/auth.json"),
         &auth_json("fresh@example.com", "acct_fresh"),
@@ -981,8 +919,6 @@ fn list_progress_counts_only_stale_accounts() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Refreshing usage ["));
     assert!(stderr.contains("1/1"));
-
-    let _ = fs::remove_dir_all(home);
 }
 
 // ── import: rotated-credential rescue ─────────────────────
@@ -1193,7 +1129,7 @@ fn run_import(home: &Path, args: &[&str], server: &MockServer) -> Output {
 
 #[test]
 fn import_rejects_an_invalid_alias_before_consuming_the_refresh_token() {
-    let home = temp_home("import-invalid-alias-preflight");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("alias@example.com", "acct_alias");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
@@ -1215,13 +1151,11 @@ fn import_rejects_an_invalid_alias_before_consuming_the_refresh_token() {
         !home.join(".codex-switch/recovery").exists(),
         "a preflight rejection must not need credential recovery"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_rejects_a_disallowed_workspace_before_consuming_the_refresh_token() {
-    let home = temp_home("import-managed-policy-preflight");
+    let home = temp_home();
     fs::create_dir_all(home.join(".codex")).unwrap();
     fs::write(
         home.join(".codex/config.toml"),
@@ -1253,13 +1187,11 @@ fn import_rejects_a_disallowed_workspace_before_consuming_the_refresh_token() {
             .contains("managed_policy"),
         "the rejection must identify the policy boundary: {report}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_rejects_a_saved_refresh_token_before_consuming_it() {
-    let home = temp_home("import-duplicate-token-preflight");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("duplicate@example.com", "acct_duplicate");
     let source = home.join("donor-auth.json");
     write_json(&source, &sample);
@@ -1296,13 +1228,11 @@ fn import_rejects_a_saved_refresh_token_before_consuming_it() {
         stored_refresh_token(&home.join(".codex-switch/profiles/existing/auth.json")),
         "refresh_old"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_rejects_the_live_refresh_token_before_consuming_it() {
-    let home = temp_home("import-live-token-preflight");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("live@example.com", "acct_live");
     let source = home.join("donor-auth.json");
     write_json(&source, &sample);
@@ -1322,8 +1252,6 @@ fn import_rejects_the_live_refresh_token_before_consuming_it() {
         stored_refresh_token(&home.join(".codex/auth.json")),
         "refresh_old"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 fn stored_refresh_token(path: &Path) -> String {
@@ -1342,7 +1270,7 @@ fn stored_refresh_token(path: &Path) -> String {
 /// it has to be written somewhere durable before the failure is reported.
 #[test]
 fn import_persists_rotated_credentials_when_usage_validation_fails() {
-    let home = temp_home("import-rotated-persist");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("rotate@example.com", "acct_rotate");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
@@ -1380,13 +1308,11 @@ fn import_persists_rotated_credentials_when_usage_validation_fails() {
         error.contains("donor"),
         "the failure must name where the rotated credentials were saved: {error}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn successful_rotated_import_promotes_stage_without_recovery_duplicate() {
-    let home = temp_home("import-rotated-promote");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("promote@example.com", "acct_promote");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
@@ -1416,13 +1342,11 @@ fn successful_rotated_import_promotes_stage_without_recovery_duplicate() {
         recovery_files, 0,
         "successful promotion must move the stage instead of leaving a credential duplicate"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 #[test]
 fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() {
-    let home = temp_home("import-rotated-missing-identity");
+    let home = temp_home();
     let mut sample = auth_json("rotate@example.com", "acct_rotate");
     sample["tokens"]
         .as_object_mut()
@@ -1470,8 +1394,6 @@ fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() 
     let error = report["error"].as_str().unwrap_or_default();
     assert!(error.contains("token_rotated"));
     assert_error_names_recovered_file(error, &recovered[0]);
-
-    let _ = fs::remove_dir_all(home);
 }
 
 /// A directory import prints one line per file. A file whose credentials were
@@ -1479,7 +1401,7 @@ fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() 
 /// profile appeared — so it must not be rendered like the others.
 #[test]
 fn import_directory_distinguishes_rotated_credentials_from_plain_skips() {
-    let home = temp_home("import-rotated-dir");
+    let home = temp_home();
     let root = home.join("to-import");
     let sample = auth_json_needing_refresh("dirrotate@example.com", "acct_dirrotate");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
@@ -1523,8 +1445,6 @@ fn import_directory_distinguishes_rotated_credentials_from_plain_skips() {
         "refresh_1",
         "the rotated refresh token was dropped during a directory import"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 /// The rescue cannot depend on the source file being writable: auth dumps are
@@ -1535,7 +1455,7 @@ fn import_directory_distinguishes_rotated_credentials_from_plain_skips() {
 fn import_persists_rotated_credentials_when_source_file_is_read_only() {
     use std::os::unix::fs::PermissionsExt;
 
-    let home = temp_home("import-rotated-readonly");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("readonly@example.com", "acct_readonly");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let dir = home.join("readonly");
@@ -1565,8 +1485,6 @@ fn import_persists_rotated_credentials_when_source_file_is_read_only() {
         error.contains("token_rotated"),
         "the rescue must still be reported, got: {error}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 /// If even the profile store cannot take the rotated credential there is
@@ -1574,7 +1492,7 @@ fn import_persists_rotated_credentials_when_source_file_is_read_only() {
 /// never be quiet: the account is gone unless the user is told now.
 #[test]
 fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
-    let home = temp_home("import-rotated-lost");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
@@ -1607,8 +1525,6 @@ fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
         error.contains("sign in again"),
         "the user must learn the account needs a new login: {error}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 /// The same single-use credential is at stake when validation *succeeds* and
@@ -1616,7 +1532,7 @@ fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
 /// available, so the rotated token must be quarantined instead of discarded.
 #[test]
 fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation() {
-    let home = temp_home("import-rotated-save-failed");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("savefail@example.com", "acct_savefail");
     let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
     let source = home.join("donor-auth.json");
@@ -1651,8 +1567,6 @@ fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation
     assert_eq!(recovered.len(), 1);
     assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
     assert_error_names_recovered_file(error, &recovered[0]);
-
-    let _ = fs::remove_dir_all(home);
 }
 
 /// The structure check that runs *after* usage validation inspects the value
@@ -1662,7 +1576,7 @@ fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation
 /// the only credential the server still accepts.
 #[test]
 fn import_rescues_rotated_credentials_when_the_refreshed_value_is_malformed() {
-    let home = temp_home("import-rotated-structure");
+    let home = temp_home();
     let sample = auth_json_needing_refresh("badid@example.com", "acct_badid");
     let source = home.join("donor-auth.json");
     write_json(&source, &sample);
@@ -1697,8 +1611,6 @@ fn import_rescues_rotated_credentials_when_the_refreshed_value_is_malformed() {
         error.contains("token_rotated"),
         "the failure must be tagged as a rotation rescue, got: {error}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }
 
 /// A `--json` directory import that imports one file fine but loses another
@@ -1708,7 +1620,7 @@ fn import_rescues_rotated_credentials_when_the_refreshed_value_is_malformed() {
 /// login.
 #[test]
 fn json_directory_import_surfaces_lost_credentials_at_top_level() {
-    let home = temp_home("import-json-lost-visible");
+    let home = temp_home();
     let root = home.join("to-import");
 
     let lost_sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
@@ -1758,6 +1670,4 @@ fn json_directory_import_surfaces_lost_credentials_at_top_level() {
         "a lost account must be discoverable from a top-level field alone, without walking \
          skipped[]: {report}"
     );
-
-    let _ = fs::remove_dir_all(home);
 }

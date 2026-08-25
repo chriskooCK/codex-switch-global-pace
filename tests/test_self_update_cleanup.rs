@@ -1,11 +1,13 @@
 #![cfg(windows)]
 
+mod support;
+
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-fn copied_application() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let directory = tempfile::tempdir().expect("create copied application directory");
+fn copied_application() -> (support::TempDir, PathBuf, PathBuf) {
+    let directory = support::tempdir();
     std::fs::create_dir(directory.path().join("state")).expect("create application state");
     std::fs::create_dir(directory.path().join("codex")).expect("create Codex state");
     let executable = directory.path().join("cleanup-startup-fixture.exe");

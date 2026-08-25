@@ -293,6 +293,56 @@ fn ensure_path_token(path: &Path, expected: &FileToken, purpose: &str) -> Result
     Ok(())
 }
 
+/// Create an application-owned temporary directory whose returned path has no
+/// symlink or reparse-point components. The operating system may expose its
+/// temporary root through an alias (macOS commonly does), so resolve that root
+/// before creating the random child rather than accepting an aliased child
+/// path at a later transaction boundary.
+pub(crate) fn create_direct_tempdir() -> Result<tempfile::TempDir> {
+    create_direct_tempdir_in(&std::env::temp_dir())
+}
+
+fn create_direct_tempdir_in(parent: &Path) -> Result<tempfile::TempDir> {
+    let physical_parent = fs::canonicalize(parent)
+        .with_context(|| format!("resolving temporary directory root {}", parent.display()))?;
+    let directory = tempfile::Builder::new()
+        .tempdir_in(&physical_parent)
+        .with_context(|| {
+            format!(
+                "creating application temporary directory in {}",
+                physical_parent.display()
+            )
+        })?;
+
+    #[cfg(unix)]
+    open_direct_directory(directory.path()).with_context(|| {
+        format!(
+            "validating direct application temporary directory {}",
+            directory.path().display()
+        )
+    })?;
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+
+        open_pinned_direct_directory(directory.path(), FILE_READ_ATTRIBUTES).with_context(
+            || {
+                format!(
+                    "validating direct application temporary directory {}",
+                    directory.path().display()
+                )
+            },
+        )?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!(
+        "direct application temporary directories are unsupported on this platform: {}",
+        directory.path().display()
+    );
+
+    Ok(directory)
+}
+
 #[cfg(unix)]
 fn direct_parent(path: &Path) -> Result<(PathBuf, &OsStr)> {
     if !path.is_absolute() {
@@ -1495,15 +1545,44 @@ pub(crate) fn remove_exact(source: &Path, expected: &FileToken) -> Result<Remove
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateExactOutcome, DirectoryRenameOutcome, RemoveExactOutcome, create_exclusive_copy,
-        remove_exact, rename_directory_noreplace_durable,
+        CreateExactOutcome, DirectoryRenameOutcome, RemoveExactOutcome, create_direct_tempdir,
+        create_exclusive_copy, remove_exact, rename_directory_noreplace_durable,
         rename_directory_noreplace_durable_with_hook, token_for_path,
     };
     use std::fs;
 
+    #[cfg(unix)]
+    #[test]
+    fn direct_tempdir_is_created_below_the_physical_parent() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = create_direct_tempdir().expect("create temporary-root fixture");
+        let physical_parent = fixture.path().join("physical");
+        let aliased_parent = fixture.path().join("alias");
+        fs::create_dir(&physical_parent).expect("create physical temporary parent");
+        symlink(&physical_parent, &aliased_parent).expect("create temporary parent alias");
+
+        let aliased_directory = tempfile::Builder::new()
+            .tempdir_in(&aliased_parent)
+            .expect("create control directory through alias");
+        assert!(
+            super::open_direct_directory(aliased_directory.path()).is_err(),
+            "the transaction path policy must continue rejecting the aliased control path"
+        );
+
+        let physical_parent =
+            fs::canonicalize(&physical_parent).expect("resolve expected physical temporary parent");
+        let directory = super::create_direct_tempdir_in(&aliased_parent)
+            .expect("create direct temporary directory through an aliased root");
+
+        assert_eq!(directory.path().parent(), Some(physical_parent.as_path()));
+        super::open_direct_directory(directory.path())
+            .expect("created temporary directory must be directly openable");
+    }
+
     #[test]
     fn durable_directory_rename_supports_cross_parent_no_replace_moves() {
-        let root = tempfile::tempdir().unwrap();
+        let root = create_direct_tempdir().unwrap();
         let source_parent = root.path().join("source-parent");
         let destination_parent = root.path().join("destination-parent");
         fs::create_dir_all(source_parent.join("profile")).unwrap();
@@ -1540,7 +1619,7 @@ mod tests {
     fn durable_directory_rename_never_follows_a_source_symlink() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = create_direct_tempdir().unwrap();
         let original = root.path().join("original");
         let source = root.path().join("source-link");
         let destination = root.path().join("destination");
@@ -1562,7 +1641,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn durable_directory_rename_rejects_a_source_swapped_after_binding() {
-        let root = tempfile::tempdir().unwrap();
+        let root = create_direct_tempdir().unwrap();
         let source_parent = root.path().join("source-parent");
         let destination_parent = root.path().join("destination-parent");
         let source = source_parent.join("profile");
@@ -1598,7 +1677,7 @@ mod tests {
     fn durable_directory_rename_restores_a_symlink_swapped_after_binding() {
         use std::os::unix::fs::symlink;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = create_direct_tempdir().unwrap();
         let source_parent = root.path().join("source-parent");
         let destination_parent = root.path().join("destination-parent");
         let source = source_parent.join("profile");
@@ -1634,7 +1713,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn durable_directory_rename_pins_the_source_namespace_until_handle_rename() {
-        let root = tempfile::tempdir().unwrap();
+        let root = create_direct_tempdir().unwrap();
         let source_parent = root.path().join("source-parent");
         let destination_parent = root.path().join("destination-parent");
         let source = source_parent.join("profile");
@@ -1661,7 +1740,7 @@ mod tests {
 
     #[test]
     fn exclusive_copy_and_exact_removal_preserve_the_bound_bytes() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = create_direct_tempdir().unwrap();
         let source = directory.path().join("source.bin");
         let destination = directory.path().join("destination.bin");
         fs::write(&source, b"verified installer bytes").unwrap();
@@ -1682,7 +1761,7 @@ mod tests {
 
     #[test]
     fn exclusive_copy_never_overwrites_a_preexisting_destination() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = create_direct_tempdir().unwrap();
         let source = directory.path().join("source.bin");
         let destination = directory.path().join("destination.bin");
         fs::write(&source, b"candidate").unwrap();
@@ -1695,7 +1774,7 @@ mod tests {
 
     #[test]
     fn source_token_mismatch_fails_before_creating_a_destination() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = create_direct_tempdir().unwrap();
         let source = directory.path().join("source.bin");
         let other = directory.path().join("other.bin");
         let destination = directory.path().join("destination.bin");
@@ -1709,7 +1788,7 @@ mod tests {
 
     #[test]
     fn exact_removal_rejects_a_different_token_without_mutation() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = create_direct_tempdir().unwrap();
         let source = directory.path().join("source.bin");
         let other = directory.path().join("other.bin");
         fs::write(&source, b"owned bytes").unwrap();
@@ -1722,7 +1801,7 @@ mod tests {
 
     #[test]
     fn created_outcome_exposes_the_exact_created_token() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = create_direct_tempdir().unwrap();
         let source = directory.path().join("source.bin");
         let destination = directory.path().join("destination.bin");
         fs::write(&source, b"candidate").unwrap();

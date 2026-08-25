@@ -95,7 +95,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn join_failure_is_reported_only_after_later_persistence_finishes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::fs_ops::create_direct_tempdir().unwrap();
         let persisted = temp.path().join("persisted");
         let delayed_path = persisted.clone();
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));

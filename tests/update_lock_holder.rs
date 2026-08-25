@@ -1,10 +1,12 @@
+mod support;
+
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const READY_MARKER: &str = "codex-switch-global-pace update lock ready";
 
@@ -12,17 +14,8 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_codex-switch-global-pace")
 }
 
-fn temp_home(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "codex-switch-global-pace-{name}-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).expect("create test home");
-    path
+fn temp_home() -> support::TempDir {
+    support::tempdir()
 }
 
 fn holder_command(home: &Path, target: &Path) -> Command {
@@ -72,7 +65,7 @@ fn internal_update_lock_command_is_absent_from_help() {
 
 #[test]
 fn two_lock_holders_serialize_on_the_normalized_destination() {
-    let home = temp_home("update-lock-holder");
+    let home = temp_home();
     let install_dir = home.join("install");
     fs::create_dir(&install_dir).expect("create install directory");
     fs::write(home.join("blocked-config"), b"not a directory")

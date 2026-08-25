@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrips_through_disk() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon-state.json");
 
         let state = DaemonState {
@@ -125,14 +125,14 @@ mod tests {
 
     #[test]
     fn missing_snapshot_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon-state.json");
         assert!(read_at(&path).unwrap().is_none());
     }
 
     #[test]
     fn malformed_snapshot_is_reported_instead_of_treated_as_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let path = dir.path().join("daemon-state.json");
         std::fs::write(&path, b"not json").unwrap();
 
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn snapshot_io_error_is_reported_instead_of_treated_as_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
 
         let error = read_at(dir.path()).expect_err("a directory is not a readable state file");
 
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn snapshot_write_error_is_returned_to_the_best_effort_logging_boundary() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
         let destination_is_a_directory = dir.path().join("daemon-state.json");
         std::fs::create_dir(&destination_is_a_directory).unwrap();
 

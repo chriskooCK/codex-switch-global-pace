@@ -3663,7 +3663,7 @@ mod tests {
     #[tokio::test]
     async fn warmup_cache_failure_remains_visible_and_starts_no_task() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         std::fs::write(home.path().join("cache.json"), b"{not valid json")
             .expect("write malformed usage cache");
@@ -3697,7 +3697,7 @@ mod tests {
     #[tokio::test]
     async fn blocked_cache_preflight_keeps_the_ui_path_nonblocking_and_starts_no_partial_batch() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let cache_lock_path = home.path().join("cache.lock");
         let cache_lock = std::fs::OpenOptions::new()
@@ -3824,7 +3824,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let mut app = App::new();
         for (alias, secret) in [
@@ -3876,7 +3876,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         crate::cache::put(
             "account",
@@ -3979,7 +3979,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
 
@@ -4027,7 +4027,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4098,7 +4098,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4160,7 +4160,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4230,7 +4230,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4284,7 +4284,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4358,7 +4358,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
 
         let mut app = App::new();
@@ -4411,7 +4411,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
         let lease_control = profile::ProfileLeaseAcquireControl::new();
@@ -4456,7 +4456,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let lease_control = profile::ProfileLeaseAcquireControl::new();
         let login_control = lease_control.clone();
@@ -4652,7 +4652,7 @@ mod tests {
     #[tokio::test]
     async fn untracked_live_auth_does_not_leave_stale_profile_active() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4713,7 +4713,7 @@ mod tests {
     #[tokio::test]
     async fn partial_switch_publication_updates_the_tui_to_the_actual_live_account() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4785,7 +4785,7 @@ mod tests {
     #[tokio::test]
     async fn partial_switch_rechecks_live_auth_before_updating_the_tui() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4849,7 +4849,7 @@ mod tests {
     #[tokio::test]
     async fn partial_switch_reconciliation_failure_clears_every_active_highlight() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4911,7 +4911,7 @@ mod tests {
     #[tokio::test]
     async fn successful_switch_surfaces_selection_history_failure_as_a_warning() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -4958,7 +4958,7 @@ mod tests {
     #[test]
     fn failed_profile_reload_preserves_the_previous_model_and_reports_the_error() {
         let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -5577,7 +5577,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let profile_path = home.path().join("profiles/account/auth.json");
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
@@ -5696,7 +5696,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
@@ -5753,7 +5753,7 @@ mod tests {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let home = tempfile::tempdir().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let codex_home = home.path().join("codex");
         let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
