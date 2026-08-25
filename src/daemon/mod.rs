@@ -3382,6 +3382,12 @@ mod tests {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null());
                 super::isolate_lifecycle_holder_from_terminal_interrupt(&mut command);
+                // The coordinator is deliberately killed while this isolated child survives;
+                // waiting here would invalidate the process-group isolation contract.
+                #[allow(
+                    clippy::zombie_processes,
+                    reason = "the coordinator intentionally exits before its isolated child"
+                )]
                 let mut holder = command.spawn().expect("spawn isolated holder helper");
                 let mut output =
                     std::io::BufReader::new(holder.stdout.take().expect("holder stdout"));
