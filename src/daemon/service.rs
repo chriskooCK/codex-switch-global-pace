@@ -90,17 +90,19 @@ fn acquire_service_operation_lease_at(path: &Path) -> Result<ServiceOperationLea
 pub fn install(expected_existing_executable: Option<PathBuf>) -> Result<()> {
     validate_install_migration_authority(expected_existing_executable.as_deref())?;
     let _lease = acquire_service_operation_lease()?;
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let executable = std::env::current_exe().context("locating daemon executable")?;
-        return install_for_executable_locked(
+        install_for_executable_locked(
             &executable,
             expected_existing_executable.as_deref(),
             &_lease,
-        );
+        )
     }
     #[cfg(target_os = "windows")]
-    return install_task_scheduler(expected_existing_executable.as_deref());
+    {
+        install_task_scheduler(expected_existing_executable.as_deref())
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     anyhow::bail!("Service install is not supported on this platform")
 }
@@ -1097,11 +1099,11 @@ pub(crate) fn capture_service_state_snapshot(
                 "LaunchAgent is loaded without an exact definition that can bind runtime ownership"
             );
         }
-        return Ok(ServiceStateSnapshot {
+        Ok(ServiceStateSnapshot {
             definition,
             loaded: runtime.loaded,
             manager_pid: runtime.manager_pid,
-        });
+        })
     }
     #[cfg(target_os = "linux")]
     {
@@ -1118,12 +1120,12 @@ pub(crate) fn capture_service_state_snapshot(
         }
         let manager_pid = systemd_manager_pid_checked()?;
         require_manager_runtime_consistency("systemd", "active", active, "MainPID", manager_pid)?;
-        return Ok(ServiceStateSnapshot {
+        Ok(ServiceStateSnapshot {
             definition,
             enabled,
             active,
             manager_pid,
-        });
+        })
     }
     #[cfg(target_os = "windows")]
     {

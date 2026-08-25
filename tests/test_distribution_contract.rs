@@ -3315,14 +3315,15 @@ PLATFORM=linux
 reset_managed_path_transaction
 prepare_managed_path_addition
 commit_managed_path_changes
+recovery_path="${{PATH_TRANSACTION_STAGE[0]}}"
 printf '%s\n' 'foreign profile' > "$HOME/replacement-profile"
 mv -f "$HOME/replacement-profile" "$HOME/.profile"
 if rollback_managed_path_changes; then
   exit 1
 fi
-[ "$PATH_TRANSACTION_ERROR" = "exact displaced profile remains at $HOME/.profile.$BINARY_NAME.install" ]
+[ "$PATH_TRANSACTION_ERROR" = "exact displaced profile remains at $recovery_path" ]
 [ "$(cat "$HOME/.profile")" = 'foreign profile' ]
-[ "$(cat "$HOME/.profile.$BINARY_NAME.install")" = 'export KEEP=1' ]
+[ "$(cat "$recovery_path")" = 'export KEEP=1' ]
 "#
     );
     let output = unix_installer_test_command()
