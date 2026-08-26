@@ -28,6 +28,9 @@
   0.149.0. The models query uses that same protocol version, and the subprocess
   version probe and its fallback were removed. Authentication fields remain
   strictly validated.
+- **Minimum Rust enforcement** — CI reads the package `rust-version` directly
+  from Cargo metadata and checks every target with that exact toolchain, keeping
+  the manifest as the single source of truth for compiler compatibility.
 - **Confirmation cleanup** — The obsolete TUI approval transition was removed;
   CLI overwrite confirmation and the TUI's non-overwriting validation now have
   distinct, direct paths.
