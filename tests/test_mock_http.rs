@@ -345,6 +345,159 @@ async fn usage_retry_exhaustion_returns_last_error_after_three_attempts() {
     server.shutdown();
 }
 
+#[tokio::test]
+async fn invalid_usage_schema_is_not_retried_as_a_network_failure() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
+    let server = mock::MockServer::start_programmed(vec![(
+        "invalid_schema".to_string(),
+        vec![mock::MockResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": 604800
+                    },
+                    "secondary_window": null
+                },
+                "rate_limit_reached_type": 7
+            }),
+        )],
+    )])
+    .await;
+    let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
+    let dir = support::tempdir();
+    let auth_path = dir.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&json!({
+            "tokens": {"access_token": "invalid_schema"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let error = usage::fetch_usage_retried_force("invalid_schema", &auth_path)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.detail.contains("rate_limit_reached_type"),
+        "{}",
+        error.detail
+    );
+    assert_eq!(
+        server.request_count("invalid_schema"),
+        1,
+        "a deterministic schema rejection must not be replayed"
+    );
+    server.shutdown();
+}
+
+#[tokio::test]
+async fn nullable_weekly_only_pro_response_is_usable_end_to_end() {
+    let _lock = HTTP_ENV_LOCK.lock().await;
+    init_test_config();
+    let now = auth::now_unix_secs().expect("test clock must produce a Unix timestamp");
+    let server = mock::MockServer::start_programmed(vec![(
+        "nullable_weekly_pro".to_string(),
+        vec![mock::MockResponse::json(
+            reqwest::StatusCode::OK,
+            json!({
+                "plan_type": "pro",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 69,
+                        "limit_window_seconds": 604800,
+                        "reset_at": now + usage::WINDOW_7D_SECS / 2
+                    },
+                    "secondary_window": null
+                },
+                "credits": null,
+                "spend_control": {
+                    "reached": false,
+                    "individual_limit": null
+                },
+                "additional_rate_limits": [{
+                    "limit_name": "Synthetic model pool",
+                    "metered_feature": "codex_synthetic",
+                    "rate_limit": {
+                        "allowed": true,
+                        "limit_reached": false,
+                        "primary_window": {
+                            "used_percent": 12,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": now + usage::WINDOW_5H_SECS / 2
+                        },
+                        "secondary_window": null
+                    }
+                }],
+                "rate_limit_reached_type": null,
+                "rate_limit_reset_credits": {
+                    "available_count": 2,
+                    "credits": null
+                }
+            }),
+        )],
+    )])
+    .await;
+    let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
+    let _reset_url = EnvVarGuard::set("CS_RESET_CREDITS_URL", server.reset_credits_url());
+    let dir = support::tempdir();
+    let auth_path = dir.path().join("auth.json");
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&json!({
+            "tokens": {"access_token": "nullable_weekly_pro"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let usage = usage::fetch_usage_retried_force("nullable_weekly_pro", &auth_path)
+        .await
+        .expect("the current nullable weekly-only Pro response must be usable");
+    let account = AccountInfo {
+        plan_type: Some("pro".to_string()),
+        ..AccountInfo::default()
+    };
+
+    assert_eq!(server.request_count("nullable_weekly_pro"), 1);
+    assert_eq!(usage.plan_type.as_deref(), Some("pro"));
+    assert!(usage.primary.is_none());
+    assert_eq!(usage.additional_limits.len(), 1);
+    assert_eq!(
+        usage.additional_limits[0].metered_feature.as_deref(),
+        Some("codex_synthetic")
+    );
+    assert_eq!(
+        usage
+            .secondary
+            .as_ref()
+            .and_then(|window| window.used_percent),
+        Some(69.0)
+    );
+    assert!(usage::is_available(&usage, &account));
+    let candidate = usage::Candidate::from_usage(
+        "nullable_weekly_pro".to_string(),
+        &usage,
+        codex_switch::jwt::PlanKind::Pro,
+        0,
+        now,
+    );
+    assert!(candidate.has_required_quota_data());
+    assert!(usage::is_candidate_eligible(&candidate, 20.0));
+    let global = usage::GlobalPaceAccountInput::from_usage("nullable_weekly_pro", &usage);
+    assert!(usage::calculate_account_weekly_pace(&global, now).is_some());
+    server.shutdown();
+}
+
 // ── Tests ──
 
 #[tokio::test]

@@ -15,6 +15,24 @@ use super::{
     TerminalAuthError, TokenPersistFailure, UsageError, UsageInfo,
 };
 
+/// A successful HTTP response whose JSON does not satisfy the usage schema.
+/// Repeating the same read cannot turn that payload into trustworthy quota
+/// data, so the outer network retry loop must surface it immediately.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+struct InvalidUsageResponse {
+    detail: String,
+}
+
+fn parse_checked_usage_response(body: &Value) -> Result<UsageInfo> {
+    parse_usage_checked(body).map_err(|error| {
+        InvalidUsageResponse {
+            detail: format!("{error:#}"),
+        }
+        .into()
+    })
+}
+
 pub(crate) fn apply_account_routing_headers(
     mut builder: reqwest::RequestBuilder,
     account_id: Option<&str>,
@@ -713,6 +731,13 @@ async fn fetch_usage_retried_with_lease(
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                if e.downcast_ref::<InvalidUsageResponse>().is_some() {
+                    warn!("[{alias}] Usage API response rejected without retry: {msg}");
+                    return Err(UsageError {
+                        summary: extract_error_summary(&msg),
+                        detail: msg,
+                    });
+                }
                 warn!(
                     "[{alias}] attempt {}/{max_attempts} failed: {msg}",
                     attempt + 1
@@ -878,7 +903,7 @@ where
                         "[{alias}] Usage API raw body (proactive): {}",
                         crate::auth::redact_sensitive_log_body(&body)
                     );
-                    let mut usage = parse_usage_checked(&body)?;
+                    let mut usage = parse_checked_usage_response(&body)?;
                     enrich_reset_credits(
                         endpoints, alias, &client, &bearer, account_id, is_fedramp, &mut usage,
                     )
@@ -925,7 +950,7 @@ where
             "[{alias}] Usage API raw body: {}",
             crate::auth::redact_sensitive_log_body(&body)
         );
-        let mut usage = parse_usage_checked(&body)?;
+        let mut usage = parse_checked_usage_response(&body)?;
         enrich_reset_credits(
             endpoints,
             alias,
@@ -976,7 +1001,7 @@ where
                             "failed to parse usage response after refresh (HTTP {status2}): {e}"
                         )
                     })?;
-                    let mut usage = parse_usage_checked(&body)?;
+                    let mut usage = parse_checked_usage_response(&body)?;
                     enrich_reset_credits(
                         endpoints, alias, &client, &bearer, account_id, is_fedramp, &mut usage,
                     )

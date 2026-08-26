@@ -1701,7 +1701,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_quota_is_unavailable_while_explicit_limits_remain_limited() {
+    fn weekly_quota_is_plan_independent_while_explicit_limits_remain_limited() {
         let missing_windows = UsageInfo::default();
         let missing_percent = UsageInfo {
             primary: Some(WindowUsage::default()),
@@ -1755,7 +1755,7 @@ mod tests {
         );
         assert_eq!(
             usage_availability(&available, &plus),
-            UsageAvailability::Unavailable
+            UsageAvailability::Available
         );
         assert_eq!(
             usage_availability(&exhausted, &AccountInfo::default()),

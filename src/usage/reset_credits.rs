@@ -131,8 +131,8 @@ async fn fetch_reset_credits_at_url(
         .json()
         .await
         .map_err(|e| anyhow::anyhow!("failed to parse reset credits response: {e}"))?;
-    parse_reset_credits_summary(&body)
-        .context("reset credits response does not match the expected summary shape")
+    parse_reset_credits_details(&body)
+        .context("reset credits response does not match the expected details shape")
 }
 
 pub(crate) fn reset_credit_expiry_sort_key(credit: &ResetCredit) -> i64 {
@@ -468,16 +468,12 @@ pub(super) fn parse_reset_credits_summary(body: &Value) -> Result<ResetCreditsSu
                 "reset credits summary must not contain both available_count and availableCount"
             )
         }
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => value,
+        (None, None) => anyhow::bail!("reset credits summary missing available_count"),
     };
-    let mut available_count = count_value
-        .map(|value| {
-            parse_optional_u64(Some(value)).context(
-                "reset credits available_count must be a non-negative integer or numeric string",
-            )
-        })
-        .transpose()?;
+    let available_count = parse_optional_u64(Some(count_value)).context(
+        "reset credits available_count must be a non-negative integer or numeric string",
+    )?;
     let credits = match obj.get("credits") {
         Some(Value::Array(items)) => Some(
             items
@@ -492,20 +488,22 @@ pub(super) fn parse_reset_credits_summary(body: &Value) -> Result<ResetCreditsSu
                 .flatten()
                 .collect::<Vec<_>>(),
         ),
+        None | Some(Value::Null) => None,
         Some(_) => anyhow::bail!("reset credits credits field must be an array"),
-        None => None,
     };
-    if count_value.is_none() && credits.is_none() {
-        anyhow::bail!("reset credits response missing expected fields");
-    }
-    if available_count.is_none() && credits.as_ref().is_some_and(Vec::is_empty) {
-        available_count = Some(0);
-    }
 
     Ok(ResetCreditsSummary {
-        available_count,
+        available_count: Some(available_count),
         credits,
     })
+}
+
+fn parse_reset_credits_details(body: &Value) -> Result<ResetCreditsSummary> {
+    let summary = parse_reset_credits_summary(body)?;
+    if summary.credits.is_none() {
+        anyhow::bail!("reset credits details response credits field must be an array");
+    }
+    Ok(summary)
 }
 
 /// Revalidate the exact card the user approved against a forced usage fetch
@@ -629,11 +627,24 @@ mod tests {
         let app = axum::Router::new()
             .route(
                 "/bad-credits",
-                get(|| async { Json(json!({"credits": {"id": "not-an-array"}})) }),
+                get(|| async {
+                    Json(json!({
+                        "available_count": 1,
+                        "credits": {"id": "not-an-array"}
+                    }))
+                }),
             )
             .route(
                 "/bad-count",
                 get(|| async { Json(json!({"available_count": "many"})) }),
+            )
+            .route(
+                "/null-credits",
+                get(|| async { Json(json!({"available_count": 0, "credits": null})) }),
+            )
+            .route(
+                "/missing-credits",
+                get(|| async { Json(json!({"available_count": 0})) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -658,10 +669,35 @@ mod tests {
         )
         .await
         .unwrap_err();
+        let null_credits = fetch_reset_credits_at_url(
+            &client,
+            "access-token",
+            None,
+            false,
+            &format!("http://{address}/null-credits"),
+        )
+        .await
+        .unwrap_err();
+        let missing_credits = fetch_reset_credits_at_url(
+            &client,
+            "access-token",
+            None,
+            false,
+            &format!("http://{address}/missing-credits"),
+        )
+        .await
+        .unwrap_err();
         server.abort();
 
         assert!(format!("{bad_credits:#}").contains("credits field must be an array"));
         assert!(format!("{bad_count:#}").contains("available_count must be"));
+        assert!(
+            format!("{null_credits:#}").contains("details response credits field must be an array")
+        );
+        assert!(
+            format!("{missing_credits:#}")
+                .contains("details response credits field must be an array")
+        );
     }
 
     #[test]
@@ -689,6 +725,7 @@ mod tests {
     #[test]
     fn empty_credit_id_rejects_the_summary_before_selection() {
         let error = parse_reset_credits_summary(&json!({
+            "available_count": 2,
             "credits": [
                 {
                     "id": "  ",
@@ -710,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_empty_credit_list_without_count_clears_stale_count_and_cards() {
+    fn explicit_empty_credit_list_clears_stale_count_and_cards() {
         let mut usage = UsageInfo {
             reset_credits_available_count: Some(1),
             reset_credits: vec![ResetCredit {
@@ -723,7 +760,7 @@ mod tests {
 
         merge_reset_credits(
             &mut usage,
-            parse_reset_credits_summary(&json!({"credits": []})).unwrap(),
+            parse_reset_credits_summary(&json!({"available_count": 0, "credits": []})).unwrap(),
         );
 
         assert_eq!(usage.reset_credits_available_count, Some(0));
@@ -731,10 +768,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_summary_treats_null_credits_as_omitted() {
+        for body in [
+            json!({"available_count": 2}),
+            json!({"available_count": 2, "credits": null}),
+        ] {
+            let summary = parse_reset_credits_summary(&body).unwrap();
+            assert_eq!(summary.available_count, Some(2));
+            assert!(summary.credits.is_none());
+        }
+    }
+
+    #[test]
     fn explicit_malformed_summary_fields_are_not_treated_as_omitted() {
         for malformed in [
-            json!({"credits": null}),
-            json!({"credits": {}}),
+            json!({}),
+            json!({"credits": []}),
+            json!({"available_count": 0, "credits": {}}),
             json!({"available_count": -1}),
             json!({"available_count": "many"}),
             json!({"available_count": null}),
@@ -749,11 +799,11 @@ mod tests {
     #[test]
     fn explicit_malformed_credit_item_rejects_the_whole_summary() {
         for malformed in [
-            json!({"credits": [7]}),
-            json!({"credits": [{}]}),
-            json!({"credits": [{"id": "  ", "status": "available"}]}),
-            json!({"credits": [{"id": "credit-1", "status": 1}]}),
-            json!({"credits": [{"id": "credit-1", "expires_at": 123}]}),
+            json!({"available_count": 1, "credits": [7]}),
+            json!({"available_count": 1, "credits": [{}]}),
+            json!({"available_count": 1, "credits": [{"id": "  ", "status": "available"}]}),
+            json!({"available_count": 1, "credits": [{"id": "credit-1", "status": 1}]}),
+            json!({"available_count": 1, "credits": [{"id": "credit-1", "expires_at": 123}]}),
         ] {
             let error = parse_reset_credits_summary(&malformed)
                 .expect_err("a malformed explicit card must reject the summary");
@@ -764,6 +814,7 @@ mod tests {
         }
 
         let summary = parse_reset_credits_summary(&json!({
+            "available_count": 1,
             "credits": [
                 {"reset_type": "other_product"},
                 {"status": "redeemed"},

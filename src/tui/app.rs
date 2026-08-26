@@ -1779,14 +1779,15 @@ impl App {
         {
             return None;
         }
-        let window = match crate::usage::normalized_plan_kind(usage, &entry.info) {
-            crate::jwt::PlanKind::Free => usage.secondary.as_ref(),
-            crate::jwt::PlanKind::Unknown => None,
-            _ => usage.primary.as_ref(),
-        };
-        window
-            .and_then(|window| window.used_percent)
-            .and_then(|used| crate::usage::normalized_quota_usage(Some(used)))
+        [
+            (usage.primary.as_ref(), crate::usage::WINDOW_5H_SECS),
+            (usage.secondary.as_ref(), crate::usage::WINDOW_7D_SECS),
+        ]
+        .into_iter()
+        .find_map(|(window, default_duration_secs)| {
+            crate::usage::validated_quota_window(window?, default_duration_secs)
+                .map(|(used_percent, _)| used_percent)
+        })
     }
 
     fn status_order(&self, idx: usize) -> u8 {
@@ -2783,8 +2784,8 @@ impl App {
     }
 
     /// Toggle auto-warmup. Auto-warmup piggybacks on the auto-refresh tick: every
-    /// refresh cycle it calls `warmup_all`, which spawns warmup for any account
-    /// whose 5h window has expired (paid) or 7d window has expired (free).
+    /// refresh cycle it calls `warmup_all`, which warms the short window when
+    /// present, or the weekly window for a weekly-only response.
     /// Enabling auto-warmup turns on auto-refresh if it is off — without refresh,
     /// the warmup pass has no fresh usage data to decide eligibility.
     pub fn toggle_auto_warmup(&mut self) {
@@ -3724,7 +3725,7 @@ mod tests {
     }
 
     #[test]
-    fn status_sort_uses_plan_required_quota_shape() {
+    fn status_sort_groups_limited_before_available_independent_of_plan() {
         let weekly_only = UsageInfo {
             secondary: Some(WindowUsage {
                 used_percent: Some(20.0),
@@ -3752,7 +3753,7 @@ mod tests {
                 is_current: false,
             },
             AccountEntry {
-                alias: "plus-incomplete".into(),
+                alias: "plus-limited".into(),
                 info: plus(),
                 usage: UsageStatus::Loaded(Box::new(UsageInfo {
                     account_limited: true,
@@ -3778,12 +3779,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             aliases,
-            vec!["plus-incomplete", "free-complete", "plus-complete"]
+            vec!["plus-limited", "free-complete", "plus-complete"]
         );
     }
 
     #[test]
-    fn quota_sort_puts_incomplete_paid_samples_after_complete_accounts() {
+    fn quota_sort_uses_valid_short_then_weekly_without_plan_shape_assumptions() {
         let weekly = |used_percent| WindowUsage {
             used_percent: Some(used_percent),
             ..WindowUsage::default()
@@ -3795,30 +3796,51 @@ mod tests {
         let mut app = App::new();
         app.accounts = vec![
             AccountEntry {
-                alias: "plus-incomplete".into(),
+                alias: "weekly-missing".into(),
                 info: plus(),
                 usage: UsageStatus::Loaded(Box::new(UsageInfo {
-                    account_limited: true,
-                    secondary: Some(weekly(5.0)),
+                    primary: Some(weekly(5.0)),
                     ..UsageInfo::default()
                 })),
                 is_current: false,
             },
             AccountEntry {
-                alias: "plus-complete".into(),
+                alias: "short-preferred".into(),
                 info: plus(),
                 usage: UsageStatus::Loaded(Box::new(UsageInfo {
                     primary: Some(weekly(30.0)),
-                    secondary: Some(weekly(40.0)),
+                    secondary: Some(weekly(1.0)),
                     ..UsageInfo::default()
                 })),
                 is_current: false,
             },
             AccountEntry {
-                alias: "free-complete".into(),
+                alias: "weekly-only-pro".into(),
+                info: plus(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    plan_type: Some("pro".to_string()),
+                    secondary: Some(weekly(20.0)),
+                    ..UsageInfo::default()
+                })),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "weekly-only-unknown".into(),
                 info: AccountInfo::default(),
                 usage: UsageStatus::Loaded(Box::new(UsageInfo {
-                    secondary: Some(weekly(20.0)),
+                    plan_type: Some("future_plan".to_string()),
+                    secondary: Some(weekly(10.0)),
+                    ..UsageInfo::default()
+                })),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "weekly-after-invalid-short".into(),
+                info: plus(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    plan_type: Some("pro".to_string()),
+                    primary: Some(weekly(101.0)),
+                    secondary: Some(weekly(15.0)),
                     ..UsageInfo::default()
                 })),
                 is_current: false,
@@ -3835,7 +3857,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             aliases,
-            vec!["free-complete", "plus-complete", "plus-incomplete"]
+            vec![
+                "weekly-only-unknown",
+                "weekly-after-invalid-short",
+                "weekly-only-pro",
+                "short-preferred",
+                "weekly-missing",
+            ]
         );
     }
 

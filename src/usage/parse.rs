@@ -126,9 +126,9 @@ struct RateLimitFlags {
     limit_reached: Option<bool>,
 }
 
-/// Current responses always name a string plan. Absence remains accepted for
-/// the legacy response shape supported by this project, but an explicitly
-/// present value must follow the current schema.
+/// Keep the public parser compatible with stored legacy responses that did not
+/// include a plan. The checked network parser separately enforces the current
+/// raw response contract, where `plan_type` is required.
 fn parse_plan_type(body: &Value) -> std::result::Result<Option<String>, UsageParseIssue> {
     match body.get("plan_type") {
         None => Ok(None),
@@ -177,11 +177,50 @@ fn parse_spend_control_reached(body: &Value) -> std::result::Result<Option<bool>
             });
         }
     };
-    optional_bool(object, "reached", "spend_control").map_err(|error| {
+    let reached = optional_bool(object, "reached", "spend_control").map_err(|error| {
         UsageParseIssue::InvalidSpendControl {
             detail: format!("{error:#}"),
         }
-    })
+    })?;
+    match object.get("individual_limit") {
+        None | Some(Value::Null | Value::Object(_)) => {}
+        Some(_) => {
+            return Err(UsageParseIssue::InvalidSpendControl {
+                detail: "spend_control.individual_limit must be an object or null when present"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(reached)
+}
+
+fn validate_credits(body: &Value) -> Result<()> {
+    let credits = match body.get("credits") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(Value::Object(credits)) => credits,
+        Some(_) => anyhow::bail!("credits must be an object or null when present"),
+    };
+
+    optional_bool(credits, "has_credits", "credits")?;
+    optional_bool(credits, "unlimited", "credits")?;
+    match credits.get("balance") {
+        None | Some(Value::Null) => {}
+        Some(Value::Number(balance)) if balance.as_f64().is_some_and(f64::is_finite) => {}
+        Some(Value::String(balance))
+            if balance
+                .parse::<f64>()
+                .is_ok_and(|balance| balance.is_finite()) => {}
+        Some(_) => {
+            anyhow::bail!("credits.balance must be a finite number, numeric string, or null")
+        }
+    }
+    for key in ["approx_local_messages", "approx_cloud_messages"] {
+        match credits.get(key) {
+            None | Some(Value::Null | Value::Array(_)) => {}
+            Some(_) => anyhow::bail!("credits.{key} must be an array or null when present"),
+        }
+    }
+    Ok(())
 }
 
 fn optional_window(
@@ -203,18 +242,31 @@ fn parse_additional_rate_limit_item(
     let item_object = item
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("{path} must be an object"))?;
+    let limit_name = optional_string(item_object, "limit_name", path)?;
+    let metered_feature = optional_string(item_object, "metered_feature", path)?;
+    if !allow_direct_rate_limit && (limit_name.is_none() || metered_feature.is_none()) {
+        anyhow::bail!("{path} must contain string limit_name and metered_feature");
+    }
     let (rate_limit, rate_limit_path) = if allow_direct_rate_limit {
         match item_object.get("rate_limit") {
-            None => (item, path.to_string()),
-            Some(value) => (value, format!("{path}.rate_limit")),
+            None => (Some(item), path.to_string()),
+            Some(value) => (Some(value), format!("{path}.rate_limit")),
         }
     } else {
-        (
-            item_object
-                .get("rate_limit")
-                .ok_or_else(|| anyhow::anyhow!("{path}.rate_limit is required"))?,
-            format!("{path}.rate_limit"),
-        )
+        match item_object.get("rate_limit") {
+            None | Some(Value::Null) => (None, format!("{path}.rate_limit")),
+            Some(value) => (Some(value), format!("{path}.rate_limit")),
+        }
+    };
+    let Some(rate_limit) = rate_limit else {
+        return Ok(AdditionalRateLimit {
+            limit_name,
+            metered_feature,
+            allowed: None,
+            limit_reached: None,
+            primary: None,
+            secondary: None,
+        });
     };
     let rate_limit_object = rate_limit
         .as_object()
@@ -239,8 +291,8 @@ fn parse_additional_rate_limit_item(
         );
     }
     Ok(AdditionalRateLimit {
-        limit_name: optional_string(item_object, "limit_name", path)?,
-        metered_feature: optional_string(item_object, "metered_feature", path)?,
+        limit_name,
+        metered_feature,
         allowed,
         limit_reached,
         primary,
@@ -250,9 +302,9 @@ fn parse_additional_rate_limit_item(
 
 fn parse_additional_rate_limits(body: &Value) -> Result<Vec<AdditionalRateLimit>> {
     let items = match body.get("additional_rate_limits") {
-        None => return Ok(Vec::new()),
+        None | Some(Value::Null) => return Ok(Vec::new()),
         Some(Value::Array(items)) => items,
-        Some(_) => anyhow::bail!("must be an array when present"),
+        Some(_) => anyhow::bail!("must be an array or null when present"),
     };
     items
         .iter()
@@ -290,8 +342,9 @@ fn invalid_rate_limit_reason(value: &Value, detail: impl Into<String>) -> UsageP
 }
 
 fn rate_limit_reached_type(body: &Value) -> std::result::Result<Option<String>, UsageParseIssue> {
-    let Some(value) = body.get("rate_limit_reached_type") else {
-        return Ok(None);
+    let value = match body.get("rate_limit_reached_type") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(value) => value,
     };
     let reason = match value {
         Value::String(reason) => reason,
@@ -312,11 +365,19 @@ fn rate_limit_reached_type(body: &Value) -> std::result::Result<Option<String>, 
 }
 
 fn reset_credits_summary_value(body: &Value) -> Option<&Value> {
-    body.get("rate_limit_reset_credits")
-        .or_else(|| body.get("rateLimitResetCredits"))
+    let value = match body.get("rate_limit_reset_credits") {
+        Some(value) => Some(value),
+        None => body.get("rateLimitResetCredits"),
+    };
+    value.filter(|value| !value.is_null())
 }
 
-pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
+fn validate_usage_response_schema(body: &Value) -> Result<()> {
+    match parse_plan_type(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))? {
+        Some(_) => {}
+        None => anyhow::bail!("plan_type: is required"),
+    }
+
     for (name, pointer) in [
         ("primary_window", "/rate_limit/primary_window"),
         ("secondary_window", "/rate_limit/secondary_window"),
@@ -326,8 +387,8 @@ pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
                 .with_context(|| format!("usage response contains invalid {name}"))?;
         }
     }
-    parse_plan_type(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
     parse_rate_limit_flags(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
+    validate_credits(body).context("usage response contains invalid credits")?;
     parse_spend_control_reached(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
     rate_limit_reached_type(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
     parse_additional_rate_limits(body)
@@ -338,31 +399,12 @@ pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
         parse_reset_credits_summary(summary)
             .context("usage response contains an invalid reset credits summary")?;
     }
-    let usage = parse_usage(body)?;
-    let credits_has_data = body
-        .get("credits")
-        .and_then(Value::as_object)
-        .is_some_and(|credits| {
-            credits
-                .get("has_credits")
-                .and_then(Value::as_bool)
-                .is_some()
-                || credits.get("unlimited").and_then(Value::as_bool).is_some()
-                || credits.get("balance").is_some_and(|balance| {
-                    balance.as_f64().is_some()
-                        || balance
-                            .as_str()
-                            .is_some_and(|value| value.parse::<f64>().is_ok())
-                })
-        });
-    if usage.primary.is_none()
-        && usage.secondary.is_none()
-        && !usage.account_limited
-        && !credits_has_data
-    {
-        anyhow::bail!("usage response missing recognized quota fields");
-    }
-    Ok(usage)
+    Ok(())
+}
+
+pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
+    validate_usage_response_schema(body)?;
+    parse_usage(body)
 }
 
 pub fn parse_usage(body: &Value) -> Result<UsageInfo> {
@@ -397,10 +439,10 @@ fn parse_usage_at(body: &Value, fetched_at: i64) -> UsageInfo {
         &mut parse_issues,
     );
 
-    // Free accounts (new API): only one window exists, placed in primary_window slot
-    // with limit_window_seconds == 604800 (7d). Remap it to secondary so scoring works.
+    // A weekly-only response places its 7d window in the primary_window slot.
+    // Normalize by duration so every consumer reads weekly quota from secondary.
     let (primary, secondary) = if primary_window_secs >= SECS_7D && secondary_parsed.is_none() {
-        debug!("parse_usage: primary_window is 7d (free account) — remapping to secondary");
+        debug!("parse_usage: primary_window is weekly — remapping to secondary");
         (None, primary_parsed)
     } else {
         if secondary_raw.is_some() && secondary_parsed.is_none() {
@@ -453,6 +495,11 @@ fn parse_usage_at(body: &Value, fetched_at: i64) -> UsageInfo {
             RateLimitFlags::default()
         }
     };
+    if let Err(error) = validate_credits(body) {
+        parse_issues.push(UsageParseIssue::InvalidCredits {
+            detail: format!("{error:#}"),
+        });
+    }
     let spend_control_reached = match parse_spend_control_reached(body) {
         Ok(reached) => reached.unwrap_or(false),
         Err(issue) => {
@@ -511,6 +558,8 @@ fn parse_usage_at(body: &Value, fetched_at: i64) -> UsageInfo {
     account_limited |= !parse_issues.is_empty();
     let individual_limit = body
         .pointer("/spend_control/individual_limit")
+        .filter(|limit| !limit.is_null())
+        .and_then(Value::as_object)
         .map(|limit| {
             let string_value = |key: &str| {
                 limit.get(key).and_then(|value| {
@@ -776,14 +825,14 @@ mod tests {
     fn test_checked_usage_rejects_empty_or_drifted_response() {
         assert!(parse_usage_checked(&json!({})).is_err());
         assert!(parse_usage_checked(&json!({"unexpected": true})).is_err());
-        assert!(parse_usage_checked(&json!({"credits": {"balance": null}})).is_err());
+        assert!(parse_usage_checked(&json!({"plan_type": null})).is_err());
     }
 
     #[test]
-    fn test_checked_usage_empty_object_error_message_names_missing_fields() {
+    fn test_checked_usage_empty_object_error_names_required_plan() {
         let err = parse_usage_checked(&json!({})).expect_err("empty body must be rejected");
         assert!(
-            err.to_string().contains("missing recognized quota fields"),
+            err.to_string().contains("plan_type: is required"),
             "unexpected error message: {err}"
         );
     }
@@ -796,9 +845,113 @@ mod tests {
         }))
         .expect_err("structurally drifted body must be rejected");
         assert!(
-            err.to_string().contains("missing recognized quota fields"),
+            err.to_string().contains("plan_type: is required"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn checked_usage_accepts_valid_all_null_quota_payload_as_unavailable() {
+        let usage = parse_usage_checked(&json!({
+            "plan_type": "pro",
+            "rate_limit": null,
+            "credits": null,
+            "spend_control": null,
+            "additional_rate_limits": null,
+            "rate_limit_reached_type": null
+        }))
+        .expect("nullable optional quota fields are a valid raw response");
+
+        assert_eq!(usage.plan_type.as_deref(), Some("pro"));
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
+        assert!(usage.additional_limits.is_empty());
+        assert!(!usage.account_limited);
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
+    }
+
+    #[test]
+    fn checked_usage_accepts_additional_pool_only_payload_as_main_quota_unavailable() {
+        let usage = parse_usage_checked(&json!({
+            "plan_type": "pro",
+            "rate_limit": null,
+            "credits": null,
+            "spend_control": null,
+            "additional_rate_limits": [{
+                "limit_name": "Extra pool",
+                "metered_feature": "extra_pool",
+                "rate_limit": {
+                    "allowed": true,
+                    "limit_reached": false,
+                    "primary_window": {
+                        "used_percent": 12,
+                        "limit_window_seconds": 18_000
+                    },
+                    "secondary_window": null
+                }
+            }],
+            "rate_limit_reached_type": null
+        }))
+        .expect("an additional pool does not imply that the main quota exists");
+
+        assert!(usage.primary.is_none());
+        assert!(usage.secondary.is_none());
+        assert_eq!(usage.additional_limits.len(), 1);
+        assert_eq!(
+            usage.additional_limits[0].metered_feature.as_deref(),
+            Some("extra_pool")
+        );
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
+    }
+
+    #[test]
+    fn checked_usage_validates_non_null_credit_fields() {
+        let valid = parse_usage_checked(&json!({
+            "plan_type": "plus",
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "5.25",
+                "approx_local_messages": null,
+                "approx_cloud_messages": []
+            }
+        }))
+        .expect("the supported credits shape must remain valid");
+        assert_eq!(valid.credits_balance, Some(5.25));
+
+        for credits in [
+            json!("invalid"),
+            json!([]),
+            json!({"has_credits": "yes"}),
+            json!({"unlimited": null}),
+            json!({"balance": "not-a-number"}),
+            json!({"balance": {}}),
+            json!({"approx_local_messages": {}}),
+            json!({"approx_cloud_messages": false}),
+        ] {
+            let body = json!({
+                "plan_type": "plus",
+                "credits": credits
+            });
+            let error = parse_usage_checked(&body)
+                .expect_err("malformed non-null credits must be rejected");
+            assert!(
+                format!("{error:#}").contains("invalid credits"),
+                "unexpected error for {body}: {error:#}"
+            );
+            let usage = parse_usage(&body);
+            assert!(matches!(
+                usage.parse_issues.as_slice(),
+                [UsageParseIssue::InvalidCredits { .. }]
+            ));
+            assert!(usage.account_limited);
+        }
     }
 
     #[test]
@@ -826,6 +979,7 @@ mod tests {
     fn checked_usage_rejects_out_of_range_percentages() {
         for used_percent in [-0.01, 100.01] {
             let body = json!({
+                "plan_type": "plus",
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": used_percent,
@@ -846,6 +1000,7 @@ mod tests {
     fn checked_usage_rejects_nonpositive_or_unrepresentable_window_durations() {
         for seconds in [-60, 0, 59] {
             let body = json!({
+                "plan_type": "plus",
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": 25,
@@ -860,6 +1015,7 @@ mod tests {
         }
 
         let wrong_type = json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 25,
@@ -870,6 +1026,7 @@ mod tests {
         assert!(parse_usage_checked(&wrong_type).is_err());
 
         let omitted_metadata = json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 25,
@@ -884,6 +1041,7 @@ mod tests {
     fn checked_usage_accepts_non_whole_minute_durations_with_explicit_truncation() {
         for (seconds, expected_minutes) in [(60, 1), (61, 1), (119, 1), (120, 2)] {
             let body = json!({
+                "plan_type": "plus",
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": 25,
@@ -908,6 +1066,7 @@ mod tests {
     #[test]
     fn one_valid_window_does_not_mask_a_malformed_sibling() {
         let body = json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "primary_window": {
                     "used_percent": -20,
@@ -948,6 +1107,7 @@ mod tests {
     fn checked_usage_rejects_explicit_malformed_reset_credit_summary() {
         for malformed in [json!({"credits": null}), json!({"available_count": "many"})] {
             let body = json!({
+                "plan_type": "plus",
                 "rate_limit": {
                     "primary_window": {"used_percent": 10.0}
                 },
@@ -985,6 +1145,75 @@ mod tests {
                 }),
                 "an explicit malformed summary must remain visible: {malformed}"
             );
+        }
+    }
+
+    #[test]
+    fn production_nullable_shape_remaps_single_weekly_window_without_parse_issues() {
+        let usage = parse_usage_checked(&json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {
+                    "used_percent": 98.0,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1_800_000_000i64
+                },
+                "secondary_window": null
+            },
+            "credits": null,
+            "spend_control": {
+                "reached": false,
+                "individual_limit": null
+            },
+            "additional_rate_limits": null,
+            "code_review_rate_limit": null,
+            "rate_limit_reached_type": null,
+            "rate_limit_reset_credits": null
+        }))
+        .expect("nullable optional fields must have the same absence semantics as omission");
+
+        assert!(!usage.account_limited);
+        assert_eq!(usage.plan_type.as_deref(), Some("pro"));
+        assert!(usage.primary.is_none());
+        assert_eq!(
+            usage
+                .secondary
+                .as_ref()
+                .and_then(|window| window.used_percent),
+            Some(98.0)
+        );
+        assert_eq!(
+            usage
+                .secondary
+                .as_ref()
+                .and_then(|window| window.window_minutes),
+            Some(10_080)
+        );
+        assert_eq!(usage.rate_limit_reached_type, None);
+        assert!(usage.additional_limits.is_empty());
+        assert!(usage.individual_limit.is_none());
+        assert_eq!(usage.reset_credits_available_count, None);
+        assert!(usage.reset_credits.is_empty());
+        assert_eq!(usage.reset_credits_error, None);
+        assert!(usage.parse_issues.is_empty());
+    }
+
+    #[test]
+    fn nullable_embedded_reset_credit_summary_is_absent_for_both_supported_names() {
+        for field in ["rate_limit_reset_credits", "rateLimitResetCredits"] {
+            let mut body = json!({
+                "plan_type": "plus",
+                "rate_limit": {"primary_window": {"used_percent": 10.0}}
+            });
+            body[field] = Value::Null;
+
+            let usage = parse_usage_checked(&body)
+                .expect("an explicitly null embedded summary must be treated as absent");
+            assert_eq!(usage.reset_credits_error, None, "field: {field}");
+            assert_eq!(usage.reset_credits_available_count, None, "field: {field}");
+            assert!(usage.reset_credits.is_empty(), "field: {field}");
         }
     }
 
@@ -1214,11 +1443,53 @@ mod tests {
     }
 
     #[test]
+    fn nullable_nested_additional_rate_limit_preserves_the_pool_identity() {
+        let usage = parse_usage_checked(&json!({
+            "plan_type": "plus",
+            "rate_limit": {"primary_window": {"used_percent": 10.0}},
+            "additional_rate_limits": [
+                {
+                    "limit_name": "Missing details",
+                    "metered_feature": "codex_missing_details"
+                },
+                {
+                    "limit_name": "Null details",
+                    "metered_feature": "codex_null_details",
+                    "rate_limit": null
+                }
+            ]
+        }))
+        .expect("the backend schema permits a missing or null nested rate_limit");
+
+        assert_eq!(usage.additional_limits.len(), 2);
+        for (limit, expected_name, expected_feature) in [
+            (
+                &usage.additional_limits[0],
+                "Missing details",
+                "codex_missing_details",
+            ),
+            (
+                &usage.additional_limits[1],
+                "Null details",
+                "codex_null_details",
+            ),
+        ] {
+            assert_eq!(limit.limit_name.as_deref(), Some(expected_name));
+            assert_eq!(limit.metered_feature.as_deref(), Some(expected_feature));
+            assert_eq!(limit.allowed, None);
+            assert_eq!(limit.limit_reached, None);
+            assert!(limit.primary.is_none());
+            assert!(limit.secondary.is_none());
+        }
+        assert!(usage.parse_issues.is_empty());
+    }
+
+    #[test]
     fn infallible_parse_preserves_malformed_additional_limits_as_a_typed_issue() {
         let usage = parse_usage(&json!({
             "rate_limit": {"primary_window": {"used_percent": 10.0}},
             "additional_rate_limits": [
-                {"limit_name": "missing_rate_limit", "metered_feature": "codex_other"},
+                {"limit_name": "missing_feature", "rate_limit": null},
             ]
         }));
 
@@ -1226,7 +1497,7 @@ mod tests {
         assert!(matches!(
             usage.parse_issues.as_slice(),
             [UsageParseIssue::InvalidAdditionalRateLimits { detail }]
-                if detail.contains("rate_limit is required")
+                if detail.contains("must contain string limit_name and metered_feature")
         ));
         assert!(usage.account_limited);
         assert!(crate::usage::explicit_account_blocker(&usage).is_some());
@@ -1240,8 +1511,17 @@ mod tests {
     fn checked_parse_rejects_malformed_additional_and_code_review_shapes() {
         let cases = [
             json!({"additional_rate_limits": {}}),
-            json!({"additional_rate_limits": null}),
             json!({"additional_rate_limits": [null]}),
+            json!({"additional_rate_limits": [{}]}),
+            json!({"additional_rate_limits": [{"rate_limit": null}]}),
+            json!({"additional_rate_limits": [{
+                "limit_name": "Missing feature",
+                "rate_limit": {"allowed": true}
+            }]}),
+            json!({"additional_rate_limits": [{
+                "metered_feature": "missing_name",
+                "rate_limit": {"allowed": true}
+            }]}),
             json!({"additional_rate_limits": [{"rate_limit": "bad"}]}),
             json!({"additional_rate_limits": [{"rate_limit": {}}]}),
             json!({"additional_rate_limits": [{"rate_limit": {"allowed": "yes"}}]}),
@@ -1258,6 +1538,7 @@ mod tests {
         ];
         for malformed in cases {
             let mut body = json!({
+                "plan_type": "plus",
                 "rate_limit": {"primary_window": {"used_percent": 10.0}}
             });
             body.as_object_mut()
@@ -1273,6 +1554,7 @@ mod tests {
     #[test]
     fn unknown_nonempty_limit_reason_is_a_hard_blocker_with_raw_reason_preserved() {
         let body = json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "allowed": true,
                 "limit_reached": false,
@@ -1302,6 +1584,7 @@ mod tests {
     #[test]
     fn legacy_scalar_omissions_remain_valid_but_future_plan_strings_are_preserved() {
         let legacy = json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "primary_window": {"used_percent": 10.0}
             },
@@ -1350,6 +1633,7 @@ mod tests {
             ("limit_reached", json!({})),
         ] {
             let mut body = json!({
+                "plan_type": "plus",
                 "rate_limit": {"primary_window": {"used_percent": 10.0}}
             });
             body["rate_limit"][field] = malformed;
@@ -1364,6 +1648,7 @@ mod tests {
 
         for malformed in [json!("yes"), json!(null), json!(1), json!({})] {
             let body = json!({
+                "plan_type": "plus",
                 "rate_limit": {"primary_window": {"used_percent": 10.0}},
                 "spend_control": {"reached": malformed}
             });
@@ -1374,6 +1659,24 @@ mod tests {
                 [UsageParseIssue::InvalidSpendControl { .. }]
             ));
             assert!(crate::usage::explicit_account_blocker(&usage).is_some());
+        }
+
+        for malformed in [json!("bad"), json!(1), json!([])] {
+            let body = json!({
+                "plan_type": "plus",
+                "rate_limit": {"primary_window": {"used_percent": 10.0}},
+                "spend_control": {
+                    "reached": false,
+                    "individual_limit": malformed
+                }
+            });
+            assert!(parse_usage_checked(&body).is_err());
+            let usage = parse_usage(&body);
+            assert!(usage.individual_limit.is_none());
+            assert!(matches!(
+                usage.parse_issues.as_slice(),
+                [UsageParseIssue::InvalidSpendControl { .. }]
+            ));
         }
     }
 
@@ -1399,8 +1702,9 @@ mod tests {
 
     #[test]
     fn malformed_limit_reason_is_rejected_checked_and_preserved_infallibly() {
-        for malformed in [json!(null), json!(7), json!({"type": false}), json!("  ")] {
+        for malformed in [json!(7), json!({"type": false}), json!("  ")] {
             let body = json!({
+                "plan_type": "plus",
                 "rate_limit": {"primary_window": {"used_percent": 10.0}},
                 "rate_limit_reached_type": malformed
             });

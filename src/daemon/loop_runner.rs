@@ -279,8 +279,8 @@ async fn check_and_switch() -> Result<PollOutcome> {
         .map_err(|e| anyhow::anyhow!("{}", e.detail))?;
 
     // 2. Check if current account exceeds threshold
-    // Free accounts have no primary window (7d is remapped to secondary),
-    // so fall back to secondary when primary is absent.
+    // Weekly-only responses have no normalized primary window, so use their
+    // secondary weekly window as the switch trigger.
     let Some(current_used) = current_usage_percent_for_switch(&current_usage) else {
         tracing::warn!(
             "Current account '{}' has no usable quota-window percentage; skipping automatic switch",

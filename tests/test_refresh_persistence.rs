@@ -525,6 +525,7 @@ fn usage_ok() -> Reply {
     reply(
         StatusCode::OK,
         json!({
+            "plan_type": "plus",
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 12.5,

@@ -64,7 +64,7 @@ codex-switch-global-pace self-update --check
 | `r` | Refresh visible accounts |
 | `a` | Add a new account |
 | `t` | Toggle auto-refresh |
-| `W` | Toggle auto-warmup for paid accounts whose primary 5h window, or Free accounts whose weekly window, has expired |
+| `W` | Toggle auto-warmup for the short window when present, or the weekly window for a weekly-only response |
 | `i` | Toggle the compact quota panel on the main view |
 | `s` | Cycle sort order (name / quota / status) |
 | `Space` | Mark or unmark an account |

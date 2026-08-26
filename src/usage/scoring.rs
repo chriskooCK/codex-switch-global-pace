@@ -2,7 +2,7 @@ use crate::jwt::{AccountInfo, PlanKind};
 
 use super::{
     Candidate, FREE_FLOOR_PCT, MIN_WARMUP_ELAPSED_SECS, ScoredCandidate, UsageInfo, WINDOW_5H_SECS,
-    WINDOW_7D_SECS, WindowUsage, plan_has_required_quota_data, quota_window_duration_secs,
+    WINDOW_7D_SECS, WindowUsage, main_weekly_quota_available, quota_window_duration_secs,
     validated_quota_window,
 };
 
@@ -38,10 +38,10 @@ pub fn warmup_window_active(w: &WindowUsage, window_secs: i64, now: i64) -> bool
 
 /// Decide whether warmup should be skipped because the relevant window is already active.
 ///
-/// Paid accounts have both 5h (primary) and 7d (secondary) windows; only the 5h window
-/// is what warmup is meant to (re)open, so a still-active 7d window must NOT suppress
-/// warmup once the 5h window has closed. Free accounts only have the 7d window, so it
-/// is the only signal available.
+/// When the API provides a short primary window, that is what warmup is meant
+/// to (re)open, so a still-active weekly window must not suppress warmup after
+/// the short window closes. Some responses expose only the weekly window; in
+/// that shape it is the only available signal.
 pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
     let main_active = match u.primary.as_ref() {
         Some(w) => quota_window_duration_secs(w, WINDOW_5H_SECS)
@@ -154,10 +154,10 @@ pub(crate) enum UsageAvailability {
     Unavailable,
 }
 
-/// Classify one loaded usage sample using the same plan-specific quota shape
-/// required by automatic selection. API plan evidence remains authoritative
-/// over the JWT; unknown plans and incomplete required windows fail closed.
-pub(crate) fn usage_availability(u: &UsageInfo, info: &AccountInfo) -> UsageAvailability {
+/// Classify one loaded usage sample using the same validated weekly-quota
+/// contract required by automatic selection and global weekly pace. Plan
+/// metadata affects scoring preferences, not whether API-provided quota exists.
+pub(crate) fn usage_availability(u: &UsageInfo, _info: &AccountInfo) -> UsageAvailability {
     if !u.parse_issues.is_empty() {
         return UsageAvailability::Unavailable;
     }
@@ -175,11 +175,7 @@ pub(crate) fn usage_availability(u: &UsageInfo, info: &AccountInfo) -> UsageAvai
         .as_ref()
         .and_then(|window| validated_quota_window(window, WINDOW_7D_SECS))
         .map(|(used, _)| used);
-    if !plan_has_required_quota_data(
-        normalized_plan_kind(u, info),
-        primary.is_some(),
-        weekly.is_some(),
-    ) {
+    if !main_weekly_quota_available(weekly.as_ref()) {
         return UsageAvailability::Unavailable;
     }
     if u.account_limited {
@@ -638,14 +634,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_required_quota_shape_is_shared_by_selection_and_status() {
+    fn weekly_quota_contract_is_shared_by_selection_status_and_global_pace() {
         let now = 1_000_000;
         let plus = AccountInfo {
             plan_type: Some("plus".to_string()),
             ..AccountInfo::default()
         };
         let weekly_only = UsageInfo {
-            secondary: Some(window(20.0, Some(now + WINDOW_7D_SECS / 2))),
+            plan_type: Some("pro".to_string()),
+            secondary: Some(WindowUsage {
+                used_percent: Some(20.0),
+                resets_at: Some(now + WINDOW_7D_SECS / 2),
+                window_minutes: Some(WINDOW_7D_SECS / 60),
+            }),
             ..UsageInfo::default()
         };
         let weekly_only_plan = normalized_plan_kind(&weekly_only, &plus);
@@ -657,78 +658,95 @@ mod tests {
             now,
         );
 
-        assert_eq!(weekly_only_plan, PlanKind::Plus);
-        assert!(!weekly_only_candidate.has_required_quota_data());
+        assert_eq!(weekly_only_plan, PlanKind::Pro);
+        assert!(weekly_only_candidate.primary.is_none());
+        assert!(weekly_only_candidate.has_required_quota_data());
+        assert!(is_candidate_eligible(&weekly_only_candidate, 20.0));
         assert_eq!(
             usage_availability(&weekly_only, &plus),
-            UsageAvailability::Unavailable
-        );
-
-        let complete = UsageInfo {
-            primary: Some(window(20.0, Some(now + WINDOW_5H_SECS / 2))),
-            ..weekly_only.clone()
-        };
-        let complete_plan = normalized_plan_kind(&complete, &plus);
-        let complete_candidate =
-            Candidate::from_usage("complete".to_string(), &complete, complete_plan, 0, now);
-        assert!(complete_candidate.has_required_quota_data());
-        assert_eq!(
-            usage_availability(&complete, &plus),
             UsageAvailability::Available
         );
+        let global_input =
+            super::super::GlobalPaceAccountInput::from_usage("weekly-only", &weekly_only);
+        assert!(
+            super::super::calculate_account_weekly_pace(&global_input, now).is_some(),
+            "the same weekly-only account must participate in global pace"
+        );
+        let primary_only = UsageInfo {
+            primary: Some(window(10.0, Some(now + WINDOW_5H_SECS / 2))),
+            ..UsageInfo::default()
+        };
+        let current = scored(
+            Candidate::from_usage(
+                "primary-only".to_string(),
+                &primary_only,
+                PlanKind::Plus,
+                0,
+                now,
+            ),
+            20.0,
+        );
+        let alternatives = [scored(weekly_only_candidate.clone(), 20.0)];
+        assert_eq!(
+            pick_switch_target(&current, &alternatives, 20.0).map(|(alias, _)| alias),
+            Some("weekly-only"),
+            "automatic selection must accept the same weekly-only account"
+        );
 
-        let api_downgrade = UsageInfo {
-            plan_type: Some("free".to_string()),
+        let unknown_plan = UsageInfo {
+            plan_type: Some("future_plan".to_string()),
             ..weekly_only.clone()
         };
-        let downgraded_plan = normalized_plan_kind(&api_downgrade, &plus);
-        let downgraded_candidate = Candidate::from_usage(
-            "downgraded".to_string(),
-            &api_downgrade,
-            downgraded_plan,
+        let unknown_kind = normalized_plan_kind(&unknown_plan, &plus);
+        let unknown_candidate = Candidate::from_usage(
+            "unknown-plan".to_string(),
+            &unknown_plan,
+            unknown_kind,
             0,
             now,
         );
-        assert_eq!(downgraded_plan, PlanKind::Free);
-        assert!(downgraded_candidate.has_required_quota_data());
+        assert_eq!(unknown_kind, PlanKind::Unknown);
+        assert!(unknown_candidate.has_required_quota_data());
+        assert!(is_candidate_eligible(&unknown_candidate, 20.0));
         assert_eq!(
-            usage_availability(&api_downgrade, &plus),
+            usage_availability(&unknown_plan, &plus),
             UsageAvailability::Available
         );
 
-        let future_plan = UsageInfo {
-            plan_type: Some("future_plan".to_string()),
-            ..complete.clone()
-        };
-        assert_eq!(
-            usage_availability(&future_plan, &plus),
-            UsageAvailability::Unavailable
-        );
-
-        let broad_limited_incomplete = UsageInfo {
+        let explicit_spend_blocker = UsageInfo {
             account_limited: true,
-            ..weekly_only
+            spend_control_reached: true,
+            ..weekly_only.clone()
         };
-        assert_eq!(
-            usage_availability(&broad_limited_incomplete, &plus),
-            UsageAvailability::Unavailable
+        let blocked_candidate = Candidate::from_usage(
+            "blocked".to_string(),
+            &explicit_spend_blocker,
+            PlanKind::Pro,
+            0,
+            now,
         );
-        let broad_limited_complete = UsageInfo {
-            account_limited: true,
-            ..complete
-        };
+        assert!(blocked_candidate.has_required_quota_data());
+        assert!(!is_candidate_eligible(&blocked_candidate, 20.0));
         assert_eq!(
-            usage_availability(&broad_limited_complete, &plus),
+            usage_availability(&explicit_spend_blocker, &plus),
             UsageAvailability::Limited
         );
-        let explicit_spend_blocker = UsageInfo {
+        let blocked_global =
+            super::super::GlobalPaceAccountInput::from_usage("blocked", &explicit_spend_blocker);
+        assert!(
+            super::super::calculate_account_weekly_pace(&blocked_global, now).is_none(),
+            "an explicit blocker must exclude the account from global pace"
+        );
+
+        let blocker_without_window = UsageInfo {
             account_limited: true,
             spend_control_reached: true,
             ..UsageInfo::default()
         };
         assert_eq!(
-            usage_availability(&explicit_spend_blocker, &plus),
-            UsageAvailability::Limited
+            usage_availability(&blocker_without_window, &plus),
+            UsageAvailability::Limited,
+            "an explicit backend blocker remains authoritative without quota data"
         );
     }
 
@@ -1024,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn paid_candidate_without_weekly_window_is_not_selectable() {
+    fn candidate_without_weekly_window_is_unavailable_everywhere() {
         let now = 1_000_000;
         let usage = UsageInfo {
             primary: Some(window(10.0, Some(now + 3_600))),
@@ -1035,6 +1053,12 @@ mod tests {
 
         assert!(!candidate.has_required_quota_data());
         assert!(!is_candidate_eligible(&candidate, 20.0));
+        assert_eq!(
+            usage_availability(&usage, &AccountInfo::default()),
+            UsageAvailability::Unavailable
+        );
+        let global_input = super::super::GlobalPaceAccountInput::from_usage("partial", &usage);
+        assert!(super::super::calculate_account_weekly_pace(&global_input, now).is_none());
 
         let current = scored(candidate, 20.0);
         let complete_but_exhausted = scored(

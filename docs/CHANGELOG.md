@@ -1,5 +1,15 @@
 # Changelog
 
+## v20260826.3.0 — 2026-08-26
+
+- **Current usage contract restored** — Explicitly nullable optional fields are
+  handled as absent, while malformed non-null values still fail validation.
+- **Window-shape-independent availability** — A validated weekly window is the
+  shared requirement for status, selection, sorting, and Global Weekly Pace;
+  a short window is optional and no longer inferred from the plan name.
+- **Deterministic response failures** — Invalid successful responses are
+  reported once instead of being retried as transient network failures.
+
 ## v20260826.2.0 — 2026-08-26
 
 - **Comparable quota meters** — Account and Global Weekly Pace rows now share

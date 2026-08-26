@@ -983,6 +983,7 @@ mod rotated_credential_import_tests {
             return (
                 axum::http::StatusCode::OK,
                 axum::Json(serde_json::json!({
+                    "plan_type": "plus",
                     "rate_limit": {
                         "primary_window": {
                             "used_percent": 12.5,
