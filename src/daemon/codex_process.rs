@@ -143,8 +143,7 @@ fn linux_process_arguments(process_path: &std::path::Path) -> ProcessInspection 
 
     let command_name = match std::fs::read_to_string(process_path.join("comm")) {
         Ok(command_name) => command_name,
-        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
-        Err(_) => return ProcessInspection::Failed,
+        Err(error) => return linux_process_file_failure(process_path, &error),
     };
     if !possible_codex_process_name(command_name.trim()) {
         return ProcessInspection::Irrelevant;
@@ -152,8 +151,7 @@ fn linux_process_arguments(process_path: &std::path::Path) -> ProcessInspection 
 
     let status = match std::fs::read_to_string(process_path.join("status")) {
         Ok(status) => status,
-        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
-        Err(_) => return ProcessInspection::Failed,
+        Err(error) => return linux_process_file_failure(process_path, &error),
     };
     match linux_effective_uid(&status) {
         Some(uid) if uid == current_uid => {}
@@ -163,8 +161,7 @@ fn linux_process_arguments(process_path: &std::path::Path) -> ProcessInspection 
 
     let cmdline = match std::fs::read(process_path.join("cmdline")) {
         Ok(cmdline) => cmdline,
-        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
-        Err(_) => return ProcessInspection::Failed,
+        Err(error) => return linux_process_file_failure(process_path, &error),
     };
     let arguments = cmdline
         .split(|byte| *byte == 0)
@@ -175,6 +172,24 @@ fn linux_process_arguments(process_path: &std::path::Path) -> ProcessInspection 
         ProcessInspection::Irrelevant
     } else {
         ProcessInspection::Arguments(arguments)
+    }
+}
+
+/// A missing `/proc/<pid>` file means the process vanished only when its PID
+/// directory is gone too. A missing required file under a live entry is an
+/// inspection failure and must remain fail-closed.
+#[cfg(any(target_os = "linux", test))]
+fn linux_process_file_failure(
+    process_path: &std::path::Path,
+    error: &std::io::Error,
+) -> ProcessInspection {
+    if !process_vanished(error) {
+        return ProcessInspection::Failed;
+    }
+
+    match std::fs::metadata(process_path) {
+        Err(root_error) if process_vanished(&root_error) => ProcessInspection::Vanished,
+        Ok(_) | Err(_) => ProcessInspection::Failed,
     }
 }
 
@@ -189,9 +204,17 @@ fn linux_effective_uid(status: &str) -> Option<u32> {
         .ok()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 fn process_vanished(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+
+    #[cfg(unix)]
+    return error.raw_os_error() == Some(libc::ESRCH);
+
+    #[cfg(not(unix))]
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -693,6 +716,28 @@ mod tests {
             Some(1001)
         );
         assert_eq!(linux_effective_uid("Name:\tcodex\n"), None);
+    }
+
+    #[test]
+    fn linux_missing_process_file_only_vanishes_with_its_process_directory() {
+        let existing_process = tempfile::tempdir().unwrap();
+        let missing_file = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            super::linux_process_file_failure(existing_process.path(), &missing_file),
+            ProcessInspection::Failed
+        );
+
+        let vanished_process = existing_process.path().join("already-gone");
+        assert_eq!(
+            super::linux_process_file_failure(&vanished_process, &missing_file),
+            ProcessInspection::Vanished
+        );
+
+        let unreadable_file = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            super::linux_process_file_failure(&vanished_process, &unreadable_file),
+            ProcessInspection::Failed
+        );
     }
 
     #[cfg(target_os = "linux")]
