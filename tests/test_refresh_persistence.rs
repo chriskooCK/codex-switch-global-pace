@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 /// Env vars are process-global; serialize every test that touches them.
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static CONFIG_INIT: Once = Once::new();
+const MOCK_REQUEST_ARRIVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct EnvVarGuard {
     key: &'static str,
@@ -133,9 +134,14 @@ struct HeldUsageRequest {
 
 impl HeldUsageRequest {
     async fn wait_until_arrived(&mut self) {
-        tokio::time::timeout(Duration::from_secs(10), self.arrivals.recv())
+        tokio::time::timeout(MOCK_REQUEST_ARRIVAL_TIMEOUT, self.arrivals.recv())
             .await
-            .expect("follow-up usage request did not arrive within 10s")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "follow-up usage request did not arrive within \
+                     {MOCK_REQUEST_ARRIVAL_TIMEOUT:?}"
+                )
+            })
             .expect("usage endpoint gate closed");
     }
 
@@ -149,16 +155,29 @@ impl HeldTokenRequests {
     /// `refresh_token` each of them presented, in arrival order.
     async fn wait_for(&mut self, n: usize) -> Vec<String> {
         let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + MOCK_REQUEST_ARRIVAL_TIMEOUT;
         while seen.len() < n {
-            let next = tokio::time::timeout(Duration::from_secs(10), self.arrivals.recv())
+            let next = tokio::time::timeout_at(deadline, self.arrivals.recv())
                 .await
                 .unwrap_or_else(|_| {
-                    panic!("expected {n} token request(s), only {seen:?} arrived within 10s")
+                    panic!(
+                        "expected {n} token request(s), only {seen:?} arrived within \
+                         {MOCK_REQUEST_ARRIVAL_TIMEOUT:?}"
+                    )
                 })
                 .expect("token endpoint gate closed");
             seen.push(next);
         }
         seen
+    }
+
+    /// Wait until the irreversible request boundary, advance beyond the
+    /// caller's start budget, then restore real time before network I/O resumes.
+    async fn wait_for_then_expire_budget(&mut self, n: usize, budget: Duration) {
+        let _ = self.wait_for(n).await;
+        tokio::time::pause();
+        tokio::time::advance(budget).await;
+        tokio::time::resume();
     }
 
     /// Let every parked request — and any that arrives later — answer.
@@ -1148,22 +1167,24 @@ fn rotation_for(alias: &str) -> (String, Reply) {
 /// response, so dropping the task (which `JoinSet::drop` does, by aborting it)
 /// leaves the profile holding a credential nothing will ever accept again.
 /// A slow answer therefore still has to be read and written.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn refresh_slower_than_the_budget_still_reaches_disk() {
     let _lock = ENV_LOCK.lock().await;
     let server = MockServer::start_keyed_by_refresh_token(vec![rotation_for("slow")]).await;
     let fx = expiring_profiles_fixture(&server, &["slow"]);
     let mut held = server.hold_token_requests();
-    let budget = Duration::from_millis(200);
+    // Arrival itself is not the behavior under test. Give the request twice
+    // the gate's bounded arrival window, then move Tokio's clock past that
+    // budget only after the handler confirms the rotation is in flight.
+    let budget = MOCK_REQUEST_ARRIVAL_TIMEOUT * 2;
 
     let (failures, ()) = tokio::join!(
         codex_switch::usage::refresh_expiring_tokens_within(budget),
         async {
             // The request is parked inside the handler, so the rotation is
-            // already spent. Only then let the budget run out — the reply can
-            // physically not be observed before that point.
-            held.wait_for(1).await;
-            tokio::time::sleep(budget * 3).await;
+            // already spent. Advancing virtual time here proves the reply is
+            // observed after the start budget without depending on CI speed.
+            held.wait_for_then_expire_budget(1, budget).await;
             held.release_all();
         }
     );
@@ -1196,7 +1217,7 @@ async fn refresh_slower_than_the_budget_still_reaches_disk() {
 /// were never started must not be contacted at all: a request that is sent and
 /// then abandoned is precisely the loss this design exists to prevent, and a
 /// profile nobody contacted keeps a perfectly usable token for the next run.
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn budget_exhaustion_stops_starting_new_refreshes() {
     let _lock = ENV_LOCK.lock().await;
     let aliases = ["first", "second", "third"];
@@ -1206,15 +1227,14 @@ async fn budget_exhaustion_stops_starting_new_refreshes() {
     .await;
     let fx = expiring_profiles_fixture(&server, &aliases);
     let mut held = server.hold_token_requests();
-    let budget = Duration::from_millis(200);
+    let budget = MOCK_REQUEST_ARRIVAL_TIMEOUT * 2;
 
     let (failures, ()) = tokio::join!(
         codex_switch::usage::refresh_expiring_tokens_within(budget),
         async {
             // Every in-flight slot is occupied and stays occupied until the
             // budget is gone, so no further candidate may be started.
-            held.wait_for(2).await;
-            tokio::time::sleep(budget * 3).await;
+            held.wait_for_then_expire_budget(2, budget).await;
             held.release_all();
         }
     );
