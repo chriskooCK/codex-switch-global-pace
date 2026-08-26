@@ -313,9 +313,24 @@ fn macos_process_arguments(pid: libc::pid_t, arg_max: usize) -> ProcessInspectio
         };
     }
     buffer.truncate(buffer_size);
-    match parse_macos_process_arguments(&buffer) {
-        Some(arguments) => ProcessInspection::Arguments(arguments),
-        None => ProcessInspection::Failed,
+    classify_macos_process_arguments(parse_macos_process_arguments(&buffer))
+}
+
+/// Re-check the executable after the `ps` snapshot. The PID may have been
+/// reused or the process may have executed a different image before sysctl
+/// returned its arguments.
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_process_arguments(arguments: Option<Vec<String>>) -> ProcessInspection {
+    let Some(arguments) = arguments else {
+        return ProcessInspection::Failed;
+    };
+    let Some(executable) = arguments.first() else {
+        return ProcessInspection::Failed;
+    };
+    if possible_codex_process_name(executable) {
+        ProcessInspection::Arguments(arguments)
+    } else {
+        ProcessInspection::Irrelevant
     }
 }
 
@@ -707,6 +722,35 @@ mod tests {
         );
         assert!(possible_codex_process_name(command));
         assert_eq!(parse_macos_process_row("123 501   "), None);
+    }
+
+    #[test]
+    fn macos_arguments_recheck_snapshot_candidates_after_pid_reuse() {
+        assert_eq!(
+            super::classify_macos_process_arguments(Some(vec![
+                "/bin/bash".to_string(),
+                "worker.sh".to_string(),
+            ])),
+            ProcessInspection::Irrelevant
+        );
+        assert_eq!(
+            super::classify_macos_process_arguments(Some(vec![
+                "/usr/local/bin/node".to_string(),
+                "/usr/local/bin/codex".to_string(),
+            ])),
+            ProcessInspection::Arguments(vec![
+                "/usr/local/bin/node".to_string(),
+                "/usr/local/bin/codex".to_string(),
+            ])
+        );
+        assert_eq!(
+            super::classify_macos_process_arguments(Some(Vec::new())),
+            ProcessInspection::Failed
+        );
+        assert_eq!(
+            super::classify_macos_process_arguments(None),
+            ProcessInspection::Failed
+        );
     }
 
     #[test]
