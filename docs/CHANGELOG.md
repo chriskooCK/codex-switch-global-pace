@@ -1,5 +1,14 @@
 # Changelog
 
+## v20260826.4.0 — 2026-08-26
+
+- **Focused Global Weekly Pace summary** — The dashboard now keeps only the
+  pace, participating account count, and nearest account reset while removing
+  duplicate reserve, capacity, and weighting labels.
+- **Stable long-running dashboard** — A successful in-memory usage snapshot no
+  longer disappears from Global Weekly Pace when the disk-cache reuse TTL
+  passes. Invalid or elapsed weekly windows remain unavailable.
+
 ## v20260826.3.0 — 2026-08-26
 
 - **Current usage contract restored** — Explicitly nullable optional fields are

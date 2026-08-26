@@ -1242,22 +1242,21 @@ impl App {
 
     /// Derive the dashboard aggregate from every registered account's current
     /// in-memory usage. Search filtering affects only `view_indices`, never this
-    /// pool, and this calculation performs no I/O or additional polling.
+    /// pool. Disk-cache TTL decides whether a new read may reuse a cache entry;
+    /// it does not expire a successful snapshot already owned by this TUI. The
+    /// pure global calculation still rejects missing, invalid, or elapsed weekly
+    /// windows, and this calculation performs no I/O or additional polling.
     pub fn global_weekly_summary(&self, now: i64) -> GlobalWeeklySummary {
-        let cache_ttl = crate::config::get().cache.ttl;
         let inputs: Vec<GlobalPaceAccountInput> = self
             .accounts
             .iter()
             .map(|entry| match &entry.usage {
-                UsageStatus::Loaded(usage)
-                    if crate::cache::usage_is_fresh_at(usage, now, cache_ttl) =>
-                {
+                UsageStatus::Loaded(usage) => {
                     GlobalPaceAccountInput::from_usage(entry.alias.clone(), usage)
                 }
-                UsageStatus::Idle
-                | UsageStatus::Loading
-                | UsageStatus::Loaded(_)
-                | UsageStatus::Error(_) => GlobalPaceAccountInput::unavailable(entry.alias.clone()),
+                UsageStatus::Idle | UsageStatus::Loading | UsageStatus::Error(_) => {
+                    GlobalPaceAccountInput::unavailable(entry.alias.clone())
+                }
             })
             .collect();
         calculate_global_weekly_summary(&inputs, now)
@@ -3687,41 +3686,46 @@ mod tests {
     }
 
     #[test]
-    fn global_weekly_summary_excludes_samples_outside_the_cache_ttl() {
-        crate::config::init_defaults_for_tests();
+    fn global_weekly_summary_keeps_loaded_snapshots_until_the_weekly_window_expires() {
         let now = 1_000_000;
-        let ttl = crate::config::get().cache.ttl;
-        let ttl = i64::try_from(ttl).expect("default cache TTL fits the timestamp model");
-        let weekly = |fetched_at| UsageInfo {
-            fetched_at,
+        let mut app = App::new();
+        let cache_ttl = i64::try_from(crate::config::get().cache.ttl)
+            .expect("default cache TTL fits the timestamp model");
+        let weekly = |fetched_at, resets_at| UsageInfo {
+            fetched_at: Some(fetched_at),
             secondary: Some(WindowUsage {
                 used_percent: Some(50.0),
-                resets_at: Some(now + crate::usage::WINDOW_7D_SECS / 2),
+                resets_at: Some(resets_at),
                 window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
             }),
             ..UsageInfo::default()
         };
-        let mut app = App::new();
-        app.accounts = [
-            ("boundary", Some(now - ttl)),
-            ("stale", Some(now - ttl - 1)),
-            ("future", Some(now + 1)),
-            ("missing", None),
-        ]
-        .into_iter()
-        .map(|(alias, fetched_at)| AccountEntry {
-            alias: alias.into(),
-            info: AccountInfo::default(),
-            usage: UsageStatus::Loaded(Box::new(weekly(fetched_at))),
-            is_current: false,
-        })
-        .collect();
+        app.accounts = vec![
+            AccountEntry {
+                alias: "loaded-before-cache-ttl".into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::new(weekly(
+                    now - cache_ttl - 1,
+                    now + crate::usage::WINDOW_7D_SECS / 2,
+                ))),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "elapsed-weekly-window".into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::new(weekly(now, now))),
+                is_current: false,
+            },
+        ];
 
         let summary = app.global_weekly_summary(now);
 
         assert_eq!(summary.included_accounts, 1);
-        assert_eq!(summary.excluded_accounts, 3);
-        assert_eq!(summary.next_reset_alias.as_deref(), Some("boundary"));
+        assert_eq!(summary.excluded_accounts, 1);
+        assert_eq!(
+            summary.next_reset_alias.as_deref(),
+            Some("loaded-before-cache-ttl")
+        );
     }
 
     #[test]

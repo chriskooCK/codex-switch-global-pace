@@ -165,23 +165,6 @@ fn timestamp_is_fresh(now: u64, recorded_at: u64, ttl: u64) -> bool {
     now.checked_sub(recorded_at).is_some_and(|age| age <= ttl)
 }
 
-/// Apply the usage-cache age contract to an in-memory usage sample.
-///
-/// The TUI retains loaded samples after the cache read that produced them, so
-/// render-time consumers must re-check the original observation timestamp.
-/// Missing, pre-epoch, future, or unrepresentable timestamps are not fresh.
-pub(crate) fn usage_is_fresh_at(usage: &UsageInfo, now: i64, ttl: u64) -> bool {
-    let Some(fetched_at) = usage.fetched_at else {
-        return false;
-    };
-    if now < 0 || fetched_at < 0 {
-        return false;
-    }
-    now.checked_sub(fetched_at)
-        .and_then(|age| u64::try_from(age).ok())
-        .is_some_and(|age| age <= ttl)
-}
-
 fn ttl() -> Result<u64> {
     Ok(crate::config::try_get()?.cache.ttl)
 }
@@ -818,35 +801,6 @@ mod tests {
         assert!(fresh_usage(&cache, "future", TEST_NOW, u64::MAX).is_none());
         assert!(fresh_usage(&cache, "unrepresentable", u64::MAX, 0).is_none());
         assert!(!workspace_name_resolved(&cache, "future", TEST_NOW));
-    }
-
-    #[test]
-    fn in_memory_usage_freshness_matches_the_cache_ttl_boundary() {
-        let now = i64::try_from(TEST_NOW).unwrap();
-        let ttl = 300;
-        let usage_at = |fetched_at| UsageInfo {
-            fetched_at,
-            ..UsageInfo::default()
-        };
-
-        assert!(usage_is_fresh_at(&usage_at(Some(now)), now, ttl));
-        assert!(usage_is_fresh_at(
-            &usage_at(Some(now - i64::try_from(ttl).unwrap())),
-            now,
-            ttl
-        ));
-        assert!(!usage_is_fresh_at(
-            &usage_at(Some(now - i64::try_from(ttl).unwrap() - 1)),
-            now,
-            ttl
-        ));
-        assert!(!usage_is_fresh_at(&usage_at(Some(now + 1)), now, ttl));
-        assert!(!usage_is_fresh_at(&usage_at(None), now, ttl));
-        assert!(!usage_is_fresh_at(
-            &usage_at(Some(i64::MIN)),
-            i64::MAX,
-            u64::MAX
-        ));
     }
 
     #[test]
