@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch-global-pace"
-version = "20260826.5.0"
+version = "20260826.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Codex multi-profile manager with a global weekly pace dashboard"
