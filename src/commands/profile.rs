@@ -1394,7 +1394,7 @@ mod revival_target_tests {
     }
 
     #[test]
-    fn revival_recheck_renormalizes_the_plan_from_fresh_evidence() {
+    fn revival_recheck_renormalizes_plan_without_changing_the_weekly_contract() {
         let now = 1_000_000;
         let weekly_only = usage::UsageInfo {
             secondary: Some(usage::WindowUsage {
@@ -1423,7 +1423,7 @@ mod revival_target_tests {
         let upgraded =
             candidate_from_revival_usage(&base, &fresh_plus_usage, &stale_free_jwt, now, false);
         assert_eq!(upgraded.plan_kind, jwt::PlanKind::Plus);
-        assert!(!upgraded.has_required_quota_data());
+        assert!(upgraded.has_required_quota_data());
 
         let current_plus_jwt = jwt::AccountInfo {
             plan_type: Some("plus".to_string()),
@@ -1441,7 +1441,7 @@ mod revival_target_tests {
         let jwt_only =
             candidate_from_revival_usage(&base, &weekly_only, &current_plus_jwt, now, false);
         assert_eq!(jwt_only.plan_kind, jwt::PlanKind::Plus);
-        assert!(!jwt_only.has_required_quota_data());
+        assert!(jwt_only.has_required_quota_data());
     }
 
     #[test]

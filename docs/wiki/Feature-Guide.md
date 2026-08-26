@@ -46,7 +46,10 @@ codex-switch-global-pace --json list
 codex-switch-global-pace
 ```
 
-The usage model includes the main 5-hour and 7-day windows, additional model-specific pools, reset cards, spend limits, account restrictions, and model capabilities returned by the authenticated service. Cached entries are scoped by profile alias and retain their own fetch time.
+The usage model includes the main short and weekly windows returned for each
+account, additional model-specific pools, reset cards, spend limits, account
+restrictions, and model capabilities returned by the authenticated service.
+Cached entries are scoped by profile alias and retain their own fetch time.
 
 Normal reads refresh only stale entries. Use `list -f` or the TUI refresh action when a fresh network read is required.
 
@@ -84,8 +87,8 @@ codex-switch-global-pace use
 
 Selection has two phases:
 
-1. **Eligibility** excludes candidates with exhausted 5h or 7d windows, critically low weekly headroom with a distant reset, or an unsafe Free-plan balance.
-2. **Scoring** ranks the eligible candidates by tier preference (Team accounts get priority by default), pace-aware 5h headroom, weekly sustainability, quota that is close to resetting, and recent use.
+1. **Eligibility** requires a valid weekly window and excludes candidates with an exhausted reported window, critically low weekly headroom with a distant reset, or an unsafe Free-plan balance.
+2. **Scoring** ranks the eligible candidates by tier preference (Team accounts get priority by default), optional short-window headroom, weekly sustainability, quota that is close to resetting, and recent use.
 
 If every account is ineligible, the best fallback is reported instead of pretending an account is healthy.
 
@@ -112,7 +115,7 @@ codex-switch-global-pace warmup work
 codex-switch-global-pace --json warmup
 ```
 
-Model names are discovered at runtime rather than maintained as a hardcoded compatibility list. Already-active or unavailable pools are skipped. JSON mode returns every profile result and a top-level `ok` field. Inside the TUI, `W` toggles automatic warmup for paid accounts whose primary 5-hour window, or Free accounts whose weekly window, has expired; the daemon has a separate `auto_warmup` setting.
+Model names are discovered at runtime rather than maintained as a hardcoded compatibility list. Already-active or unavailable pools are skipped. JSON mode returns every profile result and a top-level `ok` field. Inside the TUI, `W` toggles automatic warmup: it targets the short window when present, or the weekly window for a weekly-only response. The daemon has a separate `auto_warmup` setting.
 
 ## Run the background daemon
 
@@ -129,7 +132,7 @@ The data directory and daemon-state files remain compatible with the original
 `codex-switch`. Do not install or run both daemon services simultaneously;
 stop and uninstall one daemon before enabling the other.
 
-The daemon runs three independent timers: account polling (`poll_interval_secs`), full cache refresh with optional warmup (`cache_refresh_interval_secs`, `auto_warmup`), and proactive token refresh (`token_check_interval_secs`). With at least two profiles, `switch_threshold` starts a candidate search from the current profile's primary usage. If the account has no primary window — including Free accounts — the secondary weekly window is the trigger instead. An unavailable, account-limited, or exhausted current account is treated as 100% for this trigger so a low primary value cannot suppress recovery. Reaching the threshold does not force a credential change: the unified eligibility and scoring rules must still find a strictly better candidate.
+The daemon runs three independent timers: account polling (`poll_interval_secs`), full cache refresh with optional warmup (`cache_refresh_interval_secs`, `auto_warmup`), and proactive token refresh (`token_check_interval_secs`). With at least two profiles, `switch_threshold` starts a candidate search from the current profile's short-window usage when present; a weekly-only response uses its weekly window instead. An unavailable, account-limited, or exhausted current account is treated as 100% for this trigger so a low short-window value cannot suppress recovery. Reaching the threshold does not force a credential change: the unified eligibility and scoring rules must still find a strictly better candidate.
 
 By default, a switch is deferred while an interactive Codex process (`codex`, `codex resume`, `codex exec`) is running; the daemon records the pending switch and retries on the next poll. Long-lived MCP or app-server processes do not block a switch. Operational state lives in `daemon-state.json` and is shown by `daemon status`. Daemon switching uses the same compare-and-switch boundary: if the current marker no longer matches the live credentials observed by the poll — including when live authentication becomes untracked — the commit is refused and a later poll starts from fresh state.
 

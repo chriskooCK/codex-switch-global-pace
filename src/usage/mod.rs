@@ -145,6 +145,7 @@ pub enum UsageParseIssue {
     InvalidCodeReviewRateLimit { detail: String },
     InvalidPlanType { detail: String },
     InvalidRateLimit { detail: String },
+    InvalidCredits { detail: String },
     InvalidSpendControl { detail: String },
 }
 
@@ -168,6 +169,7 @@ impl std::fmt::Display for UsageParseIssue {
             }
             Self::InvalidPlanType { detail } => write!(formatter, "plan_type: {detail}"),
             Self::InvalidRateLimit { detail } => write!(formatter, "rate_limit: {detail}"),
+            Self::InvalidCredits { detail } => write!(formatter, "credits: {detail}"),
             Self::InvalidSpendControl { detail } => {
                 write!(formatter, "spend_control: {detail}")
             }
@@ -445,12 +447,10 @@ impl Candidate {
         }
     }
 
+    /// Whether this candidate has the validated weekly window required for
+    /// quota-aware selection. A primary window is optional scoring evidence.
     pub fn has_required_quota_data(&self) -> bool {
-        plan_has_required_quota_data(
-            self.plan_kind,
-            self.primary.is_some(),
-            self.weekly.is_some(),
-        )
+        main_weekly_quota_available(self.weekly.as_ref())
     }
 
     pub fn is_team(&self) -> bool {
@@ -483,26 +483,12 @@ impl Candidate {
     }
 }
 
-/// Apply the plan-specific minimum quota shape used by automatic selection.
-/// Callers must pass only windows whose quota values have already been
-/// validated; raw `Option` presence is not sufficient evidence.
-pub(crate) const fn plan_has_required_quota_data(
-    plan_kind: PlanKind,
-    primary_valid: bool,
-    weekly_valid: bool,
-) -> bool {
-    match plan_kind {
-        PlanKind::Free => weekly_valid,
-        PlanKind::Go
-        | PlanKind::Plus
-        | PlanKind::ProLite
-        | PlanKind::Pro
-        | PlanKind::Team
-        | PlanKind::Business
-        | PlanKind::Enterprise
-        | PlanKind::Edu => primary_valid && weekly_valid,
-        PlanKind::Unknown => false,
-    }
+/// A validated main weekly window is the quota-data contract shared by
+/// automatic selection, status, and global weekly pace. The API may omit the
+/// short window for any plan, so plan names and primary-window presence are not
+/// evidence that an otherwise valid weekly quota is unavailable.
+pub(crate) const fn main_weekly_quota_available<T>(weekly: Option<&T>) -> bool {
+    weekly.is_some()
 }
 
 /// Window durations in seconds (used for pace calculation).
