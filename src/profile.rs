@@ -922,10 +922,6 @@ pub(crate) struct AuthorizedProfileSwitch {
 }
 
 impl PreparedProfileSwitch {
-    pub(crate) fn alias(&self) -> &str {
-        &self.alias
-    }
-
     pub(crate) fn requires_confirmation(&self) -> bool {
         self.requires_confirmation
     }
@@ -2476,7 +2472,13 @@ fn plan_profile_write(
 /// derived activation marker only while that observation remains current.
 /// Live auth is never rewritten by this read-back operation.
 pub fn update_profile_from_live(alias: &str) -> Result<()> {
-    update_profile_from_live_guarded(alias, None)
+    validate_alias(alias)?;
+    let lease = acquire_profile_lease(alias)?;
+    update_profile_from_live_guarded(&lease, None)
+}
+
+pub(crate) fn update_profile_from_live_leased(lease: &ProfileLease) -> Result<()> {
+    update_profile_from_live_guarded(lease, None)
 }
 
 pub(crate) fn update_profile_from_live_if_current_marker(
@@ -2489,7 +2491,8 @@ pub(crate) fn update_profile_from_live_if_current_marker(
             expected_marker.alias()
         );
     }
-    update_profile_from_live_guarded(alias, Some(expected_marker))
+    let lease = acquire_profile_lease(alias)?;
+    update_profile_from_live_guarded(&lease, Some(expected_marker))
 }
 
 pub(crate) fn ensure_current_marker_unchanged(expected: &CurrentMarkerSnapshot) -> Result<()> {
@@ -2509,11 +2512,11 @@ pub(crate) fn ensure_current_marker_unchanged(expected: &CurrentMarkerSnapshot) 
 }
 
 fn update_profile_from_live_guarded(
-    alias: &str,
+    lease: &ProfileLease,
     expected_marker: Option<&CurrentMarkerSnapshot>,
 ) -> Result<()> {
+    let alias = lease.alias();
     validate_alias(alias)?;
-    let _lease = acquire_profile_lease(alias)?;
     let _transaction = lock_auth_transaction()?;
     if let Some(expected_marker) = expected_marker {
         ensure_current_marker_unchanged(expected_marker)?;

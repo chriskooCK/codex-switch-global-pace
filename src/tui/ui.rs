@@ -1062,10 +1062,6 @@ fn wrapped_status_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
 
 fn confirmation_status_line(confirm: &super::app::ConfirmAction) -> Line<'static> {
     let message = match confirm {
-        super::app::ConfirmAction::Switch(prepared) => format!(
-            "Current Codex login is not saved. Switch to '{}' and overwrite it? (y/n)",
-            prepared.alias()
-        ),
         super::app::ConfirmAction::Delete(alias) => {
             format!("Delete profile '{alias}'? (y/n)")
         }

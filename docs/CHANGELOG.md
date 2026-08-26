@@ -1,5 +1,15 @@
 # Changelog
 
+## v20260826.6.0 — 2026-08-26
+
+- **Single-action TUI switching** — `Enter` then `u` is the complete TUI switch
+  action; it no longer opens a second overwrite confirmation. When Codex has
+  refreshed the currently tracked account, the newer live credentials first
+  pass the existing strict identity and freshness checks and are saved back to
+  that profile before the requested switch is retried. A genuinely untracked
+  login is left untouched and the switch fails explicitly instead of silently
+  overwriting it.
+
 ## v20260826.5.0 — 2026-08-26
 
 - **Unambiguous Global Weekly summary** — The full and compact dashboards no

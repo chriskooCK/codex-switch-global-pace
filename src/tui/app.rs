@@ -156,7 +156,6 @@ impl SortMode {
 }
 
 pub enum ConfirmAction {
-    Switch(profile::PreparedProfileSwitch),
     Delete(String),
     BatchDelete(Vec<String>),
     ConsumeResetCard {
@@ -244,11 +243,16 @@ enum AccountTaskKind {
     Model { request_id: u64 },
     ResetCard,
     SwitchPrepare,
+    SwitchSync,
     SwitchCommit,
 }
 
 enum ProfileSwitchTaskResult {
-    Prepared(Result<profile::PreparedProfileSwitch>),
+    Prepared {
+        result: Result<profile::PreparedProfileSwitch>,
+        live_sync_attempted: bool,
+    },
+    LiveSynchronized(Result<()>),
     Committed(Result<profile::ProfileSwitchOutcome>),
 }
 
@@ -413,7 +417,9 @@ impl App {
         self.account_tasks.values().any(|task| {
             matches!(
                 task.kind,
-                AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit
+                AccountTaskKind::SwitchPrepare
+                    | AccountTaskKind::SwitchSync
+                    | AccountTaskKind::SwitchCommit
             )
         })
     }
@@ -470,7 +476,9 @@ impl App {
                     AccountTaskKind::ResetCard => {
                         self.reset_cards_in_flight.remove(&alias);
                     }
-                    AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit => {}
+                    AccountTaskKind::SwitchPrepare
+                    | AccountTaskKind::SwitchSync
+                    | AccountTaskKind::SwitchCommit => {}
                 }
                 continue;
             }
@@ -530,7 +538,7 @@ impl App {
                     failures.push((alias, unknown));
                     continue;
                 }
-                AccountTaskKind::SwitchPrepare => {}
+                AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchSync => {}
                 AccountTaskKind::SwitchCommit => {
                     let switch_error = anyhow::anyhow!(
                         "profile switch task stopped before reporting its outcome: {detail}"
@@ -2078,10 +2086,10 @@ impl App {
             );
             return;
         }
-        self.start_profile_switch_prepare(alias);
+        self.start_profile_switch_prepare(alias, false);
     }
 
-    fn start_profile_switch_prepare(&mut self, alias: String) {
+    fn start_profile_switch_prepare(&mut self, alias: String, live_sync_attempted: bool) {
         if self.shutting_down {
             return;
         }
@@ -2115,7 +2123,13 @@ impl App {
                 ))),
             };
             let _ = tx
-                .send((alias, ProfileSwitchTaskResult::Prepared(result)))
+                .send((
+                    alias,
+                    ProfileSwitchTaskResult::Prepared {
+                        result,
+                        live_sync_attempted,
+                    },
+                ))
                 .await;
         });
         self.track_account_task(
@@ -2125,6 +2139,74 @@ impl App {
             handle,
         );
         self.set_status(format!("Preparing switch to {tracked_alias}..."), 60);
+    }
+
+    fn start_live_auth_sync_before_switch(&mut self, target_alias: String) {
+        if self.shutting_down {
+            return;
+        }
+        let tx = self.profile_switch_sender.clone();
+        let tracked_alias = target_alias.clone();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_lease_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            let result = async {
+                let active_alias = tokio::task::spawn_blocking(profile::active_profile_from_live)
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "current-login identification worker stopped: {}",
+                            crate::task_batch::join_failure_detail(&error)
+                        )
+                    })??
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "current Codex login is not saved; switch stopped without overwriting it"
+                        )
+                    })?;
+                let lease = profile::acquire_profile_lease_async_cancellable(
+                    active_alias.clone(),
+                    &task_lease_control,
+                )
+                .await
+                .with_context(|| {
+                    format!("acquiring profile lease before synchronizing '{active_alias}'")
+                })?
+                .ok_or_else(|| anyhow::anyhow!("live-credential synchronization was cancelled"))?;
+                tokio::task::spawn_blocking(move || {
+                    profile::update_profile_from_live_leased(&lease)
+                })
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "live-credential synchronization worker stopped: {}",
+                        crate::task_batch::join_failure_detail(&error)
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "saving refreshed live credentials to profile '{active_alias}' before switching"
+                    )
+                })
+            }
+            .await;
+            let _ = tx
+                .send((
+                    target_alias.clone(),
+                    ProfileSwitchTaskResult::LiveSynchronized(result),
+                ))
+                .await;
+        });
+        self.track_account_task(
+            tracked_alias.clone(),
+            AccountTaskKind::SwitchSync,
+            lease_control,
+            handle,
+        );
+        self.set_status(
+            format!("Saving the current Codex login before switching to {tracked_alias}..."),
+            60,
+        );
     }
 
     fn start_profile_switch_commit(&mut self, confirmed: profile::ConfirmedProfileSwitch) {
@@ -2175,32 +2257,40 @@ impl App {
     pub fn poll_profile_switch_results(&mut self) {
         while let Ok((alias, result)) = self.pending_profile_switches.try_recv() {
             match result {
-                ProfileSwitchTaskResult::Prepared(_) if self.shutting_down => {}
-                ProfileSwitchTaskResult::Prepared(Ok(prepared))
-                    if prepared.requires_confirmation() =>
-                {
-                    if self.confirm.is_some() {
-                        self.set_status(
+                ProfileSwitchTaskResult::Prepared { .. } if self.shutting_down => {}
+                ProfileSwitchTaskResult::LiveSynchronized(_) if self.shutting_down => {}
+                ProfileSwitchTaskResult::Prepared {
+                    result: Ok(prepared),
+                    live_sync_attempted: false,
+                } if prepared.requires_confirmation() => {
+                    self.start_live_auth_sync_before_switch(alias);
+                }
+                ProfileSwitchTaskResult::Prepared {
+                    result: Ok(prepared),
+                    live_sync_attempted,
+                } => match profile::confirm_prepared_profile_switch_without_overwrite(prepared) {
+                    Ok(confirmed) => self.start_profile_switch_commit(confirmed),
+                    Err(error) => {
+                        let detail = if live_sync_attempted {
                             format!(
-                                "Switch to {alias} was cancelled because another confirmation is active"
-                            ),
-                            5,
-                        );
-                    } else {
-                        self.set_status(format!("Switch to {alias} requires confirmation"), 60);
-                        self.confirm = Some(ConfirmAction::Switch(prepared));
+                                "live authentication changed again after its saved profile was synchronized: {error:#}"
+                            )
+                        } else {
+                            format!("{error:#}")
+                        };
+                        self.set_status_error(format!("Switch failed: {detail}"), 5);
                     }
-                }
-                ProfileSwitchTaskResult::Prepared(Ok(prepared)) => {
-                    match profile::confirm_prepared_profile_switch_without_overwrite(prepared) {
-                        Ok(confirmed) => self.start_profile_switch_commit(confirmed),
-                        Err(error) => {
-                            self.set_status_error(format!("Switch failed: {error:#}"), 5);
-                        }
-                    }
-                }
-                ProfileSwitchTaskResult::Prepared(Err(error)) => {
+                },
+                ProfileSwitchTaskResult::Prepared {
+                    result: Err(error), ..
+                } => {
                     self.set_status_error(format!("Switch failed: {error:#}"), 5);
+                }
+                ProfileSwitchTaskResult::LiveSynchronized(Ok(())) => {
+                    self.start_profile_switch_prepare(alias, true)
+                }
+                ProfileSwitchTaskResult::LiveSynchronized(Err(error)) => {
+                    self.set_status_error(format!("Switch failed: {error:#}"), 5)
                 }
                 ProfileSwitchTaskResult::Committed(result) => {
                     self.finish_profile_switch(alias, result);
@@ -2271,11 +2361,6 @@ impl App {
             None => return,
         };
         match action {
-            ConfirmAction::Switch(prepared) => {
-                let confirmed =
-                    profile::confirm_prepared_profile_switch_after_ui_approval(prepared);
-                self.start_profile_switch_commit(confirmed);
-            }
             ConfirmAction::Delete(alias) => {
                 if self.account_operation_in_flight(&alias) {
                     self.set_status(
@@ -3619,7 +3704,9 @@ mod tests {
                 let switch_task_pending = app.account_tasks.values().any(|task| {
                     matches!(
                         task.kind,
-                        AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit
+                        AccountTaskKind::SwitchPrepare
+                            | AccountTaskKind::SwitchSync
+                            | AccountTaskKind::SwitchCommit
                     )
                 });
                 if !switch_task_pending {
@@ -4238,7 +4325,7 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn profile_switch_is_tracked_and_shutdown_cancels_a_prelease_commit() {
+    async fn profile_switch_is_tracked_and_shutdown_cancels_a_prelease_prepare() {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4258,14 +4345,16 @@ mod tests {
                 "saved-refresh",
             ),
         );
-        let untracked = serde_json::json!({
-            "tokens": {
-                "access_token": "untracked-access",
-                "refresh_token": "untracked-refresh"
-            }
-        });
         let live_path = codex_home.join("auth.json");
-        write_auth_durable(&live_path, &untracked);
+        write_auth_durable(
+            &live_path,
+            &managed_auth(
+                "account@example.com",
+                "acct_account",
+                "saved-access",
+                "saved-refresh",
+            ),
+        );
 
         let mut app = App::new();
         app.accounts.push(AccountEntry {
@@ -4276,21 +4365,12 @@ mod tests {
         });
         app.view_indices.push(0);
 
+        let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
         app.switch_selected();
         assert!(
             app.account_tasks
                 .values()
                 .any(|task| matches!(task.kind, AccountTaskKind::SwitchPrepare))
-        );
-        settle_profile_switch(&mut app).await;
-        assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
-
-        let held_lease = crate::profile::acquire_profile_lease("account").unwrap();
-        app.confirm_action();
-        assert!(
-            app.account_tasks
-                .values()
-                .any(|task| matches!(task.kind, AccountTaskKind::SwitchCommit))
         );
         tokio::task::yield_now().await;
 
@@ -4299,10 +4379,18 @@ mod tests {
             app.drain_credential_tasks(),
         )
         .await
-        .expect("shutdown must cancel a switch commit still waiting for its profile lease");
+        .expect("shutdown must cancel a switch prepare still waiting for its profile lease");
 
         assert!(app.account_tasks.is_empty());
-        assert_eq!(crate::auth::read_auth(&live_path).unwrap(), untracked);
+        assert_eq!(
+            crate::auth::read_auth(&live_path).unwrap(),
+            managed_auth(
+                "account@example.com",
+                "acct_account",
+                "saved-access",
+                "saved-refresh",
+            )
+        );
         assert!(!app.accounts[0].is_current);
         drop(held_lease);
     }
@@ -4353,7 +4441,9 @@ mod tests {
             .filter(|task| {
                 matches!(
                     task.kind,
-                    AccountTaskKind::SwitchPrepare | AccountTaskKind::SwitchCommit
+                    AccountTaskKind::SwitchPrepare
+                        | AccountTaskKind::SwitchSync
+                        | AccountTaskKind::SwitchCommit
                 )
             })
             .collect::<Vec<_>>();
@@ -4435,7 +4525,7 @@ mod tests {
         assert!(
             app.status_msg
                 .as_deref()
-                .is_some_and(|message| message.contains("another confirmation is active"))
+                .is_some_and(|message| message.contains("not saved"))
         );
     }
 
@@ -4517,12 +4607,12 @@ mod tests {
         );
         write_auth_durable(
             &codex_home.join("auth.json"),
-            &serde_json::json!({
-                "tokens": {
-                    "access_token": "untracked-access",
-                    "refresh_token": "untracked-refresh"
-                }
-            }),
+            &managed_auth(
+                "account@example.com",
+                "acct_account",
+                "saved-access",
+                "saved-refresh",
+            ),
         );
 
         let mut app = App::new();
@@ -4533,10 +4623,6 @@ mod tests {
             is_current: false,
         });
         app.view_indices.push(0);
-        app.switch_selected();
-        settle_profile_switch(&mut app).await;
-        assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
-
         let cache_lock = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -4550,7 +4636,7 @@ mod tests {
             drop(cache_lock);
         });
 
-        app.confirm_action();
+        app.switch_selected();
         let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
             tokio::task::yield_now().await;
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -4899,28 +4985,97 @@ mod tests {
 
         app.switch_selected();
         settle_profile_switch(&mut app).await;
-        assert!(matches!(app.confirm, Some(ConfirmAction::Switch(_))));
-        write_auth_durable(
-            &codex_home.join("auth.json"),
-            &serde_json::json!({
-                "tokens": { "access_token": "newer", "refresh_token": "newer-refresh" }
-            }),
-        );
-        app.confirm_action();
-        settle_profile_switch(&mut app).await;
 
         assert!(app.status_is_error);
+        assert!(app.confirm.is_none());
         assert!(
             app.status_msg
                 .as_deref()
-                .is_some_and(|message| message.contains("live auth changed"))
+                .is_some_and(|message| message.contains("not saved"))
         );
         assert_eq!(
             crate::auth::read_auth(&codex_home.join("auth.json"))
                 .unwrap()
                 .pointer("/tokens/access_token")
                 .and_then(serde_json::Value::as_str),
-            Some("newer")
+            Some("untracked")
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn refreshed_tracked_live_auth_is_saved_before_switch_without_confirmation() {
+        let _lock = crate::profile::TEST_ENV_LOCK.lock().unwrap();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        let mut stored_current = managed_auth(
+            "current@example.com",
+            "acct_current",
+            "stored-access",
+            "stored-refresh",
+        );
+        stored_current["last_refresh"] = serde_json::Value::String("2026-08-26T10:00:00Z".into());
+        let mut refreshed_live = managed_auth(
+            "current@example.com",
+            "acct_current",
+            "refreshed-access",
+            "refreshed-refresh",
+        );
+        refreshed_live["last_refresh"] = serde_json::Value::String("2026-08-26T10:05:00Z".into());
+        let target = managed_auth(
+            "target@example.com",
+            "acct_target",
+            "target-access",
+            "target-refresh",
+        );
+
+        for (alias, auth) in [("current", &stored_current), ("target", &target)] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(&path, auth);
+        }
+        write_auth_durable(&codex_home.join("auth.json"), &refreshed_live);
+        std::fs::write(home.path().join("current"), "current").unwrap();
+
+        let mut app = App::new();
+        app.load_profiles();
+        let target_idx = app
+            .accounts
+            .iter()
+            .position(|account| account.alias == "target")
+            .unwrap();
+        app.selected = app
+            .view_indices
+            .iter()
+            .position(|index| *index == target_idx)
+            .unwrap();
+
+        app.switch_selected();
+        settle_profile_switch(&mut app).await;
+
+        assert!(app.confirm.is_none());
+        assert!(
+            !app.status_is_error,
+            "unexpected status: {:?}",
+            app.status_msg
+        );
+        assert_eq!(
+            crate::auth::read_auth(&home.path().join("profiles/current/auth.json")).unwrap(),
+            refreshed_live
+        );
+        assert_eq!(
+            crate::auth::read_auth(&codex_home.join("auth.json")).unwrap(),
+            target
+        );
+        assert!(
+            app.accounts
+                .iter()
+                .find(|account| account.alias == "target")
+                .is_some_and(|account| account.is_current)
         );
     }
 
