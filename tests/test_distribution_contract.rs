@@ -36,7 +36,16 @@ fn unix_uninstall_harness(script: &str) -> String {
     let uninstall_start = script.find("run_uninstall() {").unwrap();
     let uninstall_end = script[uninstall_start..].find("# ── Install").unwrap() + uninstall_start;
     format!(
-        "{definitions}\nconfirm_locked_release_source_digest() {{ :; }}\n{}\n",
+        concat!(
+            "{definitions}\n",
+            "RELEASE_TAG=v1.2.3\n",
+            "RELEASE_SOURCE_DIGEST=0000000000000000000000000000000000000000\n",
+            "resolve_release_source_digest() {{\n",
+            "  [ \"$1\" = \"$RELEASE_TAG\" ] || return 1\n",
+            "  printf '%s\\n' \"$RELEASE_SOURCE_DIGEST\"\n",
+            "}}\n",
+            "{}\n"
+        ),
         &script[uninstall_start..uninstall_end]
     )
 }
@@ -2898,7 +2907,7 @@ esac
     .unwrap();
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
 
