@@ -110,9 +110,9 @@ pub fn calculate_effective_capacity(used_percent: f64, elapsed_percent: f64) -> 
 ///
 /// A reset at or before `now`, or more than one full window away, is stale or
 /// inconsistent and excluded. Exact 100% usage remains valid: time until reset
-/// still determines how much effective capacity it has. The fetch/cache layer's
-/// existing TTL plus these reset bounds form the freshness boundary; this pure
-/// calculation intentionally invents no second arbitrary sample-age policy.
+/// still determines how much effective capacity it has. Disk-cache reuse is a
+/// caller concern; this pure calculation validates the weekly window itself and
+/// intentionally invents no second arbitrary sample-age policy.
 pub fn calculate_account_weekly_pace(
     input: &GlobalPaceAccountInput,
     now: i64,

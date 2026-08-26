@@ -262,10 +262,7 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
     }
 
     let block = Block::default()
-        .title(format!(
-            " Global Weekly Pace · 100% normal · {} weight ",
-            summary.weighting.as_str()
-        ))
+        .title(" Global Weekly Pace ")
         .borders(Borders::ALL)
         .border_style(base().fg(C_BLUE))
         .style(base());
@@ -334,31 +331,16 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
         }
     }
 
-    let (summary_prefix, summary_segments) =
-        match (summary.pace_percent, summary.reserve_percent_points) {
-            (Some(pace), Some(reserve)) => (
-                format!("Pace {pace:.1}%"),
-                vec![
-                    format_global_pace_delta(reserve),
-                    format!(
-                        "Eff {}/{}",
-                        format_capacity(summary.effective_capacity),
-                        format_capacity(summary.normal_capacity)
-                    ),
-                    format!(
-                        "{} included / {} unavailable",
-                        summary.included_accounts, summary.excluded_accounts
-                    ),
-                ],
-            ),
-            _ => (
-                format!("{} included", summary.included_accounts),
-                vec![format!("{} unavailable", summary.excluded_accounts)],
-            ),
-        };
-    let mut summary_segments = summary_segments;
+    let summary_prefix = summary
+        .pace_percent
+        .map(|pace| format!("Pace {pace:.1}%"))
+        .unwrap_or_else(|| "Pace unavailable".to_string());
+    let mut summary_segments = Vec::new();
+    if let Some(accounts) = global_account_count_text(summary) {
+        summary_segments.push(accounts);
+    }
     if let Some(next) = next_reset_text(summary, now) {
-        summary_segments.push(format!("Next {next}"));
+        summary_segments.push(format!("Next reset: {next}"));
     }
     let summary_text = format!(
         "{}{}",
@@ -392,12 +374,12 @@ fn compact_global_weekly_line(
     } else {
         " Global: "
     };
-    let (Some(pace), Some(reserve)) = (summary.pace_percent, summary.reserve_percent_points) else {
+    let Some(pace) = summary.pace_percent else {
         let unavailable = "unavailable";
         let suffix = fitted_segment_suffix(
             display_width(prefix) + display_width(unavailable),
             width,
-            compact_account_count_segment(summary),
+            global_account_count_text(summary),
         );
         return Line::from(vec![
             Span::styled(prefix, base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
@@ -409,12 +391,13 @@ fn compact_global_weekly_line(
         summary.aggregate_elapsed_percent,
     );
     let pace_text = format!("{pace:.1}%");
-    let mut segments = vec![format_pace_delta_value(reserve)];
-    if let Some(next) = next_reset_text(summary, now) {
-        segments.push(format!("reset {next}"));
+    let mut segments = Vec::new();
+    if let Some(accounts) = global_account_count_text(summary) {
+        segments.push(accounts);
     }
-    segments.extend(compact_account_count_segment(summary));
-    segments.push(summary.weighting.as_str().to_string());
+    if let Some(next) = next_reset_text(summary, now) {
+        segments.push(format!("Next reset: {next}"));
+    }
     let suffix = fitted_segment_suffix(
         display_width(prefix) + display_width(&pace_text),
         width,
@@ -431,7 +414,15 @@ fn compact_global_weekly_line(
     ])
 }
 
-fn compact_account_count_segment(summary: &GlobalWeeklySummary) -> Option<String> {
+fn global_account_count_text(summary: &GlobalWeeklySummary) -> Option<String> {
+    if summary.excluded_accounts == 0 {
+        let noun = if summary.included_accounts == 1 {
+            "account"
+        } else {
+            "accounts"
+        };
+        return Some(format!("{} {noun}", summary.included_accounts));
+    }
     let total = summary
         .included_accounts
         .checked_add(summary.excluded_accounts)?;
@@ -454,34 +445,6 @@ fn format_duration_compact(seconds: u64) -> String {
         format!("{}h{}m", seconds / 3_600, (seconds % 3_600) / 60)
     } else {
         format!("{}d{}h", seconds / 86_400, (seconds % 86_400) / 3_600)
-    }
-}
-
-fn format_global_pace_delta(reserve: f64) -> String {
-    let reserve = if reserve.abs() < 0.05 { 0.0 } else { reserve };
-    if reserve > 0.0 {
-        format!("{} reserve", format_pace_delta_value(reserve))
-    } else if reserve < 0.0 {
-        format!("{} deficit", format_pace_delta_value(reserve))
-    } else {
-        "0.0%p normal".to_string()
-    }
-}
-
-fn format_pace_delta_value(reserve: f64) -> String {
-    let reserve = if reserve.abs() < 0.05 { 0.0 } else { reserve };
-    if reserve == 0.0 {
-        "0.0%p".to_string()
-    } else {
-        format!("{reserve:+.1}%p")
-    }
-}
-
-fn format_capacity(capacity: f64) -> String {
-    if (capacity - capacity.round()).abs() < 0.05 {
-        format!("{capacity:.0}")
-    } else {
-        format!("{capacity:.1}")
     }
 }
 
@@ -2075,7 +2038,7 @@ mod tests {
     }
 
     #[test]
-    fn full_global_panel_renders_core_capacity_counts_and_reset() {
+    fn full_global_panel_renders_pace_account_count_and_reset() {
         let now = 1_000_000;
         let summary = global_summary(now);
         let backend = TestBackend::new(110, GLOBAL_WEEKLY_FULL_HEIGHT);
@@ -2089,12 +2052,11 @@ mod tests {
             .map(|y| row_text(terminal.backend(), y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Global Weekly Pace · 100% normal · equal weight"));
+        assert!(rendered.contains("Global Weekly Pace"));
         assert!(rendered.contains("7% used"));
         assert!(rendered.contains("93% left"));
         assert!(rendered.contains("↑ pace"));
-        assert!(rendered.contains("106.7%"));
-        assert!(rendered.contains("+6.7%p reserve"));
+        assert!(rendered.contains("Pace 106.7%"));
         let (meter_start, meter_end) = meter_bounds(terminal.backend(), 1).expect("global meter");
         assert!((meter_start..meter_end).all(|x| {
             terminal
@@ -2105,10 +2067,14 @@ mod tests {
                 .symbol()
                 != "│"
         }));
-        assert!(rendered.contains("Eff 320/300"));
-        assert!(rendered.contains("3 included"));
-        assert!(rendered.contains("1 unavailable"));
-        assert!(rendered.contains("Next work2 in 3h18m"));
+        assert!(rendered.contains("3/4 accounts"));
+        assert!(rendered.contains("Next reset: work2 in 3h18m"));
+        for removed in ["100% normal", "equal weight", "+6.7%p", "Eff 320/300"] {
+            assert!(
+                !rendered.contains(removed),
+                "obsolete text remained: {removed}"
+            );
+        }
     }
 
     #[test]
@@ -2166,8 +2132,8 @@ mod tests {
         assert!(rendered.contains("3% used"));
         assert!(rendered.contains("97% left"));
         assert!(rendered.contains("Pace 97.7%"));
-        assert!(rendered.contains("-2.3%p deficit"));
-        assert!(!rendered.contains("· N"));
+        assert!(rendered.contains("3/4 accounts"));
+        assert!(!rendered.contains("-2.3%p"));
     }
 
     #[test]
@@ -2238,7 +2204,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(full_text.contains("No valid current weekly quota data"));
-        assert!(full_text.contains("0 included · 2 unavailable"));
+        assert!(full_text.contains("Pace unavailable · 0/2 accounts"));
         assert!((1..79).all(|x| {
             terminal
                 .backend()
@@ -2353,7 +2319,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_global_panel_keeps_pace_reserve_and_reset_on_one_line() {
+    fn compact_global_panel_keeps_pace_account_count_and_reset_on_one_line() {
         let now = 1_000_000;
         let summary = global_summary(now);
         let backend = TestBackend::new(70, GLOBAL_WEEKLY_COMPACT_HEIGHT);
@@ -2365,8 +2331,9 @@ mod tests {
         let text = row_text(terminal.backend(), 0);
 
         assert!(text.contains("Global Weekly: 106.7%"));
-        assert!(text.contains("+6.7%p"));
-        assert!(text.contains("reset work2 in 3h18m"));
+        assert!(text.contains("3/4 accounts"));
+        assert!(text.contains("Next reset: work2 in 3h18m"));
+        assert!(!text.contains("+6.7%p"));
         for symbol in ["█", "░", "|", "↑"] {
             assert_eq!(symbol_x(terminal.backend(), 0, symbol), None);
         }
@@ -2385,8 +2352,25 @@ mod tests {
 
         assert_eq!(
             row_text(terminal.backend(), 0).trim_end(),
-            " Global Weekly: 106.7% · +6.7%p · reset work2 in 3h18m · 3/4 accounts · equal"
+            " Global Weekly: 106.7% · 3/4 accounts · Next reset: work2 in 3h18m"
         );
+    }
+
+    #[test]
+    fn global_panel_uses_a_plain_count_when_every_account_is_available() {
+        let now = 1_000_000;
+        let mut summary = global_summary(now);
+        summary.excluded_accounts = 0;
+
+        let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
+
+        assert!(text.contains(" · 3 accounts · "), "{text:?}");
+        assert!(!text.contains("3/3 accounts"), "{text:?}");
+
+        summary.included_accounts = 1;
+        let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
+        assert!(text.contains(" · 1 account · "), "{text:?}");
+        assert!(!text.contains("1 accounts"), "{text:?}");
     }
 
     #[test]
@@ -2399,7 +2383,8 @@ mod tests {
         let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
 
         assert!(!text.contains("accounts"), "{text:?}");
-        assert!(text.contains("equal"), "{text:?}");
+        assert!(text.contains("Next reset: work2 in 3h18m"), "{text:?}");
+        assert!(!text.contains("equal"), "{text:?}");
     }
 
     #[test]
