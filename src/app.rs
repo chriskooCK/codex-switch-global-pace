@@ -373,9 +373,9 @@ pub async fn run() {
 #[cfg(test)]
 mod error_reporting_tests {
     use super::{
-        Cli, OutputAlreadyReported, PENDING_SELF_UPDATE_CLEANUP_WARNING_MAX_CHARS,
+        Cli, Commands, OutputAlreadyReported, PENDING_SELF_UPDATE_CLEANUP_WARNING_MAX_CHARS,
         format_pending_self_update_cleanup_warning, installer_owner_check_request,
-        should_report_error,
+        should_check_auth_change, should_report_error,
     };
     use clap::Parser;
 
@@ -407,6 +407,20 @@ mod error_reporting_tests {
         let cli = Cli::try_parse_from(["codex-switch-global-pace"])
             .expect("bare executable should parse without a subcommand");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn tui_skips_plain_terminal_auth_change_prompt() {
+        assert!(!should_check_auth_change(&None, false));
+        assert!(should_check_auth_change(
+            &Some(Commands::List { force: false }),
+            false
+        ));
+        assert!(!should_check_auth_change(&Some(Commands::Open), false));
+        assert!(!should_check_auth_change(
+            &Some(Commands::List { force: false }),
+            true
+        ));
     }
 
     #[test]
@@ -585,22 +599,25 @@ mod resync_reporting_tests {
     }
 }
 
-async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
-    // Startup auth change detection — skip for commands that manage auth themselves
-    let auth_check = if !json {
-        let should_check = !matches!(
-            &cmd,
+fn should_check_auth_change(cmd: &Option<Commands>, json: bool) -> bool {
+    !json
+        && cmd.is_some()
+        && !matches!(
+            cmd,
             Some(Commands::Login { .. })
                 | Some(Commands::Import { .. })
                 | Some(Commands::SelfUpdate { .. })
                 | Some(Commands::Open)
                 | Some(Commands::Daemon(_))
-        );
-        if should_check {
-            check_auth_change()?
-        } else {
-            AuthCheckResult::NoChange
-        }
+        )
+}
+
+async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
+    // The TUI reconciles live credentials after its first render so startup can
+    // never be held behind a plain-terminal prompt. CLI commands retain their
+    // existing interactive synchronization boundary.
+    let auth_check = if should_check_auth_change(&cmd, json) {
+        check_auth_change()?
     } else {
         AuthCheckResult::NoChange
     };
