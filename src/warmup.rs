@@ -3,10 +3,9 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 /// The models one warmup should touch, keyed by account *and* by the quota
 /// pools that produced the selection (see [`warmup_cache_key`]).
 ///
@@ -32,48 +31,17 @@ fn model_cache_invalidate(cache: &mut HashMap<String, Vec<String>>, key: &str) {
     cache.remove(key);
 }
 
-/// Detects the local `codex` CLI version. Runs the subprocess probe on a
-/// blocking thread pool so it never stalls a tokio worker thread.
-async fn detect_codex_version() -> &'static str {
-    CODEX_VERSION
-        .get_or_init(|| async {
-            tokio::task::spawn_blocking(|| {
-                std::process::Command::new("codex")
-                    .arg("--version")
-                    .output()
-                    .ok()
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .and_then(|s| parse_codex_version(&s))
-                    .unwrap_or_else(|| crate::auth::ALIGNED_CODEX_VERSION.to_string())
-            })
-            .await
-            .unwrap_or_else(|_| crate::auth::ALIGNED_CODEX_VERSION.to_string())
-        })
-        .await
-}
-
-/// Pick the version token out of `codex --version` output. Output shapes vary
-/// (`codex-cli 0.144.1`, `codex-cli 0.1.0 (build abc)`), so take the first
-/// dotted token that starts with a digit rather than the last token.
-fn parse_codex_version(stdout: &str) -> Option<String> {
-    stdout
-        .split_whitespace()
-        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && t.contains('.'))
-        .map(|v| v.to_string())
-}
-
 fn build_models_request(
     endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
-    version: &str,
 ) -> Result<reqwest::RequestBuilder> {
     Ok(crate::usage::apply_account_routing_headers(
         client
             .get(endpoints.models()?)
-            .query(&[("client_version", version)])
+            .query(&[("client_version", crate::auth::CODEX_COMPATIBILITY_VERSION)])
             .bearer_auth(access_token),
         account_id,
         is_fedramp,
@@ -206,18 +174,11 @@ pub(crate) async fn fetch_models(
     account_id: Option<&str>,
     is_fedramp: bool,
 ) -> Result<Vec<ModelEntry>> {
-    let version = detect_codex_version().await;
     for attempt in 1..=3 {
-        let response = build_models_request(
-            endpoints,
-            client,
-            access_token,
-            account_id,
-            is_fedramp,
-            version,
-        )?
-        .send()
-        .await;
+        let response =
+            build_models_request(endpoints, client, access_token, account_id, is_fedramp)?
+                .send()
+                .await;
         match response {
             Ok(resp) if resp.status().is_success() => {
                 let body: serde_json::Value = resp.json().await?;
@@ -1356,21 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_codex_version_picks_semver_token() {
-        assert_eq!(
-            parse_codex_version("codex-cli 0.144.1\n"),
-            Some("0.144.1".to_string())
-        );
-        assert_eq!(
-            parse_codex_version("codex-cli 0.1.0 (build abc)\n"),
-            Some("0.1.0".to_string())
-        );
-        assert_eq!(parse_codex_version("0.5.0\n"), Some("0.5.0".to_string()));
-        assert_eq!(parse_codex_version("command not found\n"), None);
-    }
-
-    #[test]
-    fn test_models_request_includes_workspace_and_fedramp_headers() {
+    fn test_models_request_uses_one_protocol_version_and_routing_headers() {
         let endpoints = crate::auth::ServiceEndpoints::production_for_test();
         let request = build_models_request(
             &endpoints,
@@ -1378,11 +1325,17 @@ mod tests {
             "access-token",
             Some("workspace-123"),
             true,
-            "0.144.1",
         )
         .unwrap()
         .build()
         .unwrap();
+
+        assert!(
+            request
+                .url()
+                .query_pairs()
+                .any(|(key, value)| { key == "client_version" && value == "0.149.0" })
+        );
 
         assert_eq!(
             request

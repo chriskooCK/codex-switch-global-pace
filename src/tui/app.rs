@@ -247,15 +247,6 @@ enum AccountTaskKind {
     SwitchCommit,
 }
 
-enum ProfileSwitchTaskResult {
-    Prepared {
-        result: Result<profile::PreparedProfileSwitch>,
-        live_sync_attempted: bool,
-    },
-    LiveSynchronized(Result<()>),
-    Committed(Result<profile::ProfileSwitchOutcome>),
-}
-
 #[derive(Debug)]
 struct AccountTask {
     alias: String,
@@ -279,6 +270,9 @@ pub struct App {
     pub status_expiry: Option<Instant>,
     pub refreshing_requests: HashMap<String, (u64, Refresh)>,
     pub pending_usage_refreshes: HashMap<String, Refresh>,
+    /// Forced usage refreshes owed to warmups that completed while a profile
+    /// switch owned the credential boundary.
+    deferred_post_switch_usage_refreshes: BTreeSet<String>,
     pub usage_next_id: u64,
     pub pending_results: tokio::sync::mpsc::Receiver<(String, u64, Result<UsageInfo, UsageError>)>,
     pub result_sender: tokio::sync::mpsc::Sender<(String, u64, Result<UsageInfo, UsageError>)>,
@@ -288,8 +282,8 @@ pub struct App {
         tokio::sync::mpsc::Receiver<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
     pub reset_card_sender:
         tokio::sync::mpsc::Sender<(String, Result<ConsumedResetCredit, ResetCardFailure>)>,
-    pending_profile_switches: tokio::sync::mpsc::Receiver<(String, ProfileSwitchTaskResult)>,
-    profile_switch_sender: tokio::sync::mpsc::Sender<(String, ProfileSwitchTaskResult)>,
+    pending_profile_switches: tokio::sync::mpsc::Receiver<(String, super::switch::TaskResult)>,
+    profile_switch_sender: tokio::sync::mpsc::Sender<(String, super::switch::TaskResult)>,
     pub reset_cards_in_flight: BTreeSet<String>,
     /// Tracks each warmup until its task has observably completed. The slow-task
     /// notice never cancels work because a refresh-token rotation or submitted
@@ -349,6 +343,7 @@ impl App {
             status_expiry: None,
             refreshing_requests: HashMap::new(),
             pending_usage_refreshes: HashMap::new(),
+            deferred_post_switch_usage_refreshes: BTreeSet::new(),
             usage_next_id: 0,
             pending_results: rx,
             result_sender: tx,
@@ -413,6 +408,53 @@ impl App {
             || self.reset_cards_in_flight.contains(alias)
     }
 
+    fn reset_card_in_flight(&self, alias: &str) -> bool {
+        self.account_tasks
+            .values()
+            .any(|task| task.alias == alias && matches!(task.kind, AccountTaskKind::ResetCard))
+    }
+
+    fn cancel_waiting_background_credential_work_for(&self, alias: &str) {
+        for task in self.account_tasks.values().filter(|task| {
+            task.alias == alias
+                && matches!(
+                    task.kind,
+                    AccountTaskKind::Usage { .. } | AccountTaskKind::Model { .. }
+                )
+        }) {
+            task.lease_control.cancel_waiting();
+        }
+        for task in self
+            .warmup_tasks
+            .values()
+            .filter(|task| task.alias == alias)
+        {
+            task.lease_control.cancel_waiting();
+        }
+    }
+
+    fn background_credential_lease_controls(
+        &self,
+    ) -> Vec<(String, profile::ProfileLeaseAcquireControl)> {
+        let mut controls: Vec<_> = self
+            .account_tasks
+            .values()
+            .filter(|task| {
+                matches!(
+                    task.kind,
+                    AccountTaskKind::Usage { .. } | AccountTaskKind::Model { .. }
+                )
+            })
+            .map(|task| (task.alias.clone(), task.lease_control.clone()))
+            .collect();
+        controls.extend(
+            self.warmup_tasks
+                .values()
+                .map(|task| (task.alias.clone(), task.lease_control.clone())),
+        );
+        controls
+    }
+
     fn profile_switch_in_flight(&self) -> bool {
         self.account_tasks.values().any(|task| {
             matches!(
@@ -426,6 +468,18 @@ impl App {
 
     fn interactive_operation_in_flight(&self) -> bool {
         self.confirm.is_some() || self.rename.is_some() || self.profile_switch_in_flight()
+    }
+
+    fn reject_new_credential_operation_during_switch(&mut self) -> bool {
+        if !self.profile_switch_in_flight() {
+            return false;
+        }
+        self.set_status(
+            "Finish the active profile switch before starting another account operation"
+                .to_string(),
+            5,
+        );
+        true
     }
 
     pub fn has_pending_credential_tasks(&self) -> bool {
@@ -452,7 +506,7 @@ impl App {
             let kind = task.kind;
             let cancelled_before_lease = task.lease_control.is_cancelled();
             let joined = task.handle.await;
-            if cancelled_before_lease {
+            if cancelled_before_lease && joined.is_ok() {
                 match kind {
                     AccountTaskKind::Usage { request_id } => {
                         let is_current = self
@@ -462,6 +516,13 @@ impl App {
                         if is_current {
                             self.refreshing_requests.remove(&alias);
                             self.pending_usage_refreshes.remove(&alias);
+                            if let Some(entry) =
+                                self.accounts.iter_mut().find(|entry| entry.alias == alias)
+                                && matches!(entry.usage, UsageStatus::Loading)
+                            {
+                                entry.usage = UsageStatus::Idle;
+                                self.update_view();
+                            }
                         }
                     }
                     AccountTaskKind::Model { request_id } => {
@@ -471,6 +532,9 @@ impl App {
                             .is_some_and(|active_id| *active_id == request_id);
                         if is_current {
                             self.model_requests.remove(&alias);
+                            if matches!(self.model_cache.get(&alias), Some(ModelStatus::Loading)) {
+                                self.model_cache.remove(&alias);
+                            }
                         }
                     }
                     AccountTaskKind::ResetCard => {
@@ -619,6 +683,9 @@ impl App {
     /// and it isn't already loaded or in flight. Idempotent — safe to call
     /// every frame.
     pub fn ensure_models_loaded(&mut self, alias: &str) {
+        if self.profile_switch_in_flight() {
+            return;
+        }
         // Errors are stable session state too. Retrying every render tick can
         // hammer a permanently failing endpoint; `refresh_one` is the explicit
         // transition that invalidates any terminal state and starts a new request.
@@ -684,7 +751,7 @@ impl App {
     /// Fetch the model list for the currently-selected account, if the
     /// detail panel is visible. No-op when nothing is selected.
     pub fn ensure_models_loaded_for_selected(&mut self) {
-        if !self.detail_visible {
+        if !self.detail_visible || self.profile_switch_in_flight() {
             return;
         }
         if let Some(alias) = self
@@ -963,6 +1030,9 @@ impl App {
 
     /// Warmup just one alias.
     pub fn warmup_one(&mut self, alias: &str) {
+        if self.reject_new_credential_operation_during_switch() {
+            return;
+        }
         let target_indices: Vec<usize> = self
             .accounts
             .iter()
@@ -1313,7 +1383,7 @@ impl App {
         target_indices: Vec<usize>,
         origin: WarmupPreflightOrigin,
     ) {
-        if self.shutting_down {
+        if self.shutting_down || self.profile_switch_in_flight() {
             return;
         }
         if self.warmup_preflight.is_some() {
@@ -1470,6 +1540,9 @@ impl App {
         {
             return;
         }
+        if !self.shutting_down && self.profile_switch_in_flight() {
+            return;
+        }
         let Some(task) = self.warmup_preflight.take() else {
             return;
         };
@@ -1526,6 +1599,9 @@ impl App {
     }
 
     pub fn refresh_one(&mut self, alias: &str) {
+        if self.reject_new_credential_operation_during_switch() {
+            return;
+        }
         let Some(idx) = self
             .accounts
             .iter()
@@ -1533,14 +1609,18 @@ impl App {
         else {
             return;
         };
-        self.model_cache.remove(alias);
-        self.model_requests.remove(alias);
+        if !self.model_requests.contains_key(alias) {
+            self.model_cache.remove(alias);
+        }
         self.fetch_usage_for(idx, Refresh::Forced);
         self.ensure_models_loaded(alias);
         self.set_status(format!("Refreshing {alias}"), 3);
     }
 
     fn spawn_warmup(&mut self, alias: String) {
+        if self.profile_switch_in_flight() {
+            return;
+        }
         // Skip if this alias already has an in-flight warmup task.
         if self.is_warmup_in_flight(&alias) {
             return;
@@ -1635,6 +1715,7 @@ impl App {
         let mut to_refresh = std::collections::BTreeSet::<String>::new();
         let mut successes = Vec::new();
         let mut failures = Vec::new();
+        let mut refresh_deferred = false;
 
         let mut finished_task_ids: Vec<u64> = self
             .warmup_tasks
@@ -1650,7 +1731,7 @@ impl App {
             let alias = task.alias;
             let cancelled_before_lease = task.lease_control.is_cancelled();
             let joined = task.handle.await;
-            if cancelled_before_lease {
+            if cancelled_before_lease && matches!(&joined, Ok(Ok(()))) {
                 continue;
             }
             match joined {
@@ -1672,6 +1753,11 @@ impl App {
         }
         for alias in to_refresh {
             if self.shutting_down {
+                continue;
+            }
+            if self.profile_switch_in_flight() {
+                self.deferred_post_switch_usage_refreshes.insert(alias);
+                refresh_deferred = true;
                 continue;
             }
             if let Some(idx) = self.accounts.iter().position(|a| a.alias == alias) {
@@ -1726,10 +1812,12 @@ impl App {
                 6,
             );
         } else if !successes.is_empty() {
-            self.set_status(
-                format!("Warmed up {} — refreshing usage...", successes.join(", ")),
-                4,
-            );
+            let action = if refresh_deferred {
+                "usage refresh queued until the profile switch finishes"
+            } else {
+                "refreshing usage..."
+            };
+            self.set_status(format!("Warmed up {} — {action}", successes.join(", ")), 4);
         }
     }
 
@@ -1808,6 +1896,9 @@ impl App {
     }
 
     fn fetch_usage_for(&mut self, idx: usize, refresh: Refresh) {
+        if self.profile_switch_in_flight() {
+            return;
+        }
         let entry = match self.accounts.get(idx) {
             Some(e) => e,
             None => return,
@@ -1990,6 +2081,9 @@ impl App {
     /// via the Enter > Batch menu so the implicit "marks change scope"
     /// behavior is gone.
     pub fn refresh(&mut self, refresh: Refresh) {
+        if self.reject_new_credential_operation_during_switch() {
+            return;
+        }
         let target_indices: Vec<usize> = self.view_indices.clone();
         self.refresh_indices(&target_indices, refresh);
     }
@@ -2079,17 +2173,18 @@ impl App {
             );
             return;
         }
-        if self.account_operation_in_flight(&alias) {
+        if self.reset_card_in_flight(&alias) {
             self.set_status(
-                format!("{alias}: wait for the account operation to finish before switching"),
+                format!("{alias}: finish the reset-card operation before switching"),
                 5,
             );
             return;
         }
-        self.start_profile_switch_prepare(alias, false);
+        self.cancel_waiting_background_credential_work_for(&alias);
+        self.start_profile_switch_prepare(alias, super::switch::PreparePass::Initial);
     }
 
-    fn start_profile_switch_prepare(&mut self, alias: String, live_sync_attempted: bool) {
+    fn start_profile_switch_prepare(&mut self, alias: String, pass: super::switch::PreparePass) {
         if self.shutting_down {
             return;
         }
@@ -2098,39 +2193,9 @@ impl App {
         let lease_control = profile::ProfileLeaseAcquireControl::new();
         let task_lease_control = lease_control.clone();
         let handle = tokio::spawn(async move {
-            let result = match profile::acquire_profile_lease_async_cancellable(
-                alias.clone(),
-                &task_lease_control,
-            )
-            .await
-            {
-                Ok(Some(lease)) => {
-                    match tokio::task::spawn_blocking(move || {
-                        profile::prepare_profile_switch_with_lease(&lease)
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(error) => Err(anyhow::anyhow!(
-                            "profile switch preparation worker stopped: {}",
-                            crate::task_batch::join_failure_detail(&error)
-                        )),
-                    }
-                }
-                Ok(None) => return,
-                Err(error) => Err(error.context(format!(
-                    "acquiring profile lease before preparing switch to '{alias}'"
-                ))),
-            };
-            let _ = tx
-                .send((
-                    alias,
-                    ProfileSwitchTaskResult::Prepared {
-                        result,
-                        live_sync_attempted,
-                    },
-                ))
-                .await;
+            if let Some(result) = super::switch::prepare(alias, pass, task_lease_control).await {
+                let _ = tx.send(result).await;
+            }
         });
         self.track_account_task(
             tracked_alias.clone(),
@@ -2147,55 +2212,17 @@ impl App {
         }
         let tx = self.profile_switch_sender.clone();
         let tracked_alias = target_alias.clone();
+        let background_leases = self.background_credential_lease_controls();
         let lease_control = profile::ProfileLeaseAcquireControl::new();
         let task_lease_control = lease_control.clone();
         let handle = tokio::spawn(async move {
-            let result = async {
-                let active_alias = tokio::task::spawn_blocking(profile::active_profile_from_live)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "current-login identification worker stopped: {}",
-                            crate::task_batch::join_failure_detail(&error)
-                        )
-                    })??
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "current Codex login is not saved; switch stopped without overwriting it"
-                        )
-                    })?;
-                let lease = profile::acquire_profile_lease_async_cancellable(
-                    active_alias.clone(),
-                    &task_lease_control,
-                )
-                .await
-                .with_context(|| {
-                    format!("acquiring profile lease before synchronizing '{active_alias}'")
-                })?
-                .ok_or_else(|| anyhow::anyhow!("live-credential synchronization was cancelled"))?;
-                tokio::task::spawn_blocking(move || {
-                    profile::update_profile_from_live_leased(&lease)
-                })
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "live-credential synchronization worker stopped: {}",
-                        crate::task_batch::join_failure_detail(&error)
-                    )
-                })?
-                .with_context(|| {
-                    format!(
-                        "saving refreshed live credentials to profile '{active_alias}' before switching"
-                    )
-                })
-            }
+            let result = super::switch::synchronize_live(
+                target_alias,
+                task_lease_control,
+                background_leases,
+            )
             .await;
-            let _ = tx
-                .send((
-                    target_alias.clone(),
-                    ProfileSwitchTaskResult::LiveSynchronized(result),
-                ))
-                .await;
+            let _ = tx.send(result).await;
         });
         self.track_account_task(
             tracked_alias.clone(),
@@ -2204,7 +2231,7 @@ impl App {
             handle,
         );
         self.set_status(
-            format!("Saving the current Codex login before switching to {tracked_alias}..."),
+            format!("Synchronizing the current Codex login before switching to {tracked_alias}..."),
             60,
         );
     }
@@ -2219,31 +2246,9 @@ impl App {
         let lease_control = profile::ProfileLeaseAcquireControl::new();
         let task_lease_control = lease_control.clone();
         let handle = tokio::spawn(async move {
-            let result = match profile::acquire_profile_lease_async_cancellable(
-                alias.clone(),
-                &task_lease_control,
-            )
-            .await
-            {
-                Ok(Some(lease)) => match tokio::task::spawn_blocking(move || {
-                    profile::commit_confirmed_profile_switch_with_lease(confirmed, &lease)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(anyhow::anyhow!(
-                        "profile switch commit worker stopped: {}",
-                        crate::task_batch::join_failure_detail(&error)
-                    )),
-                },
-                Ok(None) => return,
-                Err(error) => Err(error.context(format!(
-                    "acquiring profile lease before committing switch to '{alias}'"
-                ))),
-            };
-            let _ = tx
-                .send((alias, ProfileSwitchTaskResult::Committed(result)))
-                .await;
+            if let Some(result) = super::switch::commit(confirmed, task_lease_control).await {
+                let _ = tx.send(result).await;
+            }
         });
         self.track_account_task(
             tracked_alias.clone(),
@@ -2256,22 +2261,25 @@ impl App {
 
     pub fn poll_profile_switch_results(&mut self) {
         while let Ok((alias, result)) = self.pending_profile_switches.try_recv() {
+            result.record_timing(&alias);
             match result {
-                ProfileSwitchTaskResult::Prepared { .. } if self.shutting_down => {}
-                ProfileSwitchTaskResult::LiveSynchronized(_) if self.shutting_down => {}
-                ProfileSwitchTaskResult::Prepared {
+                super::switch::TaskResult::Prepared { .. } if self.shutting_down => {}
+                super::switch::TaskResult::LiveSynchronized { .. } if self.shutting_down => {}
+                super::switch::TaskResult::Prepared {
                     result: Ok(prepared),
-                    live_sync_attempted: false,
-                } if prepared.requires_confirmation() => {
+                    pass: super::switch::PreparePass::Initial,
+                    ..
+                } if prepared.has_live_auth() => {
                     self.start_live_auth_sync_before_switch(alias);
                 }
-                ProfileSwitchTaskResult::Prepared {
+                super::switch::TaskResult::Prepared {
                     result: Ok(prepared),
-                    live_sync_attempted,
+                    pass,
+                    ..
                 } => match profile::confirm_prepared_profile_switch_without_overwrite(prepared) {
                     Ok(confirmed) => self.start_profile_switch_commit(confirmed),
                     Err(error) => {
-                        let detail = if live_sync_attempted {
+                        let detail = if pass == super::switch::PreparePass::AfterLiveSync {
                             format!(
                                 "live authentication changed again after its saved profile was synchronized: {error:#}"
                             )
@@ -2281,20 +2289,36 @@ impl App {
                         self.set_status_error(format!("Switch failed: {detail}"), 5);
                     }
                 },
-                ProfileSwitchTaskResult::Prepared {
+                super::switch::TaskResult::Prepared {
                     result: Err(error), ..
                 } => {
                     self.set_status_error(format!("Switch failed: {error:#}"), 5);
                 }
-                ProfileSwitchTaskResult::LiveSynchronized(Ok(())) => {
-                    self.start_profile_switch_prepare(alias, true)
-                }
-                ProfileSwitchTaskResult::LiveSynchronized(Err(error)) => {
-                    self.set_status_error(format!("Switch failed: {error:#}"), 5)
-                }
-                ProfileSwitchTaskResult::Committed(result) => {
+                super::switch::TaskResult::LiveSynchronized { result: Ok(()), .. } => self
+                    .start_profile_switch_prepare(alias, super::switch::PreparePass::AfterLiveSync),
+                super::switch::TaskResult::LiveSynchronized {
+                    result: Err(error), ..
+                } => self.set_status_error(format!("Switch failed: {error:#}"), 5),
+                super::switch::TaskResult::Committed { result, .. } => {
                     self.finish_profile_switch(alias, result);
                 }
+            }
+        }
+        self.resume_deferred_post_switch_usage_refreshes();
+    }
+
+    fn resume_deferred_post_switch_usage_refreshes(&mut self) {
+        if self.shutting_down || self.profile_switch_in_flight() {
+            return;
+        }
+        let aliases = std::mem::take(&mut self.deferred_post_switch_usage_refreshes);
+        for alias in aliases {
+            if let Some(idx) = self
+                .accounts
+                .iter()
+                .position(|account| account.alias == alias)
+            {
+                self.fetch_usage_for(idx, Refresh::Forced);
             }
         }
     }
@@ -2678,6 +2702,9 @@ impl App {
         if self.marked.is_empty() {
             return;
         }
+        if self.reject_new_credential_operation_during_switch() {
+            return;
+        }
         let target_indices: Vec<usize> = self
             .accounts
             .iter()
@@ -2693,6 +2720,9 @@ impl App {
     /// Warmup all marked accounts (skipping already-active / in-flight / errored).
     pub fn warmup_marked(&mut self) {
         if self.marked.is_empty() {
+            return;
+        }
+        if self.reject_new_credential_operation_during_switch() {
             return;
         }
         let target_indices: Vec<usize> = self
@@ -2900,7 +2930,8 @@ impl App {
             return;
         }
 
-        if self.loading_count() > 0
+        if self.profile_switch_in_flight()
+            || self.loading_count() > 0
             || !self.warmup_tasks.is_empty()
             || self.warmup_preflight.is_some()
         {
@@ -3130,16 +3161,7 @@ async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: Ke
     match action {
         MenuAction::Noop => {}
         MenuAction::Close => app.close_menu(),
-        MenuAction::Use(alias) => {
-            app.close_menu();
-            // Reuse switch_selected logic by selecting the alias first.
-            if let Some(account_idx) = app.accounts.iter().position(|a| a.alias == alias)
-                && let Some(view_idx) = app.view_indices.iter().position(|&i| i == account_idx)
-            {
-                app.selected = view_idx;
-            }
-            app.switch_selected();
-        }
+        MenuAction::Use(alias) => dispatch_menu_use(app, &alias),
         MenuAction::ReloginRequest(alias, email) => {
             app.open_relogin_flow_menu(alias, email);
         }
@@ -3193,6 +3215,31 @@ async fn handle_menu_key(app: &mut App, terminal: &mut DefaultTerminal, code: Ke
     }
 }
 
+fn dispatch_menu_use(app: &mut App, alias: &str) {
+    app.close_menu();
+    let Some(account_idx) = app
+        .accounts
+        .iter()
+        .position(|account| account.alias == alias)
+    else {
+        app.set_status_error(format!("Account '{alias}' is no longer available"), 5);
+        return;
+    };
+    let Some(view_idx) = app
+        .view_indices
+        .iter()
+        .position(|&index| index == account_idx)
+    else {
+        app.set_status_error(
+            format!("Account '{alias}' is no longer in the current view"),
+            5,
+        );
+        return;
+    };
+    app.selected = view_idx;
+    app.switch_selected();
+}
+
 enum OAuthMode {
     Add,
     Relogin(String),
@@ -3229,6 +3276,10 @@ async fn perform_oauth(
     mode: OAuthMode,
     device: bool,
 ) {
+    if app.reject_new_credential_operation_during_switch() {
+        app.close_menu();
+        return;
+    }
     // Tear down TUI: restore cooked mode + clear screen so the OAuth output
     // (browser prompts, device user_code, polling progress) is visible.
     suspend_tui_for_plain_output();
@@ -3336,6 +3387,10 @@ where
 }
 
 async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, device: bool) {
+    if app.reject_new_credential_operation_during_switch() {
+        app.close_menu();
+        return;
+    }
     let aliases: Vec<String> = app.marked.iter().cloned().collect();
     if aliases.is_empty() {
         return;
@@ -3603,7 +3658,7 @@ mod tests {
     use super::{
         AccountEntry, AccountTaskKind, App, BatchDeleteReport, ConfirmAction, ModelStatus,
         STATUS_MESSAGE_MAX_CHARS, SearchState, SortMode, UsageStatus, WarmupTask,
-        batch_relogin_not_attempted, drain_credential_tasks_on_error,
+        batch_relogin_not_attempted, dispatch_menu_use, drain_credential_tasks_on_error,
         finish_login_or_stop_after_round, refresh_fetches_loaded_usage,
         refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
     };
@@ -3717,6 +3772,468 @@ mod tests {
         })
         .await
         .expect("profile switch task must settle");
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn account_menu_enter_then_u_dispatches_the_complete_switch_without_confirmation() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        std::fs::create_dir_all(&codex_home).unwrap();
+
+        for (alias, email, account_id, access) in [
+            (
+                "current",
+                "current@example.com",
+                "acct_current",
+                "refreshed-current",
+            ),
+            (
+                "target",
+                "target@example.com",
+                "acct_target",
+                "target-access",
+            ),
+            (
+                "unrelated",
+                "unrelated@example.com",
+                "acct_unrelated",
+                "unrelated-access",
+            ),
+        ] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(
+                &path,
+                &managed_auth(email, account_id, access, &format!("{alias}-refresh")),
+            );
+        }
+        let current_auth = managed_auth(
+            "current@example.com",
+            "acct_current",
+            "refreshed-current",
+            "current-refresh",
+        );
+        std::fs::write(
+            codex_home.join("auth.json"),
+            serde_json::to_vec(&current_auth).unwrap(),
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        for (alias, is_current) in [("current", true), ("target", false), ("unrelated", false)] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Idle,
+                is_current,
+            });
+        }
+        app.view_indices.extend([0, 1, 2]);
+        app.selected = 1;
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        for (idx, alias) in [(0, "current"), (1, "target"), (2, "unrelated")] {
+            app.fetch_usage_for(idx, Refresh::Cached);
+            app.ensure_models_loaded(alias);
+            app.spawn_warmup(alias.into());
+        }
+        assert!(app.refreshing_requests.contains_key("current"));
+        assert!(app.refreshing_requests.contains_key("target"));
+        assert!(app.refreshing_requests.contains_key("unrelated"));
+        assert!(app.model_requests.contains_key("current"));
+        assert!(app.model_requests.contains_key("target"));
+        assert!(app.model_requests.contains_key("unrelated"));
+        assert!(app.is_warmup_in_flight("current"));
+        assert!(app.is_warmup_in_flight("target"));
+        assert!(app.is_warmup_in_flight("unrelated"));
+
+        app.open_account_menu();
+        let action = app
+            .menu
+            .as_mut()
+            .expect("Enter should open the account menu")
+            .handle_key(KeyCode::Char('u'));
+        let super::super::menu::MenuAction::Use(alias) = action else {
+            panic!("u should dispatch the account-menu Use action");
+        };
+        dispatch_menu_use(&mut app, &alias);
+        assert!(app.profile_switch_in_flight());
+        settle_profile_switch(&mut app).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while app
+                .account_tasks
+                .values()
+                .any(|task| task.alias != "unrelated")
+                || app
+                    .warmup_tasks
+                    .values()
+                    .any(|task| task.alias != "unrelated")
+            {
+                app.poll_warmup_results().await;
+                app.poll_account_tasks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled background reads must settle");
+
+        assert!(app.menu.is_none());
+        assert!(app.confirm.is_none());
+        assert!(!app.accounts[0].is_current);
+        assert!(app.accounts[1].is_current);
+        assert!(matches!(app.accounts[0].usage, UsageStatus::Idle));
+        assert!(matches!(app.accounts[1].usage, UsageStatus::Idle));
+        assert!(!app.model_cache.contains_key("current"));
+        assert!(!app.model_cache.contains_key("target"));
+        assert!(app.refreshing_requests.contains_key("unrelated"));
+        assert!(app.model_requests.contains_key("unrelated"));
+        assert!(app.is_warmup_in_flight("unrelated"));
+        assert_eq!(
+            crate::auth::read_auth(&codex_home.join("auth.json")).unwrap(),
+            managed_auth(
+                "target@example.com",
+                "acct_target",
+                "target-access",
+                "target-refresh",
+            )
+        );
+        assert_eq!(
+            crate::auth::read_auth(&home.path().join("profiles/current/auth.json")).unwrap(),
+            managed_auth(
+                "current@example.com",
+                "acct_current",
+                "refreshed-current",
+                "current-refresh",
+            )
+        );
+        app.drain_credential_tasks().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_switch_rejects_new_background_credential_work() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: true,
+        });
+        app.view_indices.push(0);
+
+        let switch_handle = tokio::spawn(async {});
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::SwitchPrepare,
+            profile::ProfileLeaseAcquireControl::new(),
+            switch_handle,
+        );
+        assert!(app.profile_switch_in_flight());
+
+        app.refresh(Refresh::Forced);
+        app.ensure_models_loaded("account");
+        app.warmup_one("account");
+        assert!(app.refreshing_requests.is_empty());
+        assert!(app.model_requests.is_empty());
+        assert!(app.model_cache.is_empty());
+        assert!(app.warmup_preflight.is_none());
+        assert!(app.warmup_tasks.is_empty());
+
+        app.auto_refresh_enabled = true;
+        app.next_auto_refresh = Some(Instant::now());
+        let deferred_after = Instant::now();
+        app.run_due_auto_refresh();
+        assert!(
+            app.next_auto_refresh
+                .is_some_and(|next| next > deferred_after)
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while app.profile_switch_in_flight() {
+                tokio::task::yield_now().await;
+                app.poll_account_tasks().await;
+            }
+        })
+        .await
+        .expect("mock profile switch task must settle");
+        assert!(!app.profile_switch_in_flight());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_warmup_preflight_waits_for_profile_switch_to_finish() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth("account@example.com", "acct_account", "access", "refresh"),
+        );
+        let _held_lease = profile::acquire_profile_lease("account").unwrap();
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.warmup_preflight = Some(super::WarmupPreflightTask {
+            origin: super::WarmupPreflightOrigin::Single {
+                alias: "account".into(),
+            },
+            candidate_count: 1,
+            aliases: ["account".to_string()].into_iter().collect(),
+            handle: tokio::spawn(async { Ok(vec!["account".to_string()]) }),
+        });
+        let (release_switch, wait_for_release) = tokio::sync::oneshot::channel();
+        app.track_account_task(
+            "target".into(),
+            AccountTaskKind::SwitchPrepare,
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(async move {
+                let _ = wait_for_release.await;
+            }),
+        );
+        while !app
+            .warmup_preflight
+            .as_ref()
+            .is_some_and(|task| task.handle.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+
+        app.poll_warmup_preflight_result().await;
+
+        assert!(app.warmup_preflight.is_some());
+        assert!(app.warmup_tasks.is_empty());
+
+        release_switch.send(()).unwrap();
+        while app.profile_switch_in_flight() {
+            tokio::task::yield_now().await;
+            app.poll_account_tasks().await;
+        }
+        app.poll_warmup_preflight_result().await;
+
+        assert!(app.warmup_preflight.is_none());
+        assert_eq!(app.warmup_tasks.len(), 1);
+        app.drain_credential_tasks().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_warmup_defers_usage_refresh_until_profile_switch_finishes() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "unrelated".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        app.warmup_tasks.insert(
+            0,
+            WarmupTask {
+                alias: "unrelated".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                lease_control: profile::ProfileLeaseAcquireControl::new(),
+                handle: tokio::spawn(async { Ok(()) }),
+            },
+        );
+        let (release_switch, wait_for_release) = tokio::sync::oneshot::channel();
+        app.track_account_task(
+            "target".into(),
+            AccountTaskKind::SwitchPrepare,
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(async move {
+                let _ = wait_for_release.await;
+            }),
+        );
+        while !app.warmup_tasks[&0].handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        app.poll_warmup_results().await;
+
+        assert!(
+            app.deferred_post_switch_usage_refreshes
+                .contains("unrelated")
+        );
+        assert!(!app.refreshing_requests.contains_key("unrelated"));
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("queued until the profile switch finishes"))
+        );
+
+        release_switch.send(()).unwrap();
+        while app.profile_switch_in_flight() {
+            tokio::task::yield_now().await;
+            app.poll_account_tasks().await;
+        }
+        app.poll_profile_switch_results();
+
+        assert!(app.deferred_post_switch_usage_refreshes.is_empty());
+        assert!(app.refreshing_requests.contains_key("unrelated"));
+        app.drain_credential_tasks().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_account_task_panic_is_reported() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loading,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.refreshing_requests
+            .insert("account".into(), (7, Refresh::Cached));
+
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_control = lease_control.clone();
+        let handle = tokio::spawn(async move {
+            task_control.cancelled().await;
+            panic!("cancelled usage task panic");
+        });
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::Usage { request_id: 7 },
+            lease_control.clone(),
+            handle,
+        );
+        assert!(lease_control.cancel_waiting());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !app.account_tasks.is_empty() {
+                tokio::task::yield_now().await;
+                app.poll_account_tasks().await;
+            }
+        })
+        .await
+        .expect("cancelled account task must settle");
+
+        assert!(matches!(app.accounts[0].usage, UsageStatus::Error(_)));
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("panicked"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_warmup_task_panic_is_reported() {
+        let mut app = App::new();
+        let lease_control = profile::ProfileLeaseAcquireControl::new();
+        let task_control = lease_control.clone();
+        let handle: tokio::task::JoinHandle<std::result::Result<(), String>> =
+            tokio::spawn(async move {
+                task_control.cancelled().await;
+                panic!("cancelled warmup task panic");
+            });
+        app.warmup_tasks.insert(
+            0,
+            WarmupTask {
+                alias: "account".into(),
+                started: Instant::now(),
+                slow_reported: false,
+                lease_control: lease_control.clone(),
+                handle,
+            },
+        );
+        assert!(lease_control.cancel_waiting());
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !app.warmup_tasks.is_empty() {
+                tokio::task::yield_now().await;
+                app.poll_warmup_results().await;
+            }
+        })
+        .await
+        .expect("cancelled warmup task must settle");
+
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("panicked"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_account_menu_alias_never_switches_the_selected_fallback_row() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "remaining".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+
+        dispatch_menu_use(&mut app, "removed");
+
+        assert!(app.account_tasks.is_empty());
+        assert_eq!(app.selected, 0);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("no longer available"))
+        );
+        assert!(app.status_is_error);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_one_reuses_an_in_flight_model_generation() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth("account@example.com", "acct_account", "access", "refresh"),
+        );
+
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: false,
+        });
+        app.view_indices.push(0);
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        app.ensure_models_loaded("account");
+        let initial_request_id = app.model_requests["account"];
+
+        app.refresh_one("account");
+
+        assert_eq!(app.model_requests["account"], initial_request_id);
+        assert_eq!(
+            app.account_tasks
+                .values()
+                .filter(|task| matches!(task.kind, AccountTaskKind::Model { .. }))
+                .count(),
+            1
+        );
+        app.drain_credential_tasks().await;
     }
 
     #[test]

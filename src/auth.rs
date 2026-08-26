@@ -14,8 +14,9 @@ const AUTH_PUBLICATION_RECORD_VERSION: u8 = 1;
 const MAX_AUTH_PUBLICATION_RECORD_BYTES: usize = 64 * 1024;
 
 pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// Upstream Codex version this release is contract-aligned with.
-pub(crate) const ALIGNED_CODEX_VERSION: &str = "0.144.1";
+/// Upstream Codex release used as this build's explicit interoperability target.
+/// This is a deliberate protocol pin, not the package version of this application.
+pub(crate) const CODEX_COMPATIBILITY_VERSION: &str = "0.149.0";
 
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -170,7 +171,7 @@ pub(crate) fn service_endpoints() -> Result<ServiceEndpoints> {
 /// User-Agent in the upstream shape: `codex_cli_rs/<version> (<os>; <arch>)`.
 pub(crate) fn codex_user_agent() -> String {
     format!(
-        "codex_cli_rs/{ALIGNED_CODEX_VERSION} ({}; {})",
+        "codex_cli_rs/{CODEX_COMPATIBILITY_VERSION} ({}; {})",
         std::env::consts::OS,
         std::env::consts::ARCH
     )
@@ -3058,9 +3059,13 @@ mod tests {
 
     #[test]
     fn test_user_agent_matches_upstream_shape() {
+        assert_eq!(super::CODEX_COMPATIBILITY_VERSION, "0.149.0");
         let ua = codex_user_agent();
         assert!(
-            ua.starts_with("codex_cli_rs/0.144.1 ("),
+            ua.starts_with(&format!(
+                "codex_cli_rs/{} (",
+                super::CODEX_COMPATIBILITY_VERSION
+            )),
             "unexpected UA: {ua}"
         );
         assert!(ua.ends_with(')'));

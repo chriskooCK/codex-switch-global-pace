@@ -1,5 +1,37 @@
 # Changelog
 
+## v20260826.7.0 — 2026-08-26
+
+- **Auditable account switching** — The TUI switch workers now live in one
+  focused module and record total time plus profile-lock wait time for prepare,
+  live synchronization, revalidation, and commit phases. The required
+  post-synchronization revalidation remains intact.
+- **Enter → u regression coverage** — A complete account-menu key path now
+  starts with usage and model reads waiting, verifies they are cancelled before
+  credential work, saves refreshed credentials, activates the target, and
+  creates no confirmation prompt. Reads for the target or active live profile
+  that already hold their lease finish safely before the switch continues,
+  including when live auth differs only in JSON formatting or shares a legacy
+  duplicate identity. Authentication comparison is separate from managed
+  workspace enforcement, which remains at credential write and activation
+  boundaries. Waiting refresh, model, and warmup work for the target or active
+  live profile is cancelled without discarding unrelated batch work; completed
+  warmup inspection and its follow-up usage refresh resume after the switch.
+  New credential work cannot start during the switch, task panics remain visible
+  after cancellation, and a stale account menu fails closed instead of switching
+  whichever row is selected.
+- **Single model refresh generation** — An explicit account refresh reuses an
+  in-flight model request instead of discarding its generation and starting a
+  duplicate credential-bearing network task.
+- **Codex compatibility review** — The explicit interoperability target and
+  upstream-shaped User-Agent are aligned with the locally validated Codex CLI
+  0.149.0. The models query uses that same protocol version, and the subprocess
+  version probe and its fallback were removed. Authentication fields remain
+  strictly validated.
+- **Confirmation cleanup** — The obsolete TUI approval transition was removed;
+  CLI overwrite confirmation and the TUI's non-overwriting validation now have
+  distinct, direct paths.
+
 ## v20260826.6.0 — 2026-08-26
 
 - **Single-action TUI switching** — `Enter` then `u` is the complete TUI switch

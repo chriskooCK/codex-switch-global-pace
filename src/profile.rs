@@ -925,6 +925,10 @@ impl PreparedProfileSwitch {
     pub(crate) fn requires_confirmation(&self) -> bool {
         self.requires_confirmation
     }
+
+    pub(crate) fn has_live_auth(&self) -> bool {
+        self.live_snapshot.is_some()
+    }
 }
 
 impl ConfirmedProfileSwitch {
@@ -967,7 +971,7 @@ pub(crate) fn prepare_profile_switch_with_lease(
     crate::auth::validate_managed_auth_value(&target)?;
     let live_snapshot = snapshot_optional_file(&live_path)?;
     let requires_confirmation = match live_snapshot.as_deref() {
-        Some(contents) => find_matching_profiles_for_bytes_checked(contents)?.is_empty(),
+        Some(contents) => find_equivalent_profiles_for_bytes_checked(contents)?.is_empty(),
         None => false,
     };
     Ok(PreparedProfileSwitch {
@@ -1042,16 +1046,7 @@ fn confirm_prepared_profile_switch(
             return Err(CsError::Aborted.into());
         }
     }
-    Ok(confirm_prepared_profile_switch_after_ui_approval(prepared))
-}
-
-/// The TUI calls this only from its affirmative confirmation action. Keeping
-/// the transition explicit means a prepared value cannot be passed directly to
-/// the commit API by a future call site.
-pub(crate) fn confirm_prepared_profile_switch_after_ui_approval(
-    prepared: PreparedProfileSwitch,
-) -> ConfirmedProfileSwitch {
-    ConfirmedProfileSwitch { prepared }
+    Ok(ConfirmedProfileSwitch { prepared })
 }
 
 pub(crate) fn confirm_prepared_profile_switch_without_overwrite(
@@ -1443,6 +1438,27 @@ fn find_matching_profiles_for_bytes_checked(target: &[u8]) -> Result<Vec<String>
     Ok(matches)
 }
 
+fn auth_values_semantically_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    left == right
+}
+
+fn find_equivalent_profiles_for_bytes_checked(target: &[u8]) -> Result<Vec<String>> {
+    let target: serde_json::Value = serde_json::from_slice(target)
+        .context("parsing live authentication before matching saved profiles")?;
+
+    let mut matches = Vec::new();
+    for alias in list_profiles()? {
+        let path = profile_auth_path(&alias)?;
+        let profile = read_existing_auth(&path)?.ok_or_else(|| {
+            anyhow::anyhow!("saved profile '{alias}' disappeared during authentication matching")
+        })?;
+        if auth_values_semantically_equal(&profile, &target) {
+            matches.push(alias);
+        }
+    }
+    Ok(matches)
+}
+
 fn find_matching_profiles_checked(auth_path: &Path) -> Result<Vec<String>> {
     let target = match std::fs::read(auth_path) {
         Ok(contents) => contents,
@@ -1528,6 +1544,16 @@ pub fn active_profile_from_live() -> Result<Option<String>> {
             None
         };
         return select_exact_profile_binding(&exact, current.as_deref());
+    }
+
+    let equivalent = find_equivalent_profiles_for_bytes_checked(&live_bytes)?;
+    if !equivalent.is_empty() {
+        let current = if equivalent.len() > 1 {
+            read_current_checked()?
+        } else {
+            None
+        };
+        return select_exact_profile_binding(&equivalent, current.as_deref());
     }
 
     // If Codex changed the live token bytes directly, only the current marker
@@ -2474,11 +2500,13 @@ fn plan_profile_write(
 pub fn update_profile_from_live(alias: &str) -> Result<()> {
     validate_alias(alias)?;
     let lease = acquire_profile_lease(alias)?;
-    update_profile_from_live_guarded(&lease, None)
+    update_profile_from_live_guarded(&lease, None, LiveProfileSyncMode::PersistAndMark)
 }
 
-pub(crate) fn update_profile_from_live_leased(lease: &ProfileLease) -> Result<()> {
-    update_profile_from_live_guarded(lease, None)
+/// Wait for the active profile's credential work and persist live auth only
+/// when it actually differs. An exact match needs no profile or marker write.
+pub(crate) fn synchronize_profile_from_live_for_switch_leased(lease: &ProfileLease) -> Result<()> {
+    update_profile_from_live_guarded(lease, None, LiveProfileSyncMode::SwitchBoundary)
 }
 
 pub(crate) fn update_profile_from_live_if_current_marker(
@@ -2492,7 +2520,11 @@ pub(crate) fn update_profile_from_live_if_current_marker(
         );
     }
     let lease = acquire_profile_lease(alias)?;
-    update_profile_from_live_guarded(&lease, Some(expected_marker))
+    update_profile_from_live_guarded(
+        &lease,
+        Some(expected_marker),
+        LiveProfileSyncMode::PersistAndMark,
+    )
 }
 
 pub(crate) fn ensure_current_marker_unchanged(expected: &CurrentMarkerSnapshot) -> Result<()> {
@@ -2511,9 +2543,16 @@ pub(crate) fn ensure_current_marker_unchanged(expected: &CurrentMarkerSnapshot) 
     Ok(())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LiveProfileSyncMode {
+    PersistAndMark,
+    SwitchBoundary,
+}
+
 fn update_profile_from_live_guarded(
     lease: &ProfileLease,
     expected_marker: Option<&CurrentMarkerSnapshot>,
+    mode: LiveProfileSyncMode,
 ) -> Result<()> {
     let alias = lease.alias();
     validate_alias(alias)?;
@@ -2525,8 +2564,18 @@ fn update_profile_from_live_guarded(
     // This is a read-back into a profile the caller already knows, not a save:
     // a missing profile is its own failure, distinct from the guards below.
     let profile_path = profile_auth_path(alias)?;
-    if read_existing_auth(&profile_path)?.is_none() {
+    let Some(profile) = read_existing_auth(&profile_path)? else {
         return Err(CsError::NotFound(alias.to_string()).into());
+    };
+    if mode == LiveProfileSyncMode::SwitchBoundary {
+        let live_snapshot = snapshot_optional_file(&live_path)?.ok_or_else(|| {
+            anyhow::anyhow!("live auth disappeared while updating profile '{alias}'")
+        })?;
+        let live: serde_json::Value = serde_json::from_slice(&live_snapshot)
+            .with_context(|| format!("parsing live auth {}", live_path.display()))?;
+        if auth_values_semantically_equal(&profile, &live) {
+            return Ok(());
+        }
     }
 
     let mut profile_was_updated = false;
@@ -4004,6 +4053,25 @@ mod tests {
     }
 
     #[test]
+    fn semantic_live_match_precedes_ambiguous_legacy_identity_matching() {
+        let _env = TestEnv::new();
+        let matching =
+            realistic_auth_json("same@example.com", "acct_same", "current", "current-ref");
+        let stale = realistic_auth_json("same@example.com", "acct_same", "stale", "stale-ref");
+        seed_profile("matching", &matching);
+        seed_profile("stale", &stale);
+        let live_path = crate::auth::codex_auth_path().unwrap();
+        std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+        std::fs::write(&live_path, serde_json::to_vec(&matching).unwrap()).unwrap();
+        super::write_current("stale").unwrap();
+
+        assert_eq!(
+            super::active_profile_from_live().unwrap().as_deref(),
+            Some("matching")
+        );
+    }
+
+    #[test]
     fn ambiguous_exact_live_duplicates_are_reported_instead_of_becoming_no_change() {
         let _env = TestEnv::new();
         let exact = realistic_auth_json("same@example.com", "acct_same", "exact", "exact-ref");
@@ -4583,6 +4651,66 @@ mod tests {
         assert_eq!(current_alias(), "beta");
     }
 
+    #[test]
+    fn switch_boundary_noop_does_not_apply_write_policy_to_identical_auth() {
+        let env = TestEnv::new();
+        let disallowed = realistic_auth_json(
+            "blocked@example.com",
+            "workspace-blocked",
+            "same-access",
+            "same-refresh",
+        );
+        let profile_path = super::profile_auth_path("broken").unwrap();
+        super::ensure_profile_parent(&profile_path).unwrap();
+        write_auth_durable(&profile_path, &disallowed);
+        write_auth_durable(&crate::auth::codex_auth_path().unwrap(), &disallowed);
+        std::fs::create_dir_all(env._home.path().join(".codex")).unwrap();
+        std::fs::write(
+            env._home.path().join(".codex/config.toml"),
+            "forced_chatgpt_workspace_id = \"workspace-allowed\"\n",
+        )
+        .unwrap();
+        let lease = super::acquire_profile_lease("broken").unwrap();
+
+        super::synchronize_profile_from_live_for_switch_leased(&lease).unwrap();
+
+        assert_eq!(crate::auth::read_auth(&profile_path).unwrap(), disallowed);
+        assert!(!crate::auth::current_file().unwrap().exists());
+    }
+
+    #[test]
+    fn switch_boundary_still_rejects_disallowed_auth_before_profile_write() {
+        let env = TestEnv::new();
+        let saved = realistic_auth_json(
+            "blocked@example.com",
+            "workspace-blocked",
+            "old-access",
+            "old-refresh",
+        );
+        let live = realistic_auth_json(
+            "blocked@example.com",
+            "workspace-blocked",
+            "new-access",
+            "new-refresh",
+        );
+        let profile_path = super::profile_auth_path("blocked").unwrap();
+        super::ensure_profile_parent(&profile_path).unwrap();
+        write_auth_durable(&profile_path, &saved);
+        write_auth_durable(&crate::auth::codex_auth_path().unwrap(), &live);
+        std::fs::create_dir_all(env._home.path().join(".codex")).unwrap();
+        std::fs::write(
+            env._home.path().join(".codex/config.toml"),
+            "forced_chatgpt_workspace_id = \"workspace-allowed\"\n",
+        )
+        .unwrap();
+        let lease = super::acquire_profile_lease("blocked").unwrap();
+
+        let error = super::synchronize_profile_from_live_for_switch_leased(&lease).unwrap_err();
+
+        assert!(format!("{error:#}").contains("not allowed"), "{error:#}");
+        assert_eq!(crate::auth::read_auth(&profile_path).unwrap(), saved);
+    }
+
     // ── detect_auth_change tests ─────────────────────────────
 
     fn make_jwt(email: &str, account_id: &str) -> String {
@@ -4666,6 +4794,36 @@ mod tests {
             format!("{error:#}").contains("reading live auth for change detection"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn unrelated_disallowed_profile_does_not_block_live_equivalence() {
+        let env = TestEnv::new();
+        let allowed = realistic_auth_json(
+            "allowed@example.com",
+            "workspace-allowed",
+            "allowed-access",
+            "allowed-refresh",
+        );
+        let blocked = realistic_auth_json(
+            "blocked@example.com",
+            "workspace-blocked",
+            "blocked-access",
+            "blocked-refresh",
+        );
+        seed_profile("allowed", &allowed);
+        seed_profile("blocked", &blocked);
+        write_live(&allowed);
+        std::fs::create_dir_all(env._home.path().join(".codex")).unwrap();
+        std::fs::write(
+            env._home.path().join(".codex/config.toml"),
+            "forced_chatgpt_workspace_id = \"workspace-allowed\"\n",
+        )
+        .unwrap();
+
+        let prepared = super::prepare_profile_switch("allowed").unwrap();
+
+        assert!(!prepared.requires_confirmation());
     }
 
     #[test]
