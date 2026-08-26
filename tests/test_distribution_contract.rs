@@ -37,7 +37,7 @@ fn unix_uninstall_harness(script: &str) -> String {
     let uninstall_end = script[uninstall_start..].find("# ── Install").unwrap() + uninstall_start;
     format!(
         concat!(
-            "{definitions}\n",
+            "{}\n",
             "RELEASE_TAG=v1.2.3\n",
             "RELEASE_SOURCE_DIGEST=0000000000000000000000000000000000000000\n",
             "resolve_release_source_digest() {{\n",
@@ -46,6 +46,7 @@ fn unix_uninstall_harness(script: &str) -> String {
             "}}\n",
             "{}\n"
         ),
+        definitions,
         &script[uninstall_start..uninstall_end]
     )
 }
