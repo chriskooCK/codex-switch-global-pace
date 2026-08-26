@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
@@ -47,9 +48,13 @@ impl PlanKind {
             Some("prolite") => Self::ProLite,
             Some("pro") => Self::Pro,
             Some("team") => Self::Team,
-            Some("self_serve_business_usage_based" | "business") => Self::Business,
-            Some("enterprise_cbp_usage_based" | "enterprise") => Self::Enterprise,
-            Some("education" | "edu") => Self::Edu,
+            Some(
+                "self_serve_business_prolite" | "self_serve_business_usage_based" | "business",
+            ) => Self::Business,
+            Some(
+                "ent26" | "enterprise_cbp_automation" | "enterprise_cbp_usage_based" | "enterprise",
+            ) => Self::Enterprise,
+            Some("education" | "edu" | "edu_plus" | "edu_pro") => Self::Edu,
             _ => Self::Unknown,
         }
     }
@@ -222,12 +227,21 @@ pub fn token_expires_at(token: &str) -> Option<i64> {
 }
 
 /// Check if a JWT token is expired or will expire within `margin_secs`.
-/// Returns `true` if expired/expiring, `false` if still valid, `None` if exp claim is missing.
-pub fn is_token_expiring(token: &str, margin_secs: i64) -> Option<bool> {
-    let payload = decode_jwt_payload(token)?;
-    let exp = payload.get("exp")?.as_i64()?;
-    let now = crate::auth::now_unix_secs();
-    Some(now + margin_secs >= exp)
+///
+/// A missing or malformed `exp` claim is represented by `Ok(None)`. Clock and
+/// timestamp arithmetic failures stay distinct so callers cannot silently
+/// treat an unverifiable token as valid.
+pub fn is_token_expiring(token: &str, margin_secs: i64) -> Result<Option<bool>> {
+    let Some(payload) = decode_jwt_payload(token) else {
+        return Ok(None);
+    };
+    let Some(exp) = payload.get("exp").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let refresh_at = crate::auth::now_unix_secs()?
+        .checked_add(margin_secs)
+        .context("token-expiry margin overflows the supported timestamp range")?;
+    Ok(Some(refresh_at >= exp))
 }
 
 #[cfg(test)]
@@ -497,17 +511,28 @@ mod tests {
         for (wire, expected) in [
             ("team", "Team - Example Workspace"),
             (
+                "self_serve_business_prolite",
+                "Business - Example Workspace",
+            ),
+            (
                 "self_serve_business_usage_based",
                 "Business - Example Workspace",
             ),
             ("business", "Business - Example Workspace"),
             (
+                "enterprise_cbp_automation",
+                "Enterprise - Example Workspace",
+            ),
+            (
                 "enterprise_cbp_usage_based",
                 "Enterprise - Example Workspace",
             ),
+            ("ent26", "Enterprise - Example Workspace"),
             ("enterprise", "Enterprise - Example Workspace"),
             ("education", "Edu - Example Workspace"),
             ("edu", "Edu - Example Workspace"),
+            ("edu_plus", "Edu - Example Workspace"),
+            ("edu_pro", "Edu - Example Workspace"),
             ("future_plan", "future_plan - Example Workspace"),
         ] {
             assert_eq!(info.plan_label_with(Some(wire)), expected);
@@ -518,34 +543,34 @@ mod tests {
     fn test_is_token_expiring_expired() {
         let token = make_jwt(&json!({ "exp": 0 }));
 
-        assert_eq!(is_token_expiring(&token, 0), Some(true));
+        assert_eq!(is_token_expiring(&token, 0).unwrap(), Some(true));
     }
 
     #[test]
     fn test_is_token_expiring_valid() {
         let token = make_jwt(&json!({ "exp": 9_999_999_999_i64 }));
 
-        assert_eq!(is_token_expiring(&token, 60), Some(false));
+        assert_eq!(is_token_expiring(&token, 60).unwrap(), Some(false));
     }
 
     #[test]
     fn test_is_token_expiring_within_margin() {
         let token = make_jwt(&json!({
-            "exp": crate::auth::now_unix_secs() + 30
+            "exp": crate::auth::now_unix_secs().unwrap() + 30
         }));
 
-        assert_eq!(is_token_expiring(&token, 60), Some(true));
+        assert_eq!(is_token_expiring(&token, 60).unwrap(), Some(true));
     }
 
     #[test]
     fn test_is_token_expiring_no_exp_claim() {
         let token = make_jwt(&json!({ "sub": "user-123" }));
 
-        assert_eq!(is_token_expiring(&token, 60), None);
+        assert_eq!(is_token_expiring(&token, 60).unwrap(), None);
     }
 
     #[test]
     fn test_is_token_expiring_invalid_jwt() {
-        assert_eq!(is_token_expiring("not-a-jwt", 60), None);
+        assert_eq!(is_token_expiring("not-a-jwt", 60).unwrap(), None);
     }
 }

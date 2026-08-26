@@ -2,7 +2,8 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use chrono::{DateTime, Local, TimeZone, Utc};
+use anyhow::Context;
+use chrono::{DateTime, Local, TimeZone};
 use serde::Serialize;
 
 use crate::jwt::AccountInfo;
@@ -200,12 +201,17 @@ pub fn global_weekly_to_json(summary: &GlobalWeeklySummary) -> JsonGlobalWeekly 
     }
 }
 
-fn window_to_json(w: &WindowUsage, default_label: &str, default_secs: i64) -> Option<JsonWindow> {
+fn window_to_json(
+    w: &WindowUsage,
+    default_label: &str,
+    default_secs: i64,
+    now: i64,
+) -> Option<JsonWindow> {
     let used = w.used_percent?;
     crate::usage::normalized_quota_usage(Some(used))?;
     let (label, window_secs) = crate::usage::quota_window_spec(w, default_label, default_secs);
-    let resets_in_seconds = w.resets_at.map(|ts| ts - crate::auth::now_unix_secs());
-    let pace = crate::usage::pace_percent(w, window_secs);
+    let resets_in_seconds = w.resets_at.and_then(|ts| ts.checked_sub(now));
+    let pace = window_secs.and_then(|secs| crate::usage::pace_percent_at(w, secs, now));
     Some(JsonWindow {
         label,
         used_percent: used,
@@ -225,7 +231,7 @@ fn reset_credit_to_json(credit: &ResetCredit) -> JsonResetCredit {
     }
 }
 
-fn additional_limit_to_json(l: &AdditionalRateLimit) -> JsonAdditionalLimit {
+fn additional_limit_to_json(l: &AdditionalRateLimit, now: i64) -> JsonAdditionalLimit {
     JsonAdditionalLimit {
         limit_name: l.limit_name.clone(),
         metered_feature: l.metered_feature.clone(),
@@ -234,31 +240,34 @@ fn additional_limit_to_json(l: &AdditionalRateLimit) -> JsonAdditionalLimit {
         primary: l
             .primary
             .as_ref()
-            .and_then(|w| window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS).map(Box::new)),
+            .and_then(|w| window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS, now).map(Box::new)),
         secondary: l
             .secondary
             .as_ref()
-            .and_then(|w| window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS).map(Box::new)),
+            .and_then(|w| window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS, now).map(Box::new)),
     }
 }
 
-pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
+pub fn usage_to_json(
+    result: std::result::Result<&UsageInfo, &str>,
+    now: i64,
+) -> anyhow::Result<JsonUsage> {
     match result {
-        Err(e) => JsonUsage::Err {
+        Err(e) => Ok(JsonUsage::Err {
             error: e.to_string(),
-        },
+        }),
         Ok(u) => {
-            let fetched_at = u
-                .fetched_at
-                .map(format_iso8601)
-                .unwrap_or_else(|| Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
-            JsonUsage::Ok {
+            let fetched_at = format_iso8601(
+                u.fetched_at
+                    .context("usage result is missing its observation timestamp")?,
+            )?;
+            Ok(JsonUsage::Ok {
                 fetched_at,
                 primary: u.primary.as_ref().and_then(|w| {
-                    window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS).map(Box::new)
+                    window_to_json(w, "5h", crate::usage::WINDOW_5H_SECS, now).map(Box::new)
                 }),
                 secondary: u.secondary.as_ref().and_then(|w| {
-                    window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS).map(Box::new)
+                    window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS, now).map(Box::new)
                 }),
                 credits_balance: u.credits_balance,
                 unlimited_credits: u.unlimited_credits,
@@ -268,31 +277,37 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                 additional_limits: u
                     .additional_limits
                     .iter()
-                    .map(additional_limit_to_json)
+                    .map(|limit| additional_limit_to_json(limit, now))
                     .collect(),
                 parse_issues: u.parse_issues.clone(),
-            }
+            })
         }
     }
 }
 
-pub fn format_iso8601(ts: i64) -> String {
+pub fn format_iso8601(ts: i64) -> anyhow::Result<String> {
     DateTime::from_timestamp(ts, 0)
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+        .context("timestamp is outside the supported RFC 3339 range")
 }
 
 /// Shared timestamp formatter: "2h30m (14:30)" or "1d12h (03-27 14:30)"
-pub fn format_reset_time(ts: i64) -> String {
-    let now = Local::now();
+pub fn format_reset_time(ts: i64, now: i64) -> String {
     let dt: DateTime<Local> = match Local.timestamp_opt(ts, 0).single() {
         Some(d) => d,
         None => return "--".into(),
     };
-    if dt <= now {
+    let now_dt: DateTime<Local> = match Local.timestamp_opt(now, 0).single() {
+        Some(d) => d,
+        None => return "--".into(),
+    };
+    let Some(remaining) = ts.checked_sub(now) else {
+        return "--".into();
+    };
+    if remaining <= 0 {
         return "expired".into();
     }
-    let secs = (dt - now).num_seconds().max(0) as u64;
+    let secs = remaining as u64;
     let relative = if secs < 3600 {
         format!("{}m", secs / 60)
     } else if secs < 86400 {
@@ -300,7 +315,7 @@ pub fn format_reset_time(ts: i64) -> String {
     } else {
         format!("{}d{}h", secs / 86400, (secs % 86400) / 3600)
     };
-    let local_fmt = if dt.date_naive() == now.date_naive() {
+    let local_fmt = if dt.date_naive() == now_dt.date_naive() {
         dt.format("%H:%M").to_string()
     } else {
         dt.format("%m-%d %H:%M").to_string()
@@ -309,16 +324,19 @@ pub fn format_reset_time(ts: i64) -> String {
 }
 
 /// Short reset time for table columns: "14:30" or "03-27 14:30"
-pub fn format_reset_short(ts: i64) -> String {
-    let now = Local::now();
+pub fn format_reset_short(ts: i64, now: i64) -> String {
     let dt: DateTime<Local> = match Local.timestamp_opt(ts, 0).single() {
         Some(d) => d,
         None => return "--".into(),
     };
-    if dt <= now {
+    let now_dt: DateTime<Local> = match Local.timestamp_opt(now, 0).single() {
+        Some(d) => d,
+        None => return "--".into(),
+    };
+    if ts <= now {
         return "reset".into();
     }
-    if dt.date_naive() == now.date_naive() {
+    if dt.date_naive() == now_dt.date_naive() {
         dt.format("%H:%M").to_string()
     } else {
         dt.format("%m-%d %H:%M").to_string()
@@ -326,13 +344,16 @@ pub fn format_reset_short(ts: i64) -> String {
 }
 
 /// Format a timestamp as local time: "HH:MM" (today) or "MM-DD HH:MM" (other days).
-pub fn format_local_time(ts: i64) -> String {
-    let now = Local::now();
+pub fn format_local_time(ts: i64, now: i64) -> String {
     let dt: DateTime<Local> = match Local.timestamp_opt(ts, 0).single() {
         Some(d) => d,
         None => return "--".into(),
     };
-    if dt.date_naive() == now.date_naive() {
+    let now_dt: DateTime<Local> = match Local.timestamp_opt(now, 0).single() {
+        Some(d) => d,
+        None => return "--".into(),
+    };
+    if dt.date_naive() == now_dt.date_naive() {
         dt.format("%H:%M").to_string()
     } else {
         dt.format("%m-%d %H:%M").to_string()
@@ -351,12 +372,12 @@ pub fn format_local_timestamp(ts: i64) -> String {
 
 /// Format a token expiry with an explicit state so past JWT `exp` values are
 /// never presented as a future expiration.
-pub fn format_token_expiry(ts: i64) -> String {
+pub fn format_token_expiry(ts: i64, now: i64) -> String {
     let Some(dt) = Local.timestamp_opt(ts, 0).single() else {
         return "not reported".into();
     };
     let timestamp = dt.format("%Y-%m-%d %H:%M %:z");
-    if dt <= Local::now() {
+    if ts <= now {
         format!("expired {timestamp}")
     } else {
         format!("expires {timestamp}")
@@ -593,6 +614,8 @@ mod tests {
     use serde::ser::Error as _;
     use serde_json::Value;
 
+    const TEST_NOW: i64 = 1_800_000_000;
+
     struct FailingSerialization;
 
     impl serde::Serialize for FailingSerialization {
@@ -615,6 +638,7 @@ mod tests {
     #[test]
     fn test_reset_credit_without_expiry_uses_explicit_text_and_json_null() {
         let usage = UsageInfo {
+            fetched_at: Some(TEST_NOW),
             reset_credits_available_count: Some(1),
             reset_credits: vec![ResetCredit {
                 id: "credit-1".to_string(),
@@ -629,7 +653,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("no expiry"))
         );
-        let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
+        let json = serde_json::to_value(usage_to_json(Ok(&usage), TEST_NOW).unwrap()).unwrap();
         assert_eq!(
             json.pointer("/reset_credits/0/expires_at"),
             Some(&Value::Null)
@@ -640,10 +664,11 @@ mod tests {
     fn json_does_not_invent_a_window_when_usage_is_missing() {
         let missing = WindowUsage {
             used_percent: None,
-            resets_at: Some(crate::auth::now_unix_secs() + 60),
+            resets_at: Some(TEST_NOW + 60),
             window_minutes: Some(crate::usage::WINDOW_5H_SECS / 60),
         };
         let usage = UsageInfo {
+            fetched_at: Some(TEST_NOW),
             primary: Some(missing.clone()),
             additional_limits: vec![AdditionalRateLimit {
                 primary: Some(missing),
@@ -652,7 +677,7 @@ mod tests {
             ..Default::default()
         };
 
-        let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
+        let json = serde_json::to_value(usage_to_json(Ok(&usage), TEST_NOW).unwrap()).unwrap();
         assert_eq!(json["primary"], Value::Null);
         assert!(json.pointer("/additional_limits/0/primary").is_none());
     }
@@ -660,13 +685,14 @@ mod tests {
     #[test]
     fn json_preserves_typed_usage_parse_issues() {
         let usage = UsageInfo {
+            fetched_at: Some(TEST_NOW),
             parse_issues: vec![UsageParseIssue::InvalidAdditionalRateLimits {
                 detail: "item 0 has no rate_limit object".to_string(),
             }],
             ..UsageInfo::default()
         };
 
-        let json = serde_json::to_value(usage_to_json(Ok(&usage))).unwrap();
+        let json = serde_json::to_value(usage_to_json(Ok(&usage), TEST_NOW).unwrap()).unwrap();
 
         assert_eq!(
             json.pointer("/parse_issues/0/field"),
@@ -736,7 +762,16 @@ mod tests {
 
     #[test]
     fn token_expiry_marks_past_timestamps_as_expired() {
-        let text = format_token_expiry(crate::auth::now_unix_secs() - 60);
+        let text = format_token_expiry(TEST_NOW - 60, TEST_NOW);
         assert!(text.starts_with("expired "));
+    }
+
+    #[test]
+    fn json_rejects_a_missing_observation_timestamp() {
+        let error = usage_to_json(Ok(&UsageInfo::default()), TEST_NOW)
+            .err()
+            .expect("missing fetched_at must not be replaced with the current time");
+
+        assert!(error.to_string().contains("observation timestamp"));
     }
 }

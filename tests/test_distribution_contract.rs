@@ -36,7 +36,7 @@ fn unix_uninstall_harness(script: &str) -> String {
     let uninstall_start = script.find("run_uninstall() {").unwrap();
     let uninstall_end = script[uninstall_start..].find("# ── Install").unwrap() + uninstall_start;
     format!(
-        "{definitions}\n{}\n",
+        "{definitions}\nconfirm_locked_release_source_digest() {{ :; }}\n{}\n",
         &script[uninstall_start..uninstall_end]
     )
 }
@@ -215,7 +215,7 @@ fn ci_runs_build_test_lint_format_audit_and_script_parsers() {
 
     for command in [
         "cargo test --all --locked",
-        "cargo clippy --all-targets --locked -- -D warnings",
+        "cargo clippy --all-targets --locked --features test-endpoints -- -D warnings",
         "cargo build --locked",
         "cargo fmt --check",
         "cargo audit",
@@ -683,7 +683,7 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     );
     assert_before(
         &workflow,
-        "gh attestation verify \"$archive\"",
+        "gh attestation verify \"$subject\"",
         "tar xzf \"$download_dir/codex-switch-global-pace-linux-amd64.tar.gz\"",
     );
     assert_before(
@@ -1390,6 +1390,157 @@ fn direct_installers_are_release_bound_and_preflight_exact_candidate_versions() 
 }
 
 #[test]
+fn fresh_install_archives_require_exact_release_provenance_before_extraction() {
+    let unix = repo_file("scripts/install.sh");
+    let windows = repo_file("scripts/install.ps1");
+    let release = repo_file(".github/workflows/release.yml");
+    let publisher = repo_file("scripts/publish-dev.ps1");
+
+    for required in [
+        "PROVENANCE_ASSET_NAME=\"codex-switch-global-pace-build-provenance.json\"",
+        "resolve_release_source_digest()",
+        "confirm_locked_release_source_digest()",
+        "gh api --hostname github.com",
+        "gh attestation verify \"$archive\"",
+        "--signer-workflow \"$RELEASE_WORKFLOW\"",
+        "--source-ref \"refs/tags/${tag}\"",
+        "--source-digest \"$source_digest\"",
+        "--deny-self-hosted-runners",
+    ] {
+        assert!(
+            unix.contains(required),
+            "missing Unix provenance contract `{required}`"
+        );
+    }
+    let unix_download = unix
+        .split("# Download, verify, and extract")
+        .nth(1)
+        .expect("Unix verified download transaction");
+    assert_before(
+        unix_download,
+        "Checksum verified",
+        "verify_release_provenance",
+    );
+    assert_before(unix_download, "verify_release_provenance", "tar xzf");
+    assert_eq!(
+        unix_download
+            .matches("resolve_release_source_digest \"$RELEASE_TAG\"")
+            .count(),
+        2,
+        "Unix installer must re-check the tag immediately before mutation"
+    );
+
+    for required in [
+        "$ProvenanceAssetName = \"codex-switch-global-pace-build-provenance.json\"",
+        "function Resolve-ReleaseSourceDigest",
+        "function Assert-ReleaseProvenance",
+        "function Assert-LockedReleaseSourceDigest",
+        "attestation verify $Subject",
+        "--source-digest $SourceDigest",
+        "--deny-self-hosted-runners",
+    ] {
+        assert!(
+            windows.contains(required),
+            "missing Windows provenance contract `{required}`"
+        );
+    }
+    assert_before(
+        &windows,
+        "$ActualSha256 = (Get-DirectFileSha256 -Path $ZipPath)",
+        "Assert-ReleaseProvenance `",
+    );
+    assert_before(&windows, "Assert-ReleaseProvenance `", "Expand-Archive");
+    assert_eq!(
+        windows
+            .matches("Resolve-ReleaseSourceDigest -Tag $ReleaseTag")
+            .count(),
+        2,
+        "Windows installer must re-check the tag immediately before mutation"
+    );
+
+    let unix_install = unix
+        .split("# Install\n")
+        .nth(1)
+        .expect("Unix install transaction");
+    assert_before(
+        unix_install,
+        "start_install_update_locks \"$CANDIDATE_BIN\"",
+        "confirm_locked_release_source_digest \\",
+    );
+    assert_before(
+        unix_install,
+        "confirm_locked_release_source_digest \\",
+        "mkdir -p \"$INSTALL_DIR\"",
+    );
+    let unix_uninstall = unix
+        .split("run_uninstall() {")
+        .nth(1)
+        .and_then(|section| section.split("# ── Install").next())
+        .expect("Unix uninstall transaction");
+    assert_before(
+        unix_uninstall,
+        "start_update_lock \"$CANDIDATE_BIN\" \"$BIN_PATH\"",
+        "confirm_locked_release_source_digest \\",
+    );
+    assert_before(
+        unix_uninstall,
+        "confirm_locked_release_source_digest \\",
+        "begin_uninstall_file_transaction",
+    );
+    assert_eq!(
+        unix.matches("confirm_locked_release_source_digest \\")
+            .count(),
+        2,
+        "Unix install and uninstall must each confirm the tag under every relevant lock"
+    );
+
+    let windows_install = windows
+        .split("# Stage the verified candidate")
+        .nth(1)
+        .expect("Windows install transaction");
+    assert_before(
+        windows_install,
+        "$UpdateLockHolder = Start-UpdateLockHolder",
+        "Assert-LockedReleaseSourceDigest `",
+    );
+    assert_before(
+        windows_install,
+        "Assert-LockedReleaseSourceDigest `",
+        "[System.IO.Directory]::CreateDirectory($InstallDir)",
+    );
+    let windows_uninstall = windows
+        .split("# ── Uninstall")
+        .nth(1)
+        .and_then(|section| section.split("# Stage the verified candidate").next())
+        .expect("Windows uninstall transaction");
+    assert_before(
+        windows_uninstall,
+        "$UninstallLockHolder = Start-UpdateLockHolder",
+        "Assert-LockedReleaseSourceDigest `",
+    );
+    assert_before(
+        windows_uninstall,
+        "Assert-LockedReleaseSourceDigest `",
+        "$UninstallHoldToken = Copy-InstallerFileExclusive",
+    );
+    assert_eq!(
+        windows
+            .matches("Assert-LockedReleaseSourceDigest `")
+            .count(),
+        2,
+        "Windows install and uninstall must each confirm the tag under every relevant lock"
+    );
+
+    for installer in ["artifacts/install.sh", "artifacts/install.ps1"] {
+        assert!(release.contains(installer));
+    }
+    assert!(publisher.contains("$Archives + @('INSTALL.md', 'install.sh', 'install.ps1')"));
+    assert!(publisher.contains(
+        "$installGuide = \"https://github.com/$Repo/blob/$sha/docs/wiki/Getting-Started.md#install\""
+    ));
+}
+
+#[test]
 fn unix_installer_checks_homebrew_ownership_for_every_install_mode() {
     let script = repo_file("scripts/install.sh");
     let install = script
@@ -1696,7 +1847,9 @@ fn unix_installer_accepts_only_the_candidate_exact_state_tuple() {
         .nth(1)
         .and_then(|section| section.split("verify_candidate_version() {").next())
         .expect("Unix installer exact daemon-state parser");
-    assert!(parser.contains("\"$CANDIDATE_BIN\" daemon status --installer-state 8>&- 9>&- 2>&1"));
+    assert!(
+        parser.contains("\"$CANDIDATE_BIN\" daemon status --installer-state 7>&- 8>&- 9>&- 2>&1")
+    );
     for exact in [
         "'running=true service_installed=true')",
         "'running=true service_installed=false')",
@@ -1716,15 +1869,18 @@ fn unix_installer_accepts_only_the_candidate_exact_state_tuple() {
 fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
     let script = repo_file("scripts/install.sh");
     let transaction = script
-        .split("\nSYSTEM_MARKER_CREATED=false\n")
+        .split("# Install\n")
         .nth(1)
         .expect("Unix install transaction section");
     for required in [
         "CS_UPDATE_LOCK_TARGET=\"$target\"",
-        "__hold-update-lock 8>&- 9>&-",
+        "__hold-update-lock 7>&- 8>&- 9>&-",
         "codex-switch-global-pace update lock ready",
         "mkfifo \"$control\" \"$ready\"",
         "start_install_update_locks",
+        "start_stable_update_lock",
+        "STABLE_LOCK_TARGET=\"${DATA_DIR}/${BINARY_NAME}-installer-authority\"",
+        "start_update_lock \"$candidate\" \"$STABLE_LOCK_TARGET\" 7 false",
         "release_update_locks",
     ] {
         assert!(
@@ -1735,6 +1891,11 @@ fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
     assert!(
         !script.contains("read -r -t"),
         "a concurrent installer must wait for the shared lock instead of timing out"
+    );
+    assert_before(
+        transaction,
+        "start_stable_update_lock \"$CANDIDATE_BIN\"",
+        "start_install_update_locks",
     );
     assert_before(
         transaction,
@@ -1777,6 +1938,282 @@ fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
         "start_update_lock \"$candidate\" \"$LEGACY_BIN\" 8",
         "start_update_lock \"$candidate\" \"$INSTALL_DEST\" 9",
     );
+}
+
+#[test]
+fn unix_stable_installer_authority_secures_a_nested_private_parent() {
+    let script = repo_file("scripts/install.sh");
+    let preparation = script
+        .split("prepare_stable_lock_parent() {")
+        .nth(1)
+        .and_then(|section| section.split("start_stable_update_lock() {").next())
+        .expect("Unix stable-lock parent preparation");
+
+    for required in [
+        "validate_stable_lock_parent_chain \"$DATA_DIR\"",
+        "umask 077; mkdir -p \"$DATA_DIR\"",
+        "[ ! -O \"$DATA_DIR\" ]",
+        "chmod 700 \"$DATA_DIR\"",
+        "linux) mode=\"$(stat -c '%a' \"$DATA_DIR\" 2>/dev/null)\"",
+        "darwin) mode=\"$(stat -f '%Lp' \"$DATA_DIR\" 2>/dev/null)\"",
+        "[ \"$mode\" != 700 ]",
+    ] {
+        assert!(
+            preparation.contains(required),
+            "missing nested private-parent contract `{required}`"
+        );
+    }
+    assert_before(
+        preparation,
+        "validate_stable_lock_parent_chain \"$DATA_DIR\"",
+        "mkdir -p \"$DATA_DIR\"",
+    );
+    assert!(
+        preparation
+            .matches("validate_stable_lock_parent_chain \"$DATA_DIR\"")
+            .count()
+            >= 3,
+        "the full component chain must be checked before creation, after creation, and after chmod"
+    );
+    assert!(!preparation.contains("elif mode="));
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_stable_installer_authority_creates_a_nested_private_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script
+        .split("# Parse arguments")
+        .next()
+        .expect("Unix installer function definitions");
+    let root = support::tempdir();
+    let data_dir = root.path().join("state/nested/codex-switch");
+    let candidate = root.path().join("lock-helper");
+    fs::write(
+        &candidate,
+        r#"#!/bin/sh
+[ "$1" = __hold-update-lock ] || exit 70
+[ "${CS_UPDATE_LOCK_TARGET:-}" = "$EXPECTED_STABLE_TARGET" ] || exit 71
+printf 'codex-switch-global-pace update lock ready\n'
+cat >/dev/null
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let harness = format!(
+        r#"{definitions}
+OS="$TEST_OS"
+TMP_DIR="$HOME/installer-tmp"
+mkdir -p "$TMP_DIR"
+UPDATE_LOCK_PID_7=
+UPDATE_LOCK_PID_8=
+UPDATE_LOCK_PID_9=
+UPDATE_LOCK_ERROR=
+start_stable_update_lock "$CANDIDATE"
+cleanup_update_locks_on_exit
+"#
+    );
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("HOME", root.path())
+        .env("CODEX_SWITCH_HOME", &data_dir)
+        .env("CANDIDATE", &candidate)
+        .env(
+            "EXPECTED_STABLE_TARGET",
+            data_dir.join("codex-switch-global-pace-installer-authority"),
+        )
+        .env("TEST_OS", unix_installer_os())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for directory in [
+        root.path().join("state"),
+        root.path().join("state/nested"),
+        data_dir,
+    ] {
+        let metadata = fs::symlink_metadata(directory).unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_stable_installer_authority_rejects_a_symlink_component_before_starting_helper() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script
+        .split("# Parse arguments")
+        .next()
+        .expect("Unix installer function definitions");
+    let root = support::tempdir();
+    let real_parent = root.path().join("real");
+    fs::create_dir(&real_parent).unwrap();
+    let linked_parent = root.path().join("linked");
+    symlink(&real_parent, &linked_parent).unwrap();
+    let data_dir = linked_parent.join("nested/codex-switch");
+    let helper_started = root.path().join("helper-started");
+    let candidate = root.path().join("lock-helper");
+    fs::write(
+        &candidate,
+        r#"#!/bin/sh
+: > "$HELPER_STARTED"
+exit 70
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let harness = format!(
+        r#"{definitions}
+OS="$TEST_OS"
+TMP_DIR="$HOME/installer-tmp"
+mkdir -p "$TMP_DIR"
+UPDATE_LOCK_PID_7=
+UPDATE_LOCK_PID_8=
+UPDATE_LOCK_PID_9=
+UPDATE_LOCK_ERROR=
+if start_stable_update_lock "$CANDIDATE"; then
+  exit 80
+fi
+case "$UPDATE_LOCK_ERROR" in
+  *'symlink component'*) ;;
+  *) exit 81 ;;
+esac
+"#
+    );
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("HOME", root.path())
+        .env("CODEX_SWITCH_HOME", &data_dir)
+        .env("CANDIDATE", &candidate)
+        .env("HELPER_STARTED", &helper_started)
+        .env("TEST_OS", unix_installer_os())
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!helper_started.exists());
+    assert!(!real_parent.join("nested").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_locked_tag_mismatch_releases_every_lock_before_any_transaction_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let script = repo_file("scripts/install.sh");
+    let definitions = script
+        .split("# Parse arguments")
+        .next()
+        .expect("Unix installer function definitions");
+    let root = support::tempdir();
+    let data_dir = root.path().join("state/codex-switch");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let install_dir = root.path().join("install");
+    fs::create_dir(&install_dir).unwrap();
+    let target = install_dir.join("codex-switch-global-pace");
+    let candidate = root.path().join("lock-helper");
+    fs::write(
+        &candidate,
+        r#"#!/bin/sh
+[ "$1" = __hold-update-lock ] || exit 70
+case "${CS_UPDATE_LOCK_TARGET:-}" in
+  "$EXPECTED_STABLE_TARGET") held="$STABLE_HELD" ;;
+  "$EXPECTED_TARGET") held="$TARGET_HELD" ;;
+  *) exit 71 ;;
+esac
+: > "$held"
+printf 'codex-switch-global-pace update lock ready\n'
+cat >/dev/null
+rm -f "$held"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    let mock_bin = root.path().join("mock-bin");
+    fs::create_dir(&mock_bin).unwrap();
+    let gh = mock_bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf 'commit\\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let stable_held = root.path().join("stable-held");
+    let target_held = root.path().join("target-held");
+    let mutation = root.path().join("transaction-mutated");
+
+    let harness = format!(
+        r#"{definitions}
+OS="$TEST_OS"
+TMP_DIR="$HOME/installer-tmp"
+mkdir -p "$TMP_DIR"
+UPDATE_LOCK_PID_7=
+UPDATE_LOCK_PID_8=
+UPDATE_LOCK_PID_9=
+UPDATE_LOCK_ERROR=
+trap cleanup_update_locks_on_exit EXIT
+start_stable_update_lock "$CANDIDATE"
+start_update_lock "$CANDIDATE" "$EXPECTED_TARGET" 8 false
+[ -f "$STABLE_HELD" ]
+[ -f "$TARGET_HELD" ]
+confirm_locked_release_source_digest dev aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+: > "$MUTATION"
+"#
+    );
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("HOME", root.path())
+        .env("CODEX_SWITCH_HOME", &data_dir)
+        .env("CANDIDATE", &candidate)
+        .env(
+            "EXPECTED_STABLE_TARGET",
+            data_dir.join("codex-switch-global-pace-installer-authority"),
+        )
+        .env("EXPECTED_TARGET", &target)
+        .env("STABLE_HELD", &stable_held)
+        .env("TARGET_HELD", &target_held)
+        .env("MUTATION", &mutation)
+        .env("TEST_OS", unix_installer_os())
+        .env("PATH", format!("{}:/usr/bin:/bin", mock_bin.display()))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("moved while waiting for installer authority"),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!stable_held.exists());
+    assert!(!target_held.exists());
+    assert!(!mutation.exists());
+    assert!(fs::read_dir(&data_dir).unwrap().next().is_none());
 }
 
 #[test]
@@ -1924,7 +2361,8 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
         "finish_daemon_update_boundary",
         "release_daemon_update_boundary",
         "UNINSTALL_SYSTEM_MARKER_PRESENT=true",
-        "target parent ${BIN_DIR} does not exist",
+        "start_stable_update_lock \"$CANDIDATE_BIN\"",
+        "UNINSTALL_TARGET_LOCK_HELD=false",
         "release_update_locks",
     ] {
         assert!(
@@ -1975,7 +2413,7 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
     assert_before(
         uninstall,
         "No direct install, daemon service, PID state, marker, managed PATH block, or transaction residue was found; already uninstalled.",
-        "target parent ${BIN_DIR} does not exist",
+        "start_stable_update_lock \"$CANDIDATE_BIN\"",
     );
     assert!(
         !uninstall.contains("systemctl --user daemon-reload || warn"),
@@ -1997,7 +2435,7 @@ fn unix_uninstaller_uses_the_shared_lock_and_refuses_an_unlocked_service_fallbac
     );
     assert!(script.contains("This uninstaller is not bound to a GitHub Release"));
     assert!(script.contains("--expected-executable \"$1\" --check-owner"));
-    assert!(script.contains("Kept shared update lock:"));
+    assert!(script.contains("Kept stable installer lock:"));
     assert!(
         !uninstall.contains("\"$CANDIDATE_BIN\" daemon uninstall"),
         "service removal must be executed by the persistent lifecycle holder, not a second child"
@@ -2035,7 +2473,7 @@ cat >/dev/null
     fs::create_dir_all(system_target.parent().unwrap()).unwrap();
     fs::create_dir_all(user_target.parent().unwrap()).unwrap();
     let harness = format!(
-        "set -eu\n{helpers}\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nMIGRATE_LEGACY=true\nLEGACY_NEEDS_SUDO=false\nINSTALL_WITH_SUDO=false\nstart_install_update_locks \"$BIN\"\nrelease_update_locks\n"
+        "set -eu\n{helpers}\nUPDATE_LOCK_PID_7=\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nMIGRATE_LEGACY=true\nLEGACY_NEEDS_SUDO=false\nINSTALL_WITH_SUDO=false\nstart_install_update_locks \"$BIN\" true\nrelease_update_locks\n"
     );
     let output = Command::new("bash")
         .args(["-c", &harness])
@@ -2081,9 +2519,12 @@ fn unix_uninstall_keeps_its_lock_holder_alive_through_daemon_and_binary_removal(
         r#"#!/bin/sh
 case "$1" in
   __hold-update-lock)
-    [ "$CS_UPDATE_LOCK_TARGET" = "$UNINSTALL_TARGET" ] || exit 60
-    : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.codex-switch-global-pace.self-update.lock"
-    : > "$UPDATE_LOCK_HELD"
+    case "$CS_UPDATE_LOCK_TARGET" in
+      "$STABLE_AUTHORITY_TARGET") ;;
+      "$UNINSTALL_TARGET") : > "$UPDATE_LOCK_HELD" ;;
+      *) exit 60 ;;
+    esac
+    : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.$(basename "$CS_UPDATE_LOCK_TARGET").self-update.lock"
     printf 'codex-switch-global-pace update lock ready\n'
     cat >/dev/null
     rm -f "$UPDATE_LOCK_HELD"
@@ -2143,7 +2584,7 @@ esac
     fs::set_permissions(&candidate, permissions).unwrap();
 
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_7=\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
 
@@ -2152,6 +2593,11 @@ esac
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
         .env("UNINSTALL_TARGET", &binary)
+        .env(
+            "STABLE_AUTHORITY_TARGET",
+            home.path()
+                .join(".codex-switch/codex-switch-global-pace-installer-authority"),
+        )
         .env("UPDATE_LOCK_HELD", &held)
         .env("LIFECYCLE_HELD", home.path().join("lifecycle-held"))
         .env("FINAL_CONFIRMED", home.path().join("final-confirmed"))
@@ -2174,6 +2620,11 @@ esac
     assert!(
         install_dir
             .join(".codex-switch-global-pace.self-update.lock")
+            .exists()
+    );
+    assert!(
+        home.path()
+            .join(".codex-switch/.codex-switch-global-pace-installer-authority.self-update.lock")
             .exists()
     );
 }
@@ -2251,7 +2702,7 @@ esac
     .unwrap();
     fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_7=\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
     let output = unix_installer_test_command()
@@ -2465,16 +2916,18 @@ esac
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!output.status.success());
-    assert!(diagnostic.contains("target parent"), "{diagnostic}");
-    assert!(diagnostic.contains("does not exist"), "{diagnostic}");
+    assert!(
+        diagnostic.contains("stable installer authority"),
+        "{diagnostic}"
+    );
     assert!(!target.parent().unwrap().exists());
     assert_eq!(fs::read_to_string(service).unwrap(), service_contents);
 }
 
 #[cfg(unix)]
 #[test]
-fn unix_uninstall_preserves_a_stale_path_block_without_a_lock_holder_binary() {
-    use std::process::Command;
+fn unix_release_candidate_cleans_a_stale_path_block_without_recreating_install_parent() {
+    use std::os::unix::fs::PermissionsExt;
 
     let script = repo_file("scripts/install.sh");
     let home = support::tempdir();
@@ -2487,14 +2940,65 @@ fn unix_uninstall_preserves_a_stale_path_block_without_a_lock_holder_binary() {
         "after\n"
     );
     fs::write(&profile, contents).unwrap();
+    let candidate = home.path().join("verified-candidate");
+    fs::write(
+        &candidate,
+        r#"#!/bin/sh
+case "$1" in
+  __hold-update-lock)
+    [ "$CS_UPDATE_LOCK_TARGET" = "$STABLE_AUTHORITY_TARGET" ] || exit 60
+    : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.$(basename "$CS_UPDATE_LOCK_TARGET").self-update.lock"
+    printf 'codex-switch-global-pace update lock ready\n'
+    cat >/dev/null
+    ;;
+  __hold-daemon-update-boundary)
+    printf 'codex-switch-global-pace daemon update boundary ready running=false service_installed=false\n'
+    while IFS= read -r command; do
+      case "$command" in
+        uninstall) printf 'codex-switch-global-pace daemon update boundary uninstall state ready\n' ;;
+        finish) printf 'codex-switch-global-pace daemon update boundary final state confirmed\n' ;;
+        release)
+          printf 'codex-switch-global-pace daemon update boundary lifecycle authority released\n'
+          exit 0
+          ;;
+        *) exit 61 ;;
+      esac
+    done
+    exit 62
+    ;;
+  __installer-file-op)
+    exec "$REAL_INSTALLER_HELPER" "$@"
+    ;;
+  daemon)
+    [ "$2" = uninstall ] || exit 63
+    [ "$3" = --expected-executable ] || exit 64
+    [ "$4" = "$EXPECTED_TARGET" ] || exit 65
+    [ "${5:-}" = --check-owner ] || exit 66
+    ;;
+  *) exit 67 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nCANDIDATE_BIN=\"$HOME/missing-candidate\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_7=\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
 
-    let output = Command::new("bash")
+    let output = unix_installer_test_command()
         .args(["-c", &harness])
         .env("HOME", home.path())
+        .env("CANDIDATE", &candidate)
+        .env(
+            "STABLE_AUTHORITY_TARGET",
+            home.path()
+                .join(".codex-switch/codex-switch-global-pace-installer-authority"),
+        )
+        .env(
+            "EXPECTED_TARGET",
+            home.path().join(".local/bin/codex-switch-global-pace"),
+        )
         .env("TEST_OS", unix_installer_os())
         .env("PATH", "/usr/bin:/bin")
         .output()
@@ -2504,13 +3008,14 @@ fn unix_uninstall_preserves_a_stale_path_block_without_a_lock_holder_binary() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!output.status.success());
-    assert!(
-        diagnostic.contains("No directory, lock residue"),
-        "{diagnostic}"
-    );
+    assert!(output.status.success(), "{diagnostic}");
     assert!(!home.path().join(".local/bin").exists());
-    assert_eq!(fs::read_to_string(profile).unwrap(), contents);
+    assert_eq!(fs::read_to_string(profile).unwrap(), "before\nafter\n");
+    assert!(
+        home.path()
+            .join(".codex-switch/.codex-switch-global-pace-installer-authority.self-update.lock")
+            .exists()
+    );
 }
 
 #[cfg(unix)]
@@ -2590,7 +3095,7 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&candidate, permissions).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_DIR=\"$TEST_SYSTEM_DIR\"\nLEGACY_BIN=\"$SYSTEM_INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_MARKER=\"$SYSTEM_INSTALL_DIR/.codex-switch-global-pace-system-install-v1\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nexport CANDIDATE_EXPECTED_TARGET=\"$LEGACY_BIN\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_DIR=\"$TEST_SYSTEM_DIR\"\nLEGACY_BIN=\"$SYSTEM_INSTALL_DIR/$BINARY_NAME\"\nSYSTEM_INSTALL_MARKER=\"$SYSTEM_INSTALL_DIR/.codex-switch-global-pace-system-install-v1\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_7=\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nexport CANDIDATE_EXPECTED_TARGET=\"$LEGACY_BIN\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
     let output = unix_installer_test_command()
@@ -2619,13 +3124,12 @@ esac
 
 #[cfg(unix)]
 #[test]
-fn unix_release_candidate_stops_a_detached_daemon_without_an_installed_binary() {
+fn unix_release_candidate_cleans_stale_daemon_state_without_recreating_install_parent() {
     use std::os::unix::fs::PermissionsExt;
 
     let script = repo_file("scripts/install.sh");
     let home = support::tempdir();
     let install_dir = home.path().join(".local/bin");
-    fs::create_dir_all(&install_dir).unwrap();
     let data_dir = home.path().join(".codex-switch");
     fs::create_dir_all(&data_dir).unwrap();
     let pidfile = data_dir.join("daemon.pid");
@@ -2640,7 +3144,8 @@ fn unix_release_candidate_stops_a_detached_daemon_without_an_installed_binary() 
         r#"#!/bin/sh
 case "$1 $2" in
   "__hold-update-lock ")
-    : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.codex-switch-global-pace.self-update.lock"
+    [ "$CS_UPDATE_LOCK_TARGET" = "$STABLE_AUTHORITY_TARGET" ] || exit 60
+    : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.$(basename "$CS_UPDATE_LOCK_TARGET").self-update.lock"
     : > "$LOCK_HELD"
     printf 'codex-switch-global-pace update lock ready\n'
     cat >/dev/null
@@ -2692,7 +3197,7 @@ esac
     permissions.set_mode(0o755);
     fs::set_permissions(&candidate, permissions).unwrap();
     let harness = format!(
-        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nexport CANDIDATE_EXPECTED_TARGET=\"$INSTALL_DEST\"\nrun_uninstall\n",
+        "{}\nSYSTEM_INSTALL=false\nINSTALL_DIR=\"$USER_INSTALL_DIR\"\nINSTALL_DEST=\"$INSTALL_DIR/$BINARY_NAME\"\nOS=\"$TEST_OS\"\nTMP_DIR=\"$HOME/uninstall-tmp\"\nmkdir -p \"$TMP_DIR\"\nINSTALL_STAGE=\nINSTALL_BACKUP=\nINSTALL_WITH_SUDO=false\nUPDATE_LOCK_PID_7=\nUPDATE_LOCK_PID_8=\nUPDATE_LOCK_PID_9=\nUPDATE_LOCK_ERROR=\nCANDIDATE_BIN=\"$CANDIDATE\"\nexport CANDIDATE_EXPECTED_TARGET=\"$INSTALL_DEST\"\nrun_uninstall\n",
         unix_uninstall_harness(&script)
     );
     let held = home.path().join("lock-held");
@@ -2700,6 +3205,10 @@ esac
         .args(["-c", &harness])
         .env("HOME", home.path())
         .env("CANDIDATE", &candidate)
+        .env(
+            "STABLE_AUTHORITY_TARGET",
+            data_dir.join("codex-switch-global-pace-installer-authority"),
+        )
         .env("DAEMON_PIDFILE", &pidfile)
         .env("DAEMON_STATE", &state)
         .env("LOCK_HELD", &held)
@@ -2722,8 +3231,12 @@ esac
         "orphan recovery must stop the detached daemon without a later service mutation"
     );
     assert!(
-        install_dir
-            .join(".codex-switch-global-pace.self-update.lock")
+        !install_dir.exists(),
+        "stale daemon cleanup must not recreate a missing install parent"
+    );
+    assert!(
+        data_dir
+            .join(".codex-switch-global-pace-installer-authority.self-update.lock")
             .exists()
     );
 }
@@ -2791,6 +3304,8 @@ fn installers_validate_exact_versions_before_building_download_urls() {
         "SEMVER_PATTERN=",
         "validate_version()",
         "validate_version \"$VERSION\"",
+        "validate_version \"$EXPECTED_RELEASE_VERSION\"",
+        "RELEASE_TAG=\"v${EXPECTED_RELEASE_VERSION}\"",
         "Invalid CS_VERSION",
     ] {
         assert!(
@@ -2800,15 +3315,24 @@ fn installers_validate_exact_versions_before_building_download_urls() {
     }
     assert_before(
         &unix,
-        "validate_version \"$VERSION\"",
-        "releases/download/v${VERSION}/${ASSET_NAME}",
+        "validate_version \"$EXPECTED_RELEASE_VERSION\"",
+        "RELEASE_TAG=\"v${EXPECTED_RELEASE_VERSION}\"",
+    );
+    assert_before(
+        &unix,
+        "RELEASE_TAG=\"v${EXPECTED_RELEASE_VERSION}\"",
+        "RELEASE_BASE_URL=\"https://github.com/${REPO}/releases/download/${RELEASE_TAG}\"",
+    );
+    assert!(
+        !unix.contains("releases/download/v${VERSION}"),
+        "Unix download URLs must be built from the validated expected release version"
     );
 
     for required in [
         "$SemVerPattern =",
         "function Assert-SupportedVersion",
-        "Assert-SupportedVersion $Version",
-        "Invalid CS_VERSION",
+        "Assert-SupportedVersion $RequestedVersion",
+        "Invalid -Version",
     ] {
         assert!(
             windows.contains(required),
@@ -2817,8 +3341,8 @@ fn installers_validate_exact_versions_before_building_download_urls() {
     }
     assert_before(
         &windows,
-        "Assert-SupportedVersion $Version",
-        "releases/download/v$Version/$AssetName",
+        "Assert-SupportedVersion $RequestedVersion",
+        "$ReleaseBaseUrl = \"https://github.com/$Repo/releases/download/$ReleaseTag\"",
     );
     assert!(
         windows.contains("$SemVerPattern = '\\A") && windows.contains("\\z'"),
@@ -2827,12 +3351,12 @@ fn installers_validate_exact_versions_before_building_download_urls() {
 }
 
 #[test]
-fn unix_pinned_install_example_sets_the_variable_on_bash() {
+fn unix_pinned_install_example_runs_a_local_verified_script() {
     let script = repo_file("scripts/install.sh");
 
     assert!(
-        script.contains("| CS_VERSION=20260712.1.0 bash"),
-        "the pinned-install example must pass CS_VERSION to bash, not curl"
+        script.contains("CS_VERSION=20260712.1.0 bash ./install.sh"),
+        "the pinned-install example must pass CS_VERSION to the local verified script"
     );
     assert!(
         !script.contains("CS_VERSION=20260712.1.0 curl"),
@@ -2870,19 +3394,17 @@ fn unix_installer_rejects_a_repository_escape_version_before_network_access() {
 
 #[cfg(windows)]
 #[test]
-fn windows_installer_rejects_a_repository_escape_version_before_network_access() {
+fn windows_installer_rejects_a_repository_escape_parameter_before_network_access() {
     use std::process::Command;
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-File"])
         .arg(root.join("scripts/install.ps1"))
-        .env(
-            "CS_VERSION",
+        .args([
+            "-Version",
             "/../../../../../attacker/evil/releases/download/v9.9.9",
-        )
-        .env_remove("CS_DEV")
-        .env_remove("CS_UNINSTALL")
+        ])
         .output()
         .unwrap();
     let diagnostic = format!(
@@ -2892,7 +3414,7 @@ fn windows_installer_rejects_a_repository_escape_version_before_network_access()
     );
 
     assert!(!output.status.success());
-    assert!(diagnostic.contains("Invalid CS_VERSION"), "{diagnostic}");
+    assert!(diagnostic.contains("Invalid -Version"), "{diagnostic}");
     assert!(!diagnostic.contains("Downloading:"), "{diagnostic}");
 }
 
@@ -3061,7 +3583,7 @@ fn unix_installer_bounds_symlink_resolution_and_binds_recursive_temp_cleanup() {
         "[ \"$link_hops\" -le \"$SYMLINK_RESOLUTION_MAX_HOPS\" ]",
         "create_direct_installer_temp_directory() {",
         "probe=\"$(mktemp -d)\"",
-        "physical_parent=\"$(CDPATH= cd -P \"$logical_parent\" && pwd -P)\"",
+        "physical_parent=\"$(CDPATH='' cd -P \"$logical_parent\" && pwd -P)\"",
         "mktemp -d \"${TMP_DIR_PARENT%/}/.${BINARY_NAME}.XXXXXXXXXX\"",
         "Physical installer temporary root became an alias during creation; preserved",
         "Physical installer temporary root changed during creation; preserved",
@@ -3107,7 +3629,7 @@ fn unix_installer_bounds_symlink_resolution_and_binds_recursive_temp_cleanup() {
         .unwrap();
     let physical_rechecks = initializer
         .match_indices(
-            "observed_physical_parent=\"$(CDPATH= cd -P \"$TMP_DIR_PARENT\" && pwd -P)\"",
+            "observed_physical_parent=\"$(CDPATH='' cd -P \"$TMP_DIR_PARENT\" && pwd -P)\"",
         )
         .map(|(offset, _)| offset)
         .collect::<Vec<_>>();
@@ -3661,10 +4183,20 @@ fn unix_installer_aborts_if_profile_inode_changes() {
 fn release_build_installs_cross_with_locked_dependencies() {
     let release = repo_file(".github/workflows/release.yml");
     let ci = repo_file(".github/workflows/ci.yml");
+    let config = repo_file("Cross.toml");
     let install = "cargo install cross --locked --git https://github.com/cross-rs/cross --rev 64b5bb4d3d34de062552b9a2093affe77b4ad16a";
+    let image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:f604e399cbb2154ddeb013db99eb4f123d24f09a579c7e8d6ed631d15ffa8b12";
 
     assert!(release.contains(install));
     assert!(ci.contains(install));
+    assert!(config.contains("[target.aarch64-unknown-linux-musl]"));
+    assert!(config.contains(&format!("image = \"{image}\"")));
+    assert_eq!(config.matches("sha256:").count(), 1);
+    assert!(!config.contains(":main"));
+    assert!(release.contains("CROSS_CONFIG=Cross.toml cross build --release --locked"));
+    assert!(ci.contains(
+        "CROSS_CONFIG=Cross.toml cross build --release --locked --target aarch64-unknown-linux-musl"
+    ));
 }
 
 #[test]
@@ -3735,6 +4267,66 @@ fn windows_installer_verifies_checksum_before_extracting() {
 }
 
 #[test]
+fn windows_installer_uses_explicit_channel_parameters_and_stable_first_install_authority() {
+    let script = repo_file("scripts/install.ps1");
+
+    for required in [
+        "[CmdletBinding()]",
+        "[Parameter()][switch]$Dev",
+        "[Parameter()][switch]$Uninstall",
+        "[string]$Version",
+        "$PackagedIsDev = $PackagedReleaseVersion -cmatch $DevVersionPattern",
+        "function Test-MissingInstallStateIsNoOp",
+        "function Start-StableInstallerAuthority",
+        "codex-switch-global-pace-installer-authority",
+        "$InstallerAuthorityHolder = Start-StableInstallerAuthority",
+        "$UninstallAuthorityHolder = Start-StableInstallerAuthority",
+    ] {
+        assert!(
+            script.contains(required),
+            "missing Windows installer contract `{required}`"
+        );
+    }
+    for forbidden in ["$env:CS_DEV", "$env:CS_VERSION", "$env:CS_UNINSTALL"] {
+        assert!(
+            !script.contains(forbidden),
+            "persistent process environment input must not control the installer: {forbidden}"
+        );
+    }
+    assert_before(
+        &script,
+        "if ($Uninstall -and -not (Test-DirectInstallDirectory -Path $InstallDir))",
+        "$GhCommand = Get-Command gh",
+    );
+    let fresh_boundary = script
+        .split("$InstallerAuthorityHolder = Start-StableInstallerAuthority")
+        .nth(1)
+        .and_then(|tail| tail.split("$TransactionSucceeded = $false").next())
+        .expect("Windows fresh-install authority boundary");
+    assert_before(
+        fresh_boundary,
+        "Test-DirectInstallDirectory -Path $InstallDir",
+        "[System.IO.Directory]::CreateDirectory($InstallDir)",
+    );
+    assert_before(
+        fresh_boundary,
+        "if ($InstallDirWasPresent)",
+        "$UpdateLockHolder = Start-UpdateLockHolder",
+    );
+    assert_before(
+        fresh_boundary,
+        "$UpdateLockHolder = Start-UpdateLockHolder",
+        "Assert-LockedReleaseSourceDigest `",
+    );
+    assert_before(
+        fresh_boundary,
+        "Assert-LockedReleaseSourceDigest `",
+        "if (-not $InstallDirWasPresent)",
+    );
+    assert!(script.contains("Remove-NewEmptyInstallDirectory -Path $InstallDir"));
+}
+
+#[test]
 fn windows_user_path_updates_use_one_exact_compare_and_swap_contract() {
     let script = repo_file("scripts/install.ps1");
     let registry = repo_file("src/installer_registry.rs");
@@ -3773,7 +4365,19 @@ fn windows_user_path_updates_use_one_exact_compare_and_swap_contract() {
         );
     }
     assert!(!script.contains("SetEnvironmentVariable(\"Path\", $Requested, \"User\")"));
-    assert!(!script.contains("GetEnvironmentVariable(\"Path\", \"User\")"));
+    assert_eq!(
+        script
+            .matches("GetEnvironmentVariable(\"Path\", \"User\")")
+            .count(),
+        1,
+        "only the read-only missing-install no-op preflight may inspect User PATH directly"
+    );
+    let no_op_preflight = script
+        .split("function Test-MissingInstallStateIsNoOp")
+        .nth(1)
+        .and_then(|tail| tail.split("function Test-DirectInstalledBinary").next())
+        .expect("missing-install no-op preflight");
+    assert!(no_op_preflight.contains("GetEnvironmentVariable(\"Path\", \"User\")"));
     assert_eq!(
         script.matches("Set-ExactUserPathTransition `").count(),
         2,
@@ -3802,11 +4406,10 @@ fn windows_process_path_transform_preserves_unrelated_raw_segments() {
     let installer = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/install.ps1");
     let command = r#"
 $Source = [IO.File]::ReadAllText($env:INSTALLER_UNDER_TEST)
-$Entrypoint = $Source.IndexOf('# Detect architecture', [StringComparison]::Ordinal)
-if ($Entrypoint -lt 0) { throw 'entrypoint marker missing' }
-$Definitions = $Source.Substring(0, $Entrypoint)
-$Definitions = ([regex]'(?m)^& \{\r?\n').Replace($Definitions, '', 1)
-Invoke-Expression $Definitions
+$FunctionStart = $Source.IndexOf('function Get-RequestedProcessPathSnapshot', [StringComparison]::Ordinal)
+$FunctionEnd = $Source.IndexOf('function Set-ExactProcessPathSnapshot', $FunctionStart, [StringComparison]::Ordinal)
+if ($FunctionStart -lt 0 -or $FunctionEnd -le $FunctionStart) { throw 'process PATH transform definition missing' }
+Invoke-Expression $Source.Substring($FunctionStart, $FunctionEnd - $FunctionStart)
 function Present([string]$Value) { [pscustomobject]@{ Present = $true; Value = $Value } }
 $Empty = Get-RequestedProcessPathSnapshot -Current (Present '') -Action add -Entry 'Entry'
 $Normal = Get-RequestedProcessPathSnapshot -Current (Present 'A') -Action add -Entry 'Entry'
@@ -4247,15 +4850,20 @@ fn windows_installer_preserves_a_running_daemon_across_upgrade() {
 }
 
 #[test]
-fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
+fn windows_installer_holds_stable_authority_and_optional_target_lock_for_the_transaction() {
     let script = repo_file("scripts/install.ps1");
     let install_transaction = script
         .split("# Stage the verified candidate")
         .nth(1)
         .expect("Windows install transaction");
+    let locked_transaction = install_transaction
+        .split("$TransactionSucceeded = $false")
+        .nth(1)
+        .expect("Windows locked install transaction");
 
     for required in [
         "function Start-UpdateLockHolder",
+        "function Start-StableInstallerAuthority",
         "$StartInfo.Arguments = \"__hold-update-lock\"",
         "$StartInfo.EnvironmentVariables[\"CS_UPDATE_LOCK_TARGET\"] = $DestinationPath",
         "$StartInfo.RedirectStandardInput = $true",
@@ -4271,6 +4879,7 @@ fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
         "$LockProcess.ExitCode -ne 0",
         "lock-holder PID $($LockProcess.Id) did not exit after stdin EOF",
         "$TransactionSucceeded = $true",
+        "$InstallerAuthorityHolder = Start-StableInstallerAuthority",
     ] {
         assert!(
             script.contains(required),
@@ -4284,12 +4893,12 @@ fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
     );
     assert_before(
         install_transaction,
-        "$UpdateLockHolder = Start-UpdateLockHolder",
+        "$InstallerAuthorityHolder = Start-StableInstallerAuthority",
         "$OriginalUserPathSnapshot = Invoke-RequiredInstallerFileOperation",
     );
     assert_before(
         install_transaction,
-        "$UpdateLockHolder = Start-UpdateLockHolder",
+        "$InstallerAuthorityHolder = Start-StableInstallerAuthority",
         "$InstallLifecycleHolder = Start-DaemonLifecycleHolder",
     );
     assert_before(
@@ -4298,21 +4907,29 @@ fn windows_installer_holds_the_shared_update_lock_for_the_whole_transaction() {
         "$Publication = Invoke-ClassifiedInstallerReplace",
     );
     assert_before(
-        install_transaction,
+        locked_transaction,
         "if ($null -ne $InstallError)",
-        "Complete-UpdateLockHolder -LockProcess $UpdateLockHolder",
+        "Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder",
     );
     assert_before(
-        install_transaction,
+        locked_transaction,
         "if ($OldBinaryBackedUp) {",
-        "Complete-UpdateLockHolder -LockProcess $UpdateLockHolder",
+        "Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder",
     );
-    let transaction_finally = install_transaction
+    let transaction_finally = locked_transaction
         .find("} finally {\n    $LifecycleReleaseError = $null")
         .expect("Windows installer must release its lock from the transaction finally block");
     assert!(
-        install_transaction[transaction_finally..]
-            .contains("Complete-UpdateLockHolder -LockProcess $UpdateLockHolder")
+        !locked_transaction[..transaction_finally]
+            .contains("Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder"),
+        "stable installer authority must remain held until the transaction finally block"
+    );
+    let release = &locked_transaction[transaction_finally..];
+    assert!(release.contains("Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder"));
+    assert_before(
+        release,
+        "Complete-UpdateLockHolder -LockProcess $UpdateLockHolder",
+        "Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder",
     );
 }
 
@@ -4371,12 +4988,18 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
         "Set-ExactUserPathTransition `",
         "Restore-ExactUserPathTransition `",
         "Complete-UpdateLockHolder -LockProcess $UninstallLockHolder",
+        "Complete-UpdateLockHolder -LockProcess $UninstallAuthorityHolder",
     ] {
         assert!(
             uninstall.contains(required),
             "Windows uninstaller must contain locked candidate contract `{required}`"
         );
     }
+    assert_before(
+        uninstall,
+        "$UninstallAuthorityHolder = Start-StableInstallerAuthority",
+        "$UninstallLockHolder = Start-UpdateLockHolder",
+    );
     assert_before(
         uninstall,
         "$UninstallLockHolder = Start-UpdateLockHolder",
@@ -4432,6 +5055,11 @@ fn windows_uninstaller_uses_the_verified_candidate_and_shared_update_lock() {
         "-Command \"release\"",
         "Complete-UpdateLockHolder -LockProcess $UninstallLockHolder",
     );
+    assert_before(
+        uninstall,
+        "Complete-UpdateLockHolder -LockProcess $UninstallLockHolder",
+        "Complete-UpdateLockHolder -LockProcess $UninstallAuthorityHolder",
+    );
     let rollback = uninstall
         .split("} catch {\n        $UninstallFailure = $_")
         .nth(1)
@@ -4464,6 +5092,43 @@ fn self_update_checks_replace_permission_before_archive_download() {
     );
     assert!(!update.contains("permission denied? try: sudo codex-switch-global-pace self-update"));
     assert!(!update.contains("retry from PowerShell as Administrator"));
+}
+
+#[test]
+fn self_update_install_source_detection_and_migration_guidance_fail_closed() {
+    let update = repo_file("src/update.rs");
+    let detector = update
+        .split("pub fn detect_install_source()")
+        .nth(1)
+        .and_then(|tail| tail.split("pub fn current_version()").next())
+        .expect("install-source detector");
+    for required in [
+        "-> Result<InstallSource>",
+        "std::env::current_exe().context(\"locating current executable\")?",
+        "canonical_executable_path(executable)?",
+        "Ok(classify_install_source(&executable))",
+    ] {
+        assert!(
+            detector.contains(required),
+            "missing detector contract `{required}`"
+        );
+    }
+    for forbidden in [".ok()", ".or(exe)", "PathBuf::from(BIN_NAME)"] {
+        assert!(
+            !detector.contains(forbidden),
+            "install-source detection must not fall back through `{forbidden}`"
+        );
+    }
+
+    let guidance = &update[..update
+        .find("pub(crate) fn homebrew_dev_install_hint")
+        .expect("migration guidance boundary")];
+    assert!(guidance.contains("fn verified_install_guide_url("));
+    assert!(guidance.contains("{REPO_OWNER}/{REPO_NAME}/blob/{reviewed_ref}"));
+    assert!(guidance.contains("bash \\\"$work/install.sh\\\""));
+    assert!(!guidance.contains("curl"));
+    assert!(!guidance.contains("releases/latest/download/install.sh"));
+    assert!(!guidance.contains("releases/download/dev/install.sh"));
 }
 
 #[test]
@@ -5023,6 +5688,15 @@ fn uninstallers_always_preserve_the_shared_profile_directory() {
 
     assert!(unix.contains("DATA_DIR=\"${HOME}/.codex-switch\""));
     assert!(windows.contains("$DataDir = Join-Path $env:USERPROFILE \".codex-switch\""));
+    assert!(unix.contains("if [ -n \"${CODEX_SWITCH_HOME:-}\" ]; then"));
+    assert!(windows.contains("$ConfiguredDataDir = $env:CODEX_SWITCH_HOME"));
+    assert!(unix.contains("STABLE_LOCK_TARGET=\"${DATA_DIR}/${BINARY_NAME}-installer-authority\""));
+    assert!(windows.contains(
+        "$StableLockTarget = Join-Path $DataDir \"codex-switch-global-pace-installer-authority\""
+    ));
+    assert!(unix.contains(
+        "Kept stable installer lock: ${DATA_DIR}/.${BINARY_NAME}-installer-authority.self-update.lock"
+    ));
     assert!(!unix.contains("rm -rf \"$DATA_DIR\""));
     assert!(!windows.contains("Remove-Item -Recurse -Force $DataDir"));
     assert!(unix.contains("Kept shared profile data"));
@@ -5057,7 +5731,7 @@ fn release_verifies_archives_before_creating_a_release() {
 }
 
 #[test]
-fn release_attests_archives_before_publishing_them() {
+fn release_attests_archives_and_installers_before_publishing_them() {
     let workflow = repo_file(".github/workflows/release.yml");
 
     for permission in [
@@ -5074,13 +5748,22 @@ fn release_attests_archives_before_publishing_them() {
     assert!(workflow.contains("subject-path:"));
     assert!(workflow.contains("artifacts/*.tar.gz"));
     assert!(workflow.contains("artifacts/*.zip"));
+    assert!(workflow.contains("artifacts/INSTALL.md"));
+    assert!(workflow.contains("artifacts/install.sh"));
+    assert!(workflow.contains("artifacts/install.ps1"));
+    assert!(workflow.contains("\"$download_dir/INSTALL.md\""));
     assert!(workflow.contains("codex-switch-global-pace-build-provenance.json"));
     assert!(workflow.contains("target_commitish:$target"));
     assert!(workflow.contains("--arg target \"$GITHUB_SHA\""));
     assert!(workflow.contains("'.target_commitish'"));
     assert_before(
         &workflow,
-        "Attest release archives",
+        "Add installers and install notes",
+        "Attest release archives and installers",
+    );
+    assert_before(
+        &workflow,
+        "Attest release archives and installers",
         "Create isolated candidate draft",
     );
 }
@@ -5237,13 +5920,10 @@ fn readmes_describe_current_cli_and_codex_requirements() {
 }
 
 #[test]
-fn installer_instructions_use_channel_matched_release_assets() {
-    let stable_unix = "https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh";
-    let stable_windows = "https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1";
-    let dev_unix =
-        "https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh";
-    let dev_windows =
-        "https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.ps1";
+fn installer_instructions_start_from_source_controlled_verified_bootstrap() {
+    let trusted_guide = "docs/wiki/Getting-Started.md#install";
+    let untrusted_stable_notes = "releases/latest/download/INSTALL.md";
+    let untrusted_dev_notes = "releases/download/dev/INSTALL.md";
 
     for path in [
         "README.md",
@@ -5261,31 +5941,253 @@ fn installer_instructions_use_channel_matched_release_assets() {
 
     for path in ["README.md", "README_CN.md"] {
         let readme = repo_file(path);
-        for required in [stable_unix, stable_windows] {
-            assert!(
-                readme.contains(required),
-                "{path} must contain channel-matched installer URL `{required}`"
-            );
-        }
+        assert!(
+            readme.contains(trusted_guide),
+            "{path} must start installation from the reviewed repository guide"
+        );
     }
 
+    let guide = repo_file("docs/wiki/Getting-Started.md");
+    for required in [
+        "channel=stable",
+        "$Channel = \"stable\"",
+        "repos/$repo/releases/latest",
+        "repos/$Repo/releases/latest",
+        "gh release download \"$tag\"",
+        "gh release download $Tag",
+        "--pattern install.sh",
+        "--pattern install.ps1",
+        "gh attestation verify \"$work/install.sh\"",
+        "gh attestation verify (Join-Path $Work \"install.ps1\")",
+        "--source-ref \"refs/tags/$tag\"",
+        "--source-ref \"refs/tags/$Tag\"",
+        "--source-digest \"$source_digest\"",
+        "--source-digest $SourceDigest",
+        "resolve_release_tag_commit()",
+        "function Resolve-ReleaseTagCommit",
+        "repos/$repo/git/ref/tags/$tag_to_resolve",
+        "repos/$repo/git/tags/$sha",
+        "repos/$Repo/git/ref/tags/$TagToResolve",
+        "repos/$Repo/git/tags/$Sha",
+        "source_digest=\"$(resolve_release_tag_commit \"$tag\")\"",
+        "$SourceDigest = Resolve-ReleaseTagCommit -TagToResolve $Tag",
+        "[ \"$confirmed_digest\" = \"$source_digest\" ]",
+        "$ConfirmedDigest -cne $SourceDigest",
+        "--deny-self-hosted-runners",
+    ] {
+        assert!(
+            guide.contains(required),
+            "source-controlled verified bootstrap must contain `{required}`"
+        );
+    }
+    assert_before(
+        &guide,
+        "gh attestation verify \"$work/install.sh\"",
+        "bash \"$work/install.sh\"",
+    );
+    assert_before(
+        &guide,
+        "gh attestation verify (Join-Path $Work \"install.ps1\")",
+        "& (Join-Path $Work \"install.ps1\")",
+    );
+
     let development = repo_file("docs/wiki/Development-Releases.md");
-    assert!(development.contains(dev_unix));
-    assert!(development.contains(dev_windows));
-
-    let unix_installer = repo_file("scripts/install.sh");
-    assert!(unix_installer.contains(stable_unix));
-    assert!(unix_installer.contains(dev_unix));
-
-    let windows_installer = repo_file("scripts/install.ps1");
-    assert!(windows_installer.contains(stable_windows));
-    assert!(windows_installer.contains(dev_windows));
+    assert!(development.contains("[verified bootstrap](Getting-Started.md#install)"));
+    assert!(development.contains("from `stable` to `dev`"));
 
     let workflow = repo_file(".github/workflows/release.yml");
-    assert!(workflow.contains(stable_unix));
-    assert!(workflow.contains(stable_windows));
-    assert!(workflow.contains(dev_unix));
-    assert!(workflow.contains(dev_windows));
+    for required in [
+        "gh release download \"$tag\"",
+        "--pattern install.sh",
+        "--pattern install.ps1",
+        "gh attestation verify \"$work/install.sh\"",
+        "gh attestation verify (Join-Path $Work \"install.ps1\")",
+        "--source-ref \"refs/tags/$tag\"",
+        "--source-digest \"$source_digest\"",
+        "[ \"${#source_digest}\" -eq 40 ]",
+        "$SourceDigest -cnotmatch '\\A[0-9a-f]{40}\\z'",
+        "s/__SOURCE_DIGEST__/${GITHUB_SHA}/g",
+        "resolve_release_tag_commit()",
+        "function Resolve-ReleaseTagCommit",
+        "repos/$repo/git/ref/tags/$tag_to_resolve",
+        "repos/$repo/git/tags/$sha",
+        "repos/$Repo/git/ref/tags/$TagToResolve",
+        "repos/$Repo/git/tags/$Sha",
+        "current_digest=\"$(resolve_release_tag_commit \"$tag\")\"",
+        "$CurrentDigest = Resolve-ReleaseTagCommit -TagToResolve $Tag",
+        "[ \"$confirmed_digest\" = \"$source_digest\" ]",
+        "$ConfirmedDigest -cne $SourceDigest",
+        "blob/__SOURCE_DIGEST__/docs/wiki/Getting-Started.md#install",
+        "blob/${GITHUB_SHA}/docs/wiki/Getting-Started.md#install",
+        "! grep -Eq '__RELEASE_TAG__|__SOURCE_DIGEST__|__UNIX_INSTALL_ARGS__'",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "release-exact verified bootstrap must contain `{required}`"
+        );
+    }
+    for forbidden in ["repos/$repo/commits/$tag", "repos/$Repo/commits/$Tag"] {
+        assert!(
+            !guide.contains(forbidden) && !workflow.contains(forbidden),
+            "bootstrap tag resolution must not use ambiguous commit endpoint `{forbidden}`"
+        );
+    }
+    assert!(!workflow.contains("rm -rf"));
+    for path in [
+        "README.md",
+        "README_CN.md",
+        "docs/wiki/Getting-Started.md",
+        "docs/wiki/Development-Releases.md",
+        "docs/wiki/Chinese-Guide.md",
+        "docs/wiki/Updating.md",
+        ".github/workflows/release.yml",
+    ] {
+        let text = repo_file(path);
+        assert!(
+            !text.contains(untrusted_stable_notes) && !text.contains(untrusted_dev_notes),
+            "{path} must not make an unverified Release note asset the trust anchor"
+        );
+        assert!(
+            !text.contains("install.sh | bash"),
+            "unsafe bootstrap remains in {path}"
+        );
+        assert!(
+            !text.contains("install.ps1 | iex"),
+            "unsafe bootstrap remains in {path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn source_controlled_unix_bootstrap_peels_an_exact_annotated_tag() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let guide = repo_file("docs/wiki/Getting-Started.md");
+    let bash_block = guide
+        .split("```bash\n")
+        .nth(1)
+        .and_then(|section| section.split("```\n").next())
+        .expect("source-controlled Unix bootstrap");
+    let resolver = bash_block
+        .split("channel=stable")
+        .next()
+        .expect("Unix bootstrap resolver definitions");
+    let root = support::tempdir();
+    let mock_bin = root.path().join("mock-bin");
+    fs::create_dir(&mock_bin).unwrap();
+    let gh = mock_bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+case "$*" in
+  *'repos/chriskooCK/codex-switch-global-pace/git/ref/tags/dev'*)
+    printf 'tag\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+    ;;
+  *'repos/chriskooCK/codex-switch-global-pace/git/tags/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'*)
+    printf 'commit\tBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n'
+    ;;
+  *) exit 70 ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = format!("{resolver}\nresolve_release_tag_commit dev\n");
+    let output = Command::new("bash")
+        .args(["-c", &harness])
+        .env("PATH", format!("{}:/usr/bin:/bin", mock_bin.display()))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn source_controlled_stable_bootstrap_reaches_installer_without_a_nounset_empty_array() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let guide = repo_file("docs/wiki/Getting-Started.md");
+    let bash_block = guide
+        .split("```bash\n")
+        .nth(1)
+        .and_then(|section| section.split("```\n").next())
+        .expect("source-controlled Unix bootstrap");
+    assert!(bash_block.contains("set -eu"));
+    assert!(!bash_block.contains("install_args=("));
+    assert!(!bash_block.contains("${install_args[@]}"));
+
+    let root = support::tempdir();
+    let mock_bin = root.path().join("mock-bin");
+    fs::create_dir(&mock_bin).unwrap();
+    let marker = root.path().join("installer-reached");
+    let gh = mock_bin.join("gh");
+    fs::write(
+        &gh,
+        r#"#!/bin/sh
+set -eu
+case "$*" in
+  *'repos/chriskooCK/codex-switch-global-pace/releases/latest'*)
+    printf 'v20260826.2.0\n'
+    ;;
+  *'repos/chriskooCK/codex-switch-global-pace/git/ref/tags/v20260826.2.0'*)
+    printf 'commit\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+    ;;
+  *'release download v20260826.2.0'*)
+    dir=
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = --dir ]; then
+        shift
+        dir="$1"
+      fi
+      shift
+    done
+    [ -n "$dir" ] || exit 70
+    cat > "$dir/install.sh" <<'INSTALLER'
+#!/bin/sh
+set -eu
+[ "$#" -eq 0 ] || exit 71
+printf reached > "$INSTALL_STUB_MARKER"
+INSTALLER
+    printf '{}\n' > "$dir/codex-switch-global-pace-build-provenance.json"
+    ;;
+  *'attestation verify '*)
+    ;;
+  *)
+    exit 72
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new("bash")
+        .args(["-c", bash_block])
+        .env("PATH", format!("{}:/usr/bin:/bin", mock_bin.display()))
+        .env("INSTALL_STUB_MARKER", &marker)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(marker).unwrap(), "reached");
 }
 
 #[test]

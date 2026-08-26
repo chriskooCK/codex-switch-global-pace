@@ -133,7 +133,7 @@ pub async fn run_daemon_loop() -> Result<()> {
 
     let mut st = DaemonState {
         pid: std::process::id(),
-        started_at: auth::now_unix_secs(),
+        started_at: auth::now_unix_secs()?,
         ..DaemonState::default()
     };
     state::write(&mut st);
@@ -152,7 +152,7 @@ pub async fn run_daemon_loop() -> Result<()> {
             _ = poll_interval.tick() => {
                 // Failure backoff suspends polling only; token and cache
                 // timers keep running.
-                let now = auth::now_unix_secs();
+                let now = auth::now_unix_secs()?;
                 if let Some(until) = st.backoff_until {
                     if now < until {
                         tracing::debug!("Poll suspended by backoff for {}s more", until - now);
@@ -165,7 +165,7 @@ pub async fn run_daemon_loop() -> Result<()> {
                     Ok(outcome) => {
                         st.consecutive_failures = 0;
                         st.last_error = None;
-                        st.last_poll_at = Some(auth::now_unix_secs());
+                        st.last_poll_at = Some(auth::now_unix_secs()?);
                         match outcome {
                             PollOutcome::Switched { from, to, score } => {
                                 tracing::info!("Account switch completed");
@@ -173,18 +173,20 @@ pub async fn run_daemon_loop() -> Result<()> {
                                 st.last_switch = Some(SwitchRecord {
                                     from,
                                     to,
-                                    at: auth::now_unix_secs(),
+                                    at: auth::now_unix_secs()?,
                                     score,
                                 });
                             }
                             PollOutcome::Deferred { to } => {
                                 // Keep the original `since` while the same target stays pending.
-                                let since = st
+                                let since = match st
                                     .pending_switch
                                     .as_ref()
                                     .filter(|p| p.to == to)
-                                    .map(|p| p.since)
-                                    .unwrap_or_else(auth::now_unix_secs);
+                                {
+                                    Some(pending) => pending.since,
+                                    None => auth::now_unix_secs()?,
+                                };
                                 st.pending_switch = Some(PendingSwitch { to, since });
                             }
                             PollOutcome::NoAction => {
@@ -194,13 +196,13 @@ pub async fn run_daemon_loop() -> Result<()> {
                     }
                     Err(e) => {
                         st.consecutive_failures += 1;
-                        st.last_poll_at = Some(auth::now_unix_secs());
+                        st.last_poll_at = Some(auth::now_unix_secs()?);
                         st.last_error = Some(e.to_string());
                         let backoff_secs = poll_backoff_secs(poll_secs, st.consecutive_failures)?;
                         let backoff_secs_i64 = i64::try_from(backoff_secs)
                             .context("daemon poll backoff exceeds persisted state range")?;
                         st.backoff_until = Some(
-                            auth::now_unix_secs()
+                            auth::now_unix_secs()?
                                 .checked_add(backoff_secs_i64)
                                 .context("daemon poll backoff timestamp overflowed")?,
                         );
@@ -215,11 +217,16 @@ pub async fn run_daemon_loop() -> Result<()> {
             _ = token_interval.tick() => {
                 // Runs unattended on a timer: a lost write here bricks the
                 // profile with nobody watching, so it gets ERROR, not debug.
-                for failure in usage::refresh_expiring_tokens().await {
-                    // `detail` already opens with `[alias]` and carries the
-                    // underlying IO/permission cause; the field makes the
-                    // affected profile filterable in structured log output.
-                    tracing::error!(alias = %failure.alias, "{}", failure.error.detail);
+                match usage::refresh_expiring_tokens().await {
+                    Ok(failures) => for failure in failures {
+                        // `detail` already opens with `[alias]` and carries the
+                        // underlying IO/permission cause; the field makes the
+                        // affected profile filterable in structured log output.
+                        tracing::error!(alias = %failure.alias, "{}", failure.error.detail);
+                    },
+                    Err(error) => tracing::error!(
+                        "opportunistic token refresh could not start safely: {error:#}"
+                    ),
                 }
             }
             _ = cache_refresh_interval.tick() => {
@@ -232,7 +239,7 @@ pub async fn run_daemon_loop() -> Result<()> {
                     ),
                     Err(e) => tracing::warn!("Cache refresh skipped: {e}"),
                 }
-                st.last_cache_refresh_at = Some(auth::now_unix_secs());
+                st.last_cache_refresh_at = Some(auth::now_unix_secs()?);
                 state::write(&mut st);
             }
             _ = shutdown.recv() => {
@@ -263,7 +270,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
     let cfg = config::get();
     let safety_7d = cfg.use_cfg.safety_margin_7d;
     let threshold = cfg.daemon.switch_threshold;
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs()?;
 
     // 1. Force-fetch current account's usage (bypass cache)
     let current_path = profile::profile_auth_path(&current)?;
@@ -607,7 +614,7 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
         return Ok(CacheRefreshSummary::default());
     }
 
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs()?;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config::get().network.max_concurrent,
     ));

@@ -19,7 +19,12 @@ Existing `auth.json` files can be imported individually or from a directory. Imp
 codex-switch-global-pace import ~/auth-backups
 ```
 
-Interactive login deduplicates local profiles by `account_id` first and falls back to email when safe. Import is deliberately create-only and never updates an existing profile: Usage API validation proves that the bearer can access a workspace, but a Team workspace ID can be shared by several users and cannot authorize overwriting another saved credential.
+Interactive login updates an existing profile only when both `account_id` and
+email match exactly. An email-only or otherwise incomplete identity cannot
+authorize a credential overwrite. Import is deliberately create-only and never
+updates an existing profile: Usage API validation proves that the bearer can
+access a workspace, but a Team workspace ID can be shared by several users and
+cannot authorize overwriting another saved credential.
 
 Profile deletion is recoverable. An inactive profile is moved under `deleted-profiles/` after confirmation; the active profile cannot be deleted. See [recovery instructions](Troubleshooting.md#recover-a-deleted-profile).
 

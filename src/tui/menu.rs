@@ -9,6 +9,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
+use super::meter::{percent_marker_offset, usage_meter_line};
 use super::popup::{PopupState, render_popup};
 use super::ui::quota_pace_color;
 
@@ -42,6 +43,12 @@ pub enum MenuState {
 }
 
 #[derive(Debug, Clone)]
+pub struct AuthExpiry {
+    pub name: String,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
 pub struct AccountMenuInfo {
     pub alias: String,
     pub email: Option<String>,
@@ -53,7 +60,7 @@ pub struct AccountMenuInfo {
     pub plan_type: Option<String>,
     pub is_current: bool,
     pub organizations: Vec<String>,
-    pub auth_expiries: Vec<String>,
+    pub auth_expiries: Vec<AuthExpiry>,
     pub usage: Option<Box<crate::usage::UsageInfo>>,
     pub usage_meta: Vec<String>,
     pub models: Vec<String>,
@@ -104,42 +111,32 @@ fn quota_window_lines(
     window: &crate::usage::WindowUsage,
     default_label: &str,
     default_secs: i64,
+    now: i64,
 ) -> Vec<Line<'static>> {
-    const BAR_WIDTH: usize = 22;
+    const BAR_WIDTH: u16 = 22;
     let (label, window_secs) = crate::usage::quota_window_spec(window, default_label, default_secs);
     let used_percent = crate::usage::normalized_quota_usage(window.used_percent);
-    let (used_width, remaining) = match used_percent {
-        Some(used) => (
-            ((used / 100.0) * BAR_WIDTH as f64).round() as usize,
-            Some(100.0 - used),
-        ),
-        None => (0, None),
-    };
-    let pace = crate::usage::pace_percent(window, window_secs);
+    let remaining = used_percent.map(|used| 100.0 - used);
+    let pace =
+        window_secs.and_then(|duration| crate::usage::pace_percent_at(window, duration, now));
     let marker_pace = crate::usage::visible_pace_marker(used_percent, pace);
     let used_color = quota_pace_color(used_percent, pace);
-    let pace_index = marker_pace.map(|value| {
-        ((value / 100.0) * BAR_WIDTH as f64)
-            .round()
-            .clamp(0.0, (BAR_WIDTH - 1) as f64) as usize
-    });
+    let pace_index = marker_pace.and_then(|value| percent_marker_offset(value, BAR_WIDTH));
     let mut spans = vec![Span::styled(
         format!("{label:<3} "),
         Style::default().fg(C_WHITE),
     )];
-    for index in 0..BAR_WIDTH {
-        let (symbol, style) = if Some(index) == pace_index {
-            (
-                "┃",
-                Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
-            )
-        } else if index < used_width {
-            ("█", Style::default().fg(used_color))
-        } else {
-            ("░", Style::default().fg(DIM))
-        };
-        spans.push(Span::styled(symbol, style));
-    }
+    spans.extend(
+        usage_meter_line(
+            used_percent,
+            pace_index,
+            BAR_WIDTH,
+            Style::default().fg(used_color),
+            Style::default().fg(DIM),
+            Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD),
+        )
+        .spans,
+    );
     let remaining_text = remaining
         .map(|value| format!("  {value:.0}% left"))
         .unwrap_or_else(|| "  --% left".to_string());
@@ -149,7 +146,7 @@ fn quota_window_lines(
     ));
     let reset_relative = window
         .resets_at
-        .map(crate::output::format_reset_time)
+        .map(|timestamp| crate::output::format_reset_time(timestamp, now))
         .unwrap_or_else(|| "--".to_string());
     spans.push(Span::styled(
         format!(" · reset {reset_relative}"),
@@ -194,7 +191,7 @@ fn model_line_spans(model: &str, label_style: Style) -> Vec<Span<'static>> {
     spans
 }
 
-fn quota_lines(usage: Option<&crate::usage::UsageInfo>) -> Vec<Line<'static>> {
+fn quota_lines(usage: Option<&crate::usage::UsageInfo>, now: i64) -> Vec<Line<'static>> {
     let Some(usage) = usage else {
         return vec![Line::from(Span::styled(
             "Usage not loaded",
@@ -224,6 +221,7 @@ fn quota_lines(usage: Option<&crate::usage::UsageInfo>) -> Vec<Line<'static>> {
                 window,
                 "5h",
                 crate::usage::WINDOW_5H_SECS,
+                now,
             ));
         }
         if let Some(window) = secondary {
@@ -231,6 +229,7 @@ fn quota_lines(usage: Option<&crate::usage::UsageInfo>) -> Vec<Line<'static>> {
                 window,
                 "7d",
                 crate::usage::WINDOW_7D_SECS,
+                now,
             ));
         }
         if primary.is_none() && secondary.is_none() {
@@ -367,7 +366,7 @@ impl MenuState {
         }
     }
 
-    pub fn render(&mut self, f: &mut Frame, area: Rect) {
+    pub fn render(&mut self, f: &mut Frame, area: Rect, now: i64) {
         let key_style = Style::default().fg(C_YELLOW).add_modifier(Modifier::BOLD);
         let label_style = Style::default().fg(C_WHITE);
         let dim = Style::default().fg(DIM);
@@ -447,24 +446,24 @@ impl MenuState {
                     ]));
                 }
                 for expiry in &info.auth_expiries {
-                    if let Some((name, details)) = expiry.split_once(" · ") {
-                        left_lines.push(Line::from(vec![
-                            Span::styled(
-                                name.to_string(),
-                                Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(format!(" · {details}"), dim),
-                        ]));
-                    } else {
-                        left_lines.push(Line::from(Span::styled(expiry.clone(), dim)));
-                    }
+                    let details = expiry
+                        .expires_at
+                        .map(|timestamp| crate::output::format_token_expiry(timestamp, now))
+                        .unwrap_or_else(|| "not reported".to_string());
+                    left_lines.push(Line::from(vec![
+                        Span::styled(
+                            expiry.name.clone(),
+                            Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!(" · {details}"), dim),
+                    ]));
                 }
                 left_lines.push(Line::from(""));
                 left_lines.push(Line::from(Span::styled(
                     "Quota pools",
                     header_style.add_modifier(Modifier::BOLD),
                 )));
-                left_lines.extend(quota_lines(info.usage.as_deref()));
+                left_lines.extend(quota_lines(info.usage.as_deref(), now));
                 for item in &info.usage_meta {
                     left_lines.push(Line::from(Span::styled(item.clone(), dim)));
                 }
@@ -653,8 +652,8 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode, style::Color};
 
     use super::{
-        AccountMenuInfo, C_CYAN, C_GREEN, C_PURPLE, C_RED, C_YELLOW, DIM, MenuAction, MenuState,
-        model_line_spans, quota_lines, quota_window_lines,
+        AccountMenuInfo, AuthExpiry, C_CYAN, C_GREEN, C_PURPLE, C_RED, C_YELLOW, DIM, MenuAction,
+        MenuState, model_line_spans, quota_lines, quota_window_lines,
     };
     use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
@@ -717,7 +716,7 @@ mod tests {
 
     #[test]
     fn quota_visuals_include_main_and_future_model_pools() {
-        let now = crate::auth::now_unix_secs();
+        let now = 1_000_000;
         let window = WindowUsage {
             used_percent: Some(80.0),
             resets_at: Some(now + 2 * 60 * 60),
@@ -733,7 +732,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let text = quota_lines(Some(&usage))
+        let text = quota_lines(Some(&usage), now)
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -742,7 +741,7 @@ mod tests {
         assert!(text.contains("Main"));
         assert!(text.contains("GPT-6-Codex-Burst"));
         assert!(text.contains('█'));
-        assert!(text.contains('┃'));
+        assert!(text.contains('|'));
         assert!(text.contains("20% left"));
         assert!(text.contains("reset"));
         assert!(!text.contains('!'));
@@ -752,18 +751,32 @@ mod tests {
     }
 
     #[test]
+    fn popup_quota_uses_the_shared_meter_fill_geometry() {
+        let window = WindowUsage {
+            used_percent: Some(0.01),
+            resets_at: None,
+            window_minutes: Some(300),
+        };
+        let text = quota_window_lines(&window, "5h", crate::usage::WINDOW_5H_SECS, 1_000_000)[0]
+            .to_string();
+
+        assert_eq!(text.matches('█').count(), 1, "{text}");
+        assert_eq!(text.matches('░').count(), 21, "{text}");
+    }
+
+    #[test]
     fn quota_visuals_use_the_same_relative_pace_colors() {
-        let now = crate::auth::now_unix_secs();
+        let now = 1_000_000;
         let color_for = |used_percent, resets_at| {
             let window = WindowUsage {
                 used_percent,
                 resets_at,
                 window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
             };
-            quota_window_lines(&window, "7d", crate::usage::WINDOW_7D_SECS)[0]
+            quota_window_lines(&window, "7d", crate::usage::WINDOW_7D_SECS, now)[0]
                 .spans
                 .iter()
-                .find(|span| span.content.as_ref() == "█")
+                .find(|span| span.content.contains('█'))
                 .and_then(|span| span.style.fg)
         };
 
@@ -787,10 +800,10 @@ mod tests {
             window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
         };
         assert!(
-            quota_window_lines(&full, "7d", crate::usage::WINDOW_7D_SECS)[0]
+            quota_window_lines(&full, "7d", crate::usage::WINDOW_7D_SECS, now)[0]
                 .spans
                 .iter()
-                .any(|span| span.content.as_ref() == "┃")
+                .any(|span| span.content.as_ref() == "|")
         );
 
         let missing = WindowUsage {
@@ -799,7 +812,7 @@ mod tests {
             window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
         };
         let missing_text =
-            quota_window_lines(&missing, "7d", crate::usage::WINDOW_7D_SECS)[0].to_string();
+            quota_window_lines(&missing, "7d", crate::usage::WINDOW_7D_SECS, now)[0].to_string();
         assert!(missing_text.contains("--% left"));
         assert!(!missing_text.contains("100% left"));
     }
@@ -827,7 +840,7 @@ mod tests {
 
     #[test]
     fn realistic_account_detail_keeps_models_in_the_single_column() {
-        let now = crate::auth::now_unix_secs();
+        let now = 1_000_000;
         let window = WindowUsage {
             used_percent: Some(50.0),
             resets_at: Some(now + 3_600),
@@ -856,8 +869,14 @@ mod tests {
             is_current: true,
             organizations: vec!["Night City · Owner · default workspace".into()],
             auth_expiries: vec![
-                "ID token · expires soon".into(),
-                "Access token · expires soon".into(),
+                AuthExpiry {
+                    name: "ID token".into(),
+                    expires_at: Some(now + 3_600),
+                },
+                AuthExpiry {
+                    name: "Access token".into(),
+                    expires_at: Some(now + 7_200),
+                },
             ],
             usage: Some(Box::new(usage)),
             usage_meta: vec!["  updated now".into()],
@@ -870,7 +889,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| menu.render(frame, frame.area()))
+            .draw(|frame| menu.render(frame, frame.area(), now))
             .unwrap();
 
         let models = find_text(terminal.backend(), "Models").expect("models heading");

@@ -1,5 +1,22 @@
 # Changelog
 
+## v20260826.2.0 — 2026-08-26
+
+- **Comparable quota meters** — Account and Global Weekly Pace rows now share
+  one meter geometry. Global Pace aggregates each account's real weekly window,
+  displays the ideal elapsed-use marker, and uses only ahead/behind color states.
+- **Consistent account selection** — Plan tiers and required quota windows are
+  normalized once across the CLI and daemon, while scoring uses each reported
+  window duration and checked timestamps instead of fixed calendar assumptions.
+- **Fail-closed runtime boundaries** — Production service endpoints cannot be
+  redirected by ambient environment variables, clock and process-inspection
+  failures remain explicit, and daemon decisions do not guess through unknown
+  state.
+- **Verified distribution lifecycle** — Install, self-update, daemon ownership,
+  and uninstall share transactional locks and exact file authority. Release
+  archives and installer entry points are attested, while ARM cross-build inputs
+  are pinned by digest.
+
 ## v20260826.1.0 — 2026-08-26
 
 - **One credential-operation boundary** — Usage refresh, model discovery,

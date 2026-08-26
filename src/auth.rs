@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,156 @@ pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Upstream Codex version this release is contract-aligned with.
 pub(crate) const ALIGNED_CODEX_VERSION: &str = "0.144.1";
 
+const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+const ACCOUNTS_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const RESET_CREDITS_CONSUME_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
+
+#[cfg(all(feature = "test-endpoints", not(debug_assertions)))]
+compile_error!("the test-endpoints feature is forbidden in release builds");
+
+/// One immutable endpoint set for an authenticated network operation.
+///
+/// Production builds can only construct the fixed OpenAI endpoint set. Unit
+/// tests and debug builds with the explicit `test-endpoints` feature may bind
+/// each endpoint an operation contacts to a mock through the test environment.
+/// Once any mock is configured, omitted endpoints stay unavailable instead of
+/// being filled from the production set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ServiceEndpoints {
+    token: Option<Cow<'static, str>>,
+    usage: Option<Cow<'static, str>>,
+    responses: Option<Cow<'static, str>>,
+    models: Option<Cow<'static, str>>,
+    accounts_check: Option<Cow<'static, str>>,
+    reset_credits: Option<Cow<'static, str>>,
+    reset_credits_consume: Option<Cow<'static, str>>,
+}
+
+impl ServiceEndpoints {
+    fn production() -> Self {
+        Self {
+            token: Some(Cow::Borrowed(TOKEN_URL)),
+            usage: Some(Cow::Borrowed(USAGE_URL)),
+            responses: Some(Cow::Borrowed(RESPONSES_URL)),
+            models: Some(Cow::Borrowed(MODELS_URL)),
+            accounts_check: Some(Cow::Borrowed(ACCOUNTS_CHECK_URL)),
+            reset_credits: Some(Cow::Borrowed(RESET_CREDITS_URL)),
+            reset_credits_consume: Some(Cow::Borrowed(RESET_CREDITS_CONSUME_URL)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn production_for_test() -> Self {
+        Self::production()
+    }
+
+    #[cfg(any(test, feature = "test-endpoints"))]
+    fn from_test_environment() -> Result<Self> {
+        fn endpoint(variable: &'static str) -> Result<Option<Cow<'static, str>>> {
+            match std::env::var(variable) {
+                Ok(value) => {
+                    validate_test_endpoint(variable, &value)?;
+                    Ok(Some(Cow::Owned(value)))
+                }
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(error) => {
+                    Err(anyhow::Error::new(error)
+                        .context(format!("reading {variable} test endpoint")))
+                }
+            }
+        }
+
+        let endpoints = Self {
+            token: endpoint("CS_TOKEN_URL")?,
+            usage: endpoint("CS_USAGE_URL")?,
+            responses: endpoint("CS_RESPONSES_URL")?,
+            models: endpoint("CS_MODELS_URL")?,
+            accounts_check: endpoint("CS_ACCOUNTS_CHECK_URL")?,
+            reset_credits: endpoint("CS_RESET_CREDITS_URL")?,
+            reset_credits_consume: endpoint("CS_RESET_CREDITS_CONSUME_URL")?,
+        };
+        if endpoints.has_test_override() {
+            Ok(endpoints)
+        } else {
+            Ok(Self::production())
+        }
+    }
+
+    #[cfg(any(test, feature = "test-endpoints"))]
+    fn has_test_override(&self) -> bool {
+        self.token.is_some()
+            || self.usage.is_some()
+            || self.responses.is_some()
+            || self.models.is_some()
+            || self.accounts_check.is_some()
+            || self.reset_credits.is_some()
+            || self.reset_credits_consume.is_some()
+    }
+
+    fn required<'a>(endpoint: &'a Option<Cow<'static, str>>, variable: &str) -> Result<&'a str> {
+        endpoint
+            .as_deref()
+            .with_context(|| format!("{variable} is required by the active test endpoint context"))
+    }
+
+    pub(crate) fn token(&self) -> Result<&str> {
+        Self::required(&self.token, "CS_TOKEN_URL")
+    }
+
+    pub(crate) fn usage(&self) -> Result<&str> {
+        Self::required(&self.usage, "CS_USAGE_URL")
+    }
+
+    pub(crate) fn responses(&self) -> Result<&str> {
+        Self::required(&self.responses, "CS_RESPONSES_URL")
+    }
+
+    pub(crate) fn models(&self) -> Result<&str> {
+        Self::required(&self.models, "CS_MODELS_URL")
+    }
+
+    pub(crate) fn accounts_check(&self) -> Result<&str> {
+        Self::required(&self.accounts_check, "CS_ACCOUNTS_CHECK_URL")
+    }
+
+    pub(crate) fn reset_credits(&self) -> Result<&str> {
+        Self::required(&self.reset_credits, "CS_RESET_CREDITS_URL")
+    }
+
+    pub(crate) fn reset_credits_consume(&self) -> Result<&str> {
+        Self::required(&self.reset_credits_consume, "CS_RESET_CREDITS_CONSUME_URL")
+    }
+}
+
+#[cfg(any(test, feature = "test-endpoints"))]
+fn validate_test_endpoint(variable: &str, value: &str) -> Result<()> {
+    let url =
+        reqwest::Url::parse(value).with_context(|| format!("parsing {variable} test endpoint"))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("{variable} must be an absolute HTTP(S) test endpoint");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        anyhow::bail!("{variable} test endpoint must not contain credentials or a fragment");
+    }
+    Ok(())
+}
+
+pub(crate) fn service_endpoints() -> Result<ServiceEndpoints> {
+    #[cfg(any(test, feature = "test-endpoints"))]
+    {
+        ServiceEndpoints::from_test_environment()
+    }
+    #[cfg(not(any(test, feature = "test-endpoints")))]
+    {
+        Ok(ServiceEndpoints::production())
+    }
+}
+
 /// User-Agent in the upstream shape: `codex_cli_rs/<version> (<os>; <arch>)`.
 pub(crate) fn codex_user_agent() -> String {
     format!(
@@ -25,14 +176,8 @@ pub(crate) fn codex_user_agent() -> String {
     )
 }
 pub(crate) const ISSUER: &str = "https://auth.openai.com";
-const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-pub(crate) fn token_url() -> String {
-    std::env::var("CS_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string())
-}
-
-/// Serializes tests that redirect endpoint URLs (`CS_TOKEN_URL`, and the
-/// warmup equivalents) at a mock server. Environment variables are
+/// Serializes tests that install a test-only endpoint context. Environment variables are
 /// process-global, so a per-module lock only serializes that module and lets
 /// tests in a sibling module retarget the variable mid-request; both modules
 /// must take this one. Mirrors `profile::TEST_ENV_LOCK`, which does the same
@@ -2500,6 +2645,7 @@ pub fn apply_tokens(
     refresh_token: &str,
 ) -> Result<()> {
     validate_complete_oauth_tokens(id_token, access_token, refresh_token)?;
+    let last_refresh = crate::output::format_iso8601(now_unix_secs()?)?;
     let tokens = val
         .get_mut("tokens")
         .and_then(|t| t.as_object_mut())
@@ -2511,10 +2657,7 @@ pub fn apply_tokens(
     // Codex refreshes proactively when last_refresh is older than 8 days;
     // stamping it here keeps our refreshes recognized (matches upstream).
     if let Some(obj) = val.as_object_mut() {
-        obj.insert(
-            "last_refresh".into(),
-            serde_json::json!(crate::output::format_iso8601(now_unix_secs())),
-        );
+        obj.insert("last_refresh".into(), serde_json::json!(last_refresh));
     }
     Ok(())
 }
@@ -2559,12 +2702,21 @@ pub fn extract_id_token(val: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Current unix timestamp in seconds.
-pub fn now_unix_secs() -> i64 {
-    SystemTime::now()
+fn unix_secs_from_elapsed(elapsed: std::time::Duration) -> Result<i64> {
+    i64::try_from(elapsed.as_secs()).context("system clock exceeds the supported Unix timestamp")
+}
+
+fn unix_secs_at(time: SystemTime) -> Result<i64> {
+    let elapsed = time
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .context("system clock is before the Unix epoch")?;
+    unix_secs_from_elapsed(elapsed)
+}
+
+/// Current Unix timestamp in seconds, or an error when the system clock cannot
+/// be represented by the signed timestamp contract used by persisted state.
+pub fn now_unix_secs() -> Result<i64> {
+    unix_secs_at(SystemTime::now())
 }
 
 /// Read auth.json and parse AccountInfo without collapsing path, read, or JSON
@@ -2816,6 +2968,73 @@ mod tests {
             age.num_seconds().abs() < 60,
             "last_refresh not recent: {text}"
         );
+    }
+
+    #[test]
+    fn checked_unix_time_rejects_pre_epoch_and_signed_overflow() {
+        let before_epoch = UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("the platform must represent one second before the epoch");
+        assert!(unix_secs_at(before_epoch).is_err());
+        assert!(
+            unix_secs_from_elapsed(std::time::Duration::from_secs(i64::MAX as u64 + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn production_service_endpoint_policy_is_fixed() {
+        let endpoints = ServiceEndpoints::production();
+        assert_eq!(
+            endpoints.token().unwrap(),
+            "https://auth.openai.com/oauth/token"
+        );
+        assert_eq!(
+            endpoints.usage().unwrap(),
+            "https://chatgpt.com/backend-api/wham/usage"
+        );
+        assert_eq!(
+            endpoints.responses().unwrap(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            endpoints.models().unwrap(),
+            "https://chatgpt.com/backend-api/codex/models"
+        );
+        assert_eq!(
+            endpoints.accounts_check().unwrap(),
+            "https://chatgpt.com/backend-api/wham/accounts/check"
+        );
+        assert_eq!(
+            endpoints.reset_credits().unwrap(),
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+        );
+        assert_eq!(
+            endpoints.reset_credits_consume().unwrap(),
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+        );
+    }
+
+    #[test]
+    fn partial_test_endpoint_context_never_falls_back_to_production() {
+        let endpoints = ServiceEndpoints {
+            token: Some(Cow::Borrowed("http://127.0.0.1/token")),
+            usage: None,
+            responses: None,
+            models: None,
+            accounts_check: None,
+            reset_credits: None,
+            reset_credits_consume: None,
+        };
+        assert_eq!(endpoints.token().unwrap(), "http://127.0.0.1/token");
+        let error = endpoints.usage().unwrap_err().to_string();
+        assert!(error.contains("CS_USAGE_URL is required"), "{error}");
+    }
+
+    #[test]
+    fn test_endpoint_policy_rejects_non_http_and_embedded_credentials() {
+        assert!(validate_test_endpoint("TEST", "file:///tmp/mock").is_err());
+        assert!(validate_test_endpoint("TEST", "http://user:secret@127.0.0.1/mock").is_err());
+        assert!(validate_test_endpoint("TEST", "http://127.0.0.1/mock#fragment").is_err());
     }
 
     #[test]

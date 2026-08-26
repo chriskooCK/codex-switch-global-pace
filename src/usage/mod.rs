@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::jwt::PlanKind;
+
 mod api;
 mod global_pace;
 mod parse;
@@ -36,12 +38,13 @@ pub(crate) use reset_credits::{
     validate_reset_credit_preflight,
 };
 #[allow(unused_imports)]
-pub use scoring::visible_pace_percent;
+pub use scoring::visible_pace_percent_at;
 pub(crate) use scoring::{
-    QuotaPaceState, normalized_quota_usage, quota_pace_state, visible_pace_marker,
+    QuotaPaceState, UsageAvailability, normalized_plan_kind, normalized_quota_usage,
+    quota_pace_state, usage_availability, visible_pace_marker,
 };
 pub use scoring::{
-    is_available, is_candidate_eligible, pace_percent, pick_switch_target, score_candidates,
+    is_available, is_candidate_eligible, pace_percent_at, pick_switch_target, score_candidates,
     usage_has_active_warmup_window,
 };
 #[allow(unused_imports)]
@@ -54,22 +57,48 @@ pub struct WindowUsage {
     pub window_minutes: Option<i64>,
 }
 
+/// Resolve a quota window's duration without inventing metadata. The slot
+/// default is authoritative only when the API omitted the duration entirely;
+/// explicitly invalid metadata makes the window unusable for time-based
+/// decisions.
+pub(crate) fn quota_window_duration_secs(window: &WindowUsage, default_secs: i64) -> Option<i64> {
+    match window.window_minutes {
+        Some(minutes) => minutes.checked_mul(60).filter(|seconds| *seconds > 0),
+        None => (default_secs > 0).then_some(default_secs),
+    }
+}
+
+/// Validate the quota fields automatic selection needs from one window.
+/// Display-only clamping is deliberately not used here: an out-of-range value
+/// cannot prove that a required window is selectable.
+pub(crate) fn validated_quota_window(
+    window: &WindowUsage,
+    default_secs: i64,
+) -> Option<(f64, i64)> {
+    let used_percent = window
+        .used_percent
+        .filter(|used| used.is_finite() && (0.0..=100.0).contains(used))?;
+    let duration_secs = quota_window_duration_secs(window, default_secs)?;
+    Some((used_percent, duration_secs))
+}
+
 /// Resolve the label and duration from window metadata, using the caller's
 /// explicit slot definition only when the API omitted that metadata.
 pub(crate) fn quota_window_spec(
     window: &WindowUsage,
     default_label: &str,
     default_secs: i64,
-) -> (String, i64) {
+) -> (String, Option<i64>) {
+    let duration_secs = quota_window_duration_secs(window, default_secs);
     match window.window_minutes {
         Some(minutes) if minutes > 0 && minutes % 1_440 == 0 => {
-            (format!("{}d", minutes / 1_440), minutes.saturating_mul(60))
+            (format!("{}d", minutes / 1_440), duration_secs)
         }
         Some(minutes) if minutes > 0 && minutes % 60 == 0 => {
-            (format!("{}h", minutes / 60), minutes.saturating_mul(60))
+            (format!("{}h", minutes / 60), duration_secs)
         }
-        Some(minutes) => (format!("{minutes}m"), minutes.saturating_mul(60)),
-        None => (default_label.to_string(), default_secs),
+        Some(minutes) => (format!("{minutes}m"), duration_secs),
+        None => (default_label.to_string(), duration_secs),
     }
 }
 
@@ -102,9 +131,10 @@ pub struct ResetCredit {
     pub expires_at: Option<String>,
 }
 
-/// A schema problem retained by the public infallible parser. Network fetches
-/// use the checked parser and reject these responses outright; retaining the
-/// typed issue keeps direct library callers from receiving a silent fallback.
+/// A schema problem retained by the public issue-preserving parser. Network
+/// fetches use the checked parser and reject these responses outright;
+/// retaining the typed issue keeps direct library callers from receiving a
+/// silent fallback.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "field", rename_all = "snake_case")]
 pub enum UsageParseIssue {
@@ -113,6 +143,9 @@ pub enum UsageParseIssue {
     InvalidRateLimitReachedType { raw: String, detail: String },
     InvalidAdditionalRateLimits { detail: String },
     InvalidCodeReviewRateLimit { detail: String },
+    InvalidPlanType { detail: String },
+    InvalidRateLimit { detail: String },
+    InvalidSpendControl { detail: String },
 }
 
 impl std::fmt::Display for UsageParseIssue {
@@ -132,6 +165,11 @@ impl std::fmt::Display for UsageParseIssue {
             }
             Self::InvalidCodeReviewRateLimit { detail } => {
                 write!(formatter, "code_review_rate_limit: {detail}")
+            }
+            Self::InvalidPlanType { detail } => write!(formatter, "plan_type: {detail}"),
+            Self::InvalidRateLimit { detail } => write!(formatter, "rate_limit: {detail}"),
+            Self::InvalidSpendControl { detail } => {
+                write!(formatter, "spend_control: {detail}")
             }
         }
     }
@@ -294,8 +332,10 @@ pub fn ordinary_account_limit(usage: &UsageInfo) -> Option<OrdinaryAccountLimit>
     let resets_at = relevant
         .into_iter()
         .filter_map(|window| window.resets_at)
-        .max()
-        .expect("present windows with reset timestamps were checked above");
+        .max();
+    let Some(resets_at) = resets_at else {
+        return Some(OrdinaryAccountLimit::ResetUnknown);
+    };
     Some(OrdinaryAccountLimit::UntilReset(resets_at))
 }
 
@@ -325,20 +365,48 @@ pub fn additional_pool_rows(limits: &[AdditionalRateLimit]) -> Vec<PoolRow> {
         .collect()
 }
 
-/// All data needed to score an account. Pure data, no I/O.
+/// One validated quota window used by automatic selection.
+#[derive(Debug, Clone)]
+pub struct CandidateWindow {
+    pub(crate) used_percent: f64,
+    pub(crate) resets_at: Option<i64>,
+    pub(crate) duration_secs: i64,
+}
+
+impl CandidateWindow {
+    fn from_usage(window: &WindowUsage, default_secs: i64, now: i64) -> Option<Self> {
+        let (used_percent, duration_secs) = validated_quota_window(window, default_secs)?;
+        if let Some(resets_at) = window.resets_at
+            && resets_at > now
+            && resets_at.checked_sub(now)? > duration_secs
+        {
+            return None;
+        }
+        Some(Self {
+            used_percent,
+            resets_at: window.resets_at,
+            duration_secs,
+        })
+    }
+
+    pub fn effective_used(&self, now: i64) -> f64 {
+        if self.resets_at.is_some_and(|timestamp| timestamp <= now) {
+            0.0
+        } else {
+            self.used_percent
+        }
+    }
+}
+
+/// All normalized data needed to score an account. Pure data, no I/O.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub alias: String,
-    pub used_5h: f64,
-    pub resets_at_5h: Option<i64>,
-    pub used_7d: f64,
-    pub resets_at_7d: Option<i64>,
-    pub has_5h_data: bool,
-    pub has_7d_data: bool,
+    pub primary: Option<CandidateWindow>,
+    pub weekly: Option<CandidateWindow>,
     pub explicit_account_blocker: Option<ExplicitAccountBlocker>,
     pub ordinary_account_limit: Option<OrdinaryAccountLimit>,
-    pub is_team: bool,
-    pub is_free: bool,
+    pub plan_kind: PlanKind,
     pub last_used: i64,
     pub now: i64,
     // Pool-level signals (set by caller after building all candidates)
@@ -352,31 +420,23 @@ impl Candidate {
     pub fn from_usage(
         alias: String,
         u: &UsageInfo,
-        is_team: bool,
-        is_free: bool,
+        plan_kind: PlanKind,
         last_used: i64,
         now: i64,
     ) -> Self {
         Self {
             alias,
-            used_5h: u
+            primary: u
                 .primary
                 .as_ref()
-                .and_then(|w| w.used_percent)
-                .unwrap_or(0.0),
-            resets_at_5h: u.primary.as_ref().and_then(|w| w.resets_at),
-            used_7d: u
+                .and_then(|window| CandidateWindow::from_usage(window, WINDOW_5H_SECS, now)),
+            weekly: u
                 .secondary
                 .as_ref()
-                .and_then(|w| w.used_percent)
-                .unwrap_or(0.0),
-            resets_at_7d: u.secondary.as_ref().and_then(|w| w.resets_at),
-            has_5h_data: u.primary.is_some(),
-            has_7d_data: u.secondary.is_some(),
+                .and_then(|window| CandidateWindow::from_usage(window, WINDOW_7D_SECS, now)),
             explicit_account_blocker: explicit_account_blocker(u),
             ordinary_account_limit: ordinary_account_limit(u),
-            is_team,
-            is_free,
+            plan_kind,
             last_used,
             now,
             pool_size: 1,
@@ -385,22 +445,34 @@ impl Candidate {
         }
     }
 
-    /// Reset-aware effective 5h usage: 0.0 if window has already reset.
-    pub fn effective_used_5h(&self) -> f64 {
-        if self.resets_at_5h.is_some_and(|ts| ts <= self.now) {
-            0.0
-        } else {
-            self.used_5h
-        }
+    pub fn has_required_quota_data(&self) -> bool {
+        plan_has_required_quota_data(
+            self.plan_kind,
+            self.primary.is_some(),
+            self.weekly.is_some(),
+        )
     }
 
-    /// Reset-aware effective 7d usage: 0.0 if window has already reset.
-    pub fn effective_used_7d(&self) -> f64 {
-        if self.resets_at_7d.is_some_and(|ts| ts <= self.now) {
-            0.0
-        } else {
-            self.used_7d
-        }
+    pub fn is_team(&self) -> bool {
+        matches!(self.plan_kind, PlanKind::Team)
+    }
+
+    pub fn is_free(&self) -> bool {
+        matches!(self.plan_kind, PlanKind::Free)
+    }
+
+    /// Reset-aware effective primary usage: 0.0 if the window has reset.
+    pub fn effective_used_5h(&self) -> Option<f64> {
+        self.primary
+            .as_ref()
+            .map(|window| window.effective_used(self.now))
+    }
+
+    /// Reset-aware effective weekly usage: 0.0 if the window has reset.
+    pub fn effective_used_7d(&self) -> Option<f64> {
+        self.weekly
+            .as_ref()
+            .map(|window| window.effective_used(self.now))
     }
 
     pub fn account_limit_active(&self) -> bool {
@@ -408,6 +480,28 @@ impl Candidate {
             || self
                 .ordinary_account_limit
                 .is_some_and(|limit| limit.is_active(self.now))
+    }
+}
+
+/// Apply the plan-specific minimum quota shape used by automatic selection.
+/// Callers must pass only windows whose quota values have already been
+/// validated; raw `Option` presence is not sufficient evidence.
+pub(crate) const fn plan_has_required_quota_data(
+    plan_kind: PlanKind,
+    primary_valid: bool,
+    weekly_valid: bool,
+) -> bool {
+    match plan_kind {
+        PlanKind::Free => weekly_valid,
+        PlanKind::Go
+        | PlanKind::Plus
+        | PlanKind::ProLite
+        | PlanKind::Pro
+        | PlanKind::Team
+        | PlanKind::Business
+        | PlanKind::Enterprise
+        | PlanKind::Edu => primary_valid && weekly_valid,
+        PlanKind::Unknown => false,
     }
 }
 
@@ -720,11 +814,24 @@ mod pool_row_tests {
 
         assert_eq!(
             quota_window_spec(&weekly, "5h", WINDOW_5H_SECS),
-            ("7d".to_string(), WINDOW_7D_SECS)
+            ("7d".to_string(), Some(WINDOW_7D_SECS))
         );
         assert_eq!(
             quota_window_spec(&omitted, "5h", WINDOW_5H_SECS),
-            ("5h".to_string(), WINDOW_5H_SECS)
+            ("5h".to_string(), Some(WINDOW_5H_SECS))
+        );
+    }
+
+    #[test]
+    fn quota_window_spec_preserves_invalid_explicit_duration_as_unavailable() {
+        let invalid = WindowUsage {
+            window_minutes: Some(0),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            quota_window_spec(&invalid, "5h", WINDOW_5H_SECS),
+            ("0m".to_string(), None)
         );
     }
 

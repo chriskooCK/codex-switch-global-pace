@@ -12,19 +12,11 @@ Codex 必须使用 file credential store。在 `$CODEX_HOME/config.toml`（通�
 cli_auth_credentials_store = "file"
 ```
 
-macOS / Linux 安装正式版：
-
-```bash
-curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash
-```
+请使用仓库中经过代码审查的[已验证安装流程](Getting-Started.md#install)
+安装正式版。该流程先用 GitHub CLI 验证安装器 attestation，再运行本地文件；
+验证失败时不会降级为未验证安装。
 
 如果未传 `--system`，脚本却显示 `Installing to /usr/local/bin (requires sudo)`，说明运行的是旧 `master` 分支中的已淘汰脚本，请终止并改用上面的 Release 地址。当前脚本默认安装到 `~/.local/bin`；只有清理 `/usr/local/bin` 中由 root 持有的旧二进制时，才会请求一次 `sudo`。
-
-Windows PowerShell 安装正式版：
-
-```powershell
-irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
-```
 
 添加账号并打开界面：
 

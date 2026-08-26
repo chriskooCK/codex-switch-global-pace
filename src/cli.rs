@@ -205,8 +205,8 @@ pub enum Commands {
         /// Check whether a newer version is available without installing it
         #[arg(long)]
         check: bool,
-        /// Install a specific newer version instead of the latest release
-        #[arg(long, conflicts_with_all = ["dev", "stable"])]
+        /// Install a specific newer stable version; cannot be combined with --check or channel flags
+        #[arg(long, conflicts_with_all = ["check", "dev", "stable"])]
         version: Option<String>,
         /// Switch to the dev channel (latest dev build)
         #[arg(long, conflicts_with = "stable")]
@@ -236,8 +236,32 @@ pub enum Commands {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands, DaemonCommand};
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use std::path::PathBuf;
+
+    #[test]
+    fn exact_self_update_version_conflicts_with_check_and_help_explains_it() {
+        let error = Cli::try_parse_from([
+            "codex-switch-global-pace",
+            "self-update",
+            "--check",
+            "--version",
+            "20260826.1.0",
+        ])
+        .err()
+        .expect("an exact install version must not be ignored by check mode");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("self-update")
+            .expect("self-update subcommand exists")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(
+            "Install a specific newer stable version; cannot be combined with --check or channel flags"
+        ));
+    }
 
     #[test]
     fn hidden_daemon_owner_check_keeps_the_exact_expected_path() {

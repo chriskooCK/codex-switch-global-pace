@@ -63,8 +63,8 @@ Prerequisite: `dev` contains every intended commit and the local worktree is cle
 ```bash
 # 1) Run the local gate. This is a preflight, not the source of release artifacts.
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all --locked
+cargo clippy --all-targets --locked --features test-endpoints -- -D warnings
+cargo test --all --locked --features test-endpoints
 cargo audit
 bash -n scripts/install.sh
 
@@ -176,15 +176,16 @@ exact lock object it created and confirms the ref is absent.
 
 - Linux / macOS: `.tar.gz` archives named `codex-switch-global-pace-{linux,darwin}-{amd64,arm64}.tar.gz` plus `.sha256`
 - Windows: `.zip` archives named `codex-switch-global-pace-windows-{amd64,arm64}.zip` plus `.sha256`
-- Build provenance: `codex-switch-global-pace-build-provenance.json`, covering every release archive
-- `install.sh` / `install.ps1`
+- Build provenance: `codex-switch-global-pace-build-provenance.json`, covering every release archive, both installers, and `INSTALL.md`
+- Attested `install.sh` / `install.ps1` and release-exact `INSTALL.md`; the reviewed repository guide remains the external trust anchor
 - User update path: `codex-switch-global-pace self-update --dev`
 
 Post-release verification must confirm at least:
 
 - The GitHub Actions Release run succeeds, including all six builds and the release job; for `dev`, `publish-dev.ps1` also completes successfully.
 - A platform archive downloaded from GitHub Releases matches its `.sha256`.
-- A current GitHub CLI verifies that archive against `codex-switch-global-pace-build-provenance.json` with the repository, `.github/workflows/release.yml`, exact tag ref, the full commit digest reached by that tag, and self-hosted runners denied.
+- A current GitHub CLI verifies every archive, both installer scripts, and `INSTALL.md` against `codex-switch-global-pace-build-provenance.json` with the repository, `.github/workflows/release.yml`, exact tag ref, the full commit digest reached by that tag, and self-hosted runners denied.
+- Fresh-install instructions download the installer and provenance bundle separately, verify the installer before execution, and stop without an unverified fallback on any failure.
 - The unpacked release binary reports the CI-injected version with `codex-switch-global-pace --version`.
 - After `publish-dev.ps1` succeeds, the release is public and the original release path works, for example `codex-switch-global-pace self-update --check --dev`.
 

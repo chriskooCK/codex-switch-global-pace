@@ -2,14 +2,17 @@
 set -euo pipefail
 
 # codex-switch-global-pace installer / uninstaller for macOS and Linux
-# Usage:
-#   curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash
-#   curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh | bash -s -- --dev
-#   curl -fsSL .../install.sh | bash -s -- --system       # install system-wide (may require sudo)
-#   curl -fsSL .../install.sh | bash -s -- --uninstall    # uninstall this program
-#   curl -fsSL .../install.sh | CS_VERSION=20260712.1.0 bash  # install specific version
+# First verify this file with the fail-closed bootstrap in the repository's
+# reviewed Getting Started guide. Then run the local verified file explicitly:
+#   bash ./install.sh
+#   bash ./install.sh --dev
+#   bash ./install.sh --system
+#   bash ./install.sh --uninstall
+#   CS_VERSION=20260712.1.0 bash ./install.sh
 
 REPO="chriskooCK/codex-switch-global-pace"
+RELEASE_WORKFLOW="${REPO}/.github/workflows/release.yml"
+PROVENANCE_ASSET_NAME="codex-switch-global-pace-build-provenance.json"
 # Release workflow replaces this value in the installer asset. Keeping the
 # source value empty makes a raw checkout fail closed instead of guessing which
 # release version a downloaded archive ought to contain.
@@ -18,7 +21,26 @@ USER_INSTALL_DIR="${HOME}/.local/bin"
 SYSTEM_INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="codex-switch-global-pace"
 DAEMON_BOUNDARY_PROTOCOL_PREFIX="${BINARY_NAME} daemon update boundary"
-DATA_DIR="${HOME}/.codex-switch"
+if [ -n "${CODEX_SWITCH_HOME:-}" ]; then
+  case "$CODEX_SWITCH_HOME" in
+    /*) ;;
+    *) printf '[error] CODEX_SWITCH_HOME must be an absolute path.\n' >&2; exit 1 ;;
+  esac
+  case "$CODEX_SWITCH_HOME" in
+    //*) printf '[error] CODEX_SWITCH_HOME must use one absolute POSIX root.\n' >&2; exit 1 ;;
+  esac
+  case "/${CODEX_SWITCH_HOME#/}/" in
+    */./*|*/../*) printf '[error] CODEX_SWITCH_HOME must not contain dot path components.\n' >&2; exit 1 ;;
+  esac
+  DATA_DIR="$CODEX_SWITCH_HOME"
+  while [ "${DATA_DIR%/}" != "$DATA_DIR" ]; do
+    DATA_DIR="${DATA_DIR%/}"
+  done
+  [ -n "$DATA_DIR" ] || { printf '[error] CODEX_SWITCH_HOME must not be a filesystem root.\n' >&2; exit 1; }
+else
+  DATA_DIR="${HOME}/.codex-switch"
+fi
+STABLE_LOCK_TARGET="${DATA_DIR}/${BINARY_NAME}-installer-authority"
 LEGACY_BIN="${SYSTEM_INSTALL_DIR}/${BINARY_NAME}"
 SYSTEM_INSTALL_MARKER="${SYSTEM_INSTALL_DIR}/.codex-switch-global-pace-system-install-v1"
 PATH_BLOCK_BEGIN="# >>> codex-switch-global-pace PATH >>>"
@@ -41,6 +63,56 @@ SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-
 validate_version() {
   local version="$1"
   [[ "$version" =~ $SEMVER_PATTERN ]] || error "Invalid CS_VERSION '${version}'; expected a SemVer version such as 20260824.6.0."
+}
+
+resolve_release_source_digest() {
+  local tag="$1" endpoint tuple kind sha extra depth=0
+  command -v gh >/dev/null 2>&1 \
+    || error "GitHub CLI with attestation support is required to verify this installer release."
+  endpoint="repos/${REPO}/git/ref/tags/${tag}"
+  while [ "$depth" -le 5 ]; do
+    tuple="$(gh api --hostname github.com "$endpoint" \
+      --jq '[.object.type, .object.sha] | @tsv')" \
+      || error "Could not resolve release tag ${tag} through the GitHub API."
+    case "$tuple" in
+      *$'\n'*) error "Release tag ${tag} returned more than one object record." ;;
+    esac
+    IFS=$'\t' read -r kind sha extra <<< "$tuple"
+    [ -n "$kind" ] && [ -n "$sha" ] && [ -z "${extra:-}" ] \
+      || error "Release tag ${tag} returned an invalid object record."
+    [ "${#sha}" -eq 40 ] && [[ "$sha" != *[!0-9A-Fa-f]* ]] \
+      || error "Release tag ${tag} returned an invalid Git object digest."
+    if [ "$kind" = commit ]; then
+      printf '%s\n' "$sha" | tr '[:upper:]' '[:lower:]'
+      return 0
+    fi
+    [ "$kind" = tag ] \
+      || error "Release tag ${tag} resolved to unsupported Git object type ${kind}."
+    [ "$depth" -lt 5 ] \
+      || error "Release tag ${tag} contains more than five nested annotated tags."
+    endpoint="repos/${REPO}/git/tags/${sha}"
+    depth=$((depth + 1))
+  done
+  error "Release tag ${tag} could not be resolved to a commit."
+}
+
+verify_release_provenance() {
+  local archive="$1" bundle="$2" tag="$3" source_digest="$4"
+  gh attestation verify "$archive" \
+    --bundle "$bundle" \
+    --repo "$REPO" \
+    --signer-workflow "$RELEASE_WORKFLOW" \
+    --source-ref "refs/tags/${tag}" \
+    --source-digest "$source_digest" \
+    --deny-self-hosted-runners >/dev/null \
+    || error "GitHub build provenance verification failed for ${archive}; nothing was extracted or changed."
+}
+
+confirm_locked_release_source_digest() {
+  local tag="$1" expected_digest="$2" observed_digest
+  observed_digest="$(resolve_release_source_digest "$tag")"
+  [ "$observed_digest" = "$expected_digest" ] \
+    || error "Release tag ${tag} moved while waiting for installer authority; no service, binary, marker, or PATH configuration was changed."
 }
 
 is_homebrew_cellar_path() {
@@ -85,7 +157,6 @@ validate_locked_direct_binary() {
 
 find_homebrew_managed_binary() {
   local candidate path_binary
-  HOMEBREW_BIN=""
   HOMEBREW_RESOLVED=""
   path_binary="$(command -v "$BINARY_NAME" 2>/dev/null || true)"
   for candidate in \
@@ -97,7 +168,6 @@ find_homebrew_managed_binary() {
     [ -n "$candidate" ] || continue
     classify_binary_ownership "$candidate"
     if [ "$BINARY_KIND" = "homebrew" ]; then
-      HOMEBREW_BIN="$candidate"
       HOMEBREW_RESOLVED="$BINARY_RESOLVED"
       return 0
     fi
@@ -157,7 +227,7 @@ assert_no_install_transaction_residue() {
 read_checked_daemon_status() {
   local status
   DAEMON_STATUS_ERROR=""
-  if ! status="$("$CANDIDATE_BIN" daemon status --installer-state 8>&- 9>&- 2>&1)"; then
+  if ! status="$("$CANDIDATE_BIN" daemon status --installer-state 7>&- 8>&- 9>&- 2>&1)"; then
     DAEMON_STATUS_ERROR="release-verified daemon state probe failed: ${status}"
     return 1
   fi
@@ -193,7 +263,7 @@ read_checked_daemon_status() {
 
 verify_candidate_version() {
   local candidate="$1" expected="$2" output first_line
-  if ! output="$("$candidate" --version 8>&- 9>&- 2>&1)"; then
+  if ! output="$("$candidate" --version 7>&- 8>&- 9>&- 2>&1)"; then
     CANDIDATE_ERROR="candidate version check failed: ${output}"
     return 1
   fi
@@ -212,12 +282,12 @@ run_installer_file_op() {
   INSTALLER_FILE_OP_RESULT=""
   INSTALLER_FILE_OP_ERROR=""
   if [ "$use_sudo" = true ]; then
-    if ! output="$(sudo "$CANDIDATE_BIN" __installer-file-op "$@" 8>&- 9>&- 2>&1)"; then
+    if ! output="$(sudo "$CANDIDATE_BIN" __installer-file-op "$@" 7>&- 8>&- 9>&- 2>&1)"; then
       INSTALLER_FILE_OP_ERROR="$output"
       return 1
     fi
   else
-    if ! output="$("$CANDIDATE_BIN" __installer-file-op "$@" 8>&- 9>&- 2>&1)"; then
+    if ! output="$("$CANDIDATE_BIN" __installer-file-op "$@" 7>&- 8>&- 9>&- 2>&1)"; then
       INSTALLER_FILE_OP_ERROR="$output"
       return 1
     fi
@@ -842,12 +912,13 @@ restore_daemon_update_boundary_old_state() {
 
 finish_daemon_update_boundary() {
   local marker
-  [ "${DAEMON_BOUNDARY_ACTIVE:-false}" = true ] \
-    && { [ "${DAEMON_BOUNDARY_PHASE:-}" = new ] \
-      || [ "${DAEMON_BOUNDARY_PHASE:-}" = uninstall ]; } || {
-    DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not ready for final commit"
-    return 1
-  }
+  case "${DAEMON_BOUNDARY_ACTIVE:-false}:${DAEMON_BOUNDARY_PHASE:-}" in
+    true:new|true:uninstall) ;;
+    *)
+      DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not ready for final commit"
+      return 1
+      ;;
+  esac
   if ! printf 'finish\n' >&7 || ! IFS= read -r marker <&6; then
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before final state confirmation"
     close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
@@ -901,7 +972,7 @@ cleanup_daemon_update_boundary_on_exit() {
 cleanup_update_locks_on_exit() {
   local wait_status
   UPDATE_LOCK_EXIT_CLEANUP_ERROR=""
-  exec 9>&- 8>&-
+  exec 9>&- 8>&- 7>&-
   if [ -n "${UPDATE_LOCK_PID_9:-}" ]; then
     if wait "$UPDATE_LOCK_PID_9" >/dev/null 2>&1; then
       :
@@ -924,7 +995,34 @@ cleanup_update_locks_on_exit() {
     fi
     UPDATE_LOCK_PID_8=""
   fi
+  if [ -n "${UPDATE_LOCK_PID_7:-}" ]; then
+    if wait "$UPDATE_LOCK_PID_7" >/dev/null 2>&1; then
+      :
+    else
+      wait_status=$?
+      if [ -n "$UPDATE_LOCK_EXIT_CLEANUP_ERROR" ]; then
+        UPDATE_LOCK_EXIT_CLEANUP_ERROR="${UPDATE_LOCK_EXIT_CLEANUP_ERROR}; lock-holder PID ${UPDATE_LOCK_PID_7} exited with status ${wait_status} during EXIT cleanup"
+      else
+        UPDATE_LOCK_EXIT_CLEANUP_ERROR="lock-holder PID ${UPDATE_LOCK_PID_7} exited with status ${wait_status} during EXIT cleanup"
+      fi
+    fi
+    UPDATE_LOCK_PID_7=""
+  fi
   [ -z "$UPDATE_LOCK_EXIT_CLEANUP_ERROR" ]
+}
+
+cleanup_new_install_directory() {
+  NEW_INSTALL_DIR_CLEANUP_ERROR=""
+  [ "${INSTALL_DIR_CREATED:-false}" = true ] || return 0
+  if [ -L "$INSTALL_DIR" ] || [ ! -d "$INSTALL_DIR" ]; then
+    NEW_INSTALL_DIR_CLEANUP_ERROR="new install directory changed type and was preserved: ${INSTALL_DIR}"
+    return 1
+  fi
+  if ! rmdir "$INSTALL_DIR"; then
+    NEW_INSTALL_DIR_CLEANUP_ERROR="new install directory is not empty and was preserved: ${INSTALL_DIR}"
+    return 1
+  fi
+  INSTALL_DIR_CREATED=false
 }
 
 cleanup_install_exit() {
@@ -948,6 +1046,13 @@ cleanup_install_exit() {
       cleanup_errors="${cleanup_errors}; ${UPDATE_LOCK_EXIT_CLEANUP_ERROR}"
     else
       cleanup_errors="$UPDATE_LOCK_EXIT_CLEANUP_ERROR"
+    fi
+  fi
+  if ! cleanup_new_install_directory; then
+    if [ -n "$cleanup_errors" ]; then
+      cleanup_errors="${cleanup_errors}; ${NEW_INSTALL_DIR_CLEANUP_ERROR}"
+    else
+      cleanup_errors="$NEW_INSTALL_DIR_CLEANUP_ERROR"
     fi
   fi
   if ! cleanup_installer_temp_directory; then
@@ -991,7 +1096,7 @@ cleanup_installer_temp_directory() {
       return 1
       ;;
   esac
-  observed_physical_parent="$(CDPATH= cd -P "$observed_parent" && pwd -P)" || {
+  observed_physical_parent="$(CDPATH='' cd -P "$observed_parent" && pwd -P)" || {
     TMP_CLEANUP_ERROR="could not resolve recorded temporary parent ${observed_parent}"
     return 1
   }
@@ -1036,25 +1141,42 @@ start_update_lock() {
   local control="${TMP_DIR}/update-lock-${slot}.control"
   local ready="${TMP_DIR}/update-lock-${slot}.ready"
   local marker pid
+  case "$slot" in
+    7|8|9) ;;
+    *)
+      UPDATE_LOCK_ERROR="unsupported update-lock slot ${slot}"
+      return 1
+      ;;
+  esac
   mkfifo "$control" "$ready" || return 1
 
   if [ "$use_sudo" = true ]; then
-    sudo env CS_UPDATE_LOCK_TARGET="$target" \
-      "$candidate" __hold-update-lock 8>&- 9>&- \
-      < "$control" > "$ready" &
+    (
+      exec 7>&- 8>&- 9>&-
+      exec < "$control" > "$ready"
+      exec sudo env CS_UPDATE_LOCK_TARGET="$target" \
+        "$candidate" __hold-update-lock
+    ) &
   else
     CS_UPDATE_LOCK_TARGET="$target" \
-      "$candidate" __hold-update-lock 8>&- 9>&- \
+      "$candidate" __hold-update-lock 7>&- 8>&- 9>&- \
       < "$control" > "$ready" &
   fi
   pid=$!
-  if [ "$slot" = 8 ]; then
-    UPDATE_LOCK_PID_8="$pid"
-    exec 8>"$control"
-  else
-    UPDATE_LOCK_PID_9="$pid"
-    exec 9>"$control"
-  fi
+  case "$slot" in
+    7)
+      UPDATE_LOCK_PID_7="$pid"
+      exec 7>"$control"
+      ;;
+    8)
+      UPDATE_LOCK_PID_8="$pid"
+      exec 8>"$control"
+      ;;
+    9)
+      UPDATE_LOCK_PID_9="$pid"
+      exec 9>"$control"
+      ;;
+  esac
 
   if ! IFS= read -r marker < "$ready"; then
     UPDATE_LOCK_ERROR="candidate did not acquire the shared update lock for ${target}"
@@ -1073,15 +1195,110 @@ start_update_lock() {
   fi
 }
 
+validate_stable_lock_parent_chain() {
+  local path="$1" remaining component current=""
+  case "$path" in
+    /*) ;;
+    *)
+      UPDATE_LOCK_ERROR="stable lock parent is not absolute: ${path}"
+      return 1
+      ;;
+  esac
+  remaining="${path#/}"
+  while [ -n "$remaining" ]; do
+    component="${remaining%%/*}"
+    if [ "$remaining" = "$component" ]; then
+      remaining=""
+    else
+      remaining="${remaining#*/}"
+    fi
+    [ -n "$component" ] || continue
+    current="${current}/${component}"
+    if [ -L "$current" ]; then
+      UPDATE_LOCK_ERROR="stable lock parent contains a symlink component: ${current}"
+      return 1
+    fi
+    if [ -e "$current" ] && [ ! -d "$current" ]; then
+      UPDATE_LOCK_ERROR="stable lock parent contains a non-directory component: ${current}"
+      return 1
+    fi
+  done
+}
+
+prepare_stable_lock_parent() {
+  local mode
+  validate_stable_lock_parent_chain "$DATA_DIR" || return 1
+  if ! (umask 077; mkdir -p "$DATA_DIR"); then
+    UPDATE_LOCK_ERROR="could not create the stable lock parent ${DATA_DIR}"
+    return 1
+  fi
+  validate_stable_lock_parent_chain "$DATA_DIR" || return 1
+  if [ -L "$DATA_DIR" ] || [ ! -d "$DATA_DIR" ]; then
+    UPDATE_LOCK_ERROR="stable lock parent is not a direct directory: ${DATA_DIR}"
+    return 1
+  fi
+  if [ ! -O "$DATA_DIR" ]; then
+    UPDATE_LOCK_ERROR="stable lock parent is not owned by the effective user: ${DATA_DIR}"
+    return 1
+  fi
+  if ! chmod 700 "$DATA_DIR"; then
+    UPDATE_LOCK_ERROR="could not set private mode 700 on the stable lock parent ${DATA_DIR}"
+    return 1
+  fi
+  validate_stable_lock_parent_chain "$DATA_DIR" || return 1
+  [ ! -L "$DATA_DIR" ] && [ -d "$DATA_DIR" ] && [ -O "$DATA_DIR" ] || {
+    UPDATE_LOCK_ERROR="stable lock parent changed type or owner while securing it: ${DATA_DIR}"
+    return 1
+  }
+  case "$OS" in
+    linux) mode="$(stat -c '%a' "$DATA_DIR" 2>/dev/null)" ;;
+    darwin) mode="$(stat -f '%Lp' "$DATA_DIR" 2>/dev/null)" ;;
+    *)
+      UPDATE_LOCK_ERROR="stable lock parent mode verification is unsupported on ${OS}"
+      return 1
+      ;;
+  esac
+  if [ "$mode" != 700 ]; then
+    UPDATE_LOCK_ERROR="stable lock parent does not have private mode 700: ${DATA_DIR}"
+    return 1
+  fi
+}
+
+start_stable_update_lock() {
+  local candidate="$1" parent_identity observed_identity
+  prepare_stable_lock_parent || return 1
+  parent_identity="$(file_identity "$DATA_DIR" 2>/dev/null)" || {
+    UPDATE_LOCK_ERROR="could not identify the stable lock parent ${DATA_DIR}"
+    return 1
+  }
+  start_update_lock "$candidate" "$STABLE_LOCK_TARGET" 7 false || return 1
+  [ ! -L "$DATA_DIR" ] && [ -d "$DATA_DIR" ] || {
+    UPDATE_LOCK_ERROR="stable lock parent changed type while acquiring authority: ${DATA_DIR}"
+    cleanup_update_locks_on_exit
+    return 1
+  }
+  observed_identity="$(file_identity "$DATA_DIR" 2>/dev/null)" || {
+    UPDATE_LOCK_ERROR="could not re-identify stable lock parent ${DATA_DIR}"
+    cleanup_update_locks_on_exit
+    return 1
+  }
+  [ "$observed_identity" = "$parent_identity" ] || {
+    UPDATE_LOCK_ERROR="stable lock parent identity changed while acquiring authority: ${DATA_DIR}"
+    cleanup_update_locks_on_exit
+    return 1
+  }
+}
+
 start_install_update_locks() {
-  local candidate="$1"
-  # Every transaction that touches the system target acquires it first. A
-  # user migration then acquires its user target, so two installers can never
-  # hold these two shared locks in opposite order.
+  local candidate="$1" install_parent_preexisting="$2"
+  # A transaction that touches the system target acquires it before the user
+  # target, so two installers can never hold destination locks in opposite order.
   if [ "$MIGRATE_LEGACY" = true ]; then
     start_update_lock "$candidate" "$LEGACY_BIN" 8 "$LEGACY_NEEDS_SUDO" || return 1
-    start_update_lock "$candidate" "$INSTALL_DEST" 9 false || return 1
-  else
+    if [ "$install_parent_preexisting" = true ]; then
+      start_update_lock "$candidate" "$INSTALL_DEST" 9 false || return 1
+    fi
+  elif [ "$install_parent_preexisting" = true ]; then
     start_update_lock "$candidate" "$INSTALL_DEST" 8 "$INSTALL_WITH_SUDO"
   fi
 }
@@ -1092,7 +1309,7 @@ release_update_locks() {
     UPDATE_LOCK_ERROR="refusing to release update locks while the daemon lifecycle holder is active"
     return 1
   fi
-  exec 9>&- 8>&-
+  exec 9>&- 8>&- 7>&-
   if [ -n "${UPDATE_LOCK_PID_9:-}" ]; then
     wait "$UPDATE_LOCK_PID_9" || failed=true
     UPDATE_LOCK_PID_9=""
@@ -1100,6 +1317,10 @@ release_update_locks() {
   if [ -n "${UPDATE_LOCK_PID_8:-}" ]; then
     wait "$UPDATE_LOCK_PID_8" || failed=true
     UPDATE_LOCK_PID_8=""
+  fi
+  if [ -n "${UPDATE_LOCK_PID_7:-}" ]; then
+    wait "$UPDATE_LOCK_PID_7" || failed=true
+    UPDATE_LOCK_PID_7=""
   fi
   if [ "$failed" = true ]; then
     UPDATE_LOCK_ERROR="an update-lock helper did not exit successfully after the transaction"
@@ -1252,7 +1473,7 @@ resolve_path_target() (
     esac
     profile_target="$link_target"
   done
-  physical_dir="$(CDPATH= cd -P "$(dirname "$profile_target")" && pwd -P)" || error "Failed to resolve profile directory for $1."
+  physical_dir="$(CDPATH='' cd -P "$(dirname "$profile_target")" && pwd -P)" || error "Failed to resolve profile directory for $1."
   printf '%s/%s\n' "$physical_dir" "$(basename "$profile_target")"
 )
 
@@ -1288,7 +1509,7 @@ create_direct_installer_temp_directory() {
     || error "Could not identify temporary-root discovery directory ${probe}; it was preserved."
 
   logical_parent="$(dirname "$probe")"
-  physical_parent="$(CDPATH= cd -P "$logical_parent" && pwd -P)" \
+  physical_parent="$(CDPATH='' cd -P "$logical_parent" && pwd -P)" \
     || error "Could not resolve the physical temporary root selected at ${logical_parent}; preserved ${probe}."
   [ ! -L "$physical_parent" ] && [ -d "$physical_parent" ] \
     || error "The resolved temporary root is not a direct directory; preserved ${probe}."
@@ -1309,7 +1530,7 @@ create_direct_installer_temp_directory() {
     error "The verified temporary-root discovery directory still exists after removal: ${physical_probe}"
   fi
 
-  observed_physical_parent="$(CDPATH= cd -P "$TMP_DIR_PARENT" && pwd -P)" \
+  observed_physical_parent="$(CDPATH='' cd -P "$TMP_DIR_PARENT" && pwd -P)" \
     || error "Could not re-resolve physical installer temporary root ${TMP_DIR_PARENT}."
   if [ "$observed_physical_parent" != "$TMP_DIR_PARENT" ]; then
     error "Physical installer temporary root became an alias after discovery: ${TMP_DIR_PARENT}"
@@ -1324,7 +1545,7 @@ create_direct_installer_temp_directory() {
   if [ "$(dirname "$TMP_DIR")" != "$TMP_DIR_PARENT" ]; then
     error "Installer temporary directory is not a direct child of its physical root; preserved ${TMP_DIR}."
   fi
-  observed_physical_parent="$(CDPATH= cd -P "$TMP_DIR_PARENT" && pwd -P)" \
+  observed_physical_parent="$(CDPATH='' cd -P "$TMP_DIR_PARENT" && pwd -P)" \
     || error "Could not resolve physical installer temporary root after creation; preserved ${TMP_DIR}."
   if [ "$observed_physical_parent" != "$TMP_DIR_PARENT" ]; then
     error "Physical installer temporary root became an alias during creation; preserved ${TMP_DIR}."
@@ -1416,8 +1637,8 @@ create_profile_parent_chain() {
       fi
       return 1
     }
-    PATH_TRANSACTION_CREATED_PARENT[$PATH_TRANSACTION_CREATED_PARENT_COUNT]="$parent"
-    PATH_TRANSACTION_CREATED_PARENT_IDENTITY[$PATH_TRANSACTION_CREATED_PARENT_COUNT]="$identity"
+    PATH_TRANSACTION_CREATED_PARENT[PATH_TRANSACTION_CREATED_PARENT_COUNT]="$parent"
+    PATH_TRANSACTION_CREATED_PARENT_IDENTITY[PATH_TRANSACTION_CREATED_PARENT_COUNT]="$identity"
     PATH_TRANSACTION_CREATED_PARENT_COUNT=$((PATH_TRANSACTION_CREATED_PARENT_COUNT + 1))
   done
 }
@@ -1460,7 +1681,7 @@ assert_no_managed_path_transaction_residue() {
 }
 
 prepare_path_block_removal() {
-  local profile_file="$1" profile_target profile_identity original original_token updated
+  local profile_file="$1" profile_target profile_identity original updated
   local profile_stage profile_displaced profile_failed
   local index existing_index
   [ -f "$profile_file" ] || return 0
@@ -1503,8 +1724,8 @@ prepare_path_block_removal() {
     PATH_TRANSACTION_ERROR="an incomplete PATH transaction remains beside ${profile_target}"
     return 1
   fi
-  if ! capture_installer_file_copy \
-    "$profile_target" "$original" "$profile_identity" false original_token \
+  if ! copy_installer_file_exclusive \
+    "$profile_target" "$original" "$profile_identity" false \
     || ! cp -p "$original" "$updated"
   then
     PATH_TRANSACTION_ERROR="failed to stage ${profile_file} for PATH removal"
@@ -1515,15 +1736,15 @@ prepare_path_block_removal() {
     return 1
   fi
 
-  PATH_TRANSACTION_LOGICAL[$index]="$profile_file"
-  PATH_TRANSACTION_TARGET[$index]="$profile_target"
-  PATH_TRANSACTION_IDENTITY[$index]="$profile_identity"
-  PATH_TRANSACTION_ORIGINAL_EXISTS[$index]=true
-  PATH_TRANSACTION_UPDATED[$index]="$updated"
-  PATH_TRANSACTION_STAGE[$index]="$profile_stage"
-  PATH_TRANSACTION_STAGE_TOKEN[$index]=""
-  PATH_TRANSACTION_COMMITTED_IDENTITY[$index]=""
-  PATH_TRANSACTION_ACTION[$index]="Removed codex-switch-global-pace PATH entry from ${profile_file}."
+  PATH_TRANSACTION_LOGICAL[index]="$profile_file"
+  PATH_TRANSACTION_TARGET[index]="$profile_target"
+  PATH_TRANSACTION_IDENTITY[index]="$profile_identity"
+  PATH_TRANSACTION_ORIGINAL_EXISTS[index]=true
+  PATH_TRANSACTION_UPDATED[index]="$updated"
+  PATH_TRANSACTION_STAGE[index]="$profile_stage"
+  PATH_TRANSACTION_STAGE_TOKEN[index]=""
+  PATH_TRANSACTION_COMMITTED_IDENTITY[index]=""
+  PATH_TRANSACTION_ACTION[index]="Removed codex-switch-global-pace PATH entry from ${profile_file}."
   PATH_TRANSACTION_COUNT=$((PATH_TRANSACTION_COUNT + 1))
 }
 
@@ -1543,7 +1764,14 @@ prepare_managed_path_removals() {
 
 prepare_managed_path_addition() {
   local profile_file path_line profile_parent profile_target profile_identity
-  local original original_token updated profile_stage profile_displaced profile_failed validation index=0
+  local original updated profile_stage profile_displaced profile_failed validation index=0
+  local posix_path_line fish_path_line
+  # These are profile source lines. Preserve their dollar expressions so the
+  # user's future shell, rather than this installer, expands them.
+  # shellcheck disable=SC2016
+  posix_path_line='export PATH="$HOME/.local/bin:$PATH"'
+  # shellcheck disable=SC2016
+  fish_path_line='fish_add_path "$HOME/.local/bin"'
   reset_managed_path_transaction
   assert_no_managed_path_transaction_residue || return 1
   case ":${PATH}:" in
@@ -1552,7 +1780,7 @@ prepare_managed_path_addition() {
   case "${SHELL:-}" in
     */zsh)
       profile_file="${HOME}/.zprofile"
-      path_line='export PATH="$HOME/.local/bin:$PATH"'
+      path_line="$posix_path_line"
       ;;
     */bash)
       if [ "$PLATFORM" = "darwin" ]; then
@@ -1560,11 +1788,11 @@ prepare_managed_path_addition() {
       else
         profile_file="${HOME}/.profile"
       fi
-      path_line='export PATH="$HOME/.local/bin:$PATH"'
+      path_line="$posix_path_line"
       ;;
     */fish)
       profile_file="${HOME}/.config/fish/config.fish"
-      path_line='fish_add_path "$HOME/.local/bin"'
+      path_line="$fish_path_line"
       ;;
     *) return 0 ;;
   esac
@@ -1601,13 +1829,14 @@ prepare_managed_path_addition() {
       PATH_TRANSACTION_ERROR="failed to identify ${profile_file}"
       return 1
     }
-    capture_installer_file_copy \
-      "$profile_target" "$original" "$profile_identity" false original_token \
-      && cp -p "$original" "$updated" || {
+    if ! copy_installer_file_exclusive \
+      "$profile_target" "$original" "$profile_identity" false \
+      || ! cp -p "$original" "$updated"
+    then
       PATH_TRANSACTION_ERROR="failed to stage ${profile_file} for PATH addition"
       return 1
-      }
-    PATH_TRANSACTION_ORIGINAL_EXISTS[$index]=true
+    fi
+    PATH_TRANSACTION_ORIGINAL_EXISTS[index]=true
   else
     profile_target="$(resolve_path_target "$profile_file")" || {
       PATH_TRANSACTION_ERROR="failed to resolve new profile path ${profile_file}"
@@ -1619,7 +1848,7 @@ prepare_managed_path_addition() {
       PATH_TRANSACTION_ERROR="failed to stage new profile ${profile_file}"
       return 1
     }
-    PATH_TRANSACTION_ORIGINAL_EXISTS[$index]=false
+    PATH_TRANSACTION_ORIGINAL_EXISTS[index]=false
   fi
   profile_stage="${profile_target}.${BINARY_NAME}.install"
   profile_displaced="${profile_target}.${BINARY_NAME}.displaced"
@@ -1636,14 +1865,14 @@ prepare_managed_path_addition() {
       return 1
     }
 
-  PATH_TRANSACTION_LOGICAL[$index]="$profile_file"
-  PATH_TRANSACTION_TARGET[$index]="$profile_target"
-  PATH_TRANSACTION_IDENTITY[$index]="$profile_identity"
-  PATH_TRANSACTION_UPDATED[$index]="$updated"
-  PATH_TRANSACTION_STAGE[$index]="$profile_stage"
-  PATH_TRANSACTION_STAGE_TOKEN[$index]=""
-  PATH_TRANSACTION_COMMITTED_IDENTITY[$index]=""
-  PATH_TRANSACTION_ACTION[$index]="Added ${USER_INSTALL_DIR} to PATH in ${profile_file}; restart your shell to apply it."
+  PATH_TRANSACTION_LOGICAL[index]="$profile_file"
+  PATH_TRANSACTION_TARGET[index]="$profile_target"
+  PATH_TRANSACTION_IDENTITY[index]="$profile_identity"
+  PATH_TRANSACTION_UPDATED[index]="$updated"
+  PATH_TRANSACTION_STAGE[index]="$profile_stage"
+  PATH_TRANSACTION_STAGE_TOKEN[index]=""
+  PATH_TRANSACTION_COMMITTED_IDENTITY[index]=""
+  PATH_TRANSACTION_ACTION[index]="Added ${USER_INSTALL_DIR} to PATH in ${profile_file}; restart your shell to apply it."
   PATH_TRANSACTION_COUNT=1
 }
 
@@ -1672,7 +1901,7 @@ commit_managed_path_changes() {
       PATH_TRANSACTION_ERROR="failed to create the fixed PATH transaction stage ${stage}: ${INSTALLER_FILE_OP_ERROR}"
       return 1
     }
-    PATH_TRANSACTION_STAGE_TOKEN[$index]="$stage_token"
+    PATH_TRANSACTION_STAGE_TOKEN[index]="$stage_token"
     if ! current_target="$(resolve_path_target "$logical")"; then
       PATH_TRANSACTION_ERROR="failed to re-resolve ${logical} before commit"
       return 1
@@ -1681,7 +1910,7 @@ commit_managed_path_changes() {
       PATH_TRANSACTION_ERROR="profile link changed while updating ${logical}"
       return 1
     fi
-    PATH_TRANSACTION_COMMITTED_IDENTITY[$index]="$stage_token"
+    PATH_TRANSACTION_COMMITTED_IDENTITY[index]="$stage_token"
     if [ "$original_exists" = true ]; then
       if ! exchange_installer_files \
         "$stage" "$target" "$stage_token" "$expected_identity" false
@@ -1694,7 +1923,7 @@ commit_managed_path_changes() {
         if [ "$stage_after" = "$expected_identity" ] \
           && [ "$target_after" = "$stage_token" ]
         then
-          PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+          PATH_TRANSACTION_STAGE_TOKEN[index]="$expected_identity"
           PATH_TRANSACTION_COMMITTED=$((index + 1))
           PATH_TRANSACTION_ERROR="profile exchange reached its published state but did not confirm durability: ${boundary_error}"
         else
@@ -1702,7 +1931,7 @@ commit_managed_path_changes() {
         fi
         return 1
       fi
-      PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+      PATH_TRANSACTION_STAGE_TOKEN[index]="$expected_identity"
     else
       if ! move_installer_file_noreplace "$stage" "$target" "$stage_token" false; then
         boundary_error="$INSTALLER_FILE_OP_ERROR"
@@ -1711,13 +1940,13 @@ commit_managed_path_changes() {
         if [ "$target_after" = "$stage_token" ] \
           && [ ! -e "$stage" ] && [ ! -L "$stage" ]
         then
-          PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+          PATH_TRANSACTION_STAGE_TOKEN[index]=""
           PATH_TRANSACTION_COMMITTED=$((index + 1))
         fi
         PATH_TRANSACTION_ERROR="failed to publish new profile ${logical} without replacing another writer: ${boundary_error}"
         return 1
       fi
-      PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+      PATH_TRANSACTION_STAGE_TOKEN[index]=""
     fi
     PATH_TRANSACTION_COMMITTED=$((index + 1))
     if ! capture_installer_file_token "$target" false committed_identity; then
@@ -1767,14 +1996,14 @@ rollback_managed_path_changes() {
           if [ "$stage_after" = "$expected_identity" ] \
             && [ "$target_after" = "$original_identity" ]
           then
-            PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+            PATH_TRANSACTION_STAGE_TOKEN[index]="$expected_identity"
             PATH_TRANSACTION_COMMITTED="$index"
             PATH_TRANSACTION_ERROR="restored ${logical}, but rollback durability was not confirmed; the failed candidate remains at ${stage}"
           else
             PATH_TRANSACTION_ERROR="could not atomically restore ${logical}; all exchange operands were preserved"
           fi
         else
-          PATH_TRANSACTION_STAGE_TOKEN[$index]="$expected_identity"
+          PATH_TRANSACTION_STAGE_TOKEN[index]="$expected_identity"
           if ! installer_file_token_matches "$target" false "$original_identity"; then
             failed=true
             PATH_TRANSACTION_ERROR="restored profile identity did not match the captured ${logical}"
@@ -1782,7 +2011,7 @@ rollback_managed_path_changes() {
             failed=true
             PATH_TRANSACTION_ERROR="restored ${logical}, but the failed candidate remains at ${stage}"
           else
-            PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+            PATH_TRANSACTION_STAGE_TOKEN[index]=""
             PATH_TRANSACTION_COMMITTED="$index"
           fi
         fi
@@ -1817,7 +2046,7 @@ rollback_managed_path_changes() {
         && remove_installer_file_owned \
           "$stage" "${PATH_TRANSACTION_STAGE_TOKEN[$index]}" false
       then
-        PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+        PATH_TRANSACTION_STAGE_TOKEN[index]=""
       else
         failed=true
         PATH_TRANSACTION_ERROR="PATH transaction residue remains at ${stage}"
@@ -1855,7 +2084,7 @@ finalize_managed_path_changes() {
         PATH_TRANSACTION_ERROR="committed PATH recovery file could not be removed safely: ${stage}"
         return 1
       fi
-      PATH_TRANSACTION_STAGE_TOKEN[$index]=""
+      PATH_TRANSACTION_STAGE_TOKEN[index]=""
     fi
     index=$((index + 1))
   done
@@ -1889,7 +2118,7 @@ daemon_pid_state_exists() {
 check_candidate_uninstall_owner() {
   SERVICE_OWNER_ERROR=""
   SERVICE_OWNER_ERROR="$("$CANDIDATE_BIN" daemon uninstall \
-    --expected-executable "$1" --check-owner 8>&- 9>&- 2>&1)"
+    --expected-executable "$1" --check-owner 7>&- 8>&- 9>&- 2>&1)"
 }
 
 begin_uninstall_file_transaction() {
@@ -1935,12 +2164,6 @@ begin_uninstall_file_transaction() {
       return 1
     fi
     UNINSTALL_PUBLIC_TOKEN="$UNINSTALL_STAGE_TOKEN"
-  else
-    capture_empty_installer_file \
-      "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" UNINSTALL_HOLD_TOKEN || {
-      UNINSTALL_TRANSACTION_ERROR="failed to create the fixed uninstall boundary: ${INSTALLER_FILE_OP_ERROR}"
-      return 1
-    }
   fi
   UNINSTALL_FILE_TRANSACTION_OPEN=true
 }
@@ -1948,9 +2171,9 @@ begin_uninstall_file_transaction() {
 hold_uninstall_binary_for_commit() {
   local boundary_error binary_after stage_after
   [ "${UNINSTALL_FILE_TRANSACTION_OPEN:-false}" = true ] || return 1
-  installer_file_token_matches \
-    "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_HOLD_TOKEN" || return 1
   if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
+    installer_file_token_matches \
+      "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_HOLD_TOKEN" || return 1
     if ! exchange_installer_files \
       "$UNINSTALL_STAGE" "$BIN_PATH" "$UNINSTALL_STAGE_TOKEN" \
       "$UNINSTALL_ORIGINAL_TOKEN" "$UNINSTALL_WITH_SUDO"
@@ -1977,9 +2200,9 @@ hold_uninstall_binary_for_commit() {
 rollback_uninstall_file_transaction() {
   local current_token stage_token restored_token restored_digest
   [ "${UNINSTALL_FILE_TRANSACTION_OPEN:-false}" = true ] || return 0
-  installer_file_token_matches \
-    "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_HOLD_TOKEN" || return 1
   if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
+    installer_file_token_matches \
+      "$UNINSTALL_HOLD" "$UNINSTALL_WITH_SUDO" "$UNINSTALL_HOLD_TOKEN" || return 1
     capture_installer_file_token \
       "$BIN_PATH" "$UNINSTALL_WITH_SUDO" current_token || return 1
     capture_installer_file_token \
@@ -2003,11 +2226,11 @@ rollback_uninstall_file_transaction() {
     [ "$restored_digest" = "$(file_token_digest "$UNINSTALL_HOLD_TOKEN")" ] || return 1
     remove_installer_file_owned \
       "$UNINSTALL_STAGE" "$UNINSTALL_PUBLIC_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
+    remove_installer_file_owned \
+      "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
   elif [ -e "$BIN_PATH" ] || [ -L "$BIN_PATH" ]; then
     return 1
   fi
-  remove_installer_file_owned \
-    "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
   UNINSTALL_FILE_TRANSACTION_OPEN=false
 }
 
@@ -2030,9 +2253,9 @@ commit_uninstall_file_transaction() {
     remove_installer_file_owned \
       "$BIN_PATH" "$UNINSTALL_PUBLIC_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
   fi
-  remove_installer_file_owned \
-    "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
   if [ "$UNINSTALL_BINARY_PRESENT" = true ]; then
+    remove_installer_file_owned \
+      "$UNINSTALL_HOLD" "$UNINSTALL_HOLD_TOKEN" "$UNINSTALL_WITH_SUDO" || return 1
     remove_installer_file_owned \
       "$UNINSTALL_STAGE" "$UNINSTALL_ORIGINAL_TOKEN" "$UNINSTALL_WITH_SUDO" \
       || return 1
@@ -2165,10 +2388,11 @@ run_uninstall() {
       *) error "The uninstall target ${BIN_PATH} is not absolute; no service, binary, or PATH configuration was changed." ;;
     esac
     BIN_DIR="${BIN_PATH%/*}"
-    [ -d "$BIN_DIR" ] \
-      || error "Cannot acquire the shared uninstall lock because target parent ${BIN_DIR} does not exist. No directory, lock residue, service, binary, or PATH configuration was changed."
+    if ! start_stable_update_lock "$CANDIDATE_BIN"; then
+      error "The release-verified uninstall helper could not acquire stable installer authority: ${UPDATE_LOCK_ERROR}. No daemon, service, binary, or PATH configuration was changed."
+    fi
     UNINSTALL_WITH_SUDO=false
-    if [ ! -w "$BIN_DIR" ]; then
+    if [ -d "$BIN_DIR" ] && [ ! -w "$BIN_DIR" ]; then
       info "Removing ${BIN_PATH} requires sudo."
       sudo -v || error "Cannot uninstall ${BIN_PATH} without sudo; nothing was changed."
       UNINSTALL_WITH_SUDO=true
@@ -2176,8 +2400,12 @@ run_uninstall() {
 
     INSTALL_WITH_SUDO="$UNINSTALL_WITH_SUDO"
 
-    if ! start_update_lock "$CANDIDATE_BIN" "$BIN_PATH" 8 "$UNINSTALL_WITH_SUDO"; then
-      error "The release-verified uninstall helper could not acquire the shared update lock: ${UPDATE_LOCK_ERROR}. No daemon, service, binary, or PATH configuration was changed."
+    UNINSTALL_TARGET_LOCK_HELD=false
+    if [ -d "$BIN_DIR" ]; then
+      if ! start_update_lock "$CANDIDATE_BIN" "$BIN_PATH" 8 "$UNINSTALL_WITH_SUDO"; then
+        error "The release-verified uninstall helper could not acquire the shared target lock: ${UPDATE_LOCK_ERROR}. No daemon, service, binary, or PATH configuration was changed."
+      fi
+      UNINSTALL_TARGET_LOCK_HELD=true
     fi
 
     assert_no_install_transaction_residue "$BIN_DIR"
@@ -2219,6 +2447,9 @@ run_uninstall() {
         || error "PATH preflight failed (${PATH_TRANSACTION_ERROR}), and ${UPDATE_LOCK_ERROR}. No service, binary, or PATH configuration was changed."
       error "PATH preflight failed: ${PATH_TRANSACTION_ERROR}. No service, binary, or PATH configuration was changed."
     fi
+
+    confirm_locked_release_source_digest \
+      "$RELEASE_TAG" "$RELEASE_SOURCE_DIGEST"
 
     UNINSTALL_TRANSACTION_ERROR=""
     UNINSTALL_FILE_TRANSACTION_OPEN=false
@@ -2294,7 +2525,10 @@ run_uninstall() {
     fi
     # The lock inode is persistent protocol state. Deleting it after release
     # could split the lock from an installer that was already waiting on it.
-    info "Kept shared update lock: ${BIN_DIR}/.${BINARY_NAME}.self-update.lock"
+    if [ "$UNINSTALL_TARGET_LOCK_HELD" = true ]; then
+      info "Kept shared target lock: ${BIN_DIR}/.${BINARY_NAME}.self-update.lock"
+    fi
+    info "Kept stable installer lock: ${DATA_DIR}/.${BINARY_NAME}-installer-authority.self-update.lock"
   fi
 
   # This directory is deliberately shared with codex-switch. Removing it here
@@ -2408,14 +2642,12 @@ ASSET_NAME="codex-switch-global-pace-${PLATFORM}-${ARCH_NAME}.tar.gz"
 
 # Get release URL
 if [ "$USE_DEV" = true ]; then
-  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/dev/${ASSET_NAME}"
+  RELEASE_TAG="dev"
 else
-  if [ "$VERSION" = "latest" ]; then
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${ASSET_NAME}"
-  else
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET_NAME}"
-  fi
+  RELEASE_TAG="v${EXPECTED_RELEASE_VERSION}"
 fi
+RELEASE_BASE_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
+DOWNLOAD_URL="${RELEASE_BASE_URL}/${ASSET_NAME}"
 
 info "Detected: ${PLATFORM}/${ARCH_NAME}"
 info "Downloading: ${DOWNLOAD_URL}"
@@ -2434,7 +2666,10 @@ INSTALL_PUBLISHED_TOKEN=""
 INSTALL_WITH_SUDO=false
 UPDATE_LOCK_PID_8=""
 UPDATE_LOCK_PID_9=""
+UPDATE_LOCK_PID_7=""
 UPDATE_LOCK_ERROR=""
+INSTALL_DIR_CREATED=false
+NEW_INSTALL_DIR_CLEANUP_ERROR=""
 DAEMON_BOUNDARY_PID=""
 DAEMON_BOUNDARY_ACTIVE=false
 DAEMON_BOUNDARY_ROLLBACK_SAFE=false
@@ -2464,6 +2699,9 @@ curl -fsSL "$DOWNLOAD_URL" -o "${TMP_DIR}/${ASSET_NAME}" || error "Download fail
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 CHECKSUM_FILE="${TMP_DIR}/${ASSET_NAME}.sha256"
 curl -fsSL "$CHECKSUM_URL" -o "$CHECKSUM_FILE" || error "Checksum download failed. The release is incomplete or your network is unavailable."
+PROVENANCE_FILE="${TMP_DIR}/${PROVENANCE_ASSET_NAME}"
+curl -fsSL "${RELEASE_BASE_URL}/${PROVENANCE_ASSET_NAME}" -o "$PROVENANCE_FILE" \
+  || error "Build provenance download failed. The release is incomplete or your network is unavailable."
 
 EXPECTED_SHA256="$(awk -v filename="$ASSET_NAME" '
   NF != 2 { exit 1 }
@@ -2485,6 +2723,11 @@ fi
 
 [ "$ACTUAL_SHA256" = "$EXPECTED_SHA256" ] || error "Checksum mismatch for ${ASSET_NAME}; refusing to extract it."
 info "Checksum verified: ${ASSET_NAME}"
+RELEASE_SOURCE_DIGEST="$(resolve_release_source_digest "$RELEASE_TAG")"
+verify_release_provenance \
+  "${TMP_DIR}/${ASSET_NAME}" "$PROVENANCE_FILE" \
+  "$RELEASE_TAG" "$RELEASE_SOURCE_DIGEST"
+info "Build provenance verified: ${ASSET_NAME}"
 tar xzf "${TMP_DIR}/${ASSET_NAME}" -C "$TMP_DIR"
 
 CANDIDATE_BIN="${TMP_DIR}/${BINARY_NAME}"
@@ -2492,6 +2735,9 @@ CANDIDATE_ERROR=""
 if ! verify_candidate_version "$CANDIDATE_BIN" "$EXPECTED_RELEASE_VERSION"; then
   error "Downloaded binary failed its pre-install check; the existing installation was not changed: ${CANDIDATE_ERROR}"
 fi
+CONFIRMED_RELEASE_SOURCE_DIGEST="$(resolve_release_source_digest "$RELEASE_TAG")"
+[ "$CONFIRMED_RELEASE_SOURCE_DIGEST" = "$RELEASE_SOURCE_DIGEST" ] \
+  || error "Release tag ${RELEASE_TAG} moved during verification; no service, binary, marker, or PATH configuration was changed."
 
 if [ "$UNINSTALL" = true ]; then
   run_uninstall
@@ -2502,21 +2748,31 @@ if [ "$MIGRATE_LEGACY" = true ] && [ "$LEGACY_NEEDS_SUDO" = true ]; then
 fi
 
 # Install
+if ! start_stable_update_lock "$CANDIDATE_BIN"; then
+  error "The downloaded binary cannot acquire stable installer authority: ${UPDATE_LOCK_ERROR}. The existing installation was not changed."
+fi
+if [ -L "$INSTALL_DIR" ] || { [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR" ]; }; then
+  error "The install parent is not a direct directory: ${INSTALL_DIR}. Nothing was changed."
+fi
+INSTALL_DIR_WAS_PRESENT=false
+if [ -d "$INSTALL_DIR" ]; then
+  INSTALL_DIR_WAS_PRESENT=true
+fi
 if [ "$SYSTEM_INSTALL" = true ]; then
+  [ "$INSTALL_DIR_WAS_PRESENT" = true ] \
+    || error "System install directory ${INSTALL_DIR} does not exist; nothing was changed."
   if [ ! -w "$INSTALL_DIR" ]; then
     info "Installing system-wide to ${INSTALL_DIR} (requires sudo)"
     sudo -v || error "Cannot install to ${INSTALL_DIR} without sudo."
     INSTALL_WITH_SUDO=true
   fi
-else
-  mkdir -p "$INSTALL_DIR"
 fi
 
 SYSTEM_MARKER_CREATED=false
 SYSTEM_MARKER_CREATED_TOKEN=""
 BINARY_REPLACED=false
 
-if ! start_install_update_locks "$CANDIDATE_BIN"; then
+if ! start_install_update_locks "$CANDIDATE_BIN" "$INSTALL_DIR_WAS_PRESENT"; then
   error "The downloaded binary cannot participate in a safe installer/self-update transaction: ${UPDATE_LOCK_ERROR}. The existing installation was not changed."
 fi
 
@@ -2539,6 +2795,16 @@ if [ -e "$SYSTEM_INSTALL_MARKER" ] || [ -L "$SYSTEM_INSTALL_MARKER" ]; then
   capture_installer_file_token \
     "$SYSTEM_INSTALL_MARKER" "$MARKER_WITH_SUDO" SYSTEM_MARKER_ORIGINAL_TOKEN \
     || error "The system-install marker could not be bound to this installer transaction; nothing was changed."
+fi
+
+confirm_locked_release_source_digest \
+  "$RELEASE_TAG" "$RELEASE_SOURCE_DIGEST"
+
+if [ "$SYSTEM_INSTALL" = false ] && [ "$INSTALL_DIR_WAS_PRESENT" = false ]; then
+  mkdir -p "$INSTALL_DIR" || error "Could not create the direct install directory ${INSTALL_DIR}."
+  [ ! -L "$INSTALL_DIR" ] && [ -d "$INSTALL_DIR" ] \
+    || error "Created install path is not a direct directory: ${INSTALL_DIR}."
+  INSTALL_DIR_CREATED=true
 fi
 
 if [ "$SYSTEM_INSTALL" = false ] && ! prepare_managed_path_addition; then
@@ -2630,6 +2896,7 @@ else
     preserve_install_backup
   fi
   BINARY_REPLACED=false
+  INSTALL_DIR_CREATED=false
 
   if ! commit_held_legacy_install; then
     POST_COMMIT_ERRORS="${POST_COMMIT_ERRORS}${POST_COMMIT_ERRORS:+; }held legacy-install cleanup failed"
@@ -2667,5 +2934,5 @@ if [ -n "$POST_COMMIT_ERRORS" ]; then
   error "The new install was committed, but cleanup was incomplete: ${POST_COMMIT_ERRORS}."
 fi
 
-info "Installed: $(${INSTALL_DIR}/${BINARY_NAME} --version 8>&- 9>&-)"
+info "Installed: $("${INSTALL_DIR}/${BINARY_NAME}" --version 7>&- 8>&- 9>&-)"
 info "Run 'codex-switch-global-pace --help' to get started"

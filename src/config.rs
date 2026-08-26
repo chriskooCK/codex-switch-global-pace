@@ -68,7 +68,7 @@ impl AppConfig {
         )?;
         let poll_backoff_horizon = i64::try_from(poll_backoff_horizon)
             .context("config.daemon.poll_interval_secs is too large for persisted daemon state")?;
-        crate::auth::now_unix_secs()
+        crate::auth::now_unix_secs()?
             .checked_add(poll_backoff_horizon)
             .ok_or_else(|| {
                 anyhow::anyhow!(

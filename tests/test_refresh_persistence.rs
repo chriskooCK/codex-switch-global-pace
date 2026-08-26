@@ -41,14 +41,6 @@ impl EnvVarGuard {
         }
         Self { key, previous }
     }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self { key, previous }
-    }
 }
 
 impl Drop for EnvVarGuard {
@@ -282,6 +274,13 @@ impl MockServer {
         format!("http://{}/oauth/token", self.addr)
     }
 
+    fn reset_credits_url(&self) -> String {
+        format!(
+            "http://{}/backend-api/wham/rate-limit-reset-credits",
+            self.addr
+        )
+    }
+
     /// Register a concurrent winner: the next time the token endpoint is asked
     /// to rotate `presented`, `winner`'s credentials land in its profile first.
     fn set_concurrent_winner(&self, presented: &str, winner: ConcurrentWinner) {
@@ -414,7 +413,7 @@ async fn token_handler(
 
 /// A JWT whose `exp` is `secs` from now (negative = already expired).
 fn jwt_expiring_in(secs: i64) -> String {
-    let exp = codex_switch::auth::now_unix_secs() + secs;
+    let exp = codex_switch::auth::now_unix_secs().unwrap() + secs;
     let payload = URL_SAFE_NO_PAD.encode(json!({"exp": exp}).to_string());
     format!("header.{payload}.signature")
 }
@@ -482,7 +481,7 @@ fn env_guards(server: &MockServer, home: &Path) -> Vec<EnvVarGuard> {
         EnvVarGuard::set("CODEX_HOME", home.join("codex").display().to_string()),
         EnvVarGuard::set("CS_USAGE_URL", server.usage_url()),
         EnvVarGuard::set("CS_TOKEN_URL", server.token_url()),
-        EnvVarGuard::remove("CS_RESET_CREDITS_URL"),
+        EnvVarGuard::set("CS_RESET_CREDITS_URL", server.reset_credits_url()),
     ]
 }
 
@@ -511,7 +510,7 @@ fn usage_ok() -> Reply {
                 "primary_window": {
                     "used_percent": 12.5,
                     "limit_window_seconds": 18_000,
-                    "reset_at": codex_switch::auth::now_unix_secs() + 3_600,
+                    "reset_at": codex_switch::auth::now_unix_secs().unwrap() + 3_600,
                 }
             }
         }),
@@ -1028,6 +1027,7 @@ async fn opportunistic_refresh_reports_active_profile_sync_failure() {
         codex_switch::usage::refresh_expiring_tokens(),
         replace_file_after_rotations(&mut held, 2, &fx.live_auth_path),
     );
+    let failures = failures.unwrap();
     presented.sort_unstable();
     assert_eq!(
         presented,
@@ -1076,6 +1076,7 @@ async fn opportunistic_refresh_keeps_going_after_active_profile_sync_fails() {
         codex_switch::usage::refresh_expiring_tokens(),
         replace_file_after_rotations(&mut held, 2, &fx.live_auth_path),
     );
+    let failures = failures.unwrap();
 
     assert_eq!(
         stored_refresh_token(&fx.keeper_profile),
@@ -1166,6 +1167,7 @@ async fn refresh_slower_than_the_budget_still_reaches_disk() {
             held.release_all();
         }
     );
+    let failures = failures.unwrap();
 
     assert_eq!(
         stored_refresh_token(&fx.profiles[0]),
@@ -1206,7 +1208,7 @@ async fn budget_exhaustion_stops_starting_new_refreshes() {
     let mut held = server.hold_token_requests();
     let budget = Duration::from_millis(200);
 
-    let (_failures, ()) = tokio::join!(
+    let (failures, ()) = tokio::join!(
         codex_switch::usage::refresh_expiring_tokens_within(budget),
         async {
             // Every in-flight slot is occupied and stays occupied until the
@@ -1216,6 +1218,7 @@ async fn budget_exhaustion_stops_starting_new_refreshes() {
             held.release_all();
         }
     );
+    let _failures = failures.unwrap();
 
     let mut seen = server.token_calls();
     seen.sort();
@@ -1260,8 +1263,9 @@ async fn lease_contention_cannot_start_a_rotation_after_the_budget() {
         .unwrap();
     FileExt::lock(&held).unwrap();
 
-    let failures =
-        codex_switch::usage::refresh_expiring_tokens_within(Duration::from_millis(200)).await;
+    let failures = codex_switch::usage::refresh_expiring_tokens_within(Duration::from_millis(200))
+        .await
+        .unwrap();
     drop(held);
 
     assert!(failures.is_empty());
@@ -1286,7 +1290,9 @@ async fn every_expiring_profile_is_refreshed_when_the_server_answers_promptly() 
     .await;
     let fx = expiring_profiles_fixture(&server, &aliases);
 
-    let failures = codex_switch::usage::refresh_expiring_tokens().await;
+    let failures = codex_switch::usage::refresh_expiring_tokens()
+        .await
+        .unwrap();
 
     assert!(
         failures.is_empty(),
@@ -1955,7 +1961,9 @@ async fn opportunistic_refresh_skips_a_credential_the_server_already_rejected() 
         .expect_err("the credential is spent");
     let after_fetch = server.token_calls().len();
 
-    let failures = codex_switch::usage::refresh_expiring_tokens().await;
+    let failures = codex_switch::usage::refresh_expiring_tokens()
+        .await
+        .unwrap();
 
     assert!(
         failures.is_empty(),
@@ -1981,7 +1989,9 @@ async fn opportunistic_refresh_remembers_a_terminal_verdict_it_discovers() {
     .await;
     let _fx = expiring_profiles_fixture(&server, &["dead_tail"]);
 
-    let first_failures = codex_switch::usage::refresh_expiring_tokens().await;
+    let first_failures = codex_switch::usage::refresh_expiring_tokens()
+        .await
+        .unwrap();
     assert!(
         first_failures.is_empty(),
         "a rejected credential is not a persistence failure: {first_failures:?}"
@@ -1992,7 +2002,9 @@ async fn opportunistic_refresh_remembers_a_terminal_verdict_it_discovers() {
         "the first opportunistic pass must contact the auth server once"
     );
 
-    let second_failures = codex_switch::usage::refresh_expiring_tokens().await;
+    let second_failures = codex_switch::usage::refresh_expiring_tokens()
+        .await
+        .unwrap();
     assert!(
         second_failures.is_empty(),
         "skipping a known rejection is not a persistence failure: {second_failures:?}"

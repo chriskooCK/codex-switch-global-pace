@@ -22,8 +22,10 @@ const SYSTEM_INSTALL_DIR: &str = "/usr/local/bin";
 const SYSTEM_INSTALL_MARKER_NAME: &str = ".codex-switch-global-pace-system-install-v1";
 const UPDATE_CACHE_NAME: &str = "global-pace-update-check.json";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
+const GITHUB_API_BASE: &str = "https://api.github.com";
 const UPDATE_LOCK_TARGET_ENV: &str = "CS_UPDATE_LOCK_TARGET";
 const UPDATE_LOCK_READY_MARKER: &str = "codex-switch-global-pace update lock ready";
+const INSTALLER_AUTHORITY_TARGET_NAME: &str = "codex-switch-global-pace-installer-authority";
 #[cfg(windows)]
 const WINDOWS_RECOVERY_PATH_COLLISION_RETRY_LIMIT: usize = 16;
 #[cfg(windows)]
@@ -104,6 +106,12 @@ enum UpdatePlatform {
     Windows,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallGuideChannel {
+    Stable,
+    Dev,
+}
+
 fn current_update_platform() -> UpdatePlatform {
     if cfg!(windows) {
         UpdatePlatform::Windows
@@ -112,22 +120,21 @@ fn current_update_platform() -> UpdatePlatform {
     }
 }
 
-fn unix_migration_command(release_tag: &str) -> String {
-    let safe_tag = !release_tag.is_empty()
-        && release_tag
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
-    let url = if safe_tag {
-        format!(
-            "https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{release_tag}/install.sh"
-        )
-    } else {
-        format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/install.sh")
+fn verified_install_guide_url(channel: InstallGuideChannel) -> String {
+    let reviewed_ref = match channel {
+        InstallGuideChannel::Stable => "master",
+        InstallGuideChannel::Dev => "dev",
     };
-    if release_tag == "dev" && safe_tag {
-        format!("`curl -fsSL {url} | bash -s -- --dev`")
+    format!(
+        "https://github.com/{REPO_OWNER}/{REPO_NAME}/blob/{reviewed_ref}/docs/wiki/Getting-Started.md#install"
+    )
+}
+
+fn install_guide_channel(release_tag: &str) -> InstallGuideChannel {
+    if release_tag == "dev" {
+        InstallGuideChannel::Dev
     } else {
-        format!("`curl -fsSL {url} | bash`")
+        InstallGuideChannel::Stable
     }
 }
 
@@ -156,36 +163,34 @@ fn legacy_system_install_migration_hint(
         ));
     }
 
-    let (user_command, system_command) = if let Some(version) = exact_version {
-        let url = format!(
-            "https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/v{version}/install.sh"
-        );
+    let (channel_instruction, user_command, system_command) = if let Some(version) = exact_version {
         (
-            format!("curl -fsSL {url} | CS_VERSION={version} bash"),
-            format!("curl -fsSL {url} | CS_VERSION={version} bash -s -- --system"),
+            "Keep the guide's stable channel selection.".to_string(),
+            format!("CS_VERSION={version} bash \"$work/install.sh\""),
+            format!("CS_VERSION={version} bash \"$work/install.sh\" --system"),
         )
     } else if use_dev {
         (
-            format!(
-                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/dev/install.sh | bash -s -- --dev"
-            ),
-            format!(
-                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/dev/install.sh | bash -s -- --dev --system"
-            ),
+            "Change only the guide's documented channel value from `stable` to `dev`.".to_string(),
+            "bash \"$work/install.sh\" --dev".to_string(),
+            "bash \"$work/install.sh\" --dev --system".to_string(),
         )
     } else {
         (
-            format!(
-                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/install.sh | bash"
-            ),
-            format!(
-                "curl -fsSL https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest/download/install.sh | bash -s -- --system"
-            ),
+            "Keep the guide's stable channel selection.".to_string(),
+            "bash \"$work/install.sh\"".to_string(),
+            "bash \"$work/install.sh\" --system".to_string(),
         )
     };
 
+    let guide_channel = if use_dev {
+        InstallGuideChannel::Dev
+    } else {
+        InstallGuideChannel::Stable
+    };
+    let guide_url = verified_install_guide_url(guide_channel);
     Some(format!(
-        "One-time setup required\n\ncodex-switch-global-pace is still installed system-wide at '{}'. Choose how future updates should work.\n\nRecommended — move it to your user account:\n  {user_command}\n\nProfiles and configuration are preserved. Future updates will not need sudo.\n\nKeep the system-wide install instead:\n  {system_command}\n\nFuture updates will continue to require sudo.",
+        "One-time setup required\n\ncodex-switch-global-pace is still installed system-wide at '{}'. Start from the source-controlled verified install guide:\n  {guide_url}\n\n{channel_instruction}\n\nRecommended — move it to your user account by changing only the guide's final execution line to:\n  {user_command}\n\nProfiles and configuration are preserved. Future updates will not need sudo.\n\nKeep the system-wide install instead by changing only the final execution line to:\n  {system_command}\n\nFuture updates will continue to require sudo. Verification failure must stop; there is no unverified download fallback.",
         executable.display()
     ))
 }
@@ -237,15 +242,17 @@ pub fn ensure_legacy_system_install_migrated(
 fn replacement_permission_hint(
     executable: &Path,
     platform: UpdatePlatform,
-    release_tag: &str,
+    guide_channel: InstallGuideChannel,
 ) -> String {
     let parent = executable.parent().unwrap_or(executable);
     match platform {
-        UpdatePlatform::Unix if parent == Path::new(SYSTEM_INSTALL_DIR) => format!(
-            "install directory '{}' is not writable; for a legacy direct install, rerun the user-level installer once with {}. If codex-switch-global-pace was intentionally installed with `--system`, run `sudo codex-switch-global-pace self-update` instead",
-            parent.display(),
-            unix_migration_command(release_tag)
-        ),
+        UpdatePlatform::Unix if parent == Path::new(SYSTEM_INSTALL_DIR) => {
+            let guide_url = verified_install_guide_url(guide_channel);
+            format!(
+                "install directory '{}' is not writable; for a legacy direct install, follow the source-controlled verified install guide at {guide_url}. If codex-switch-global-pace was intentionally installed with `--system`, run `sudo codex-switch-global-pace self-update` instead",
+                parent.display(),
+            )
+        }
         UpdatePlatform::Unix => format!(
             "user-owned install directory '{}' is not writable; fix its ownership or reinstall with the user-level installer. Do not run self-update with elevated privileges",
             parent.display()
@@ -276,8 +283,9 @@ fn ensure_replace_parent_writable(
     let parent = executable
         .parent()
         .with_context(|| format!("current executable has no parent: {}", executable.display()))?;
+    let guide_channel = install_guide_channel(release_tag);
     tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| replacement_permission_hint(executable, platform, release_tag))?;
+        .with_context(|| replacement_permission_hint(executable, platform, guide_channel))?;
     Ok(())
 }
 
@@ -483,7 +491,7 @@ struct UpdateLease {
 
 #[derive(Debug)]
 struct UpdateLeaseInner {
-    file: fs::File,
+    files: Vec<fs::File>,
 }
 
 #[derive(Debug, Clone)]
@@ -491,7 +499,9 @@ pub(crate) struct SelfUpdateLease(UpdateLease);
 
 impl Drop for UpdateLeaseInner {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        for file in self.files.iter().rev() {
+            let _ = FileExt::unlock(file);
+        }
     }
 }
 
@@ -925,6 +935,17 @@ struct UpdateCache {
     latest_version: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SelfUpdateRecordTime {
+    checked_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedVersion {
+    normalized: String,
+    semver: Version,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -958,14 +979,14 @@ struct GithubAsset {
 pub async fn check_for_update(force: bool) -> Result<Option<UpdateInfo>> {
     let current_version = current_version().to_string();
     let latest_version = latest_release_version(force).await?;
-    if !is_newer_version(&latest_version, &current_version) {
+    if !is_newer_version(&latest_version, &current_version)? {
         return Ok(None);
     }
 
     Ok(Some(UpdateInfo {
         current_version,
         latest_version,
-        install_source: detect_install_source(),
+        install_source: detect_install_source()?,
     }))
 }
 
@@ -982,14 +1003,14 @@ pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
         Some(r) => r,
         None => return Ok(None), // No dev release exists (404).
     };
-    let dev_version = extract_release_version(&release);
-    if !is_dev_update_available(&dev_version, &current_version) {
+    let dev_version = extract_release_version(&release)?;
+    if !is_dev_update_available(&dev_version, &current_version)? {
         return Ok(None);
     }
     Ok(Some(UpdateInfo {
         current_version,
         latest_version: dev_version,
-        install_source: detect_install_source(),
+        install_source: detect_install_source()?,
     }))
 }
 
@@ -1002,7 +1023,7 @@ pub(crate) async fn self_update(
     // GitHub API path, so it is rejected here rather than encoded and sent.
     let requested_version = version.map(validate_requested_version).transpose()?;
 
-    let install_source = detect_install_source();
+    let install_source = detect_install_source()?;
     if install_source == InstallSource::Homebrew {
         anyhow::bail!(
             "Homebrew-managed install detected. Run `{}` instead.",
@@ -1013,13 +1034,13 @@ pub(crate) async fn self_update(
 
     let current_version = current_version().to_string();
     let release = fetch_release(requested_version.as_deref()).await?;
-    let latest_version = extract_release_version(&release);
+    let latest_version = extract_release_version(&release)?;
 
     if let Some(requested) = requested_version {
         if requested != latest_version {
             anyhow::bail!("requested version '{requested}' was not found on GitHub Releases");
         }
-        if is_older_version(&latest_version, &current_version) {
+        if is_older_version(&latest_version, &current_version)? {
             anyhow::bail!(
                 "downgrades are not supported: requested version {latest_version} is older than current version {current_version}"
             );
@@ -1035,7 +1056,7 @@ pub(crate) async fn self_update(
                 transaction_lease: Some(update_lease),
             });
         }
-    } else if !is_newer_version(&latest_version, &current_version) {
+    } else if !is_newer_version(&latest_version, &current_version)? {
         return Ok(SelfUpdateResult {
             current_version,
             latest_version,
@@ -1047,6 +1068,9 @@ pub(crate) async fn self_update(
         });
     }
 
+    let replacement =
+        download_and_replace(&release, &latest_version, show_progress, "", update_lease).await?;
+
     // Keep publication-to-owner transfer free of user code: once the await
     // returns its guarded PendingReplacement, only infallible moves construct
     // the result handed to the orchestration coordinator.
@@ -1055,19 +1079,37 @@ pub(crate) async fn self_update(
         latest_version,
         install_source,
         updated: true,
-        replacement: Some(download_and_replace(&release, show_progress, "", update_lease).await?),
+        replacement: Some(replacement),
         replacement_state: SelfUpdateReplacementState::Pending,
         transaction_lease: None,
     })
 }
 
-pub(crate) fn record_successful_self_update(result: &SelfUpdateResult) {
-    if result.updated && result.replacement_state == SelfUpdateReplacementState::Committed {
-        save_update_cache(&UpdateCache {
-            checked_at: crate::auth::now_unix_secs(),
-            latest_version: result.latest_version.clone(),
-        });
+pub(crate) fn capture_self_update_record_time() -> Result<SelfUpdateRecordTime> {
+    Ok(SelfUpdateRecordTime {
+        checked_at: crate::auth::now_unix_secs()?,
+    })
+}
+
+pub(crate) fn record_successful_self_update(
+    result: &SelfUpdateResult,
+    record_time: SelfUpdateRecordTime,
+) {
+    if let Some(cache) = successful_self_update_cache(result, record_time) {
+        save_update_cache(&cache);
     }
+}
+
+fn successful_self_update_cache(
+    result: &SelfUpdateResult,
+    record_time: SelfUpdateRecordTime,
+) -> Option<UpdateCache> {
+    (result.updated && result.replacement_state == SelfUpdateReplacementState::Committed).then(
+        || UpdateCache {
+            checked_at: record_time.checked_at,
+            latest_version: result.latest_version.clone(),
+        },
+    )
 }
 
 /// Install the dev build from the `dev` GitHub Release tag.
@@ -1077,7 +1119,7 @@ pub(crate) async fn self_update_dev(
     show_progress: bool,
     lease: SelfUpdateLease,
 ) -> Result<SelfUpdateResult> {
-    let install_source = detect_install_source();
+    let install_source = detect_install_source()?;
     if install_source == InstallSource::Homebrew {
         anyhow::bail!(homebrew_dev_install_error());
     }
@@ -1087,9 +1129,9 @@ pub(crate) async fn self_update_dev(
     let release = fetch_release(Some("dev"))
         .await
         .context("fetching dev release from GitHub")?;
-    let dev_version = extract_release_version(&release);
+    let dev_version = extract_release_version(&release)?;
 
-    if !is_dev_update_available(&dev_version, &current_version) {
+    if !is_dev_update_available(&dev_version, &current_version)? {
         return Ok(SelfUpdateResult {
             current_version,
             latest_version: dev_version,
@@ -1101,7 +1143,14 @@ pub(crate) async fn self_update_dev(
         });
     }
 
-    let replacement = download_and_replace(&release, show_progress, " (dev)", update_lease).await?;
+    let replacement = download_and_replace(
+        &release,
+        &dev_version,
+        show_progress,
+        " (dev)",
+        update_lease,
+    )
+    .await?;
 
     Ok(SelfUpdateResult {
         current_version,
@@ -1119,24 +1168,44 @@ pub(crate) async fn self_update_dev(
 /// For dev releases (`is_dev = true`) the version is embedded in the release
 /// name (e.g. `"dev (20260712.1.0-dev)"`) because the tag itself is just
 /// `"dev"`. For stable releases the tag carries the version directly.
-fn extract_release_version(release: &GithubRelease) -> String {
-    // Dev releases carry the version in the name: "dev (X.Y.Z-dev)"
-    if release.tag_name == "dev"
-        && let Some(v) = release
-            .name
-            .as_deref()
-            .and_then(|n| n.strip_prefix("dev ("))
-            .and_then(|n| n.strip_suffix(')'))
-        && Version::parse(v).is_ok()
-    {
-        return v.to_string();
+fn extract_release_version(release: &GithubRelease) -> Result<String> {
+    if release.tag_name == "dev" {
+        let name = release.name.as_deref().context(
+            "dev GitHub Release has no name; expected `dev (<development semantic version>)`",
+        )?;
+        let version = name
+            .strip_prefix("dev (")
+            .and_then(|value| value.strip_suffix(')'))
+            .with_context(|| {
+                format!(
+                    "dev GitHub Release name '{name}' is invalid; expected `dev (<development semantic version>)`"
+                )
+            })?;
+        let validated = validate_exact_semver(
+            version,
+            "development version in the dev GitHub Release name",
+        )?;
+        if !is_rolling_dev_semver(&validated.semver) {
+            anyhow::bail!(
+                "dev GitHub Release name '{name}' does not contain a rolling dev semantic version"
+            );
+        }
+        return Ok(validated.normalized);
     }
-    normalize_version(&release.tag_name)
+
+    let version = release.tag_name.strip_prefix('v').with_context(|| {
+        format!(
+            "stable GitHub Release tag '{}' is invalid; expected `v<semantic version>`",
+            release.tag_name
+        )
+    })?;
+    Ok(validate_exact_semver(version, "version in the stable GitHub Release tag")?.normalized)
 }
 
 /// Download, verify, extract and replace the current binary from a GitHub Release.
 async fn download_and_replace(
     release: &GithubRelease,
+    expected_version: &str,
     show_progress: bool,
     label_suffix: &str,
     update_lease: UpdateLease,
@@ -1199,7 +1268,7 @@ async fn download_and_replace(
         eprintln!("Extracting update package...");
     }
     extract_binary(&archive_path, &extracted_path)?;
-    verify_candidate_binary(&extracted_path, &extract_release_version(release))?;
+    verify_candidate_binary(&extracted_path, expected_version)?;
 
     // Keep the mutable-tag check after every expensive local operation. A dev
     // tag move during extraction or candidate execution must be observed before
@@ -1289,7 +1358,14 @@ pub(crate) fn acquire_self_update_lease() -> Result<SelfUpdateLease> {
     let executable =
         fs::canonicalize(std::env::current_exe().context("locating current executable")?)
             .context("resolving current executable")?;
-    Ok(SelfUpdateLease(acquire_update_lease(&executable)?))
+    let app_home = crate::auth::app_home().context("resolving stable installer authority home")?;
+    crate::auth::ensure_private_directory(&app_home)
+        .context("preparing stable installer authority home")?;
+    let stable_target = app_home.join(INSTALLER_AUTHORITY_TARGET_NAME);
+    Ok(SelfUpdateLease(acquire_ordered_update_lease(
+        &stable_target,
+        &executable,
+    )?))
 }
 
 fn normalize_update_lock_target(destination: &Path) -> Result<PathBuf> {
@@ -1375,6 +1451,26 @@ pub(crate) fn hold_update_lock_from_env() -> Result<()> {
 }
 
 fn acquire_update_lease(executable: &Path) -> Result<UpdateLease> {
+    Ok(UpdateLease {
+        _inner: std::sync::Arc::new(UpdateLeaseInner {
+            files: vec![acquire_update_lock_file(executable)?],
+        }),
+    })
+}
+
+fn acquire_ordered_update_lease(stable_target: &Path, executable: &Path) -> Result<UpdateLease> {
+    let stable_lock_path = transaction_sibling_path(stable_target, ".self-update.lock")?;
+    let executable_lock_path = transaction_sibling_path(executable, ".self-update.lock")?;
+    let mut files = vec![acquire_update_lock_file(stable_target)?];
+    if stable_lock_path != executable_lock_path {
+        files.push(acquire_update_lock_file(executable)?);
+    }
+    Ok(UpdateLease {
+        _inner: std::sync::Arc::new(UpdateLeaseInner { files }),
+    })
+}
+
+fn acquire_update_lock_file(executable: &Path) -> Result<fs::File> {
     let lock_path = transaction_sibling_path(executable, ".self-update.lock")?;
     match fs::symlink_metadata(&lock_path) {
         Ok(metadata) if !metadata.file_type().is_file() => anyhow::bail!(
@@ -1397,9 +1493,7 @@ fn acquire_update_lease(executable: &Path) -> Result<UpdateLease> {
         .with_context(|| format!("opening self-update lock {}", lock_path.display()))?;
     FileExt::lock(&file)
         .with_context(|| format!("locking self-update transaction {}", lock_path.display()))?;
-    Ok(UpdateLease {
-        _inner: std::sync::Arc::new(UpdateLeaseInner { file }),
-    })
+    Ok(file)
 }
 
 fn replace_candidate(
@@ -1680,7 +1774,7 @@ fn replace_candidate_inner(
         executable.display(),
         staged.display(),
         backup.display(),
-        replacement_permission_hint(executable, platform, release_tag)
+        replacement_permission_hint(executable, platform, install_guide_channel(release_tag),)
     ))
 }
 
@@ -2405,7 +2499,7 @@ fn replace_candidate_inner(
             "Windows self-update candidate was not published ({replace_detail}); candidate cleanup was {} and backup cleanup was {}. {}",
             cleanup_result(staged_cleanup),
             cleanup_result(backup_cleanup),
-            replacement_permission_hint(executable, platform, release_tag)
+            replacement_permission_hint(executable, platform, install_guide_channel(release_tag),)
         );
     }
 
@@ -2654,26 +2748,27 @@ pub fn is_dev_version(version: &str) -> bool {
     let Ok(version) = Version::parse(&normalize_version(version)) else {
         return false;
     };
-    let prerelease = version.pre.as_str();
-    prerelease == "dev" || prerelease.starts_with("dev.")
+    is_rolling_dev_semver(&version)
 }
 
-pub fn detect_install_source() -> InstallSource {
-    let exe = std::env::current_exe().ok();
-    let exe = exe
-        .as_ref()
-        .and_then(|path| fs::canonicalize(path).ok())
-        .or(exe)
-        .unwrap_or_else(|| PathBuf::from(BIN_NAME));
-    let path = exe.to_string_lossy().replace('\\', "/");
-
-    if path.contains("/Cellar/codex-switch-global-pace/")
-        || path.contains("/Homebrew/Cellar/codex-switch-global-pace/")
-    {
+fn classify_install_source(executable: &Path) -> InstallSource {
+    let components = executable
+        .components()
+        .map(|component| component.as_os_str())
+        .collect::<Vec<_>>();
+    if components.windows(2).any(|pair| {
+        pair[0] == std::ffi::OsStr::new("Cellar") && pair[1] == std::ffi::OsStr::new(BIN_NAME)
+    }) {
         InstallSource::Homebrew
     } else {
         InstallSource::Direct
     }
+}
+
+pub fn detect_install_source() -> Result<InstallSource> {
+    let executable = std::env::current_exe().context("locating current executable")?;
+    let executable = canonical_executable_path(executable)?;
+    Ok(classify_install_source(&executable))
 }
 
 pub fn current_version() -> &'static str {
@@ -2685,17 +2780,18 @@ pub fn should_show_download_progress() -> bool {
 }
 
 async fn latest_release_version(force: bool) -> Result<String> {
+    let now = crate::auth::now_unix_secs()?;
     if !force
-        && let Some(cache) = load_update_cache()
-        && crate::auth::now_unix_secs() - cache.checked_at <= update_ttl_secs()
+        && let Some(cache) = load_update_cache()?
+        && let Some(version) = fresh_cached_release_version(&cache, now)?
     {
-        return Ok(cache.latest_version);
+        return Ok(version);
     }
 
     let release = fetch_release(None).await?;
-    let latest_version = normalize_version(&release.tag_name);
+    let latest_version = extract_release_version(&release)?;
     save_update_cache(&UpdateCache {
-        checked_at: crate::auth::now_unix_secs(),
+        checked_at: crate::auth::now_unix_secs()?,
         latest_version: latest_version.clone(),
     });
     Ok(latest_version)
@@ -2993,24 +3089,24 @@ fn release_tag(version: &str) -> String {
 }
 
 fn release_api_url(version: Option<&str>) -> String {
-    let base = github_api_base();
-
     match version {
         // Encoded for the same reason as `tag_ref_api_url`: the tag is a path
         // segment, and `url` would otherwise resolve `..` inside it and send
         // the request to a different repository.
         Some(version) => format!(
-            "{base}/repos/{REPO_OWNER}/{REPO_NAME}/releases/tags/{}",
+            "{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/releases/tags/{}",
             urlencoding::encode(&release_tag(version))
         ),
-        None => format!("{base}/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"),
+        None => {
+            format!("{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest")
+        }
     }
 }
 
 fn tag_ref_api_url(tag: &str) -> String {
     format!(
         "{}/repos/{REPO_OWNER}/{REPO_NAME}/git/ref/tags/{}",
-        github_api_base(),
+        GITHUB_API_BASE,
         urlencoding::encode(tag)
     )
 }
@@ -3018,15 +3114,8 @@ fn tag_ref_api_url(tag: &str) -> String {
 fn git_tag_api_url(sha: &str) -> String {
     format!(
         "{}/repos/{REPO_OWNER}/{REPO_NAME}/git/tags/{sha}",
-        github_api_base()
+        GITHUB_API_BASE
     )
-}
-
-fn github_api_base() -> String {
-    std::env::var("CS_GITHUB_API_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_string())
 }
 
 fn normalize_version(version: &str) -> String {
@@ -3043,22 +3132,43 @@ fn normalize_version(version: &str) -> String {
 /// safety of that path never rests on a downstream string comparison, and so a
 /// typo is reported as a bad argument rather than as a 404.
 fn validate_requested_version(version: &str) -> Result<String> {
-    let normalized = normalize_version(version);
-    Version::parse(&normalized).map_err(|err| {
+    validate_semver(version, "--version").map_err(|error| {
         anyhow::anyhow!(
-            "invalid --version '{version}': expected a semantic version such as 20260731.1.0 ({err}). \
+            "invalid --version '{version}': expected a semantic version such as 20260731.1.0 ({error:#}). \
              Use --dev for the rolling development build."
         )
-    })?;
-    Ok(normalized)
+    })
+    .map(|version| version.normalized)
 }
 
-fn update_ttl_secs() -> i64 {
-    std::env::var("CS_UPDATE_TTL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value >= 0)
-        .unwrap_or(UPDATE_TTL_SECS)
+fn validate_semver(version: &str, source: &str) -> Result<ValidatedVersion> {
+    let normalized = normalize_version(version);
+    let semver = Version::parse(&normalized)
+        .with_context(|| format!("{source} '{version}' is not a valid semantic version"))?;
+    Ok(ValidatedVersion { normalized, semver })
+}
+
+fn validate_exact_semver(version: &str, source: &str) -> Result<ValidatedVersion> {
+    let semver = Version::parse(version)
+        .with_context(|| format!("{source} '{version}' is not a valid semantic version"))?;
+    Ok(ValidatedVersion {
+        normalized: version.to_string(),
+        semver,
+    })
+}
+
+fn update_cache_is_fresh(cache: &UpdateCache, now: i64) -> bool {
+    now.checked_sub(cache.checked_at)
+        .is_some_and(|age| (0..=UPDATE_TTL_SECS).contains(&age))
+}
+
+fn fresh_cached_release_version(cache: &UpdateCache, now: i64) -> Result<Option<String>> {
+    if !update_cache_is_fresh(cache, now) {
+        return Ok(None);
+    }
+    Ok(Some(
+        validate_exact_semver(&cache.latest_version, "cached latest release version")?.normalized,
+    ))
 }
 
 fn update_cache_path() -> anyhow::Result<PathBuf> {
@@ -3068,10 +3178,18 @@ fn update_cache_path() -> anyhow::Result<PathBuf> {
     Ok(crate::auth::app_home()?.join(UPDATE_CACHE_NAME))
 }
 
-fn load_update_cache() -> Option<UpdateCache> {
-    let path = update_cache_path().ok()?;
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+fn load_update_cache() -> Result<Option<UpdateCache>> {
+    let path = update_cache_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading update cache {}", path.display()));
+        }
+    };
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parsing update cache {}", path.display()))
+        .map(Some)
 }
 
 fn save_update_cache(cache: &UpdateCache) {
@@ -3087,71 +3205,51 @@ fn save_update_cache(cache: &UpdateCache) {
     }
 }
 
-fn is_newer_version(candidate: &str, current: &str) -> bool {
-    compare_versions(candidate, current)
-        .is_some_and(|ordering| ordering == std::cmp::Ordering::Greater)
+fn is_newer_version(candidate: &str, current: &str) -> Result<bool> {
+    Ok(compare_versions(candidate, current)? == std::cmp::Ordering::Greater)
 }
 
-fn is_older_version(candidate: &str, current: &str) -> bool {
-    compare_versions(candidate, current)
-        .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+fn is_older_version(candidate: &str, current: &str) -> Result<bool> {
+    Ok(compare_versions(candidate, current)? == std::cmp::Ordering::Less)
 }
 
-fn is_dev_update_available(candidate: &str, current: &str) -> bool {
-    if is_newer_version(candidate, current) {
-        return true;
+fn is_dev_update_available(candidate: &str, current: &str) -> Result<bool> {
+    let candidate = validate_semver(candidate, "candidate version")?.semver;
+    let current = validate_semver(current, "current version")?.semver;
+
+    if candidate > current {
+        return Ok(true);
     }
-    if is_dev_version(current) && is_dev_version(candidate) {
-        let candidate = Version::parse(&normalize_version(candidate)).ok();
-        let current = Version::parse(&normalize_version(current)).ok();
-        return matches!((candidate, current), (Some(candidate), Some(current))
-            if candidate.major == current.major
-                && candidate.minor == current.minor
-                && candidate.patch == current.patch
-                && candidate.pre.as_str() == "dev"
-                && current.pre.as_str().starts_with("dev."));
+    let candidate_is_dev = is_rolling_dev_semver(&candidate);
+    let current_is_dev = is_rolling_dev_semver(&current);
+    if current_is_dev && candidate_is_dev {
+        return Ok(candidate.major == current.major
+            && candidate.minor == current.minor
+            && candidate.patch == current.patch
+            && candidate.pre.as_str() == "dev"
+            && current.pre.as_str().starts_with("dev."));
     }
     // Explicit --dev should be able to switch from a stable/base install to the
     // rolling dev build with the same base version, e.g. 20260712.1.0 -> 20260712.1.0-dev.
-    if !is_dev_version(candidate) {
-        return false;
+    if !candidate_is_dev {
+        return Ok(false);
     }
-    let Some(candidate_base) = version_base(candidate) else {
-        return false;
-    };
-    let Some(current_base) = version_base(current) else {
-        return false;
-    };
-    candidate_base >= current_base
+    Ok(version_base(&candidate) >= version_base(&current))
 }
 
-fn version_base(version: &str) -> Option<(u64, u64, u64)> {
-    let parsed = match Version::parse(&normalize_version(version)) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("failed to parse version '{version}': {e}");
-            return None;
-        }
-    };
-    Some((parsed.major, parsed.minor, parsed.patch))
+fn is_rolling_dev_semver(version: &Version) -> bool {
+    let prerelease = version.pre.as_str();
+    prerelease == "dev" || prerelease.starts_with("dev.")
 }
 
-fn compare_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
-    let left_parsed = match Version::parse(&normalize_version(left)) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("failed to parse version '{left}': {e}");
-            return None;
-        }
-    };
-    let right_parsed = match Version::parse(&normalize_version(right)) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("failed to parse version '{right}': {e}");
-            return None;
-        }
-    };
-    Some(left_parsed.cmp(&right_parsed))
+fn version_base(version: &Version) -> (u64, u64, u64) {
+    (version.major, version.minor, version.patch)
+}
+
+fn compare_versions(left: &str, right: &str) -> Result<std::cmp::Ordering> {
+    let left = validate_semver(left, "candidate version")?.semver;
+    let right = validate_semver(right, "current version")?.semver;
+    Ok(left.cmp(&right))
 }
 
 #[cfg(test)]
@@ -3419,6 +3517,60 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("second self-update did not resume after lease release");
         waiter.join().expect("join update-lease waiter");
+    }
+
+    #[test]
+    fn ordered_self_update_lease_holds_stable_then_adjacent_authorities() {
+        let temp = crate::fs_ops::create_direct_tempdir().expect("create lease fixture");
+        let stable_target = temp.path().join(INSTALLER_AUTHORITY_TARGET_NAME);
+        let executable = temp.path().join(extracted_binary_name());
+        fs::write(&executable, b"current executable").expect("write executable fixture");
+        let stable_lock = transaction_sibling_path(&stable_target, ".self-update.lock").unwrap();
+        assert_eq!(
+            stable_lock.file_name().and_then(|name| name.to_str()),
+            Some(".codex-switch-global-pace-installer-authority.self-update.lock")
+        );
+
+        let first = acquire_ordered_update_lease(&stable_target, &executable)
+            .expect("acquire ordered update lease");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let stable_waiter = {
+            let stable_target = stable_target.clone();
+            let acquired_tx = acquired_tx.clone();
+            std::thread::spawn(move || {
+                let lease = acquire_update_lease(&stable_target).expect("acquire stable authority");
+                acquired_tx.send("stable").unwrap();
+                drop(lease);
+            })
+        };
+        let adjacent_waiter = {
+            let executable = executable.clone();
+            std::thread::spawn(move || {
+                let lease = acquire_update_lease(&executable).expect("acquire adjacent authority");
+                acquired_tx.send("adjacent").unwrap();
+                drop(lease);
+            })
+        };
+
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "an authority was acquired while the ordered lease was held"
+        );
+        drop(first);
+        let mut resumed = [
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("first authority did not resume"),
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("second authority did not resume"),
+        ];
+        resumed.sort_unstable();
+        assert_eq!(resumed, ["adjacent", "stable"]);
+        stable_waiter.join().unwrap();
+        adjacent_waiter.join().unwrap();
     }
 
     #[cfg(not(windows))]
@@ -4795,29 +4947,80 @@ mod tests {
 
     #[test]
     fn version_compare_ignores_v_prefix() {
-        assert!(is_newer_version("v0.0.2", "0.0.1"));
-        assert!(is_older_version("0.0.1", "v0.0.2"));
+        assert!(is_newer_version("v0.0.2", "0.0.1").unwrap());
+        assert!(is_older_version("0.0.1", "v0.0.2").unwrap());
+    }
+
+    #[test]
+    fn version_comparison_propagates_malformed_metadata() {
+        let candidate_error = is_newer_version("not-semver", "1.0.0").unwrap_err();
+        assert!(format!("{candidate_error:#}").contains("candidate version 'not-semver'"));
+
+        let current_error = is_dev_update_available("1.0.0-dev", "broken").unwrap_err();
+        assert!(format!("{current_error:#}").contains("current version 'broken'"));
+    }
+
+    #[test]
+    fn release_version_contract_rejects_malformed_stable_and_dev_metadata() {
+        let release = |tag: &str, name: Option<&str>| GithubRelease {
+            tag_name: tag.to_string(),
+            name: name.map(str::to_string),
+            assets: Vec::new(),
+        };
+
+        assert_eq!(
+            extract_release_version(&release("v20260826.2.0", None)).unwrap(),
+            "20260826.2.0"
+        );
+        assert_eq!(
+            extract_release_version(&release("dev", Some("dev (20260826.2.0-dev)"))).unwrap(),
+            "20260826.2.0-dev"
+        );
+        for tag in [
+            "20260826.2.0",
+            "vv20260826.2.0",
+            " v20260826.2.0",
+            "v20260826.2.0 ",
+            "vnot-semver",
+        ] {
+            assert!(
+                extract_release_version(&release(tag, None)).is_err(),
+                "invalid stable Release tag was accepted: {tag:?}"
+            );
+        }
+
+        for name in [
+            None,
+            Some("development (20260826.2.0-dev)"),
+            Some("dev (v20260826.2.0-dev)"),
+            Some("dev (20260826.2.0)"),
+            Some("dev (not-semver)"),
+        ] {
+            assert!(
+                extract_release_version(&release("dev", name)).is_err(),
+                "invalid dev Release name was accepted: {name:?}"
+            );
+        }
     }
 
     #[test]
     fn calendar_versions_remain_semver_comparable() {
         assert!(Version::parse("20260712.1").is_err());
         assert!(Version::parse("20260712.1.0").is_ok());
-        assert!(is_newer_version("20260712.1.0", "0.0.21"));
-        assert!(is_newer_version(
-            "20260712.1.0-dev.20260712000000",
-            "0.0.22-dev.20260711000000"
-        ));
-        assert!(is_newer_version("20260712.2.0", "20260712.1.0"));
-        assert!(is_newer_version("20260713.1.0", "20260712.9.0"));
-        assert!(is_newer_version(
-            "20260712.1.0",
-            "20260712.1.0-dev.20260712000000"
-        ));
-        assert!(is_dev_update_available(
-            "20260712.1.0-dev.20260712000000",
-            "20260712.1.0"
-        ));
+        assert!(is_newer_version("20260712.1.0", "0.0.21").unwrap());
+        assert!(
+            is_newer_version(
+                "20260712.1.0-dev.20260712000000",
+                "0.0.22-dev.20260711000000"
+            )
+            .unwrap()
+        );
+        assert!(is_newer_version("20260712.2.0", "20260712.1.0").unwrap());
+        assert!(is_newer_version("20260713.1.0", "20260712.9.0").unwrap());
+        assert!(is_newer_version("20260712.1.0", "20260712.1.0-dev.20260712000000").unwrap());
+        assert!(
+            is_dev_update_available("20260712.1.0-dev.20260712000000", "20260712.1.0").unwrap()
+        );
     }
 
     #[test]
@@ -4830,7 +5033,7 @@ mod tests {
             "20260712.2.0-dev",
         ] {
             assert!(
-                is_newer_version(stable, current),
+                is_newer_version(stable, current).unwrap(),
                 "{current} must be able to graduate to stable {stable}"
             );
         }
@@ -4846,6 +5049,49 @@ mod tests {
             release_api_url(Some("0.1.0")),
             "https://api.github.com/repos/chriskooCK/codex-switch-global-pace/releases/tags/v0.1.0"
         );
+    }
+
+    #[test]
+    fn update_cache_rejects_future_and_overflowing_timestamps() {
+        let cache = |checked_at| UpdateCache {
+            checked_at,
+            latest_version: "20260826.1.0".to_string(),
+        };
+
+        assert!(update_cache_is_fresh(&cache(100), 100));
+        assert!(update_cache_is_fresh(&cache(100), 100 + UPDATE_TTL_SECS));
+        assert!(!update_cache_is_fresh(&cache(101), 100));
+        assert!(!update_cache_is_fresh(&cache(i64::MIN), i64::MAX));
+        assert!(!update_cache_is_fresh(&cache(i64::MAX), i64::MIN));
+    }
+
+    #[test]
+    fn fresh_update_cache_rejects_a_corrupted_latest_version() {
+        let cache = UpdateCache {
+            checked_at: 100,
+            latest_version: "not-semver".to_string(),
+        };
+
+        let error = fresh_cached_release_version(&cache, 100).unwrap_err();
+        assert!(format!("{error:#}").contains("cached latest release version 'not-semver'"));
+    }
+
+    #[test]
+    fn successful_update_cache_uses_the_prevalidated_record_time() {
+        let result = SelfUpdateResult {
+            current_version: "20260826.1.0-dev".to_string(),
+            latest_version: "20260826.2.0-dev".to_string(),
+            install_source: InstallSource::Direct,
+            updated: true,
+            replacement: None,
+            replacement_state: SelfUpdateReplacementState::Committed,
+            transaction_lease: None,
+        };
+
+        let cache = successful_self_update_cache(&result, SelfUpdateRecordTime { checked_at: 123 })
+            .expect("a committed update must produce a cache record");
+        assert_eq!(cache.checked_at, 123);
+        assert_eq!(cache.latest_version, "20260826.2.0-dev");
     }
 
     /// `--version` is interpolated into a GitHub API path. `url` resolves `..`
@@ -4940,35 +5186,39 @@ mod tests {
     }
 
     #[test]
+    fn install_source_classifier_uses_only_the_resolved_executable_path() {
+        assert_eq!(
+            classify_install_source(Path::new(
+                "/opt/homebrew/Cellar/codex-switch-global-pace/1.2.3/bin/codex-switch-global-pace",
+            )),
+            InstallSource::Homebrew
+        );
+        assert_eq!(
+            classify_install_source(Path::new("/home/alice/.local/bin/codex-switch-global-pace",)),
+            InstallSource::Direct
+        );
+    }
+
+    #[test]
     fn dev_update_can_switch_from_same_base_stable() {
-        assert!(is_dev_update_available(
-            "0.0.20-dev.20260701094804",
-            "0.0.20"
-        ));
-        assert!(is_dev_update_available(
-            "0.0.20-dev.20260701094804",
-            "0.0.20-dev.20260701090000"
-        ));
-        assert!(!is_dev_update_available(
-            "0.0.20-dev.20260701094804",
-            "0.0.20-dev.20260701094804"
-        ));
-        assert!(!is_dev_update_available(
-            "0.0.20-dev.20260701094804",
-            "0.0.21"
-        ));
+        assert!(is_dev_update_available("0.0.20-dev.20260701094804", "0.0.20").unwrap());
+        assert!(
+            is_dev_update_available("0.0.20-dev.20260701094804", "0.0.20-dev.20260701090000")
+                .unwrap()
+        );
+        assert!(
+            !is_dev_update_available("0.0.20-dev.20260701094804", "0.0.20-dev.20260701094804")
+                .unwrap()
+        );
+        assert!(!is_dev_update_available("0.0.20-dev.20260701094804", "0.0.21").unwrap());
     }
 
     #[test]
     fn short_dev_version_replaces_legacy_timestamped_dev_on_the_same_base() {
-        assert!(is_dev_update_available(
-            "20260712.1.0-dev",
-            "20260712.1.0-dev.20260712055522"
-        ));
-        assert!(!is_dev_update_available(
-            "20260712.1.0-dev",
-            "20260712.1.0-dev"
-        ));
+        assert!(
+            is_dev_update_available("20260712.1.0-dev", "20260712.1.0-dev.20260712055522").unwrap()
+        );
+        assert!(!is_dev_update_available("20260712.1.0-dev", "20260712.1.0-dev").unwrap());
     }
 
     #[test]
@@ -5020,12 +5270,12 @@ mod tests {
         let hint = replacement_permission_hint(
             Path::new("/usr/local/bin/codex-switch-global-pace"),
             UpdatePlatform::Unix,
-            "dev",
+            InstallGuideChannel::Dev,
         );
 
         assert!(hint.contains("legacy direct install"));
-        assert!(hint.contains("releases/download/dev/install.sh"));
-        assert!(hint.contains("--dev"));
+        assert!(hint.contains(&verified_install_guide_url(InstallGuideChannel::Dev)));
+        assert!(!hint.contains("curl"));
         assert!(hint.contains("intentionally installed with `--system`"));
         assert!(hint.contains("sudo codex-switch-global-pace self-update"));
     }
@@ -5035,7 +5285,7 @@ mod tests {
         let hint = replacement_permission_hint(
             Path::new("/home/alice/.local/bin/codex-switch-global-pace"),
             UpdatePlatform::Unix,
-            "v20260713.3.0",
+            InstallGuideChannel::Stable,
         );
 
         assert!(hint.contains("user-owned install directory"));
@@ -5050,7 +5300,7 @@ mod tests {
                 r"C:\Users\Alice\AppData\Local\Programs\codex-switch-global-pace\codex-switch-global-pace.exe",
             ),
             UpdatePlatform::Windows,
-            "v20260713.3.0",
+            InstallGuideChannel::Stable,
         );
 
         assert!(hint.contains("close running codex-switch-global-pace processes"));
@@ -5060,15 +5310,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_hint_does_not_embed_an_untrusted_release_tag() {
+    fn migration_hint_uses_only_the_reviewed_install_guide() {
         let hint = replacement_permission_hint(
             Path::new("/usr/local/bin/codex-switch-global-pace"),
             UpdatePlatform::Unix,
-            "v1.2.3;echo-pwned",
+            InstallGuideChannel::Stable,
         );
 
-        assert!(hint.contains("releases/latest/download/install.sh"));
-        assert!(!hint.contains("echo-pwned"));
+        assert!(hint.contains(&verified_install_guide_url(InstallGuideChannel::Stable)));
+        assert!(!hint.contains("releases/download"));
+        assert!(!hint.contains("curl"));
     }
 
     #[test]
@@ -5083,9 +5334,11 @@ mod tests {
         .expect("markerless /usr/local install must migrate");
 
         assert!(hint.contains("One-time setup required"));
-        assert!(hint.contains("releases/download/dev/install.sh"));
-        assert!(hint.contains("bash -s -- --dev"));
+        assert!(hint.contains(&verified_install_guide_url(InstallGuideChannel::Dev)));
+        assert!(hint.contains("from `stable` to `dev`"));
+        assert!(hint.contains("bash \"$work/install.sh\" --dev"));
         assert!(hint.contains("--dev --system"));
+        assert!(!hint.contains("curl"));
     }
 
     #[test]
@@ -5120,9 +5373,12 @@ mod tests {
         )
         .expect("markerless /usr/local install must migrate");
 
-        assert!(hint.contains("releases/latest/download/install.sh"));
+        assert!(hint.contains(&verified_install_guide_url(InstallGuideChannel::Stable)));
+        assert!(hint.contains("stable channel selection"));
+        assert!(hint.contains("bash \"$work/install.sh\""));
         assert!(!hint.contains("--dev"));
         assert!(hint.contains("--system"));
+        assert!(!hint.contains("curl"));
     }
 
     #[test]
@@ -5228,9 +5484,10 @@ mod tests {
         )
         .expect("markerless /usr/local install must migrate");
 
-        assert!(hint.contains("releases/download/v20260712.2.0/install.sh"));
-        assert!(hint.contains("| CS_VERSION=20260712.2.0 bash"));
-        assert!(!hint.contains("releases/latest/download"));
+        assert!(hint.contains(&verified_install_guide_url(InstallGuideChannel::Stable)));
+        assert!(hint.contains("CS_VERSION=20260712.2.0 bash \"$work/install.sh\""));
+        assert!(!hint.contains("releases/download"));
+        assert!(!hint.contains("curl"));
     }
 
     #[test]

@@ -1,20 +1,50 @@
 # codex-switch-global-pace installer / uninstaller for Windows
 # Usage:
-#   irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
-#   $env:CS_DEV="1"; irm https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.ps1 | iex
-#   $env:CS_VERSION="20260712.1.0"; irm .../install.ps1 | iex # install specific version
-#   $env:CS_UNINSTALL="1"; irm .../install.ps1 | iex         # uninstall this program
+#   & .\install.ps1
+#   & .\install.ps1 -Dev
+#   & .\install.ps1 -Version 20260712.1.0
+#   & .\install.ps1 -Uninstall
+
+[CmdletBinding()]
+param(
+    [Parameter()][switch]$Dev,
+    [Parameter()][switch]$Uninstall,
+    [Parameter()][ValidateNotNullOrEmpty()][string]$Version
+)
 
 & {
 $ErrorActionPreference = "Stop"
+$RequestedDev = [bool]$Dev
+$RequestedUninstall = [bool]$Uninstall
+$RequestedVersion = $Version
 $TmpDir = $null
 $InstallerFailure = $null
 $TempCleanupError = $null
 $Repo = "chriskooCK/codex-switch-global-pace"
+$ReleaseWorkflow = "$Repo/.github/workflows/release.yml"
+$ProvenanceAssetName = "codex-switch-global-pace-build-provenance.json"
 $PackagedReleaseVersion = ""
 $BinaryName = "codex-switch-global-pace.exe"
 $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\codex-switch-global-pace"
-$DataDir = Join-Path $env:USERPROFILE ".codex-switch"
+$ConfiguredDataDir = $env:CODEX_SWITCH_HOME
+if ([string]::IsNullOrWhiteSpace($ConfiguredDataDir)) {
+    $DataDir = Join-Path $env:USERPROFILE ".codex-switch"
+} else {
+    $IsDriveAbsolute = $ConfiguredDataDir -cmatch '\A[A-Za-z]:[\\/]'
+    $IsUncAbsolute = $ConfiguredDataDir -cmatch '\A\\\\[^\\/]+[\\/][^\\/]+'
+    if ((-not $IsDriveAbsolute -and -not $IsUncAbsolute) -or
+        ($ConfiguredDataDir -split '[\\/]' | Where-Object { $_ -ceq '.' -or $_ -ceq '..' }).Count -gt 0) {
+        throw "CODEX_SWITCH_HOME must be an absolute path without dot path components."
+    }
+    $TrimSeparators = [char[]]@('\', '/')
+    $DataDir = [System.IO.Path]::GetFullPath($ConfiguredDataDir).TrimEnd($TrimSeparators)
+    $DataRoot = [System.IO.Path]::GetPathRoot($DataDir).TrimEnd($TrimSeparators)
+    if ([System.StringComparer]::OrdinalIgnoreCase.Equals($DataDir, $DataRoot)) {
+        throw "CODEX_SWITCH_HOME must not be a filesystem root."
+    }
+}
+$StableLockTarget = Join-Path $DataDir "codex-switch-global-pace-installer-authority"
+$DaemonTaskName = "codex-switch-global-pace-daemon"
 $SemVerPattern = '\A(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?\z'
 $DevVersionPattern = '\A[0-9]+\.[0-9]+\.[0-9]+-dev(?:\.|(?=\+|\z))'
 $RecoveryNameCollisionLimit = 16
@@ -31,7 +61,76 @@ function Assert-SupportedVersion {
         $SemVerPattern,
         [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
     )) {
-        throw "Invalid CS_VERSION '$Value'; expected a SemVer version such as 20260824.6.0."
+        throw "Invalid -Version '$Value'; expected a SemVer version such as 20260824.6.0."
+    }
+}
+
+function Resolve-ReleaseSourceDigest {
+    param([Parameter(Mandatory = $true)][string]$Tag)
+
+    $Endpoint = "repos/$Repo/git/ref/tags/$Tag"
+    foreach ($Depth in 0..5) {
+        $Response = @(& $GhCommand.Source api --hostname github.com $Endpoint `
+            --jq '[.object.type, .object.sha] | @tsv' 2>&1)
+        $ExitCode = $LASTEXITCODE
+        if ($ExitCode -ne 0) {
+            throw "Could not resolve release tag '$Tag' through the GitHub API: $([string]::Join(' ', $Response))"
+        }
+        if ($Response.Count -ne 1) {
+            throw "Release tag '$Tag' returned $($Response.Count) object records; expected exactly one."
+        }
+        $Fields = ([string]$Response[0]).Split([char]"`t")
+        if ($Fields.Count -ne 2 -or
+            [string]::IsNullOrWhiteSpace($Fields[0]) -or
+            $Fields[1] -cnotmatch '\A[0-9A-Fa-f]{40}\z') {
+            throw "Release tag '$Tag' returned an invalid Git object record."
+        }
+        $Kind = $Fields[0]
+        $Sha = $Fields[1].ToLowerInvariant()
+        if ($Kind -ceq 'commit') {
+            return $Sha
+        }
+        if ($Kind -cne 'tag') {
+            throw "Release tag '$Tag' resolved to unsupported Git object type '$Kind'."
+        }
+        if ($Depth -eq 5) {
+            throw "Release tag '$Tag' contains more than five nested annotated tags."
+        }
+        $Endpoint = "repos/$Repo/git/tags/$Sha"
+    }
+    throw "Release tag '$Tag' could not be resolved to a commit."
+}
+
+function Assert-ReleaseProvenance {
+    param(
+        [Parameter(Mandatory = $true)][string]$Subject,
+        [Parameter(Mandatory = $true)][string]$Bundle,
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$SourceDigest
+    )
+
+    $Verification = @(& $GhCommand.Source attestation verify $Subject `
+        --bundle $Bundle `
+        --repo $Repo `
+        --signer-workflow $ReleaseWorkflow `
+        --source-ref "refs/tags/$Tag" `
+        --source-digest $SourceDigest `
+        --deny-self-hosted-runners 2>&1)
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -ne 0) {
+        throw "GitHub build provenance verification failed for '$Subject': $([string]::Join(' ', $Verification))"
+    }
+}
+
+function Assert-LockedReleaseSourceDigest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tag,
+        [Parameter(Mandatory = $true)][string]$ExpectedDigest
+    )
+
+    $ObservedDigest = Resolve-ReleaseSourceDigest -Tag $Tag
+    if ($ObservedDigest -cne $ExpectedDigest) {
+        throw "Release tag '$Tag' moved while waiting for installer authority; no service, binary, or PATH configuration was changed."
     }
 }
 
@@ -77,6 +176,47 @@ function Remove-NewEmptyInstallDirectory {
         throw "New install directory is no longer empty and was preserved: $Path"
     }
     [System.IO.Directory]::Delete($Item.FullName, $false)
+}
+
+function Test-RawPathContainsExactEntry {
+    param(
+        [AllowNull()][string]$Value,
+        [Parameter(Mandatory = $true)][string]$Entry
+    )
+
+    if ($null -eq $Value) {
+        return $false
+    }
+    foreach ($Segment in $Value.Split([char[]]@(';'), [System.StringSplitOptions]::None)) {
+        if ([System.StringComparer]::OrdinalIgnoreCase.Equals($Segment, $Entry)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-MissingInstallStateIsNoOp {
+    if (Test-DirectInstallDirectory -Path $InstallDir) {
+        return $false
+    }
+    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $ProcessPath = [Environment]::GetEnvironmentVariable("Path", "Process")
+    if ((Test-RawPathContainsExactEntry -Value $UserPath -Entry $InstallDir) -or
+        (Test-RawPathContainsExactEntry -Value $ProcessPath -Entry $InstallDir)) {
+        return $false
+    }
+    foreach ($PidState in @(
+        (Join-Path $DataDir "daemon.pid"),
+        (Join-Path $DataDir "daemon.pid.lock")
+    )) {
+        if ($null -ne (Get-DirectPathItem -Path $PidState)) {
+            return $false
+        }
+    }
+    $Tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+        $_.TaskPath -ceq "\" -and $_.TaskName -ceq $DaemonTaskName
+    })
+    return $Tasks.Count -eq 0
 }
 
 function Test-DirectInstalledBinary {
@@ -513,6 +653,24 @@ function Complete-UpdateLockHolder {
     if ($ReleaseErrors.Count -gt 0) {
         throw ($ReleaseErrors -join "; ")
     }
+}
+
+function Start-StableInstallerAuthority {
+    param([Parameter(Mandatory = $true)][string]$CandidatePath)
+
+    $DataItem = Get-DirectPathItem -Path $DataDir
+    if ($null -eq $DataItem) {
+        [void][System.IO.Directory]::CreateDirectory($DataDir)
+        $DataItem = Get-DirectPathItem -Path $DataDir
+    }
+    if ($null -eq $DataItem -or
+        -not $DataItem.PSIsContainer -or
+        ($DataItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Stable installer-lock parent is not a direct directory: $DataDir"
+    }
+    return Start-UpdateLockHolder `
+        -CandidatePath $CandidatePath `
+        -DestinationPath $StableLockTarget
 }
 
 function ConvertTo-InstallerProcessArgument {
@@ -1030,50 +1188,74 @@ $Arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitect
 }
 $AssetName = "codex-switch-global-pace-windows-${Arch}.zip"
 
-# Determine version / channel. Uninstall uses the release that packaged this
-# script, so its lock helper cannot drift to another moving channel.
-$Uninstall = $env:CS_UNINSTALL -eq "1"
-$UseDev = $env:CS_DEV -eq "1"
+# Determine version / channel from explicit parameters and the version embedded
+# in this Release asset. A packaged development installer selects dev
+# automatically; no process-scoped CS_* variable can silently change behavior.
+$Uninstall = $RequestedUninstall
+if ($RequestedUninstall -and
+    ($RequestedDev -or -not [string]::IsNullOrWhiteSpace($RequestedVersion))) {
+    throw "-Uninstall cannot be combined with -Dev or -Version."
+}
+if ($RequestedDev -and -not [string]::IsNullOrWhiteSpace($RequestedVersion)) {
+    throw "-Dev cannot be combined with -Version."
+}
+
+$PackagedIsDev = $false
+if (-not [string]::IsNullOrWhiteSpace($PackagedReleaseVersion)) {
+    Assert-SupportedVersion $PackagedReleaseVersion
+    $PackagedIsDev = $PackagedReleaseVersion -cmatch $DevVersionPattern
+}
+
 if ($Uninstall) {
     if ([string]::IsNullOrWhiteSpace($PackagedReleaseVersion)) {
         throw "This uninstaller is not bound to a GitHub Release. Download install.ps1 from that Release before uninstalling."
     }
-    Assert-SupportedVersion $PackagedReleaseVersion
-    if ($PackagedReleaseVersion -cmatch $DevVersionPattern) {
-        $UseDev = $true
-        $Version = "dev"
-    } else {
-        $UseDev = $false
-        $Version = $PackagedReleaseVersion
+    $UseDev = $PackagedIsDev
+    $ExpectedReleaseVersion = $PackagedReleaseVersion
+} elseif (-not [string]::IsNullOrWhiteSpace($RequestedVersion)) {
+    Assert-SupportedVersion $RequestedVersion
+    if ($RequestedVersion -cmatch $DevVersionPattern) {
+        throw "-Version selects an immutable stable tag and cannot name a -dev version. Use the packaged development installer instead."
     }
-} elseif ($UseDev) {
-    $Version = "dev"
-} else {
-    $Version = if ($env:CS_VERSION) { $env:CS_VERSION } else { "latest" }
-}
-
-if ($Version -notin @("latest", "dev")) {
-    Assert-SupportedVersion $Version
-}
-$DownloadUrl = if ($Version -eq "dev") {
-    "https://github.com/$Repo/releases/download/dev/$AssetName"
-} elseif ($Version -eq "latest") {
-    "https://github.com/$Repo/releases/latest/download/$AssetName"
-} else {
-    "https://github.com/$Repo/releases/download/v$Version/$AssetName"
-}
-
-$ExpectedReleaseVersion = if ($Version -notin @("latest", "dev")) {
-    $Version
+    $UseDev = $false
+    $ExpectedReleaseVersion = $RequestedVersion
 } else {
     if ([string]::IsNullOrWhiteSpace($PackagedReleaseVersion)) {
         throw "This installer is not bound to a GitHub Release. Download install.ps1 from the stable or dev Release assets instead of running the repository copy directly."
     }
-    Assert-SupportedVersion $PackagedReleaseVersion
-    $PackagedReleaseVersion
+    $UseDev = $RequestedDev -or $PackagedIsDev
+    $ExpectedReleaseVersion = $PackagedReleaseVersion
+}
+
+if ($UseDev -and -not $PackagedIsDev) {
+    throw "-Dev requires an install.ps1 asset packaged by the dev Release."
 }
 if ($UseDev -and $ExpectedReleaseVersion -cnotmatch $DevVersionPattern) {
     throw "Development installer expected a -dev release, got '$ExpectedReleaseVersion'."
+}
+
+$ReleaseTag = if ($UseDev) {
+    "dev"
+} else {
+    "v$ExpectedReleaseVersion"
+}
+if ($Uninstall -and -not (Test-DirectInstallDirectory -Path $InstallDir)) {
+    try {
+        $AlreadyUninstalled = Test-MissingInstallStateIsNoOp
+    } catch {
+        throw "Could not inspect the missing-install uninstall state; nothing was downloaded or changed: $_"
+    }
+    if ($AlreadyUninstalled) {
+        Write-Host "[info]  No binary, daemon task/PID state, or exact PATH entry was found; already uninstalled." -ForegroundColor Blue
+        return
+    }
+}
+$ReleaseBaseUrl = "https://github.com/$Repo/releases/download/$ReleaseTag"
+$DownloadUrl = "$ReleaseBaseUrl/$AssetName"
+try {
+    $GhCommand = Get-Command gh -CommandType Application -ErrorAction Stop
+} catch {
+    throw "GitHub CLI with attestation support is required to verify this installer release."
 }
 
 Write-Host "[info]  Detected: windows/$Arch" -ForegroundColor Blue
@@ -1085,13 +1267,15 @@ New-Item -ItemType Directory -Path $TmpDir | Out-Null
 $ZipPath = Join-Path $TmpDir $AssetName
 $ChecksumUrl = "$DownloadUrl.sha256"
 $ChecksumPath = "$ZipPath.sha256"
+$ProvenancePath = Join-Path $TmpDir $ProvenanceAssetName
 
 try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $ZipPath -UseBasicParsing
     Invoke-WebRequest -Uri $ChecksumUrl -OutFile $ChecksumPath -UseBasicParsing
+    Invoke-WebRequest -Uri "$ReleaseBaseUrl/$ProvenanceAssetName" -OutFile $ProvenancePath -UseBasicParsing
 } catch {
     $DownloadError = $_
-    throw "Archive or checksum download failed: $DownloadError"
+    throw "Archive, checksum, or build provenance download failed: $DownloadError"
 }
 
 # Verify checksum before extracting any downloaded content
@@ -1108,13 +1292,21 @@ if ($ActualSha256 -ne $ExpectedSha256) {
 }
 Write-Host "[info]  Checksum verified: $AssetName" -ForegroundColor Blue
 
+$ReleaseSourceDigest = Resolve-ReleaseSourceDigest -Tag $ReleaseTag
+Assert-ReleaseProvenance `
+    -Subject $ZipPath `
+    -Bundle $ProvenancePath `
+    -Tag $ReleaseTag `
+    -SourceDigest $ReleaseSourceDigest
+Write-Host "[info]  Build provenance verified: $AssetName" -ForegroundColor Blue
+
 # Extract
 Expand-Archive -Path $ZipPath -DestinationPath $TmpDir -Force
 $CandidateBin = Join-Path $TmpDir $BinaryName
 
 # Prove that the downloaded executable can run on this host before stopping a
-# working daemon. A valid checksum authenticates the release bytes, but it does
-# not prove that the selected asset is executable on this Windows installation.
+# working daemon. Checksum and provenance establish integrity and release origin,
+# but do not prove that the selected asset runs on this Windows installation.
 try {
     $CandidateVersionOutput = & $CandidateBin --version 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -1128,6 +1320,10 @@ try {
 } catch {
     $CandidateError = $_
     throw "Downloaded binary failed its pre-install check; the existing installation was not changed: $CandidateError"
+}
+$ConfirmedReleaseSourceDigest = Resolve-ReleaseSourceDigest -Tag $ReleaseTag
+if ($ConfirmedReleaseSourceDigest -cne $ReleaseSourceDigest) {
+    throw "Release tag '$ReleaseTag' moved during verification; no service, binary, or PATH configuration was changed."
 }
 
 # ── Uninstall ────────────────────────────────────────────
@@ -1149,18 +1345,7 @@ if ($Uninstall) {
         throw "Could not inspect the existing uninstall state; nothing was changed: $PreflightError"
     }
 
-    if (-not $InstallDirWasPresent) {
-        try {
-            [void][System.IO.Directory]::CreateDirectory($InstallDir)
-            if (-not (Test-DirectInstallDirectory -Path $InstallDir)) {
-                throw "Install path was not created as a direct directory: $InstallDir"
-            }
-        } catch {
-            $DirectoryError = $_
-            throw "Could not create the direct install directory; nothing was changed: $DirectoryError"
-        }
-    }
-
+    $UninstallAuthorityHolder = $null
     $UninstallLockHolder = $null
     $UninstallLifecycleHolder = $null
     $UninstallError = $null
@@ -1182,15 +1367,18 @@ if ($Uninstall) {
     $UninstallMutationAttempted = $false
     $UninstallCommitted = $false
     try {
-        # A release-verified temporary executable holds the same destination
-        # lease as install and self-update. The installed executable can then be
-        # removed without asking a process loaded from that path to stay alive.
-        $UninstallLockHolder = Start-UpdateLockHolder `
-            -CandidatePath $CandidateBin `
-            -DestinationPath $InstalledBin
-
-        if (-not (Test-DirectInstallDirectory -Path $InstallDir)) {
-            throw "Install directory disappeared after acquiring the shared update lock: $InstallDir"
+        # Stable authority lives outside the optional install parent, so stale
+        # PATH/service state can be removed without creating that parent. The
+        # adjacent self-update lease is added only when the parent already exists.
+        $UninstallAuthorityHolder = Start-StableInstallerAuthority -CandidatePath $CandidateBin
+        $InstallDirWasPresent = Test-DirectInstallDirectory -Path $InstallDir
+        if ($InstallDirWasPresent) {
+            $UninstallLockHolder = Start-UpdateLockHolder `
+                -CandidatePath $CandidateBin `
+                -DestinationPath $InstalledBin
+            if (-not (Test-DirectInstallDirectory -Path $InstallDir)) {
+                throw "Install directory disappeared after acquiring the shared update lock: $InstallDir"
+            }
         }
         Assert-NoInstallTransactionResidue -Path $InstallDir -Binary $BinaryName
         $InstalledBinaryWasPresent = Test-DirectInstalledBinary -Path $InstalledBin
@@ -1199,6 +1387,9 @@ if ($Uninstall) {
         } else {
             $null
         }
+        Assert-LockedReleaseSourceDigest `
+            -Tag $ReleaseTag `
+            -ExpectedDigest $ReleaseSourceDigest
         if ($InstalledBinaryWasPresent) {
             $UninstallHoldToken = Copy-InstallerFileExclusive `
                 -CandidatePath $CandidateBin `
@@ -1494,14 +1685,16 @@ if ($Uninstall) {
                 $LockReleaseError = $_
             }
         }
-    }
-
-    $NewInstallDirectoryCleanupError = $null
-    if (-not $InstallDirWasPresent) {
-        try {
-            Remove-NewEmptyInstallDirectory -Path $InstallDir
-        } catch {
-            $NewInstallDirectoryCleanupError = $_
+        if ($null -ne $UninstallAuthorityHolder) {
+            try {
+                Complete-UpdateLockHolder -LockProcess $UninstallAuthorityHolder
+            } catch {
+                if ($null -eq $LockReleaseError) {
+                    $LockReleaseError = $_
+                } else {
+                    $LockReleaseError = "$LockReleaseError; stable installer authority did not close cleanly: $_"
+                }
+            }
         }
     }
 
@@ -1513,9 +1706,6 @@ if ($Uninstall) {
         if ($null -ne $LockReleaseError) {
             $Suffix += " Additionally, the exclusive update lock did not close cleanly: $LockReleaseError"
         }
-        if ($null -ne $NewInstallDirectoryCleanupError) {
-            $Suffix += " Additionally, exact cleanup of the newly created install directory failed: $NewInstallDirectoryCleanupError"
-        }
         throw "Uninstall did not complete: $UninstallError$Suffix"
     }
     if ($null -ne $PostCommitCleanupError) {
@@ -1526,9 +1716,6 @@ if ($Uninstall) {
         if ($null -ne $LockReleaseError) {
             $Suffix += " Additionally, the exclusive update lock did not close cleanly: $LockReleaseError"
         }
-        if ($null -ne $NewInstallDirectoryCleanupError) {
-            $Suffix += " Additionally, exact cleanup of the newly created install directory failed: $NewInstallDirectoryCleanupError"
-        }
         throw "Uninstall committed, but post-commit cleanup could not be confirmed. Official executable path: $InstalledBin. Recovery residue path: $UninstallBackupBin. $PostCommitCleanupError$Suffix"
     }
     if ($null -ne $LifecycleReleaseError) {
@@ -1537,10 +1724,6 @@ if ($Uninstall) {
     if ($null -ne $LockReleaseError) {
         throw "Uninstall completed, but the exclusive update lock did not close cleanly: $LockReleaseError"
     }
-    if ($null -ne $NewInstallDirectoryCleanupError) {
-        throw "Uninstall completed, but exact cleanup of the newly created install directory failed: $NewInstallDirectoryCleanupError"
-    }
-
     # This directory is deliberately shared with codex-switch so existing
     # profiles work without another login. Never remove it from this uninstaller.
     if (Test-Path -LiteralPath $DataDir) {
@@ -1562,21 +1745,50 @@ try {
     throw $DirectoryError
 }
 
+$InstallerAuthorityHolder = $null
 $UpdateLockHolder = $null
 $InstallLifecycleHolder = $null
 
 try {
+    $InstallerAuthorityHolder = Start-StableInstallerAuthority -CandidatePath $CandidateBin
+    # The stable lock defines the first-install boundary. Re-read the parent only
+    # after acquiring it; a completed concurrent install becomes an upgrade.
+    $InstallDirWasPresent = Test-DirectInstallDirectory -Path $InstallDir
+    if ($InstallDirWasPresent) {
+        $UpdateLockHolder = Start-UpdateLockHolder `
+            -CandidatePath $CandidateBin `
+            -DestinationPath $InstalledBin
+    }
+    Assert-LockedReleaseSourceDigest `
+        -Tag $ReleaseTag `
+        -ExpectedDigest $ReleaseSourceDigest
     if (-not $InstallDirWasPresent) {
         [void][System.IO.Directory]::CreateDirectory($InstallDir)
         if (-not (Test-DirectInstallDirectory -Path $InstallDir)) {
             throw "Install path was not created as a directory: $InstallDir"
         }
     }
-    $UpdateLockHolder = Start-UpdateLockHolder `
-        -CandidatePath $CandidateBin `
-        -DestinationPath $InstalledBin
 } catch {
     $LockError = $_
+    $AuthorityReleaseError = $null
+    if ($null -ne $UpdateLockHolder) {
+        try {
+            Complete-UpdateLockHolder -LockProcess $UpdateLockHolder
+        } catch {
+            $AuthorityReleaseError = $_
+        }
+    }
+    if ($null -ne $InstallerAuthorityHolder) {
+        try {
+            Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder
+        } catch {
+            if ($null -eq $AuthorityReleaseError) {
+                $AuthorityReleaseError = $_
+            } else {
+                $AuthorityReleaseError = "$AuthorityReleaseError; stable installer authority did not close cleanly: $_"
+            }
+        }
+    }
     $DirectoryCleanupError = $null
     if (-not $InstallDirWasPresent) {
         try {
@@ -1584,6 +1796,9 @@ try {
         } catch {
             $DirectoryCleanupError = $_
         }
+    }
+    if ($null -ne $AuthorityReleaseError) {
+        throw "${LockError}. Additionally, installer authority did not close cleanly: $AuthorityReleaseError"
     }
     if ($null -ne $DirectoryCleanupError) {
         throw "${LockError}. Additionally, exact cleanup of the newly created install directory failed: $DirectoryCleanupError"
@@ -1699,7 +1914,7 @@ try {
     ) | Where-Object { $null -ne $_ }
     if (-not $InstallDirWasPresent) {
         try {
-            Remove-NewEmptyInstallDirectory -Path $InstallDir
+                Remove-NewEmptyInstallDirectory -Path $InstallDir
         } catch {
             $CleanupErrors += "new install directory ${InstallDir}: $_"
         }
@@ -2060,10 +2275,23 @@ $TransactionSucceeded = $true
         }
     }
     $LockReleaseError = $null
-    try {
-        Complete-UpdateLockHolder -LockProcess $UpdateLockHolder
-    } catch {
-        $LockReleaseError = $_
+    if ($null -ne $UpdateLockHolder) {
+        try {
+            Complete-UpdateLockHolder -LockProcess $UpdateLockHolder
+        } catch {
+            $LockReleaseError = $_
+        }
+    }
+    if ($null -ne $InstallerAuthorityHolder) {
+        try {
+            Complete-UpdateLockHolder -LockProcess $InstallerAuthorityHolder
+        } catch {
+            if ($null -eq $LockReleaseError) {
+                $LockReleaseError = $_
+            } else {
+                $LockReleaseError = "$LockReleaseError; stable installer authority did not close cleanly: $_"
+            }
+        }
     }
     if ($null -ne $LockReleaseError) {
         $LockMessage = "The exclusive update lock did not close cleanly: $LockReleaseError"

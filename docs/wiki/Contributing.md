@@ -6,7 +6,7 @@ Contributions normally target `dev`; `master` tracks stable releases. The short 
 
 - Keep one pull request focused on one behavior or concern, small enough to review and revert independently.
 - Define behavior with a failing test before implementation when the change has a testable contract.
-- Run the documented quality gate (`cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all --locked`, `cargo audit`, installer syntax checks) and state exactly what was not run on your platform.
+- Run the documented quality gate (`cargo fmt --check`, `cargo clippy --all-targets --locked --features test-endpoints -- -D warnings`, `cargo test --all --locked --features test-endpoints`, `cargo audit`, installer syntax checks) and state exactly what was not run on your platform.
 - Update the affected documentation — the relevant `docs/wiki/` page, `README.md`, and the changelog — in the same pull request.
 - Preserve the safety contracts: JSON stdout, atomic file writes, cross-process locks, recoverable deletion, and the file-backed Codex credential-store requirement.
 - For a substantial feature or architecture change, open an issue first so the boundary can be agreed before implementation.

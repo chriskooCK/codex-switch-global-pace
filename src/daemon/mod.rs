@@ -3098,7 +3098,9 @@ fn status(json: bool) -> Result<()> {
                     // fixed the cause has no way to tell how long the fix will
                     // take to show up — or that restarting would apply it now.
                     if let Some(until) = snap.backoff_until {
-                        let remaining = until - crate::auth::now_unix_secs();
+                        let remaining = until
+                            .checked_sub(crate::auth::now_unix_secs()?)
+                            .context("daemon backoff timestamp exceeds the signed time range")?;
                         if remaining > 0 {
                             user_println(&format!(
                                 "  Polling suspended for another {remaining}s (until {}) after \

@@ -11,10 +11,6 @@ use super::api::{apply_account_routing_headers, extract_error_summary};
 use super::parse::parse_optional_u64;
 use super::{ConsumedResetCredit, MAX_RETRIES, RETRY_DELAY, ResetCredit, UsageInfo};
 
-const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
-const RESET_CREDITS_CONSUME_URL: &str =
-    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConsumeFailureKind {
     DefinitelyNotConsumed,
@@ -68,29 +64,8 @@ impl std::error::Error for ConsumeResetCreditError {
     }
 }
 
-fn reset_credits_url() -> String {
-    if let Ok(url) = std::env::var("CS_RESET_CREDITS_URL") {
-        return url;
-    }
-    if let Ok(url) = std::env::var("CS_USAGE_URL")
-        && let Some(base) = url.strip_suffix("/usage")
-    {
-        return format!("{base}/rate-limit-reset-credits");
-    }
-    RESET_CREDITS_URL.to_string()
-}
-
-fn reset_credits_consume_url() -> String {
-    if let Ok(url) = std::env::var("CS_RESET_CREDITS_CONSUME_URL") {
-        return url;
-    }
-    if std::env::var("CS_RESET_CREDITS_URL").is_ok() {
-        return format!("{}/consume", reset_credits_url().trim_end_matches('/'));
-    }
-    RESET_CREDITS_CONSUME_URL.to_string()
-}
-
 pub(super) async fn enrich_reset_credits(
+    endpoints: &auth::ServiceEndpoints,
     alias: &str,
     client: &reqwest::Client,
     access_token: &str,
@@ -98,7 +73,7 @@ pub(super) async fn enrich_reset_credits(
     is_fedramp: bool,
     usage: &mut UsageInfo,
 ) {
-    match fetch_reset_credits(client, access_token, account_id, is_fedramp).await {
+    match fetch_reset_credits(endpoints, client, access_token, account_id, is_fedramp).await {
         Ok(summary) => {
             merge_reset_credits(usage, summary);
             usage.reset_credits_error = None;
@@ -112,6 +87,7 @@ pub(super) async fn enrich_reset_credits(
 }
 
 async fn fetch_reset_credits(
+    endpoints: &auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
@@ -122,7 +98,7 @@ async fn fetch_reset_credits(
         access_token,
         account_id,
         is_fedramp,
-        &reset_credits_url(),
+        endpoints.reset_credits()?,
     )
     .await
 }
@@ -238,8 +214,10 @@ pub(crate) async fn consume_reset_credit_by_id_leased(
         )));
     }
     let (client, access_token, account_id, is_fedramp) = load_consume_context(alias, profile_path)?;
+    let endpoints = auth::service_endpoints().map_err(ConsumeResetCreditError::not_consumed)?;
 
     send_reset_credit_consume(
+        &endpoints,
         &client,
         &access_token,
         account_id.as_deref(),
@@ -250,6 +228,7 @@ pub(crate) async fn consume_reset_credit_by_id_leased(
 }
 
 async fn send_reset_credit_consume(
+    endpoints: &auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
@@ -262,7 +241,9 @@ async fn send_reset_credit_consume(
         account_id,
         is_fedramp,
         credit,
-        &reset_credits_consume_url(),
+        endpoints
+            .reset_credits_consume()
+            .map_err(ConsumeResetCreditError::not_consumed)?,
     )
     .await
 }

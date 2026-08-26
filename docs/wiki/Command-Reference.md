@@ -22,7 +22,7 @@ applies when the Windows executable is launched directly.
 | `daemon status` | Report daemon support, service, process, configuration, and pending-switch state. |
 | `daemon install` | Install the native user service: LaunchAgent on macOS, systemd on Linux, Task Scheduler on Windows (elevated PowerShell required). |
 | `daemon uninstall` | Remove the native user service. |
-| `self-update [--check] [--dev\|--stable] [--version <VERSION>]` | Check or update a direct installation. Without flags it stays on the current channel; `--version` installs a specific newer stable version and conflicts with the channel flags. |
+| `self-update [--check] [--dev\|--stable]`<br>`self-update --version <VERSION>` | Check or update a direct installation. Without flags it stays on the current channel; `--version` installs a specific newer stable version and is mutually exclusive with `--check`, `--dev`, and `--stable`. |
 | `open` | Open the codex-switch-global-pace data directory in the platform file manager. |
 
 ## Global options

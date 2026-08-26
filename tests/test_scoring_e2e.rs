@@ -6,6 +6,10 @@ use mock::scenarios;
 
 type CandidateInput = (String, UsageInfo, AccountInfo, i64);
 
+fn checked_now() -> i64 {
+    codex_switch::auth::now_unix_secs().expect("test clock must be a supported Unix timestamp")
+}
+
 /// Parse a mock usage response into the input consumed by the production
 /// `score_candidates` entry point.
 fn candidate_from_json(
@@ -13,7 +17,7 @@ fn candidate_from_json(
     json: &serde_json::Value,
     jwt_plan: Option<&str>,
 ) -> CandidateInput {
-    let usage = usage::parse_usage(json);
+    let usage = usage::parse_usage(json).expect("test clock must be supported");
     let account = AccountInfo {
         plan_type: jwt_plan.map(str::to_string),
         ..AccountInfo::default()
@@ -41,7 +45,7 @@ fn rank(
 #[test]
 fn healthy_pool_prefers_least_used() {
     let scenario = scenarios::healthy_pool();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     let candidates: Vec<CandidateInput> = scenario
         .iter()
@@ -63,7 +67,7 @@ fn healthy_pool_prefers_least_used() {
 #[test]
 fn team_priority_outranks_plus() {
     let scenario = scenarios::team_priority();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     let candidates: Vec<CandidateInput> = scenario
         .iter()
@@ -87,7 +91,7 @@ fn team_priority_outranks_plus() {
 #[test]
 fn drain_window_prefers_soon_to_reset() {
     let scenario = scenarios::drain_window();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     let candidates: Vec<CandidateInput> = scenario
         .iter()
@@ -111,7 +115,7 @@ fn drain_window_prefers_soon_to_reset() {
 #[test]
 fn seven_day_crisis_penalizes_near_7d_limit() {
     let scenario = scenarios::seven_day_crisis();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     let candidates: Vec<CandidateInput> = scenario
         .iter()
@@ -135,7 +139,7 @@ fn seven_day_crisis_penalizes_near_7d_limit() {
 #[test]
 fn gradual_exhaustion_shifts_preference() {
     let scenario = scenarios::gradual_exhaustion();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     // Tick 0: A=30%, B=20% — both are healthy, A has more headroom in 5h window
     // because both have similar reset times but A starts with a higher burn rate.
@@ -191,7 +195,7 @@ fn gradual_exhaustion_shifts_preference() {
 #[test]
 fn all_exhausted_prefers_soonest_reset() {
     let scenario = scenarios::all_exhausted();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     let candidates: Vec<CandidateInput> = scenario
         .iter()
@@ -214,7 +218,7 @@ fn all_exhausted_prefers_soonest_reset() {
 #[test]
 fn team_exhausted_falls_back_to_plus() {
     let scenario = scenarios::team_exhausted();
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
 
     let candidates: Vec<CandidateInput> = scenario
         .iter()
@@ -235,7 +239,7 @@ fn team_exhausted_falls_back_to_plus() {
 
 #[test]
 fn api_plan_overrides_stale_jwt_team_claim() {
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
     let response = mock::transformer::base_response("plus", 10.0, 18000, 10.0, 604800);
 
     let scored = usage::score_candidates(
@@ -245,13 +249,13 @@ fn api_plan_overrides_stale_jwt_team_claim() {
         true,
     );
 
-    assert!(!scored[0].candidate.is_team);
-    assert!(!scored[0].candidate.is_free);
+    assert!(!scored[0].candidate.is_team());
+    assert!(!scored[0].candidate.is_free());
 }
 
 #[test]
 fn pool_exhausted_counts_every_successfully_fetched_candidate() {
-    let now = codex_switch::auth::now_unix_secs();
+    let now = checked_now();
     let responses = [
         mock::transformer::base_response("plus", 100.0, 1800, 10.0, 604800),
         mock::transformer::base_response("plus", 100.0, 3600, 10.0, 604800),

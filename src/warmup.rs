@@ -6,17 +6,6 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, warn};
 
-const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
-
-fn responses_url() -> String {
-    std::env::var("CS_RESPONSES_URL").unwrap_or_else(|_| RESPONSES_URL.to_string())
-}
-
-fn models_url() -> String {
-    std::env::var("CS_MODELS_URL").unwrap_or_else(|_| MODELS_URL.to_string())
-}
-
 static CODEX_VERSION: OnceCell<String> = OnceCell::const_new();
 /// The models one warmup should touch, keyed by account *and* by the quota
 /// pools that produced the selection (see [`warmup_cache_key`]).
@@ -74,20 +63,21 @@ fn parse_codex_version(stdout: &str) -> Option<String> {
 }
 
 fn build_models_request(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
     version: &str,
-) -> reqwest::RequestBuilder {
-    crate::usage::apply_account_routing_headers(
+) -> Result<reqwest::RequestBuilder> {
+    Ok(crate::usage::apply_account_routing_headers(
         client
-            .get(models_url())
+            .get(endpoints.models()?)
             .query(&[("client_version", version)])
             .bearer_auth(access_token),
         account_id,
         is_fedramp,
-    )
+    ))
 }
 
 /// One entry from the `/models` endpoint's `models[]` array.
@@ -210,6 +200,7 @@ pub(crate) fn sorted_models_for_display(models: &[ModelEntry]) -> Vec<&ModelEntr
 
 /// Fetch and parse the full model list from the `/models` endpoint.
 pub(crate) async fn fetch_models(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
@@ -217,9 +208,16 @@ pub(crate) async fn fetch_models(
 ) -> Result<Vec<ModelEntry>> {
     let version = detect_codex_version().await;
     for attempt in 1..=3 {
-        let response = build_models_request(client, access_token, account_id, is_fedramp, version)
-            .send()
-            .await;
+        let response = build_models_request(
+            endpoints,
+            client,
+            access_token,
+            account_id,
+            is_fedramp,
+            version,
+        )?
+        .send()
+        .await;
         match response {
             Ok(resp) if resp.status().is_success() => {
                 let body: serde_json::Value = resp.json().await?;
@@ -251,13 +249,14 @@ pub(crate) async fn fetch_models(
 /// Resolve every model this warmup should touch, from one `/models` response:
 /// the main-pool model first, then one per additional quota pool.
 async fn fetch_warmup_models(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
     additional_limits: &[crate::usage::AdditionalRateLimit],
 ) -> Result<Vec<String>> {
-    let models = fetch_models(client, access_token, account_id, is_fedramp).await?;
+    let models = fetch_models(endpoints, client, access_token, account_id, is_fedramp).await?;
     let selected = select_warmup_models(&models, additional_limits)?;
     if selected.is_empty() {
         return require_official_model(Err(anyhow::anyhow!(
@@ -405,6 +404,7 @@ fn select_warmup_models(
 }
 
 async fn resolve_warmup_models(
+    endpoints: &crate::auth::ServiceEndpoints,
     cache_key: &str,
     client: &reqwest::Client,
     access_token: &str,
@@ -429,6 +429,7 @@ async fn resolve_warmup_models(
     }
 
     let models = fetch_warmup_models(
+        endpoints,
         client,
         access_token,
         account_id,
@@ -470,21 +471,22 @@ fn build_body(model: &str) -> serde_json::Value {
 }
 
 fn make_request(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
     body: &serde_json::Value,
-) -> reqwest::RequestBuilder {
-    crate::usage::apply_account_routing_headers(
+) -> Result<reqwest::RequestBuilder> {
+    Ok(crate::usage::apply_account_routing_headers(
         client
-            .post(responses_url())
+            .post(endpoints.responses()?)
             .bearer_auth(access_token)
             .header("Content-Type", "application/json"),
         account_id,
         is_fedramp,
     )
-    .json(body)
+    .json(body))
 }
 
 /// Warm one request per additional quota pool.
@@ -493,6 +495,7 @@ fn make_request(
 /// list again: both halves come from the same `/models` answer, and
 /// `select_warmup_models` already excludes the main-pool model from this slice.
 async fn warmup_additional_models(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
@@ -501,11 +504,21 @@ async fn warmup_additional_models(
 ) -> Result<()> {
     for model in additional_models {
         let body = build_body(model);
-        debug!("warmup additional pool POST → {RESPONSES_URL} (model={model})");
-        let mut resp = make_request(client, access_token, account_id, is_fedramp, &body)
-            .send()
-            .await
-            .map_err(|e| crate::auth::format_reqwest_error("additional warmup failed", &e))?;
+        debug!(
+            "warmup additional pool POST → {} (model={model})",
+            endpoints.responses()?
+        );
+        let mut resp = make_request(
+            endpoints,
+            client,
+            access_token,
+            account_id,
+            is_fedramp,
+            &body,
+        )?
+        .send()
+        .await
+        .map_err(|e| crate::auth::format_reqwest_error("additional warmup failed", &e))?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -540,6 +553,7 @@ pub(crate) async fn warmup_account_leased(
             lease.alias()
         );
     }
+    let endpoints = crate::auth::service_endpoints()?;
     let usage = match crate::cache::get(alias)? {
         Some(usage) => Some(usage),
         None => {
@@ -584,7 +598,7 @@ pub(crate) async fn warmup_account_leased(
 
     // Pre-refresh: if token is about to expire, refresh proactively
     if let Some(ref rt) = refresh_token
-        && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
+        && crate::jwt::is_token_expiring(&access_token, 60)? == Some(true)
     {
         debug!("[{alias}] access_token expiring soon, refreshing before warmup");
         let activation_authorization =
@@ -593,7 +607,9 @@ pub(crate) async fn warmup_account_leased(
                     "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                 )
             })?;
-        match crate::usage::do_refresh_token(alias, &client, id_token.as_deref(), rt).await {
+        match crate::usage::do_refresh_token(&endpoints, alias, &client, id_token.as_deref(), rt)
+            .await
+        {
             Ok(resolution) => {
                 let refreshed = crate::usage::persist_refresh_resolution(
                     lease,
@@ -630,6 +646,7 @@ pub(crate) async fn warmup_account_leased(
     // additional-pool request after it.
     let cache_key = warmup_cache_key(alias, &additional_limits);
     let selected_models = resolve_warmup_models(
+        &endpoints,
         &cache_key,
         &client,
         &access_token,
@@ -643,15 +660,19 @@ pub(crate) async fn warmup_account_leased(
         .with_context(|| format!("{alias}: failed to select a supported warmup model"))?;
     let body = build_body(model);
 
-    debug!("[{alias}] warmup POST → {RESPONSES_URL} (model={model})");
+    debug!(
+        "[{alias}] warmup POST → {} (model={model})",
+        endpoints.responses()?
+    );
 
     let mut resp = make_request(
+        &endpoints,
         &client,
         &access_token,
         account_id.as_deref(),
         is_fedramp,
         &body,
-    )
+    )?
     .send()
     .await
     .map_err(|e| crate::auth::format_reqwest_error("warmup request failed", &e))?;
@@ -665,6 +686,7 @@ pub(crate) async fn warmup_account_leased(
             // Read one chunk to confirm streaming started, then drop.
             let _ = resp.chunk().await;
             warmup_additional_models(
+                &endpoints,
                 &client,
                 &access_token,
                 account_id.as_deref(),
@@ -682,6 +704,7 @@ pub(crate) async fn warmup_account_leased(
                 );
                 model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
                 let refreshed_models = resolve_warmup_models(
+                    &endpoints,
                     &cache_key,
                     &client,
                     &access_token,
@@ -699,12 +722,13 @@ pub(crate) async fn warmup_account_leased(
                     })?;
                 let retry_body = build_body(new_model);
                 let mut retry_resp = make_request(
+                    &endpoints,
                     &client,
                     &access_token,
                     account_id.as_deref(),
                     is_fedramp,
                     &retry_body,
-                )
+                )?
                 .send()
                 .await
                 .map_err(|e| crate::auth::format_reqwest_error("warmup retry failed", &e))?;
@@ -712,6 +736,7 @@ pub(crate) async fn warmup_account_leased(
                 if retry_status.is_success() {
                     let _ = retry_resp.chunk().await;
                     return warmup_additional_models(
+                        &endpoints,
                         &client,
                         &access_token,
                         account_id.as_deref(),
@@ -747,7 +772,14 @@ pub(crate) async fn warmup_account_leased(
                             )
                         },
                     )?;
-                match crate::usage::do_refresh_token(alias, &client, id_token.as_deref(), rt).await
+                match crate::usage::do_refresh_token(
+                    &endpoints,
+                    alias,
+                    &client,
+                    id_token.as_deref(),
+                    rt,
+                )
+                .await
                 {
                     Ok(resolution) => {
                         let refreshed = crate::usage::persist_refresh_resolution(
@@ -758,12 +790,13 @@ pub(crate) async fn warmup_account_leased(
                         )
                         .map_err(|error| anyhow::anyhow!(error.detail))?;
                         let mut retry_resp = make_request(
+                            &endpoints,
                             &client,
                             &refreshed.access_token,
                             account_id.as_deref(),
                             is_fedramp,
                             &body,
-                        )
+                        )?
                         .send()
                         .await
                         .map_err(|e| {
@@ -773,6 +806,7 @@ pub(crate) async fn warmup_account_leased(
                         if retry_status.is_success() {
                             let _ = retry_resp.chunk().await;
                             return warmup_additional_models(
+                                &endpoints,
                                 &client,
                                 &refreshed.access_token,
                                 account_id.as_deref(),
@@ -813,6 +847,7 @@ pub(crate) async fn fetch_models_for_profile_leased(
             lease.alias()
         );
     }
+    let endpoints = crate::auth::service_endpoints()?;
     let val = crate::auth::read_auth(profile_path)
         .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
 
@@ -830,7 +865,7 @@ pub(crate) async fn fetch_models_for_profile_leased(
     let client = crate::auth::build_http_client()?;
 
     if let Some(ref rt) = refresh_token
-        && crate::jwt::is_token_expiring(&access_token, 60) == Some(true)
+        && crate::jwt::is_token_expiring(&access_token, 60)? == Some(true)
     {
         let activation_authorization =
             crate::profile::authorize_fresh_credentials_activation(lease).with_context(|| {
@@ -838,7 +873,9 @@ pub(crate) async fn fetch_models_for_profile_leased(
                     "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                 )
             })?;
-        match crate::usage::do_refresh_token(alias, &client, id_token.as_deref(), rt).await {
+        match crate::usage::do_refresh_token(&endpoints, alias, &client, id_token.as_deref(), rt)
+            .await
+        {
             Ok(resolution) => {
                 // No degrade here: the refresh *worked*, so the old token this
                 // would fall back to has already been invalidated server-side.
@@ -870,7 +907,14 @@ pub(crate) async fn fetch_models_for_profile_leased(
         }
     }
 
-    fetch_models(&client, &access_token, account_id.as_deref(), is_fedramp).await
+    fetch_models(
+        &endpoints,
+        &client,
+        &access_token,
+        account_id.as_deref(),
+        is_fedramp,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1327,13 +1371,16 @@ mod tests {
 
     #[test]
     fn test_models_request_includes_workspace_and_fedramp_headers() {
+        let endpoints = crate::auth::ServiceEndpoints::production_for_test();
         let request = build_models_request(
+            &endpoints,
             &reqwest::Client::new(),
             "access-token",
             Some("workspace-123"),
             true,
             "0.144.1",
         )
+        .unwrap()
         .build()
         .unwrap();
 
@@ -1355,13 +1402,16 @@ mod tests {
 
     #[test]
     fn test_responses_request_includes_workspace_and_fedramp_headers() {
+        let endpoints = crate::auth::ServiceEndpoints::production_for_test();
         let request = make_request(
+            &endpoints,
             &reqwest::Client::new(),
             "access-token",
             Some("workspace-123"),
             true,
             &build_body("gpt-test"),
         )
+        .unwrap()
         .build()
         .unwrap();
 
@@ -1383,11 +1433,10 @@ mod tests {
 
     // ── Terminal refresh failure must not be replayed ──────────────────
     //
-    // `CS_TOKEN_URL`, `CS_MODELS_URL` and `CS_RESPONSES_URL` are process-global
-    // env vars (see `responses_url()` / `models_url()` and
-    // `auth::token_url()`), and login's tests retarget `CS_TOKEN_URL` as well,
-    // so every test in this group takes the crate-wide `auth::URL_ENV_LOCK`
-    // rather than a lock private to this module.
+    // The debug-only endpoint context reads `CS_TOKEN_URL`, `CS_MODELS_URL`
+    // and `CS_RESPONSES_URL`, which are process-global; login's tests retarget
+    // `CS_TOKEN_URL` as well. Every test in this group therefore takes the
+    // crate-wide `auth::URL_ENV_LOCK` rather than a module-private lock.
     mod refresh_short_circuit {
         use super::*;
         use axum::http::StatusCode;
@@ -1448,7 +1497,7 @@ mod tests {
         /// An access_token JWT that `is_token_expiring` already treats as expired,
         /// so `warmup_account`'s pre-warmup proactive refresh always fires.
         fn expired_access_token() -> String {
-            make_jwt(&serde_json::json!({ "exp": crate::auth::now_unix_secs() - 10 }))
+            make_jwt(&serde_json::json!({ "exp": crate::auth::now_unix_secs().unwrap() - 10 }))
         }
 
         fn write_test_auth(path: &std::path::Path, access_token: &str, refresh_token: &str) {
@@ -1566,10 +1615,13 @@ mod tests {
             let _models_url =
                 EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
 
+            let endpoints = crate::auth::service_endpoints().unwrap();
             let client = reqwest::Client::new();
             let first_client = client.clone();
+            let first_endpoints = endpoints.clone();
             let first = tokio::spawn(async move {
                 resolve_warmup_models(
+                    &first_endpoints,
                     "concurrent-model-account-one",
                     &first_client,
                     "token-one",
@@ -1583,6 +1635,7 @@ mod tests {
 
             let second = tokio::spawn(async move {
                 resolve_warmup_models(
+                    &endpoints,
                     "concurrent-model-account-two",
                     &client,
                     "token-two",
@@ -1807,7 +1860,7 @@ mod tests {
         /// refresh stays out of the way and the 401 retry path can be exercised
         /// on its own.
         fn live_access_token() -> String {
-            make_jwt(&serde_json::json!({ "exp": crate::auth::now_unix_secs() + 3600 }))
+            make_jwt(&serde_json::json!({ "exp": crate::auth::now_unix_secs().unwrap() + 3600 }))
         }
 
         /// Stage a profile that reads fine but can never be written back: the

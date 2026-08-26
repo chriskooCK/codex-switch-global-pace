@@ -26,6 +26,61 @@ impl CodexActivity {
     }
 }
 
+const AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
+// Long-lived Codex processes that do not own the interactive auth lifecycle.
+// Keep this compatibility contract aligned with the Codex CLI help surface.
+const INFRA_SUBCOMMANDS: &[&str] = &[
+    "app-server",
+    "completion",
+    "exec-server",
+    "mcp",
+    "mcp-server",
+];
+
+#[cfg(any(unix, test))]
+#[derive(Debug, Eq, PartialEq)]
+enum ProcessInspection {
+    Irrelevant,
+    Vanished,
+    Arguments(Vec<String>),
+    Failed,
+}
+
+/// One process returned by the Windows CIM query. Keeping the image name and
+/// PID alongside the command line lets us distinguish an unrelated node.exe
+/// whose command line is unavailable from a native Codex process that we were
+/// unable to inspect safely.
+#[cfg(any(windows, test))]
+#[derive(Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WindowsProcess {
+    name: String,
+    process_id: u32,
+    command_line: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WindowsProcessSnapshot {
+    processes: Vec<WindowsProcess>,
+}
+
+#[cfg(any(unix, test))]
+fn collect_process_inspections(
+    inspections: impl IntoIterator<Item = ProcessInspection>,
+) -> Option<Vec<Vec<String>>> {
+    let mut processes = Vec::new();
+    for inspection in inspections {
+        match inspection {
+            ProcessInspection::Irrelevant | ProcessInspection::Vanished => {}
+            ProcessInspection::Arguments(arguments) => processes.push(arguments),
+            ProcessInspection::Failed => return None,
+        }
+    }
+    Some(processes)
+}
+
 /// Classify the current Codex activity. Inspection failure is an explicit
 /// state so callers can fail closed instead of replacing auth optimistically.
 #[cfg(unix)]
@@ -44,60 +99,149 @@ pub fn codex_activity() -> CodexActivity {
 /// state so callers can fail closed instead of replacing auth optimistically.
 #[cfg(windows)]
 pub fn codex_activity() -> CodexActivity {
-    let Some(output) = list_process_command_lines() else {
+    let Some(processes) = list_windows_processes() else {
         return CodexActivity::Unknown;
     };
-    output.lines().fold(CodexActivity::Idle, |activity, line| {
-        activity.merge(classify_codex_command(line))
-    })
+    processes
+        .iter()
+        .fold(CodexActivity::Idle, |activity, process| {
+            activity.merge(classify_windows_process(process))
+        })
 }
 
 #[cfg(target_os = "linux")]
 fn list_process_arguments() -> Option<Vec<Vec<String>>> {
-    let mut processes = Vec::new();
-    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+    let mut inspections = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else {
+            return None;
+        };
         if entry
             .file_name()
             .to_str()
-            .is_none_or(|name| name.parse::<u32>().is_err())
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
         {
             continue;
         }
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let args: Vec<String> = cmdline
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect();
-        if !args.is_empty() {
-            processes.push(args);
-        }
+        inspections.push(linux_process_arguments(&entry.path()));
     }
-    Some(processes)
+    collect_process_inspections(inspections)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_arguments(process_path: &std::path::Path) -> ProcessInspection {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let current_uid = unsafe { libc::geteuid() };
+    match std::fs::metadata(process_path) {
+        Ok(metadata) if metadata.uid() != current_uid => return ProcessInspection::Irrelevant,
+        Ok(_) => {}
+        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
+        Err(_) => return ProcessInspection::Failed,
+    }
+
+    let command_name = match std::fs::read_to_string(process_path.join("comm")) {
+        Ok(command_name) => command_name,
+        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
+        Err(_) => return ProcessInspection::Failed,
+    };
+    if !possible_codex_process_name(command_name.trim()) {
+        return ProcessInspection::Irrelevant;
+    }
+
+    let status = match std::fs::read_to_string(process_path.join("status")) {
+        Ok(status) => status,
+        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
+        Err(_) => return ProcessInspection::Failed,
+    };
+    match linux_effective_uid(&status) {
+        Some(uid) if uid == current_uid => {}
+        Some(_) => return ProcessInspection::Irrelevant,
+        None => return ProcessInspection::Failed,
+    }
+
+    let cmdline = match std::fs::read(process_path.join("cmdline")) {
+        Ok(cmdline) => cmdline,
+        Err(error) if process_vanished(&error) => return ProcessInspection::Vanished,
+        Err(_) => return ProcessInspection::Failed,
+    };
+    let arguments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect::<Vec<_>>();
+    if arguments.is_empty() {
+        ProcessInspection::Irrelevant
+    } else {
+        ProcessInspection::Arguments(arguments)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_effective_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+#[cfg(unix)]
+fn process_vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(target_os = "macos")]
 fn list_process_arguments() -> Option<Vec<Vec<String>>> {
-    let output = std::process::Command::new("ps")
-        .args(["-axo", "pid="])
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,uid=,comm="])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let pids = String::from_utf8(output.stdout).ok()?;
-    Some(
-        pids.lines()
-            .filter_map(|line| line.trim().parse::<libc::pid_t>().ok())
-            .filter_map(macos_process_arguments)
-            .collect(),
+    let processes = String::from_utf8(output.stdout).ok()?;
+    let current_uid = unsafe { libc::geteuid() };
+    let mut candidate_pids = Vec::new();
+    for line in processes.lines() {
+        let (pid, uid, command) = parse_macos_process_row(line)?;
+        if uid == current_uid && possible_codex_process_name(command) {
+            candidate_pids.push(pid);
+        }
+    }
+    if candidate_pids.is_empty() {
+        return Some(Vec::new());
+    }
+    let arg_max = macos_arg_max()?;
+    collect_process_inspections(
+        candidate_pids
+            .into_iter()
+            .map(|pid| macos_process_arguments(pid, arg_max)),
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_process_row(line: &str) -> Option<(i32, u32, &str)> {
+    let line = line.trim_start();
+    let pid_end = line.find(char::is_whitespace)?;
+    let pid = line[..pid_end].parse().ok()?;
+
+    let remainder = line[pid_end..].trim_start();
+    let uid_end = remainder.find(char::is_whitespace)?;
+    let uid = remainder[..uid_end].parse().ok()?;
+    let command = remainder[uid_end..].trim_start();
+    if command.is_empty() {
+        return None;
+    }
+
+    Some((pid, uid, command))
+}
+
 #[cfg(target_os = "macos")]
-fn macos_process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
+fn macos_arg_max() -> Option<usize> {
     let mut arg_max = 0 as libc::c_int;
     let mut arg_max_size = std::mem::size_of_val(&arg_max);
     let mut arg_max_mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
@@ -117,7 +261,12 @@ fn macos_process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
         return None;
     }
 
-    let mut buffer = vec![0_u8; usize::try_from(arg_max).ok()?];
+    usize::try_from(arg_max).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_arguments(pid: libc::pid_t, arg_max: usize) -> ProcessInspection {
+    let mut buffer = vec![0_u8; arg_max];
     let mut buffer_size = buffer.len();
     let mut process_mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
     // SAFETY: `buffer` is writable for `buffer_size` bytes and sysctl updates
@@ -133,10 +282,18 @@ fn macos_process_arguments(pid: libc::pid_t) -> Option<Vec<String>> {
         )
     };
     if status != 0 {
-        return None;
+        let error = std::io::Error::last_os_error();
+        return if process_vanished(&error) {
+            ProcessInspection::Vanished
+        } else {
+            ProcessInspection::Failed
+        };
     }
     buffer.truncate(buffer_size);
-    parse_macos_process_arguments(&buffer)
+    match parse_macos_process_arguments(&buffer) {
+        Some(arguments) => ProcessInspection::Arguments(arguments),
+        None => ProcessInspection::Failed,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -164,20 +321,62 @@ fn parse_macos_process_arguments(buffer: &[u8]) -> Option<Vec<String>> {
 }
 
 #[cfg(windows)]
-fn list_process_command_lines() -> Option<String> {
-    // tasklist has no command lines; CIM does. Filter server-side to codex*.
+fn list_windows_processes() -> Option<Vec<WindowsProcess>> {
+    // tasklist has no command lines; CIM does. Emit one JSON envelope so a
+    // null command line cannot disappear as an empty output line and process
+    // identity remains attached to every command line.
+    const PROCESS_QUERY: &str = concat!(
+        "$ErrorActionPreference = 'Stop'; ",
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+        "$processes = @(Get-CimInstance Win32_Process ",
+        "-Filter \"Name LIKE 'codex%' OR Name = 'node.exe'\" | ForEach-Object { ",
+        "$commandLine = if ($null -eq $_.CommandLine) { $null } else { [string]$_.CommandLine }; ",
+        "[pscustomobject]@{ Name = [string]$_.Name; ProcessId = [uint32]$_.ProcessId; ",
+        "CommandLine = $commandLine } }); ",
+        "[pscustomobject]@{ Processes = $processes } | ConvertTo-Json -Compress -Depth 3"
+    );
+
     let output = std::process::Command::new("powershell")
         .args([
+            "-NoLogo",
+            "-NonInteractive",
             "-NoProfile",
             "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name LIKE 'codex%' OR Name = 'node.exe'\" | ForEach-Object { $_.CommandLine }",
+            PROCESS_QUERY,
         ])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    String::from_utf8(output.stdout).ok()
+    parse_windows_process_snapshot(&output.stdout)
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_process_snapshot(output: &[u8]) -> Option<Vec<WindowsProcess>> {
+    serde_json::from_slice::<WindowsProcessSnapshot>(output)
+        .ok()
+        .map(|snapshot| snapshot.processes)
+}
+
+#[cfg(any(windows, test))]
+fn classify_windows_process(process: &WindowsProcess) -> CodexActivity {
+    match process
+        .command_line
+        .as_deref()
+        .filter(|command_line| !command_line.trim().is_empty())
+    {
+        Some(command_line) => classify_codex_command(command_line),
+        None if is_codex_binary_name(&process.name) => {
+            tracing::debug!(
+                pid = process.process_id,
+                process_name = %process.name,
+                "native Codex process command line unavailable; activity is unknown"
+            );
+            CodexActivity::Unknown
+        }
+        None => CodexActivity::Idle,
+    }
 }
 
 /// Classify a Win32 command line returned by CIM.
@@ -242,9 +441,6 @@ fn classify_codex_invocation<S: AsRef<str>>(args: &[S]) -> CodexActivity {
         "--strict-config",
     ];
     const SHORT_VALUE_FLAGS: &[&str] = &["-C", "-a", "-c", "-i", "-m", "-p", "-s"];
-    const INFRA_SUBCOMMANDS: &[&str] = &["app-server", "completion", "mcp", "mcp-server"];
-    const AUTH_SUBCOMMANDS: &[&str] = &["login", "logout"];
-
     let mut index = 0;
     loop {
         let Some(arg) = args.get(index).map(AsRef::as_ref) else {
@@ -360,6 +556,14 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+#[cfg(any(unix, test))]
+fn possible_codex_process_name(name: &str) -> bool {
+    let base = basename(name);
+    base.eq_ignore_ascii_case("node")
+        || base.eq_ignore_ascii_case("node.exe")
+        || is_codex_binary_name(base)
+}
+
 /// Match the Codex CLI by binary name. Accepts plain `codex`, platform
 /// binaries like `codex-aarch64-apple-darwin` (npm vendor binary; Linux comm
 /// truncation is irrelevant here since we read full command lines), and
@@ -378,7 +582,142 @@ fn is_codex_binary_name(base: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CodexActivity, classify_codex_args, classify_codex_command};
+    use super::{
+        CodexActivity, ProcessInspection, classify_codex_args, classify_codex_command,
+        classify_windows_process, collect_process_inspections, linux_effective_uid,
+        parse_macos_process_row, parse_windows_process_snapshot, possible_codex_process_name,
+    };
+
+    #[test]
+    fn vanished_candidates_are_ignored_but_inspection_failures_fail_closed() {
+        assert_eq!(
+            collect_process_inspections([
+                ProcessInspection::Vanished,
+                ProcessInspection::Irrelevant,
+                ProcessInspection::Arguments(vec!["codex".to_string(), "login".to_string()]),
+            ]),
+            Some(vec![vec!["codex".to_string(), "login".to_string()]])
+        );
+        assert_eq!(
+            collect_process_inspections([ProcessInspection::Vanished, ProcessInspection::Failed,]),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_prefilter_covers_native_and_node_codex_processes() {
+        assert!(possible_codex_process_name("codex"));
+        assert!(possible_codex_process_name("codex-aarch64-apple-darwin"));
+        assert!(possible_codex_process_name("node"));
+        assert!(!possible_codex_process_name("codex-switch-global-pace"));
+        assert!(!possible_codex_process_name("codex-code-mode-host"));
+        assert!(!possible_codex_process_name("bash"));
+    }
+
+    #[test]
+    fn windows_snapshot_preserves_process_identity_and_nullable_command_line() {
+        let processes = parse_windows_process_snapshot(
+            br#"{"Processes":[{"Name":"codex.exe","ProcessId":41,"CommandLine":null},{"Name":"node.exe","ProcessId":42,"CommandLine":"node.exe codex app-server"}]}"#,
+        )
+        .expect("valid CIM JSON snapshot");
+
+        assert_eq!(processes.len(), 2);
+        assert_eq!(processes[0].name, "codex.exe");
+        assert_eq!(processes[0].process_id, 41);
+        assert_eq!(processes[0].command_line, None);
+        assert_eq!(processes[1].name, "node.exe");
+        assert_eq!(processes[1].process_id, 42);
+        assert_eq!(
+            processes[1].command_line.as_deref(),
+            Some("node.exe codex app-server")
+        );
+        assert!(parse_windows_process_snapshot(b"not JSON").is_none());
+    }
+
+    #[test]
+    fn unavailable_native_windows_codex_command_line_fails_closed() {
+        let native = super::WindowsProcess {
+            name: "codex.exe".to_string(),
+            process_id: 100,
+            command_line: None,
+        };
+        assert_eq!(classify_windows_process(&native), CodexActivity::Unknown);
+
+        let vendor_native = super::WindowsProcess {
+            name: "codex-x86_64-pc-windows-msvc.exe".to_string(),
+            process_id: 101,
+            command_line: Some("  ".to_string()),
+        };
+        assert_eq!(
+            classify_windows_process(&vendor_native),
+            CodexActivity::Unknown
+        );
+    }
+
+    #[test]
+    fn unavailable_non_codex_windows_command_line_is_irrelevant() {
+        for name in ["node.exe", "codex-switch.exe", "codex-code-mode-host.exe"] {
+            let process = super::WindowsProcess {
+                name: name.to_string(),
+                process_id: 200,
+                command_line: None,
+            };
+            assert_eq!(
+                classify_windows_process(&process),
+                CodexActivity::Idle,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_process_row_preserves_spaces_in_the_command_path() {
+        let (pid, uid, command) = parse_macos_process_row(
+            "  123   501 /Applications/Codex Preview.app/Contents/MacOS/codex",
+        )
+        .unwrap();
+        assert_eq!(pid, 123);
+        assert_eq!(uid, 501);
+        assert_eq!(
+            command,
+            "/Applications/Codex Preview.app/Contents/MacOS/codex"
+        );
+        assert!(possible_codex_process_name(command));
+        assert_eq!(parse_macos_process_row("123 501   "), None);
+    }
+
+    #[test]
+    fn linux_status_parser_reads_the_effective_uid() {
+        assert_eq!(
+            linux_effective_uid("Name:\tcodex\nUid:\t1000\t1001\t1002\t1003\n"),
+            Some(1001)
+        );
+        assert_eq!(linux_effective_uid("Name:\tcodex\n"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_only_relevant_same_user_inspection_failures_fail_closed() {
+        let irrelevant = tempfile::tempdir().unwrap();
+        std::fs::write(irrelevant.path().join("comm"), "bash\n").unwrap();
+        assert_eq!(
+            super::linux_process_arguments(irrelevant.path()),
+            ProcessInspection::Irrelevant
+        );
+
+        let candidate = tempfile::tempdir().unwrap();
+        std::fs::write(candidate.path().join("comm"), "codex\n").unwrap();
+        assert_eq!(
+            super::linux_process_arguments(candidate.path()),
+            ProcessInspection::Failed
+        );
+
+        let vanished = candidate.path().join("already-gone");
+        assert_eq!(
+            super::linux_process_arguments(&vanished),
+            ProcessInspection::Vanished
+        );
+    }
 
     #[test]
     fn interactive_sessions_are_detected() {
@@ -497,6 +836,10 @@ mod tests {
         );
         assert_eq!(
             classify_codex_command("/usr/local/bin/codex app-server"),
+            CodexActivity::Idle
+        );
+        assert_eq!(
+            classify_codex_command("/usr/local/bin/codex exec-server --listen ws://127.0.0.1:0"),
             CodexActivity::Idle
         );
         assert_eq!(classify_codex_command("codex --help"), CodexActivity::Idle);

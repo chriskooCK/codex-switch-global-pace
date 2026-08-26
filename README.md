@@ -21,17 +21,10 @@ Codex must use its file credential store. If needed, add this to
 cli_auth_credentials_store = "file"
 ```
 
-Install on macOS or Linux:
-
-```bash
-curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash
-```
-
-Install from Windows PowerShell:
-
-```powershell
-irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
-```
+Install with the source-controlled [verified bootstrap](docs/wiki/Getting-Started.md#install).
+It uses a current [GitHub CLI](https://cli.github.com/) to bind the installer
+attestation to the exact Release tag and commit before running the local file.
+Verification failure stops the install; there is no direct-download fallback.
 
 Then add an account or open the dashboard:
 
@@ -124,8 +117,8 @@ Requires Rust 1.88 or newer:
 
 ```bash
 cargo fmt --check
-cargo test --all --locked
-cargo clippy --all-targets --locked -- -D warnings
+cargo test --all --locked --features test-endpoints
+cargo clippy --all-targets --locked --features test-endpoints -- -D warnings
 ```
 
 See the [developer onboarding](docs/wiki/Developer-Onboarding.md),

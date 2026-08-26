@@ -44,7 +44,16 @@ pub fn state_path() -> anyhow::Result<PathBuf> {
 /// Best-effort atomic write. Snapshot failure must not stop the daemon, but it
 /// must remain visible in unattended logs.
 pub fn write(state: &mut DaemonState) {
-    state.updated_at = crate::auth::now_unix_secs();
+    let updated_at = match crate::auth::now_unix_secs() {
+        Ok(updated_at) => updated_at,
+        Err(error) => {
+            tracing::warn!(
+                "daemon state snapshot skipped because system time is unavailable: {error:#}"
+            );
+            return;
+        }
+    };
+    state.updated_at = updated_at;
     if let Err(error) = write_snapshot(state) {
         tracing::warn!("daemon state snapshot write failed: {error:#}");
     }

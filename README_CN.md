@@ -18,17 +18,10 @@ Codex 必须使用文件型凭据存储。在 `$CODEX_HOME/config.toml`（通常
 cli_auth_credentials_store = "file"
 ```
 
-macOS / Linux：
-
-```bash
-curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash
-```
-
-Windows PowerShell：
-
-```powershell
-irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
-```
+请使用仓库中经过代码审查的
+[已验证安装流程](docs/wiki/Getting-Started.md#install)。该流程使用当前版 [GitHub CLI](https://cli.github.com/)
+通过 `gh attestation verify` 先验证安装器 attestation，再运行本地文件；
+验证失败时不会降级为未验证安装。
 
 常用命令：
 

@@ -157,7 +157,7 @@ pub(crate) async fn warmup_cmd(alias: Option<&str>, json: bool) -> Result<()> {
     // Filter out accounts whose usage data proves an active rate-limit window.
     // A window that appears "just started" (elapsed < 5 min) likely means the previous warmup
     // ping didn't consume real quota — allow the user to retry.
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs()?;
     let mut to_warmup = Vec::new();
     for alias in &aliases {
         let already_active = cache::get(alias)?

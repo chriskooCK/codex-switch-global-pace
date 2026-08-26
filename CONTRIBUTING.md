@@ -26,8 +26,8 @@ Run the full local quality gate:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all --locked
+cargo clippy --all-targets --locked --features test-endpoints -- -D warnings
+cargo test --all --locked --features test-endpoints
 cargo audit
 bash -n scripts/install.sh
 ```

@@ -52,7 +52,8 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
         if json {
-            let summary = usage::calculate_global_weekly_summary(&[], crate::auth::now_unix_secs());
+            let summary =
+                usage::calculate_global_weekly_summary(&[], crate::auth::now_unix_secs()?);
             print_json(&output::JsonUsageResult {
                 profiles: vec![],
                 global_weekly: global_weekly_to_json(&summary),
@@ -198,7 +199,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
         ));
     }
 
-    let global_now = auth::now_unix_secs();
+    let global_now = auth::now_unix_secs()?;
     let global_inputs: Vec<usage::GlobalPaceAccountInput> = rows
         .iter()
         .map(|row| match row.usage_result.as_ref() {
@@ -211,16 +212,13 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
     let mut json_items = vec![];
 
     for row in rows {
-        let usage_result = row.usage_result.unwrap_or_else(|| {
-            Err(usage::UsageError {
-                summary: "unknown".into(),
-                detail: "usage result missing".into(),
-            })
-        });
+        let usage_result = row
+            .usage_result
+            .with_context(|| format!("usage worker returned no result for '{}'", row.name))?;
         if json {
             let ju = match &usage_result {
-                Ok(u) => usage_to_json(Ok(u)),
-                Err(e) => usage_to_json(Err(&e.detail)),
+                Ok(u) => usage_to_json(Ok(u), global_now)?,
+                Err(e) => usage_to_json(Err(&e.detail), global_now)?,
             };
             json_items.push(output::JsonProfileWithUsage {
                 alias: row.name,
@@ -267,7 +265,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
             }
             println!();
             match usage_result {
-                Ok(u) => print_usage_line(&u),
+                Ok(u) => print_usage_line(&u, global_now),
                 Err(e) => println!("  {} {}", color::error("!!"), color::error(&e.summary)),
             }
             println!(); // blank line between accounts
@@ -282,7 +280,7 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
     }
 
     // Opportunistically refresh tokens about to expire (background, bounded)
-    report_token_persist_failures(&usage::refresh_expiring_tokens().await);
+    report_token_persist_failures(&usage::refresh_expiring_tokens().await?);
 
     Ok(())
 }
@@ -402,6 +400,16 @@ fn score_profile_candidates(
             .map(|s| (s.candidate, s.usage, s.score))
             .collect();
 
+    // An incomplete snapshot cannot participate in automatic selection. Keep
+    // explicit account blockers so callers can still surface their concrete
+    // server verdict when no selectable profile remains.
+    scored.retain(|(candidate, _, _)| {
+        candidate.has_required_quota_data() || candidate.explicit_account_blocker.is_some()
+    });
+    if scored.is_empty() {
+        anyhow::bail!("no profile has complete authoritative quota data for automatic selection");
+    }
+
     scored.sort_by(|a, b| {
         let eligible_a = usage::is_candidate_eligible(&a.0, safety_7d);
         let eligible_b = usage::is_candidate_eligible(&b.0, safety_7d);
@@ -410,7 +418,7 @@ fn score_profile_candidates(
         eligible_b
             .cmp(&eligible_a)
             .then(blocked_a.cmp(&blocked_b))
-            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.2.total_cmp(&a.2))
             .then(a.0.last_used.cmp(&b.0.last_used))
             .then(a.0.alias.cmp(&b.0.alias))
     });
@@ -443,6 +451,7 @@ pub(crate) struct SelectOutcome {
     pub(crate) alias: String,
     pub(crate) usage: usage::UsageInfo,
     pub(crate) score: f64,
+    pub(crate) evaluated_at: i64,
     pub(crate) revival_hint: Option<RevivalHint>,
 }
 
@@ -549,11 +558,7 @@ fn pick_revival_target(candidates: &[RevivalCandidate]) -> Option<String> {
             a_key
                 .cmp(b_key)
                 .then_with(|| b.reset_credits.len().cmp(&a.reset_credits.len()))
-                .then_with(|| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+                .then_with(|| b.score.total_cmp(&a.score))
         })
         .map(|(c, _)| c.alias.to_string())
 }
@@ -690,7 +695,7 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
 
     let safety_7d = config::get().use_cfg.safety_margin_7d;
     let team_priority = config::get().use_cfg.team_priority;
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs()?;
     let scored = score_profile_candidates(fetched, now, safety_7d, team_priority)?;
     let (top_candidate, top_usage, top_score) = scored
         .first()
@@ -702,6 +707,7 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
             alias: top_candidate.alias,
             usage: top_usage,
             score: top_score,
+            evaluated_at: now,
             revival_hint: None,
         }));
     }
@@ -729,6 +735,7 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
             alias: top_candidate.alias,
             usage: top_usage,
             score: top_score,
+            evaluated_at: now,
             revival_hint: None,
         }));
     };
@@ -761,6 +768,7 @@ async fn plan_best_profile(json: bool, card_policy: CardPolicy) -> Result<Select
         alias: top_candidate.alias.clone(),
         usage: top_usage.clone(),
         score: top_score,
+        evaluated_at: now,
         revival_hint: hint,
     };
 
@@ -787,14 +795,14 @@ fn same_reset_credit(left: &usage::ResetCredit, right: &usage::ResetCredit) -> b
 fn candidate_from_revival_usage(
     base: &usage::Candidate,
     usage: &usage::UsageInfo,
+    account_info: &jwt::AccountInfo,
     now: i64,
     released_one_pool_member: bool,
 ) -> usage::Candidate {
     let mut candidate = usage::Candidate::from_usage(
         base.alias.clone(),
         usage,
-        base.is_team,
-        base.is_free,
+        usage::normalized_plan_kind(usage, account_info),
         base.last_used,
         now,
     );
@@ -838,10 +846,17 @@ async fn execute_revival(
     .await
     .map_err(|error| anyhow::anyhow!(error.detail))
     .context("reset-card preflight failed; no card was requested and no profile was switched")?;
+    let preflight_info = auth::read_account_info_checked(&target_path).with_context(|| {
+        format!(
+            "reading current profile metadata for reset-card preflight: {target_alias}; no card was requested and no profile was switched"
+        )
+    })?;
+    let preflight_now = auth::now_unix_secs()?;
     let preflight_candidate = candidate_from_revival_usage(
         &target_candidate,
         &preflight_usage,
-        auth::now_unix_secs(),
+        &preflight_info,
+        preflight_now,
         false,
     );
     let preflight_score = usage::score_unified(&preflight_candidate, safety_7d);
@@ -850,12 +865,18 @@ async fn execute_revival(
             "'{target_alias}' became blocked by an account/workspace restriction ({blocker}); no reset card was requested and no profile was switched"
         );
     }
+    if !preflight_candidate.has_required_quota_data() {
+        anyhow::bail!(
+            "'{target_alias}' returned incomplete authoritative quota data during reset-card preflight; no reset card was requested and no profile was switched"
+        );
+    }
     if usage::is_candidate_eligible(&preflight_candidate, safety_7d) {
         return Ok(RevivalExecution {
             outcome: SelectOutcome {
                 alias: target_alias,
                 usage: preflight_usage,
                 score: preflight_score,
+                evaluated_at: preflight_now,
                 revival_hint: None,
             },
             side_effect: RevivalSideEffect::None,
@@ -903,30 +924,49 @@ async fn execute_revival(
             .await
             {
                 Ok(revived_usage) => {
-                    let revived_candidate = candidate_from_revival_usage(
-                        &target_candidate,
-                        &revived_usage,
-                        auth::now_unix_secs(),
-                        true,
-                    );
-                    let score = usage::score_unified(&revived_candidate, safety_7d);
-                    if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
-                        return Ok(RevivalExecution {
-                            outcome: SelectOutcome {
-                                alias: target_alias.clone(),
-                                usage: revived_usage,
-                                score,
-                                revival_hint: None,
-                            },
-                            side_effect: RevivalSideEffect::Consumed {
-                                alias: target_alias,
-                            },
+                    let current_metadata = auth::read_account_info_checked(&target_path)
+                        .context("reading current profile metadata after reset-card redemption")
+                        .and_then(|info| {
+                            let now = auth::now_unix_secs()
+                                .context("reading evaluation time after reset-card redemption")?;
+                            Ok((info, now))
                         });
+                    match current_metadata {
+                        Ok((revived_info, revived_now)) => {
+                            let revived_candidate = candidate_from_revival_usage(
+                                &target_candidate,
+                                &revived_usage,
+                                &revived_info,
+                                revived_now,
+                                true,
+                            );
+                            let score = usage::score_unified(&revived_candidate, safety_7d);
+                            if usage::is_candidate_eligible(&revived_candidate, safety_7d) {
+                                return Ok(RevivalExecution {
+                                    outcome: SelectOutcome {
+                                        alias: target_alias.clone(),
+                                        usage: revived_usage,
+                                        score,
+                                        evaluated_at: revived_now,
+                                        revival_hint: None,
+                                    },
+                                    side_effect: RevivalSideEffect::Consumed {
+                                        alias: target_alias,
+                                    },
+                                });
+                            }
+                            tracing::warn!(
+                                "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
+                            );
+                            "quota remained exhausted after refresh"
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                "[{target_alias}] could not revalidate current profile metadata after consuming a reset card: {error:#}"
+                            );
+                            "current profile metadata could not be revalidated"
+                        }
                     }
-                    tracing::warn!(
-                        "[{target_alias}] still exhausted after consuming a reset card; not consuming a second card"
-                    );
-                    "quota remained exhausted after refresh"
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1001,6 +1041,7 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
         alias: best_alias,
         usage: best_usage,
         score: best_score,
+        evaluated_at,
         revival_hint,
     } = outcome;
 
@@ -1021,21 +1062,21 @@ async fn best_cmd(json: bool, consume_card: bool) -> Result<()> {
         print_json(&output::JsonBest {
             switched_to: best_alias.clone(),
             account: account_to_json(&info, best_usage.plan_type.as_deref()),
-            usage: usage_to_json(Ok(&best_usage)),
+            usage: usage_to_json(Ok(&best_usage), evaluated_at)?,
             score: best_score,
             mode: "unified".to_string(),
             hint: revival_hint.as_ref().map(revival_hint_message),
         })?;
     } else {
         println!("{}", color::success(&format!("Switched to: {best_alias}")));
-        print_usage_line(&best_usage);
+        print_usage_line(&best_usage, evaluated_at);
         if let Some(hint) = &revival_hint {
             println!("  {}", color::dim(&revival_hint_message(hint)));
         }
     }
 
     // Opportunistically refresh tokens about to expire (background, bounded)
-    report_token_persist_failures(&usage::refresh_expiring_tokens().await);
+    report_token_persist_failures(&usage::refresh_expiring_tokens().await?);
 
     Ok(())
 }
@@ -1122,6 +1163,35 @@ mod revival_target_tests {
         let error = format!("{error:#}");
         assert!(error.contains("reading profile metadata for automatic ranking"));
         assert!(error.contains("parsing"));
+    }
+
+    #[test]
+    fn automatic_ranking_rejects_paid_snapshot_without_weekly_quota() {
+        let _lock = lock_profile_test_environment();
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_dir = home.path().join("profiles/alice");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::write(profile_dir.join("auth.json"), "{}").unwrap();
+        std::fs::write(home.path().join("cache.json"), r#"{"entries": {}}"#).unwrap();
+        let usage = usage::UsageInfo {
+            primary: Some(usage::WindowUsage {
+                used_percent: Some(10.0),
+                resets_at: Some(1_003_600),
+                window_minutes: Some(300),
+            }),
+            plan_type: Some("plus".to_string()),
+            ..usage::UsageInfo::default()
+        };
+
+        let error =
+            score_profile_candidates(vec![("alice".to_string(), usage)], 1_000_000, 20.0, false)
+                .expect_err("paid automatic selection must require the weekly window");
+
+        assert!(
+            format!("{error:#}").contains("complete authoritative quota data"),
+            "{error:#}"
+        );
     }
 
     fn credit(id: &str, expires_at: Option<&str>) -> usage::ResetCredit {
@@ -1301,17 +1371,77 @@ mod revival_target_tests {
             account_limited: true,
             ..usage::UsageInfo::default()
         };
-        let base =
-            usage::Candidate::from_usage("boundary".to_string(), &usage, false, false, 0, 1_000);
+        let base = usage::Candidate::from_usage(
+            "boundary".to_string(),
+            &usage,
+            crate::jwt::PlanKind::Plus,
+            0,
+            1_000,
+        );
         assert!(!usage::is_candidate_eligible(&base, 20.0));
 
-        let rechecked = candidate_from_revival_usage(&base, &usage, 1_002, true);
+        let current_info = jwt::AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..jwt::AccountInfo::default()
+        };
+        let rechecked = candidate_from_revival_usage(&base, &usage, &current_info, 1_002, true);
 
         assert_eq!(rechecked.now, 1_002);
         assert!(
             usage::is_candidate_eligible(&rechecked, 20.0),
             "a reset crossed while the request was in flight must be evaluated at response time"
         );
+    }
+
+    #[test]
+    fn revival_recheck_renormalizes_the_plan_from_fresh_evidence() {
+        let now = 1_000_000;
+        let weekly_only = usage::UsageInfo {
+            secondary: Some(usage::WindowUsage {
+                used_percent: Some(10.0),
+                resets_at: Some(now + usage::WINDOW_7D_SECS),
+                window_minutes: Some(usage::WINDOW_7D_SECS / 60),
+            }),
+            ..usage::UsageInfo::default()
+        };
+        let base = usage::Candidate::from_usage(
+            "plan-change".to_string(),
+            &weekly_only,
+            jwt::PlanKind::Free,
+            0,
+            now,
+        );
+        let stale_free_jwt = jwt::AccountInfo {
+            plan_type: Some("free".to_string()),
+            ..jwt::AccountInfo::default()
+        };
+        let fresh_plus_usage = usage::UsageInfo {
+            plan_type: Some("plus".to_string()),
+            ..weekly_only.clone()
+        };
+
+        let upgraded =
+            candidate_from_revival_usage(&base, &fresh_plus_usage, &stale_free_jwt, now, false);
+        assert_eq!(upgraded.plan_kind, jwt::PlanKind::Plus);
+        assert!(!upgraded.has_required_quota_data());
+
+        let current_plus_jwt = jwt::AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..jwt::AccountInfo::default()
+        };
+        let fresh_free_usage = usage::UsageInfo {
+            plan_type: Some("free".to_string()),
+            ..weekly_only.clone()
+        };
+        let downgraded =
+            candidate_from_revival_usage(&base, &fresh_free_usage, &current_plus_jwt, now, false);
+        assert_eq!(downgraded.plan_kind, jwt::PlanKind::Free);
+        assert!(downgraded.has_required_quota_data());
+
+        let jwt_only =
+            candidate_from_revival_usage(&base, &weekly_only, &current_plus_jwt, now, false);
+        assert_eq!(jwt_only.plan_kind, jwt::PlanKind::Plus);
+        assert!(!jwt_only.has_required_quota_data());
     }
 
     #[test]

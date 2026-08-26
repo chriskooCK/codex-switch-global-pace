@@ -756,7 +756,8 @@ try {
     if ($cargo -notmatch '(?ms)\A\[package\].*?^name\s*=\s*"codex-switch-global-pace"\s*$.*?^version\s*=\s*"([^"]+)"\s*$' -or $Matches[1] -ne $baseVersion) {
         throw 'Cargo.toml package version does not match VERSION at dev.'
     }
-    $expectedBody = "Development build from ``refs/tags/dev`` at $sha.`n`nUse ``codex-switch-global-pace self-update --dev`` to install, or ``codex-switch-global-pace self-update --stable`` to return to stable.`n`nmacOS / Linux: ``curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh | bash -s -- --dev```n`nWindows PowerShell: ```$env:CS_DEV=`"1`"; irm https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.ps1 | iex```n`nVersion: ``$version```n"
+    $installGuide = "https://github.com/$Repo/blob/$sha/docs/wiki/Getting-Started.md#install"
+    $expectedBody = "Development build from ``refs/tags/dev`` at $sha.`n`nUse ``codex-switch-global-pace self-update --dev`` to install, or ``codex-switch-global-pace self-update --stable`` to return to stable.`n`nStart with the [source-controlled verified install guide]($installGuide). It verifies the installer before execution with no fallback.`n`nThe attached ``INSTALL.md`` is release-exact and attested in the same provenance bundle. The packaged Windows installer selects dev automatically.`n`nVersion: ``$version```n"
     if (-not (Same ([IO.File]::ReadAllText((Join-Path $bundle 'release_body.md'))) $expectedBody)) { throw 'release_body.md is not exact.' }
     foreach ($spec in @(
         @('scripts/install.sh', 'install.sh', 'PACKAGED_RELEASE_VERSION=""', "PACKAGED_RELEASE_VERSION=`"$version`""),
@@ -768,6 +769,8 @@ try {
     foreach ($a in $Archives) {
         $text = [IO.File]::ReadAllText((Join-Path $bundle "$a.sha256")); $m = [regex]::Match($text, '\A([0-9A-Fa-f]{64})[ \t]+\*?([^\r\n \t]+)\r?\n?\z')
         if (-not $m.Success -or $m.Groups[2].Value -ne $a -or -not (SameSha $m.Groups[1].Value (Hash (Join-Path $bundle $a)))) { throw "Invalid checksum for $a." }
+    }
+    foreach ($a in @($Archives + @('INSTALL.md', 'install.sh', 'install.ps1'))) {
         $verify = RunGh @('attestation', 'verify', (Join-Path $bundle $a), '--repo', $Repo,
             '--bundle', (Join-Path $bundle 'codex-switch-global-pace-build-provenance.json'),
             '--signer-workflow', "$Repo/.github/workflows/release.yml", '--source-digest', $sha,

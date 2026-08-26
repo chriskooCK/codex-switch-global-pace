@@ -135,6 +135,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
             Ok(imported) => imported,
             Err(failure) => anyhow::bail!("{}: {}", failure.stage, failure.error),
         };
+        let now = auth::now_unix_secs()?;
         if json {
             print_json(&output::JsonOk {
                 ok: true,
@@ -152,7 +153,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
                 ))
             );
             print!("  ");
-            print_usage_line(&imported.usage);
+            print_usage_line(&imported.usage, now);
         }
         return Ok(());
     }
@@ -183,6 +184,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
         .skipped
         .iter()
         .any(|item| item.stage == STAGE_TOKEN_ROTATION_LOST);
+    let now = auth::now_unix_secs()?;
     if json {
         print_json(&output::JsonImportReport {
             ok: !all_skipped,
@@ -190,14 +192,16 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
             imported: report
                 .imported
                 .iter()
-                .map(|item| output::JsonImportEntry {
-                    source: item.source.display().to_string(),
-                    alias: item.alias.clone(),
-                    action: item.action.to_string(),
-                    account: account_to_json(&item.account, item.usage.plan_type.as_deref()),
-                    usage: usage_to_json(Ok(&item.usage)),
+                .map(|item| {
+                    Ok(output::JsonImportEntry {
+                        source: item.source.display().to_string(),
+                        alias: item.alias.clone(),
+                        action: item.action.to_string(),
+                        account: account_to_json(&item.account, item.usage.plan_type.as_deref()),
+                        usage: usage_to_json(Ok(&item.usage), now)?,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             skipped: report
                 .skipped
                 .iter()
@@ -230,7 +234,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
                 item.action
             );
             print!("    ");
-            print_usage_line(&item.usage);
+            print_usage_line(&item.usage, now);
         }
 
         for item in &report.skipped {

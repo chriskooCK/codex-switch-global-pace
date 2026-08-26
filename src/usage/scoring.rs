@@ -1,9 +1,18 @@
-use crate::auth;
+use crate::jwt::{AccountInfo, PlanKind};
 
 use super::{
     Candidate, FREE_FLOOR_PCT, MIN_WARMUP_ELAPSED_SECS, ScoredCandidate, UsageInfo, WINDOW_5H_SECS,
-    WINDOW_7D_SECS, WindowUsage,
+    WINDOW_7D_SECS, WindowUsage, plan_has_required_quota_data, quota_window_duration_secs,
+    validated_quota_window,
 };
+
+fn seconds_until(timestamp: i64, now: i64) -> Option<i64> {
+    if timestamp <= now {
+        Some(0)
+    } else {
+        timestamp.checked_sub(now)
+    }
+}
 
 /// Returns true only when usage data proves a warmup-opened window is active.
 pub fn warmup_window_active(w: &WindowUsage, window_secs: i64, now: i64) -> bool {
@@ -11,10 +20,19 @@ pub fn warmup_window_active(w: &WindowUsage, window_secs: i64, now: i64) -> bool
         Some(t) if t > now => t,
         _ => return false,
     };
-    if w.used_percent.unwrap_or(0.0) <= 0.0 {
+    if !w
+        .used_percent
+        .is_some_and(|used| used.is_finite() && used > 0.0 && used <= 100.0)
+    {
         return false;
     }
-    let elapsed = window_secs - (resets_at - now);
+    let Some(remaining) = resets_at.checked_sub(now) else {
+        return false;
+    };
+    if window_secs <= 0 || remaining > window_secs {
+        return false;
+    }
+    let elapsed = window_secs - remaining;
     elapsed >= MIN_WARMUP_ELAPSED_SECS
 }
 
@@ -26,11 +44,15 @@ pub fn warmup_window_active(w: &WindowUsage, window_secs: i64, now: i64) -> bool
 /// is the only signal available.
 pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
     let main_active = match u.primary.as_ref() {
-        Some(w) => warmup_window_active(w, WINDOW_5H_SECS, now),
+        Some(w) => quota_window_duration_secs(w, WINDOW_5H_SECS)
+            .is_some_and(|duration| warmup_window_active(w, duration, now)),
         None => u
             .secondary
             .as_ref()
-            .is_some_and(|w| warmup_window_active(w, WINDOW_7D_SECS, now)),
+            .and_then(|w| {
+                quota_window_duration_secs(w, WINDOW_7D_SECS).map(|duration| (w, duration))
+            })
+            .is_some_and(|(w, duration)| warmup_window_active(w, duration, now)),
     };
     let additional_active = u
         .additional_limits
@@ -46,11 +68,15 @@ pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
                 return true;
             }
             match limit.primary.as_ref() {
-                Some(w) => warmup_window_active(w, WINDOW_5H_SECS, now),
+                Some(w) => quota_window_duration_secs(w, WINDOW_5H_SECS)
+                    .is_some_and(|duration| warmup_window_active(w, duration, now)),
                 None => limit
                     .secondary
                     .as_ref()
-                    .is_some_and(|w| warmup_window_active(w, WINDOW_7D_SECS, now)),
+                    .and_then(|w| {
+                        quota_window_duration_secs(w, WINDOW_7D_SECS).map(|duration| (w, duration))
+                    })
+                    .is_some_and(|(w, duration)| warmup_window_active(w, duration, now)),
             }
         });
     main_active && additional_active
@@ -58,12 +84,11 @@ pub fn usage_has_active_warmup_window(u: &UsageInfo, now: i64) -> bool {
 
 /// Calculate pace: the expected used percentage if consumption were even across the window.
 /// Invalid or stale windows cannot produce a meaningful comparison.
-pub fn pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
+pub fn pace_percent_at(w: &WindowUsage, window_secs: i64, now: i64) -> Option<f64> {
     if window_secs <= 0 {
         return None;
     }
     let resets_at = w.resets_at?;
-    let now = auth::now_unix_secs();
     let remaining_secs = resets_at.checked_sub(now)?;
     if remaining_secs <= 0 || remaining_secs > window_secs {
         return None;
@@ -115,43 +140,79 @@ pub(crate) fn visible_pace_marker(
     pace_percent.filter(|pace| pace.is_finite() && (0.0..=100.0).contains(pace))
 }
 
-/// Public compatibility wrapper for library consumers that need a window marker.
+/// Public helper for library consumers that need a window marker at one
+/// caller-supplied observation time.
 #[allow(dead_code)]
-pub fn visible_pace_percent(w: &WindowUsage, window_secs: i64) -> Option<f64> {
-    visible_pace_marker(w.used_percent, pace_percent(w, window_secs))
+pub fn visible_pace_percent_at(w: &WindowUsage, window_secs: i64, now: i64) -> Option<f64> {
+    visible_pace_marker(w.used_percent, pace_percent_at(w, window_secs, now))
 }
 
-/// Whether an account is currently usable (both windows have remaining quota).
-pub fn is_available(u: &UsageInfo) -> bool {
-    if super::explicit_account_blocker(u).is_some()
-        || u.account_limited
-        || (u.primary.is_none() && u.secondary.is_none())
-    {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageAvailability {
+    Available,
+    Limited,
+    Unavailable,
+}
+
+/// Classify one loaded usage sample using the same plan-specific quota shape
+/// required by automatic selection. API plan evidence remains authoritative
+/// over the JWT; unknown plans and incomplete required windows fail closed.
+pub(crate) fn usage_availability(u: &UsageInfo, info: &AccountInfo) -> UsageAvailability {
+    if !u.parse_issues.is_empty() {
+        return UsageAvailability::Unavailable;
     }
-    if let Some(w) = &u.secondary
-        && w.used_percent.unwrap_or(0.0) >= 100.0
-    {
-        return false;
+    if super::explicit_account_blocker(u).is_some() {
+        return UsageAvailability::Limited;
     }
-    if let Some(w) = &u.primary
-        && w.used_percent.unwrap_or(0.0) >= 100.0
-    {
-        return false;
+
+    let primary = u
+        .primary
+        .as_ref()
+        .and_then(|window| validated_quota_window(window, WINDOW_5H_SECS))
+        .map(|(used, _)| used);
+    let weekly = u
+        .secondary
+        .as_ref()
+        .and_then(|window| validated_quota_window(window, WINDOW_7D_SECS))
+        .map(|(used, _)| used);
+    if !plan_has_required_quota_data(
+        normalized_plan_kind(u, info),
+        primary.is_some(),
+        weekly.is_some(),
+    ) {
+        return UsageAvailability::Unavailable;
     }
-    true
+    if u.account_limited {
+        return UsageAvailability::Limited;
+    }
+    if [primary, weekly]
+        .into_iter()
+        .flatten()
+        .any(|used| used >= 100.0)
+    {
+        UsageAvailability::Limited
+    } else {
+        UsageAvailability::Available
+    }
+}
+
+/// Whether an account's loaded quota sample proves it currently usable.
+pub fn is_available(u: &UsageInfo, info: &AccountInfo) -> bool {
+    usage_availability(u, info) == UsageAvailability::Available
 }
 
 /// Eligibility check on a Candidate (reset-aware).
 pub fn is_candidate_eligible(c: &Candidate, safety_margin_7d: f64) -> bool {
-    if c.account_limit_active() || (!c.has_5h_data && !c.has_7d_data) {
+    if c.account_limit_active() || !c.has_required_quota_data() {
         return false;
     }
     let used_5h = c.effective_used_5h();
-    let used_7d = c.effective_used_7d();
+    let Some(used_7d) = c.effective_used_7d() else {
+        return false;
+    };
 
     // Gate 1: 5h exhausted (and not past reset)
-    if used_5h >= 100.0 {
+    if used_5h.is_some_and(|used| used >= 100.0) {
         return false;
     }
     // Gate 2: 7d exhausted (and not past reset)
@@ -159,21 +220,24 @@ pub fn is_candidate_eligible(c: &Candidate, safety_margin_7d: f64) -> bool {
         return false;
     }
     // Gate 3: 7d critically low and reset far away
-    if c.has_7d_data {
+    if let Some(weekly) = &c.weekly {
         let remaining_7d = 100.0 - used_7d;
         let critical_pct = (safety_margin_7d * 0.25_f64).max(1.0);
         if remaining_7d < critical_pct {
-            let hours_to_reset = c
-                .resets_at_7d
-                .map(|ts| ((ts - c.now) as f64 / 3600.0).max(0.0))
-                .unwrap_or(f64::MAX);
-            if hours_to_reset > 48.0 {
+            let reset_is_far = match weekly.resets_at {
+                Some(timestamp) => seconds_until(timestamp, c.now)
+                    .is_none_or(|seconds| seconds as f64 / 3600.0 > 48.0),
+                None => true,
+            };
+            if reset_is_far {
                 return false;
             }
         }
     }
     // Gate 4: Free plan safety floor
-    if c.is_free && c.has_5h_data {
+    if c.is_free()
+        && let Some(used_5h) = used_5h
+    {
         let remaining_5h = 100.0 - used_5h;
         if remaining_5h < FREE_FLOOR_PCT {
             return false;
@@ -201,7 +265,7 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     let used_7d = c.effective_used_7d();
 
     // ── Component A: tier_bonus (0 or 500) ──
-    let tier_bonus = if c.is_team && c.team_priority {
+    let tier_bonus = if c.is_team() && c.team_priority {
         500.0
     } else {
         0.0
@@ -210,41 +274,51 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     // ── Component B: headroom (0..1100) ──
     // Pace-aware: uses burn rate to project effective remaining time,
     // not just static remaining%.
-    let headroom = if !c.has_5h_data {
-        50.0
-    } else if used_5h >= 100.0 {
-        // Exhausted: score by time-to-reset (closer = higher, range 0..500).
-        // The 500 ceiling (vs 1000+ for active accounts) is intentional:
-        // is_candidate_eligible() marks exhausted accounts as ineligible,
-        // and the caller sorts eligible-first. This branch only ranks among
-        // ineligible fallback candidates when no eligible account exists.
-        match c.resets_at_5h {
-            None => 0.0,
-            Some(reset_ts) => {
-                let remaining_secs = (reset_ts - c.now).max(0) as f64;
-                (500.0 - remaining_secs / 60.0).max(0.0)
+    let headroom = match (c.primary.as_ref(), used_5h) {
+        (None, _) | (Some(_), None) => 50.0,
+        (Some(primary), Some(used_5h)) if used_5h >= 100.0 => {
+            // Exhausted: score by time-to-reset (closer = higher, range 0..500).
+            // The 500 ceiling (vs 1000+ for active accounts) is intentional:
+            // is_candidate_eligible() marks exhausted accounts as ineligible,
+            // and the caller sorts eligible-first. This branch only ranks among
+            // ineligible fallback candidates when no eligible account exists.
+            match primary.resets_at {
+                None => 0.0,
+                Some(reset_ts) => match seconds_until(reset_ts, c.now) {
+                    None => 0.0,
+                    Some(remaining_secs) => {
+                        let remaining_secs = remaining_secs as f64;
+                        (500.0 - remaining_secs / 60.0).max(0.0)
+                    }
+                },
             }
         }
-    } else {
-        // Pace-aware headroom: project remaining minutes using burn rate
-        let remaining_pct = 100.0 - used_5h;
-        match c.resets_at_5h {
-            Some(reset_ts) => {
-                let remaining_secs = (reset_ts - c.now).max(0) as f64;
-                let elapsed_secs = (WINDOW_5H_SECS as f64 - remaining_secs).max(1.0);
-                let burn_rate = used_5h / elapsed_secs; // %/sec
+        (Some(primary), Some(used_5h)) => {
+            // Pace-aware headroom: project remaining minutes using burn rate
+            let remaining_pct = 100.0 - used_5h;
+            match primary.resets_at {
+                Some(reset_ts) => match seconds_until(reset_ts, c.now) {
+                    None => 0.0,
+                    Some(remaining_secs) => {
+                        let remaining_secs = remaining_secs as f64;
+                        let duration_secs = primary.duration_secs as f64;
+                        let elapsed_secs = (duration_secs - remaining_secs).max(1.0);
+                        let burn_rate = used_5h / elapsed_secs; // %/sec
 
-                if burn_rate > 0.001 {
-                    // Project minutes until exhaustion at current rate
-                    let projected_min = (remaining_pct / burn_rate) / 60.0;
-                    // Cap at 300 min (5h), normalize to 0..100, add base 1000
-                    1000.0 + (projected_min.min(300.0) / 300.0 * 100.0)
-                } else {
-                    // Near-zero burn rate → effectively full capacity
-                    1000.0 + remaining_pct
-                }
+                        if burn_rate > 0.001 {
+                            // Project minutes until exhaustion at current rate
+                            let projected_min = (remaining_pct / burn_rate) / 60.0;
+                            let duration_min = duration_secs / 60.0;
+                            // Normalize the projected reserve to this window's actual duration.
+                            1000.0 + (projected_min.min(duration_min) / duration_min * 100.0)
+                        } else {
+                            // Near-zero burn rate → effectively full capacity
+                            1000.0 + remaining_pct
+                        }
+                    }
+                },
+                None => 1000.0 + remaining_pct,
             }
-            None => 1000.0 + remaining_pct,
         }
     };
 
@@ -253,59 +327,78 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     const RELIEF_WINDOW_HOURS: f64 = 48.0;
     const MAX_RELIEF: f64 = 0.8;
 
-    let sustain = if !c.has_7d_data {
-        -50.0
-    } else if used_7d >= 100.0 {
-        // 7d exhausted: heavy penalty, relieved as reset approaches
-        match c.resets_at_7d {
-            None => -800.0, // no reset info: maximum penalty
-            Some(reset_ts) => {
-                let remaining_min = ((reset_ts - c.now).max(0) as f64) / 60.0;
-                let relief = (1.0 - remaining_min / 10080.0).clamp(0.0, 1.0);
-                -800.0 * (1.0 - relief)
+    let sustain = match (c.weekly.as_ref(), used_7d) {
+        (None, _) | (Some(_), None) => -50.0,
+        (Some(weekly), Some(used_7d)) if used_7d >= 100.0 => {
+            // 7d exhausted: heavy penalty, relieved as reset approaches
+            match weekly.resets_at {
+                None => -800.0, // no reset info: maximum penalty
+                Some(reset_ts) => match seconds_until(reset_ts, c.now) {
+                    None => -800.0,
+                    Some(remaining_secs) => {
+                        let remaining_fraction =
+                            remaining_secs as f64 / weekly.duration_secs as f64;
+                        let relief = (1.0 - remaining_fraction).clamp(0.0, 1.0);
+                        -800.0 * (1.0 - relief)
+                    }
+                },
             }
         }
-    } else {
-        let remaining_7d = 100.0 - used_7d;
-        if remaining_7d >= safety_margin_7d {
-            0.0
-        } else {
-            // Compute budget per remaining 5h window
-            let budget_penalty = if let Some(reset_ts_7d) = c.resets_at_7d {
-                let hours_to_7d_reset = ((reset_ts_7d - c.now) as f64 / 3600.0).max(0.0);
-                let remaining_windows = (hours_to_7d_reset / 5.0).max(1.0);
-                let budget_per_window = remaining_7d / remaining_windows;
-                // If each window gets ≥ safety_margin worth of budget, it's fine
-                if budget_per_window >= safety_margin_7d {
-                    0.0
-                } else {
-                    // Shortfall: 0..1, higher = more pressure
-                    ((safety_margin_7d - budget_per_window) / safety_margin_7d).clamp(0.0, 1.0)
-                }
+        (Some(weekly), Some(used_7d)) => {
+            let remaining_7d = 100.0 - used_7d;
+            if remaining_7d >= safety_margin_7d {
+                0.0
             } else {
-                // No reset time: use simple pressure
-                if safety_margin_7d > 0.0 {
-                    ((safety_margin_7d - remaining_7d) / safety_margin_7d).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                }
-            };
-
-            // Time relief: if 7d resets within 48h, reduce penalty
-            let time_relief = c
-                .resets_at_7d
-                .map(|ts| {
-                    let hours = ((ts - c.now) as f64 / 3600.0).max(0.0);
-                    if hours < RELIEF_WINDOW_HOURS {
-                        (1.0 - hours / RELIEF_WINDOW_HOURS).clamp(0.0, 1.0)
-                    } else {
-                        0.0
+                // Compute budget per remaining 5h window
+                let budget_penalty = if let (Some(reset_ts_7d), Some(primary)) =
+                    (weekly.resets_at, c.primary.as_ref())
+                {
+                    let hours_to_7d_reset =
+                        seconds_until(reset_ts_7d, c.now).map(|seconds| seconds as f64 / 3600.0);
+                    let primary_hours = primary.duration_secs as f64 / 3600.0;
+                    match hours_to_7d_reset {
+                        Some(hours_to_7d_reset) => {
+                            let remaining_windows = (hours_to_7d_reset / primary_hours).max(1.0);
+                            let budget_per_window = remaining_7d / remaining_windows;
+                            // If each window gets ≥ safety_margin worth of budget, it's fine
+                            if budget_per_window >= safety_margin_7d {
+                                0.0
+                            } else {
+                                // Shortfall: 0..1, higher = more pressure
+                                ((safety_margin_7d - budget_per_window) / safety_margin_7d)
+                                    .clamp(0.0, 1.0)
+                            }
+                        }
+                        None => 1.0,
                     }
-                })
-                .unwrap_or(0.0);
+                } else {
+                    // No reset time: use simple pressure
+                    if safety_margin_7d > 0.0 {
+                        ((safety_margin_7d - remaining_7d) / safety_margin_7d).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    }
+                };
 
-            let effective = budget_penalty * (1.0 - time_relief * MAX_RELIEF);
-            -800.0 * effective
+                // Time relief: if 7d resets within 48h, reduce penalty
+                let time_relief = match weekly.resets_at {
+                    Some(ts) => match seconds_until(ts, c.now) {
+                        Some(seconds) => {
+                            let hours = seconds as f64 / 3600.0;
+                            if hours < RELIEF_WINDOW_HOURS {
+                                (1.0 - hours / RELIEF_WINDOW_HOURS).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        }
+                        None => 0.0,
+                    },
+                    None => 0.0,
+                };
+
+                let effective = budget_penalty * (1.0 - time_relief * MAX_RELIEF);
+                -800.0 * effective
+            }
         }
     };
 
@@ -314,17 +407,26 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     // Pool-adaptive: larger pools with more available accounts → more aggressive drain.
     const DRAIN_WINDOW_MIN: f64 = 60.0;
 
-    let raw_drain = if c.has_5h_data && used_5h < 100.0 {
-        if let Some(reset_ts) = c.resets_at_5h {
-            let remaining_min = ((reset_ts - c.now).max(0) as f64) / 60.0;
-            if remaining_min <= DRAIN_WINDOW_MIN {
-                let remaining_pct = 100.0 - used_5h;
-                let urgency =
-                    ((DRAIN_WINDOW_MIN - remaining_min) / DRAIN_WINDOW_MIN).clamp(0.0, 1.0);
-                // waste = remaining quota × urgency, scaled to 0..300
-                (remaining_pct * urgency * 3.0).min(300.0)
-            } else {
-                0.0
+    let raw_drain = if let (Some(primary), Some(used_5h)) = (c.primary.as_ref(), used_5h)
+        && used_5h < 100.0
+    {
+        if let Some(reset_ts) = primary.resets_at
+            && reset_ts > c.now
+        {
+            match seconds_until(reset_ts, c.now) {
+                Some(remaining_secs) => {
+                    let remaining_min = remaining_secs as f64 / 60.0;
+                    if remaining_min <= DRAIN_WINDOW_MIN {
+                        let remaining_pct = 100.0 - used_5h;
+                        let urgency =
+                            ((DRAIN_WINDOW_MIN - remaining_min) / DRAIN_WINDOW_MIN).clamp(0.0, 1.0);
+                        // waste = remaining quota × urgency, scaled to 0..300
+                        (remaining_pct * urgency * 3.0).min(300.0)
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
             }
         } else {
             0.0
@@ -354,7 +456,11 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
     let recency = if c.last_used == 0 {
         0.0
     } else {
-        let seconds_ago = (c.now - c.last_used).max(0) as f64;
+        let seconds_ago = match c.now.checked_sub(c.last_used) {
+            Some(seconds) => seconds.max(0) as f64,
+            None if c.last_used < c.now => f64::INFINITY,
+            None => 0.0,
+        };
         -(60.0 - (seconds_ago / 30.0)).clamp(0.0, 60.0)
     };
 
@@ -366,9 +472,28 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
 // CLI `use` and the daemon score the same way through these helpers; only
 // the final ranking/selection policy differs per caller.
 
+/// Normalize every plan signal into one exclusive tier. A present API plan is
+/// authoritative, then a JWT plan, while organization/workspace evidence is
+/// consulted only when neither source names a plan. A truly signal-free
+/// account retains the historical Free classification without also becoming
+/// Team.
+pub(crate) fn normalized_plan_kind(usage: &UsageInfo, info: &crate::jwt::AccountInfo) -> PlanKind {
+    if let Some(api_plan) = usage.plan_type.as_deref() {
+        return PlanKind::from_wire(Some(api_plan));
+    }
+    if let Some(jwt_plan) = info.plan_type.as_deref() {
+        return PlanKind::from_wire(Some(jwt_plan));
+    }
+    if info.is_team() {
+        PlanKind::Team
+    } else {
+        PlanKind::Free
+    }
+}
+
 /// Build and score candidates uniformly: the API `plan_type` is
 /// authoritative over the JWT (handles plan downgrades), and
-/// `pool_exhausted` counts 5h-exhausted accounts across the whole input.
+/// `pool_exhausted` counts every account unavailable to automatic selection.
 /// Input order is preserved.
 pub fn score_candidates(
     fetched: Vec<(String, UsageInfo, crate::jwt::AccountInfo, i64)>,
@@ -381,14 +506,8 @@ pub fn score_candidates(
     let mut candidates: Vec<(Candidate, UsageInfo)> = fetched
         .into_iter()
         .map(|(alias, u, info, last_used)| {
-            let api_plan = u.plan_type.as_deref();
-            let is_team = api_plan
-                .map(|p| p == "team")
-                .unwrap_or_else(|| info.is_team());
-            let is_free = api_plan
-                .map(|p| p == "free")
-                .unwrap_or_else(|| info.is_free());
-            let mut candidate = Candidate::from_usage(alias, &u, is_team, is_free, last_used, now);
+            let plan_kind = normalized_plan_kind(&u, &info);
+            let mut candidate = Candidate::from_usage(alias, &u, plan_kind, last_used, now);
             candidate.pool_size = pool_size;
             candidate.team_priority = team_priority;
             (candidate, u)
@@ -397,9 +516,7 @@ pub fn score_candidates(
 
     let pool_exhausted = candidates
         .iter()
-        .filter(|(candidate, _)| {
-            candidate.account_limit_active() || candidate.effective_used_5h() >= 100.0
-        })
+        .filter(|(candidate, _)| !is_candidate_eligible(candidate, safety_7d))
         .count();
     for (candidate, _) in &mut candidates {
         candidate.pool_exhausted = pool_exhausted;
@@ -429,13 +546,15 @@ pub fn pick_switch_target<'a>(
     safety_7d: f64,
 ) -> Option<(&'a str, f64)> {
     let current_eligible = is_candidate_eligible(&current.candidate, safety_7d);
-    let current_blocked = current.candidate.explicit_account_blocker.is_some();
+    let current_unselectable = current.candidate.explicit_account_blocker.is_some()
+        || !current.candidate.has_required_quota_data();
     let mut best_eligible: Option<(&'a str, f64)> = None;
     let mut best_ineligible: Option<(&'a str, f64)> = None;
     let mut any_eligible = false;
 
     for s in others {
-        if s.candidate.explicit_account_blocker.is_some() {
+        if s.candidate.explicit_account_blocker.is_some() || !s.candidate.has_required_quota_data()
+        {
             continue;
         }
         let eligible = is_candidate_eligible(&s.candidate, safety_7d);
@@ -446,7 +565,7 @@ pub fn pick_switch_target<'a>(
             {
                 best_eligible = Some((s.candidate.alias.as_str(), s.score));
             }
-        } else if (current_blocked || s.score > current.score)
+        } else if (current_unselectable || s.score > current.score)
             && best_ineligible.is_none_or(|(_, bs)| s.score > bs)
         {
             best_ineligible = Some((s.candidate.alias.as_str(), s.score));
@@ -494,12 +613,14 @@ mod tests {
 
     #[test]
     fn test_default_usage_is_not_available() {
-        assert!(!is_available(&UsageInfo::default()));
+        assert!(!is_available(
+            &UsageInfo::default(),
+            &AccountInfo::default()
+        ));
         let candidate = Candidate::from_usage(
             "empty".to_string(),
             &UsageInfo::default(),
-            false,
-            false,
+            PlanKind::Unknown,
             0,
             1,
         );
@@ -513,7 +634,102 @@ mod tests {
             Some(window(30.0, Some(2_000))),
         );
 
-        assert!(is_available(&usage));
+        assert!(is_available(&usage, &AccountInfo::default()));
+    }
+
+    #[test]
+    fn plan_required_quota_shape_is_shared_by_selection_and_status() {
+        let now = 1_000_000;
+        let plus = AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..AccountInfo::default()
+        };
+        let weekly_only = UsageInfo {
+            secondary: Some(window(20.0, Some(now + WINDOW_7D_SECS / 2))),
+            ..UsageInfo::default()
+        };
+        let weekly_only_plan = normalized_plan_kind(&weekly_only, &plus);
+        let weekly_only_candidate = Candidate::from_usage(
+            "weekly-only".to_string(),
+            &weekly_only,
+            weekly_only_plan,
+            0,
+            now,
+        );
+
+        assert_eq!(weekly_only_plan, PlanKind::Plus);
+        assert!(!weekly_only_candidate.has_required_quota_data());
+        assert_eq!(
+            usage_availability(&weekly_only, &plus),
+            UsageAvailability::Unavailable
+        );
+
+        let complete = UsageInfo {
+            primary: Some(window(20.0, Some(now + WINDOW_5H_SECS / 2))),
+            ..weekly_only.clone()
+        };
+        let complete_plan = normalized_plan_kind(&complete, &plus);
+        let complete_candidate =
+            Candidate::from_usage("complete".to_string(), &complete, complete_plan, 0, now);
+        assert!(complete_candidate.has_required_quota_data());
+        assert_eq!(
+            usage_availability(&complete, &plus),
+            UsageAvailability::Available
+        );
+
+        let api_downgrade = UsageInfo {
+            plan_type: Some("free".to_string()),
+            ..weekly_only.clone()
+        };
+        let downgraded_plan = normalized_plan_kind(&api_downgrade, &plus);
+        let downgraded_candidate = Candidate::from_usage(
+            "downgraded".to_string(),
+            &api_downgrade,
+            downgraded_plan,
+            0,
+            now,
+        );
+        assert_eq!(downgraded_plan, PlanKind::Free);
+        assert!(downgraded_candidate.has_required_quota_data());
+        assert_eq!(
+            usage_availability(&api_downgrade, &plus),
+            UsageAvailability::Available
+        );
+
+        let future_plan = UsageInfo {
+            plan_type: Some("future_plan".to_string()),
+            ..complete.clone()
+        };
+        assert_eq!(
+            usage_availability(&future_plan, &plus),
+            UsageAvailability::Unavailable
+        );
+
+        let broad_limited_incomplete = UsageInfo {
+            account_limited: true,
+            ..weekly_only
+        };
+        assert_eq!(
+            usage_availability(&broad_limited_incomplete, &plus),
+            UsageAvailability::Unavailable
+        );
+        let broad_limited_complete = UsageInfo {
+            account_limited: true,
+            ..complete
+        };
+        assert_eq!(
+            usage_availability(&broad_limited_complete, &plus),
+            UsageAvailability::Limited
+        );
+        let explicit_spend_blocker = UsageInfo {
+            account_limited: true,
+            spend_control_reached: true,
+            ..UsageInfo::default()
+        };
+        assert_eq!(
+            usage_availability(&explicit_spend_blocker, &plus),
+            UsageAvailability::Limited
+        );
     }
 
     #[test]
@@ -523,7 +739,7 @@ mod tests {
             Some(window(30.0, Some(2_000))),
         );
 
-        assert!(!is_available(&usage));
+        assert!(!is_available(&usage, &AccountInfo::default()));
     }
 
     #[test]
@@ -533,12 +749,15 @@ mod tests {
             Some(window(100.0, Some(2_000))),
         );
 
-        assert!(!is_available(&usage));
+        assert!(!is_available(&usage, &AccountInfo::default()));
     }
 
     #[test]
     fn test_is_available_no_data() {
-        assert!(!is_available(&UsageInfo::default()));
+        assert!(!is_available(
+            &UsageInfo::default(),
+            &AccountInfo::default()
+        ));
     }
 
     #[test]
@@ -552,12 +771,30 @@ mod tests {
         };
 
         let candidate =
-            Candidate::from_usage("ordinary".to_string(), &usage, false, false, 0, 1_000_000);
+            Candidate::from_usage("ordinary".to_string(), &usage, PlanKind::Plus, 0, 1_000_000);
 
-        assert_eq!(candidate.used_5h, 100.0);
-        assert_eq!(candidate.resets_at_5h, Some(1_001_800));
-        assert_eq!(candidate.used_7d, 80.0);
-        assert_eq!(candidate.resets_at_7d, Some(1_604_800));
+        assert_eq!(
+            candidate.primary.as_ref().map(|window| window.used_percent),
+            Some(100.0)
+        );
+        assert_eq!(
+            candidate
+                .primary
+                .as_ref()
+                .and_then(|window| window.resets_at),
+            Some(1_001_800)
+        );
+        assert_eq!(
+            candidate.weekly.as_ref().map(|window| window.used_percent),
+            Some(80.0)
+        );
+        assert_eq!(
+            candidate
+                .weekly
+                .as_ref()
+                .and_then(|window| window.resets_at),
+            Some(1_604_800)
+        );
         assert_eq!(candidate.explicit_account_blocker, None);
         assert_eq!(
             candidate.ordinary_account_limit,
@@ -570,29 +807,37 @@ mod tests {
         for used in [10.0, 99.0] {
             let usage = UsageInfo {
                 primary: Some(window(used, Some(1_003_600))),
+                secondary: Some(window(20.0, Some(1_604_800))),
                 account_limited: true,
                 ..UsageInfo::default()
             };
             let mut candidate = Candidate::from_usage(
                 format!("limited-{used}"),
                 &usage,
-                false,
-                false,
+                PlanKind::Plus,
                 0,
                 1_000_000,
             );
 
-            assert_eq!(candidate.used_5h, used);
+            assert_eq!(
+                candidate.primary.as_ref().map(|window| window.used_percent),
+                Some(used)
+            );
             assert_eq!(
                 candidate.ordinary_account_limit,
-                Some(super::super::OrdinaryAccountLimit::UntilReset(1_003_600))
+                Some(super::super::OrdinaryAccountLimit::UntilReset(1_604_800))
             );
             assert!(!is_candidate_eligible(&candidate, 20.0));
 
             candidate.now = 1_003_600;
             assert!(
+                !is_candidate_eligible(&candidate, 20.0),
+                "an ambiguous broad verdict remains active until every possible window resets"
+            );
+            candidate.now = 1_604_800;
+            assert!(
                 is_candidate_eligible(&candidate, 20.0),
-                "the stale broad verdict may be ignored once its reported window reset"
+                "the stale broad verdict may be ignored once every reported window reset"
             );
         }
     }
@@ -606,8 +851,7 @@ mod tests {
         let candidate = Candidate::from_usage(
             "missing-window".to_string(),
             &usage,
-            false,
-            false,
+            PlanKind::Plus,
             0,
             1_000_000,
         );
@@ -635,8 +879,7 @@ mod tests {
             let candidate = Candidate::from_usage(
                 "unknown-reason".to_string(),
                 &usage,
-                false,
-                false,
+                PlanKind::Plus,
                 0,
                 1_000_000,
             );
@@ -648,7 +891,7 @@ mod tests {
             ));
             assert_eq!(candidate.ordinary_account_limit, None);
             assert!(!is_candidate_eligible(&candidate, 20.0));
-            assert!(!is_available(&usage));
+            assert!(!is_available(&usage, &AccountInfo::default()));
         }
     }
 
@@ -663,14 +906,14 @@ mod tests {
         };
 
         let candidate =
-            Candidate::from_usage("blocked".to_string(), &usage, false, false, 0, 1_000_000);
+            Candidate::from_usage("blocked".to_string(), &usage, PlanKind::Plus, 0, 1_000_000);
 
         assert_eq!(
             candidate.explicit_account_blocker,
             Some(super::super::ExplicitAccountBlocker::SpendControlReached)
         );
         assert!(!is_candidate_eligible(&candidate, 20.0));
-        assert!(!is_available(&usage));
+        assert!(!is_available(&usage, &AccountInfo::default()));
     }
 
     // ── adaptive scoring tests ──
@@ -684,16 +927,19 @@ mod tests {
     ) -> Candidate {
         Candidate {
             alias: alias.to_string(),
-            used_5h,
-            resets_at_5h: reset_5h,
-            used_7d,
-            resets_at_7d: reset_7d,
-            has_5h_data: true,
-            has_7d_data: true,
+            primary: Some(super::super::CandidateWindow {
+                used_percent: used_5h,
+                resets_at: reset_5h,
+                duration_secs: WINDOW_5H_SECS,
+            }),
+            weekly: Some(super::super::CandidateWindow {
+                used_percent: used_7d,
+                resets_at: reset_7d,
+                duration_secs: WINDOW_7D_SECS,
+            }),
             explicit_account_blocker: None,
             ordinary_account_limit: None,
-            is_team: false,
-            is_free: false,
+            plan_kind: PlanKind::Plus,
             last_used: 0,
             now: 1_000_000,
             pool_size: 5,
@@ -747,12 +993,64 @@ mod tests {
 
         assert_eq!(scored.len(), 2);
         assert_eq!(scored[0].candidate.alias, "downgraded"); // input order preserved
-        assert!(scored[0].candidate.is_free);
-        assert!(!scored[0].candidate.is_team);
+        assert!(scored[0].candidate.is_free());
+        assert!(!scored[0].candidate.is_team());
         // One exhausted account (100% 5h), visible to every candidate
         assert_eq!(scored[0].candidate.pool_exhausted, 1);
         assert_eq!(scored[1].candidate.pool_exhausted, 1);
         assert_eq!(scored[1].candidate.pool_size, 2);
+    }
+
+    #[test]
+    fn plan_evidence_normalizes_to_one_exclusive_kind() {
+        let usage = usage_with_5h(20.0, 1_003_600, None);
+        let workspace_only = crate::jwt::AccountInfo {
+            organizations: vec![crate::jwt::OrgInfo::default()],
+            ..Default::default()
+        };
+        assert_eq!(
+            normalized_plan_kind(&usage, &workspace_only),
+            PlanKind::Team
+        );
+
+        let api_free = UsageInfo {
+            plan_type: Some("free".to_string()),
+            ..usage
+        };
+        assert_eq!(
+            normalized_plan_kind(&api_free, &workspace_only),
+            PlanKind::Free
+        );
+    }
+
+    #[test]
+    fn paid_candidate_without_weekly_window_is_not_selectable() {
+        let now = 1_000_000;
+        let usage = UsageInfo {
+            primary: Some(window(10.0, Some(now + 3_600))),
+            ..UsageInfo::default()
+        };
+        let candidate =
+            Candidate::from_usage("partial".to_string(), &usage, PlanKind::Plus, 0, now);
+
+        assert!(!candidate.has_required_quota_data());
+        assert!(!is_candidate_eligible(&candidate, 20.0));
+
+        let current = scored(candidate, 20.0);
+        let complete_but_exhausted = scored(
+            make_candidate(
+                "complete",
+                100.0,
+                Some(now + 3_600),
+                20.0,
+                Some(now + 5 * 86_400),
+            ),
+            20.0,
+        );
+        assert_eq!(
+            pick_switch_target(&current, &[complete_but_exhausted], 20.0).map(|(alias, _)| alias),
+            Some("complete")
+        );
     }
 
     fn scored(candidate: Candidate, safety_7d: f64) -> ScoredCandidate {
@@ -909,7 +1207,7 @@ mod tests {
         // Non-team with 0% used vs Team with 50% used → Team wins with priority
         let a = make_candidate("a", 0.0, Some(now + 18000), 10.0, Some(now + 5 * 86400));
         let mut b = make_candidate("b", 50.0, Some(now + 7200), 10.0, Some(now + 5 * 86400));
-        b.is_team = true;
+        b.plan_kind = PlanKind::Team;
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
         assert!(
@@ -925,7 +1223,7 @@ mod tests {
         let mut a = make_candidate("a", 0.0, Some(now + 18000), 10.0, Some(now + 5 * 86400));
         a.team_priority = false;
         let mut b = make_candidate("b", 50.0, Some(now + 7200), 10.0, Some(now + 5 * 86400));
-        b.is_team = true;
+        b.plan_kind = PlanKind::Team;
         b.team_priority = false;
         let sa = score_unified(&a, 20.0);
         let sb = score_unified(&b, 20.0);
@@ -948,6 +1246,74 @@ mod tests {
             sa > sb,
             "near-reset account should score higher due to drain: {sa} > {sb}"
         );
+    }
+
+    #[test]
+    fn past_reset_never_receives_drain_bonus() {
+        let now = 1_000_000;
+        let past_reset = make_candidate("past", 90.0, Some(now - 1), 20.0, Some(now + 5 * 86_400));
+        let unused = make_candidate("unused", 0.0, Some(now - 1), 20.0, Some(now + 5 * 86_400));
+
+        assert_eq!(
+            score_unified(&past_reset, 20.0),
+            score_unified(&unused, 20.0)
+        );
+    }
+
+    #[test]
+    fn scoring_uses_the_primary_windows_actual_duration() {
+        let now = 1_000_000;
+        let mut ten_hour = make_candidate(
+            "ten-hour",
+            25.0,
+            Some(now + 5 * 3_600),
+            20.0,
+            Some(now + 5 * 86_400),
+        );
+        ten_hour.primary.as_mut().unwrap().duration_secs = 10 * 3_600;
+        let five_hour = make_candidate(
+            "five-hour",
+            50.0,
+            Some(now + 4 * 3_600),
+            20.0,
+            Some(now + 5 * 86_400),
+        );
+
+        assert!(score_unified(&ten_hour, 20.0) > score_unified(&five_hour, 20.0));
+
+        let usage = UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(1.0),
+                resets_at: Some(now + 10 * 3_600 - MIN_WARMUP_ELAPSED_SECS),
+                window_minutes: Some(600),
+            }),
+            secondary: Some(window(1.0, Some(now + WINDOW_7D_SECS - 3_600))),
+            ..UsageInfo::default()
+        };
+        assert!(usage_has_active_warmup_window(&usage, now));
+    }
+
+    #[test]
+    fn exhausted_weekly_relief_uses_the_windows_actual_duration() {
+        let now = 1_000_000;
+        let seven_day = make_candidate(
+            "seven-day",
+            20.0,
+            Some(now + 4 * 3_600),
+            100.0,
+            Some(now + WINDOW_7D_SECS / 2),
+        );
+        let mut fourteen_day = seven_day.clone();
+        fourteen_day.alias = "fourteen-day".to_string();
+        let fourteen_day_secs = 2 * WINDOW_7D_SECS;
+        let weekly = fourteen_day.weekly.as_mut().unwrap();
+        weekly.duration_secs = fourteen_day_secs;
+        weekly.resets_at = Some(now + fourteen_day_secs / 2);
+
+        let seven_day_score = score_unified(&seven_day, 20.0);
+        let fourteen_day_score = score_unified(&fourteen_day, 20.0);
+
+        assert!((seven_day_score - fourteen_day_score).abs() < 1e-9);
     }
 
     #[test]
@@ -1049,7 +1415,7 @@ mod tests {
     fn test_adaptive_free_floor_ineligible() {
         let now = 1_000_000i64;
         let mut c = make_candidate("free1", 70.0, Some(now + 3600), 20.0, Some(now + 5 * 86400));
-        c.is_free = true;
+        c.plan_kind = PlanKind::Free;
         assert!(!is_candidate_eligible(&c, 20.0));
     }
 
@@ -1057,16 +1423,11 @@ mod tests {
     fn test_adaptive_no_data_low_score() {
         let c = Candidate {
             alias: "unknown".to_string(),
-            used_5h: 0.0,
-            resets_at_5h: None,
-            used_7d: 0.0,
-            resets_at_7d: None,
-            has_5h_data: false,
-            has_7d_data: false,
+            primary: None,
+            weekly: None,
             explicit_account_blocker: None,
             ordinary_account_limit: None,
-            is_team: false,
-            is_free: false,
+            plan_kind: PlanKind::Unknown,
             last_used: 0,
             now: 1_000_000,
             pool_size: 1,
@@ -1085,9 +1446,7 @@ mod tests {
     fn test_adaptive_both_windows_exhausted() {
         let now = 1_000_000i64;
         // 5h exhausted (no reset info) + 7d exhausted (resets in 7 days)
-        let mut c = make_candidate("both_dead", 100.0, None, 100.0, Some(now + 7 * 86400));
-        c.has_5h_data = true;
-        c.has_7d_data = true;
+        let c = make_candidate("both_dead", 100.0, None, 100.0, Some(now + 7 * 86400));
         let s = score_unified(&c, 20.0);
         // headroom=0 (exhausted, no reset), sustain should still be heavily negative
         assert!(
@@ -1101,16 +1460,19 @@ mod tests {
         // Worst case: both exhausted, no reset info at all
         let c = Candidate {
             alias: "dead".to_string(),
-            used_5h: 100.0,
-            resets_at_5h: None,
-            used_7d: 100.0,
-            resets_at_7d: None,
-            has_5h_data: true,
-            has_7d_data: true,
+            primary: Some(super::super::CandidateWindow {
+                used_percent: 100.0,
+                resets_at: None,
+                duration_secs: WINDOW_5H_SECS,
+            }),
+            weekly: Some(super::super::CandidateWindow {
+                used_percent: 100.0,
+                resets_at: None,
+                duration_secs: WINDOW_7D_SECS,
+            }),
             explicit_account_blocker: None,
             ordinary_account_limit: None,
-            is_team: false,
-            is_free: false,
+            plan_kind: PlanKind::Plus,
             last_used: 0,
             now: 1_000_000,
             pool_size: 1,
@@ -1174,12 +1536,15 @@ mod tests {
 
     #[test]
     fn pace_marker_remains_visible_when_ui_rounds_remaining_to_zero() {
+        let now = 1_000_000;
         let w = WindowUsage {
             used_percent: Some(99.6),
-            resets_at: Some(auth::now_unix_secs() + 3600),
+            resets_at: Some(now + 3600),
             window_minutes: None,
         };
-        assert!(visible_pace_marker(w.used_percent, pace_percent(&w, WINDOW_5H_SECS)).is_some());
+        assert!(
+            visible_pace_marker(w.used_percent, pace_percent_at(&w, WINDOW_5H_SECS, now)).is_some()
+        );
     }
 
     #[test]
@@ -1220,30 +1585,33 @@ mod tests {
 
     #[test]
     fn pace_requires_a_current_consistent_window() {
-        let now = auth::now_unix_secs();
+        let now = 1_000_000;
         let window = |resets_at| WindowUsage {
             used_percent: Some(20.0),
             resets_at: Some(resets_at),
             window_minutes: None,
         };
 
-        assert_eq!(pace_percent(&window(now - 1), WINDOW_5H_SECS), None);
+        assert_eq!(pace_percent_at(&window(now - 1), WINDOW_5H_SECS, now), None);
         assert_eq!(
-            pace_percent(&window(now + WINDOW_5H_SECS + 60), WINDOW_5H_SECS),
+            pace_percent_at(&window(now + WINDOW_5H_SECS + 60), WINDOW_5H_SECS, now,),
             None
         );
-        assert_eq!(pace_percent(&window(now + 60), 0), None);
-        assert_eq!(pace_percent(&window(now + 60), -1), None);
+        assert_eq!(pace_percent_at(&window(now + 60), 0, now), None);
+        assert_eq!(pace_percent_at(&window(now + 60), -1, now), None);
     }
 
     #[test]
     fn pace_marker_is_shown_at_exact_exhaustion() {
+        let now = 1_000_000;
         let w = WindowUsage {
             used_percent: Some(100.0),
-            resets_at: Some(auth::now_unix_secs() + 3600),
+            resets_at: Some(now + 3600),
             window_minutes: None,
         };
-        assert!(visible_pace_marker(w.used_percent, pace_percent(&w, WINDOW_5H_SECS)).is_some());
+        assert!(
+            visible_pace_marker(w.used_percent, pace_percent_at(&w, WINDOW_5H_SECS, now)).is_some()
+        );
     }
 
     #[test]
