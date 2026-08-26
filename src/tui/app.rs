@@ -13,8 +13,8 @@ use crate::jwt::AccountInfo;
 use crate::login;
 use crate::output::{format_local_datetime, format_local_timestamp, reset_credits_count};
 use crate::profile::{
-    self, cmd_delete, list_profiles, profile_auth_path, rename_profile, sync_current_from_live,
-    validate_alias,
+    self, TuiAuthReconciliation, cmd_delete, list_profiles, profile_auth_path,
+    read_current_checked, rename_profile, sync_current_from_live, validate_alias,
 };
 use crate::safe_text;
 use crate::usage::{
@@ -298,6 +298,10 @@ pub struct App {
     /// strand a rotated credential or leave a reset-card outcome unknown.
     account_tasks: HashMap<u64, AccountTask>,
     account_task_next_id: u64,
+    /// Guarded live-credential reconciliation begins only after the first TUI
+    /// frame. It is tracked to completion because it may write a newer live
+    /// credential into its strictly matched saved profile.
+    startup_auth_reconciliation: Option<tokio::task::JoinHandle<Result<TuiAuthReconciliation>>>,
     shutting_down: bool,
     pub confirm: Option<ConfirmAction>,
     pub rename: Option<RenameState>,
@@ -359,6 +363,7 @@ impl App {
             warmup_preflight: None,
             account_tasks: HashMap::new(),
             account_task_next_id: 0,
+            startup_auth_reconciliation: None,
             shutting_down: false,
             confirm: None,
             rename: None,
@@ -466,11 +471,23 @@ impl App {
         })
     }
 
+    fn startup_auth_reconciliation_in_flight(&self) -> bool {
+        self.startup_auth_reconciliation.is_some()
+    }
+
     fn interactive_operation_in_flight(&self) -> bool {
         self.confirm.is_some() || self.rename.is_some() || self.profile_switch_in_flight()
     }
 
     fn reject_new_credential_operation_during_switch(&mut self) -> bool {
+        if self.startup_auth_reconciliation_in_flight() {
+            self.set_status(
+                "Finishing live credential synchronization before starting an account operation"
+                    .to_string(),
+                5,
+            );
+            return true;
+        }
         if !self.profile_switch_in_flight() {
             return false;
         }
@@ -483,7 +500,70 @@ impl App {
     }
 
     pub fn has_pending_credential_tasks(&self) -> bool {
-        !self.account_tasks.is_empty() || !self.warmup_tasks.is_empty()
+        self.startup_auth_reconciliation.is_some()
+            || !self.account_tasks.is_empty()
+            || !self.warmup_tasks.is_empty()
+    }
+
+    fn start_startup_auth_reconciliation(&mut self) {
+        if self.startup_auth_reconciliation.is_some() {
+            return;
+        }
+        self.set_status("Synchronizing live Codex credentials...".to_string(), 60);
+        self.startup_auth_reconciliation = Some(tokio::task::spawn_blocking(
+            profile::reconcile_live_auth_for_tui,
+        ));
+    }
+
+    /// Returns true once the one-shot startup reconciliation has completed.
+    async fn poll_startup_auth_reconciliation(&mut self) -> bool {
+        let Some(task) = self.startup_auth_reconciliation.as_ref() else {
+            return true;
+        };
+        if !task.is_finished() {
+            return false;
+        }
+        let task = self
+            .startup_auth_reconciliation
+            .take()
+            .expect("finished startup reconciliation must remain tracked");
+        match task.await {
+            Ok(Ok(TuiAuthReconciliation::NoChange)) => {
+                self.load_profiles_from_marker_preserving_selection();
+                self.set_status("Accounts ready".to_string(), 3);
+            }
+            Ok(Ok(TuiAuthReconciliation::ProfileUpdated { alias })) => {
+                self.invalidate_models_after_credential_reload();
+                self.load_profiles_from_marker_preserving_selection();
+                self.set_status(format!("Updated live credentials for {alias}"), 5);
+            }
+            Ok(Ok(TuiAuthReconciliation::UntrackedAccount)) => {
+                if let Err(error) = self.try_load_profiles_with_current(None) {
+                    self.set_status_error(format!("Profile reload failed: {error:#}"), 6);
+                } else {
+                    self.set_status(
+                        "The live Codex account is not saved; press a to add it".to_string(),
+                        8,
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                self.set_status_error(
+                    format!("Live credential synchronization failed: {error:#}"),
+                    8,
+                );
+            }
+            Err(error) => {
+                self.set_status_error(
+                    format!(
+                        "Live credential synchronization task failed: {}",
+                        crate::task_batch::join_failure_detail(&error)
+                    ),
+                    8,
+                );
+            }
+        }
+        true
     }
 
     /// Observe completed account tasks so panics cannot leave their state
@@ -661,6 +741,7 @@ impl App {
             task.lease_control.cancel_waiting();
         }
         while self.has_pending_credential_tasks() {
+            self.poll_startup_auth_reconciliation().await;
             self.poll_results();
             self.poll_reset_card_results();
             self.poll_model_results();
@@ -1161,11 +1242,26 @@ impl App {
     }
 
     fn try_load_profiles(&mut self) -> Result<()> {
-        let profiles = list_profiles().context("listing saved profiles")?;
         // The live auth file is the source of truth. If it belongs to an
         // untracked account, no saved profile is active; retaining the stale
         // marker here would highlight the account that used to be active.
         let current = sync_current_from_live().context("synchronizing the active profile")?;
+        self.try_load_profiles_with_current(current)
+    }
+
+    fn load_profiles_from_marker(&mut self) {
+        if let Err(error) = self.try_load_profiles_from_marker() {
+            self.set_status_error(format!("Profile reload failed: {error:#}"), 6);
+        }
+    }
+
+    fn try_load_profiles_from_marker(&mut self) -> Result<()> {
+        let current = read_current_checked().context("reading the active profile marker")?;
+        self.try_load_profiles_with_current(current)
+    }
+
+    fn try_load_profiles_with_current(&mut self, current: Option<String>) -> Result<()> {
+        let profiles = list_profiles().context("listing saved profiles")?;
         let mut loaded = Vec::with_capacity(profiles.len());
         for alias in profiles {
             let path = profile_auth_path(&alias)
@@ -1212,6 +1308,22 @@ impl App {
             self.selected = view_idx;
         }
         Ok(())
+    }
+
+    fn load_profiles_from_marker_preserving_selection(&mut self) {
+        let selected_alias = self
+            .selected_account_idx()
+            .and_then(|idx| self.accounts.get(idx))
+            .map(|entry| entry.alias.clone());
+
+        self.load_profiles_from_marker();
+
+        if let Some(alias) = selected_alias
+            && let Some(account_idx) = self.accounts.iter().position(|a| a.alias == alias)
+            && let Some(view_idx) = self.view_indices.iter().position(|&idx| idx == account_idx)
+        {
+            self.selected = view_idx;
+        }
     }
 
     pub fn load_profiles_preserving_selection(&mut self) {
@@ -2966,8 +3078,6 @@ impl App {
 }
 
 pub async fn run() -> Result<()> {
-    // auth-change detection runs before dispatch(), so auto_track is already handled.
-
     // Ensure terminal is restored even on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2994,15 +3104,28 @@ async fn drain_credential_tasks_on_error<T>(app: &mut App, result: Result<T>) ->
 
 async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
     let mut app = App::new();
-    app.load_profiles();
+    // Marker-only loading performs no live-auth transaction, so the first
+    // frame is never held behind the credential lock or a plain-terminal
+    // confirmation. The guarded reconciliation starts immediately afterward.
+    app.load_profiles_from_marker();
     app.update_view();
 
-    if !app.accounts.is_empty() {
-        app.refresh(Refresh::Cached);
-    }
+    let initial_render_now = crate::auth::now_unix_secs().context("reading startup clock")?;
+    terminal
+        .draw(|frame| super::ui::render(frame, &mut app, initial_render_now))
+        .context("drawing initial TUI frame")?;
+
+    app.start_startup_auth_reconciliation();
     app.start_update_check();
+    let mut startup_ready = false;
 
     loop {
+        if !startup_ready && app.poll_startup_auth_reconciliation().await {
+            startup_ready = true;
+            if !app.accounts.is_empty() {
+                app.refresh(Refresh::Cached);
+            }
+        }
         app.poll_results();
         app.poll_warmup_preflight_result().await;
         app.poll_warmup_results().await;
@@ -3013,7 +3136,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.poll_update();
         app.tick();
         app.run_due_auto_refresh();
-        app.ensure_models_loaded_for_selected();
+        if startup_ready {
+            app.ensure_models_loaded_for_selected();
+        }
 
         let render_now =
             crate::auth::now_unix_secs().context("reading system clock for TUI render")?;

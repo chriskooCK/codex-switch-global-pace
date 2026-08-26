@@ -189,18 +189,8 @@ fn format_refresh_error(code: &str, message: Option<&str>) -> String {
     }
 }
 
-fn token_needs_refresh(
-    access_token: &str,
-    id_token: Option<&str>,
-    margin_secs: i64,
-) -> Result<bool> {
-    if crate::jwt::is_token_expiring(access_token, margin_secs)? == Some(true) {
-        return Ok(true);
-    }
-    match id_token {
-        Some(token) => Ok(crate::jwt::is_token_expiring(token, margin_secs)? == Some(true)),
-        None => Ok(false),
-    }
+fn access_token_needs_refresh(access_token: &str, margin_secs: i64) -> Result<bool> {
+    Ok(crate::jwt::is_token_expiring(access_token, margin_secs)? == Some(true))
 }
 
 /// Extract a short summary from an error message for user-facing display.
@@ -869,10 +859,11 @@ where
     let usage_url = endpoints.usage()?;
     let mut rejected_refresh: Option<anyhow::Error> = None;
 
-    // Refresh when either JWT is near expiry so account identity metadata does
-    // not remain stale while the access token is still usable.
+    // Usage authorization depends on the access token. An expired ID token is
+    // not a reason to serialize a healthy read through the credential-write
+    // boundary; it is replaced when the access token itself needs rotation.
     if let Some(rt) = refresh_token
-        && token_needs_refresh(access_token, id_token, 60)?
+        && access_token_needs_refresh(access_token, 60)?
     {
         info!("[{alias}] token expiring soon, proactively refreshing");
 
@@ -1779,12 +1770,19 @@ mod tests {
     }
 
     #[test]
-    fn expired_id_token_triggers_refresh_before_access_token_expires() {
+    fn expired_id_token_does_not_refresh_a_valid_access_token() {
         let now = crate::auth::now_unix_secs().unwrap();
         let access = jwt_with_exp(now + 86_400);
-        let id = jwt_with_exp(now - 60);
 
-        assert!(token_needs_refresh(&access, Some(&id), 60).unwrap());
+        assert!(!access_token_needs_refresh(&access, 60).unwrap());
+    }
+
+    #[test]
+    fn expiring_access_token_still_triggers_proactive_refresh() {
+        let now = crate::auth::now_unix_secs().unwrap();
+        let access = jwt_with_exp(now + 30);
+
+        assert!(access_token_needs_refresh(&access, 60).unwrap());
     }
 
     #[test]

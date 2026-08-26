@@ -2075,6 +2075,29 @@ pub enum AuthChange {
     NoChange,
 }
 
+/// Result of reconciling live Codex credentials after the TUI is visible.
+/// Existing profiles are updated only through the same guarded read-back path
+/// used by the interactive startup flow. A genuinely new account remains an
+/// explicit user action and is never saved under a guessed alias.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TuiAuthReconciliation {
+    NoChange,
+    ProfileUpdated { alias: String },
+    UntrackedAccount,
+}
+
+pub(crate) fn reconcile_live_auth_for_tui() -> Result<TuiAuthReconciliation> {
+    match detect_auth_change()? {
+        AuthChange::NoChange => Ok(TuiAuthReconciliation::NoChange),
+        AuthChange::TokensUpdated { alias } => {
+            update_profile_from_live(&alias)
+                .with_context(|| format!("synchronizing newer live credentials for '{alias}'"))?;
+            Ok(TuiAuthReconciliation::ProfileUpdated { alias })
+        }
+        AuthChange::NewAccount => Ok(TuiAuthReconciliation::UntrackedAccount),
+    }
+}
+
 fn read_live_auth_snapshot_for_detection(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -5219,6 +5242,84 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn tui_reconciliation_updates_only_a_strict_newer_identity_match() {
+        let _env = TestEnv::new();
+        seed_profile(
+            "alice",
+            &stamped_auth_json(
+                "alice@example.com",
+                "acct_a",
+                "old-access",
+                "old-refresh",
+                Some("2026-08-25T00:00:00Z"),
+            ),
+        );
+        write_live(&stamped_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "new-access",
+            "new-refresh",
+            Some("2026-08-26T00:00:00Z"),
+        ));
+
+        assert_eq!(
+            super::reconcile_live_auth_for_tui().unwrap(),
+            super::TuiAuthReconciliation::ProfileUpdated {
+                alias: "alice".to_string()
+            }
+        );
+        assert_eq!(profile_access_token("alice"), "new-access");
+        assert_eq!(profile_refresh_token("alice"), "new-refresh");
+        assert_eq!(
+            super::read_current_checked().unwrap().as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn tui_reconciliation_never_auto_saves_an_untracked_account() {
+        let _env = TestEnv::new();
+        let saved = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "alice-access",
+            "alice-refresh",
+        );
+        seed_profile("alice", &saved);
+        write_live(&realistic_auth_json(
+            "foreign@example.com",
+            "acct_foreign",
+            "foreign-access",
+            "foreign-refresh",
+        ));
+
+        assert_eq!(
+            super::reconcile_live_auth_for_tui().unwrap(),
+            super::TuiAuthReconciliation::UntrackedAccount
+        );
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap(),
+            saved
+        );
+        assert_eq!(super::list_profiles().unwrap(), vec!["alice"]);
+    }
+
+    #[test]
+    fn tui_reconciliation_leaves_exact_live_credentials_untouched() {
+        let _env = TestEnv::new();
+        let auth =
+            realistic_auth_json("alice@example.com", "acct_a", "same-access", "same-refresh");
+        seed_profile("alice", &auth);
+        write_live(&auth);
+
+        assert_eq!(
+            super::reconcile_live_auth_for_tui().unwrap(),
+            super::TuiAuthReconciliation::NoChange
+        );
+        assert_eq!(profile_access_token("alice"), "same-access");
     }
 
     /// The rollback guard is typed so callers can recognise it without matching

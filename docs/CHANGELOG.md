@@ -1,5 +1,19 @@
 # Changelog
 
+## v20260827.1.0 — 2026-08-27
+
+- **Immediate TUI startup** — The account screen renders from the saved active
+  marker before live-auth reconciliation begins. TUI startup no longer pauses
+  in a plain-terminal credential-update prompt.
+- **Guarded background credential reconciliation** — Once the first frame is
+  visible, a strictly matched existing profile receives newer live Codex
+  credentials through the existing identity, freshness, and rollback guards.
+  Untracked accounts are reported without being saved under a guessed alias.
+- **Read-only usage stays read-only** — An expired ID token no longer forces a
+  healthy usage request through the credential-write lock. Proactive rotation
+  is based on access-token expiry; 401/403 responses retain the explicit token
+  refresh path.
+
 ## v20260826.7.0 — 2026-08-26
 
 - **Auditable account switching** — The TUI switch workers now live in one
