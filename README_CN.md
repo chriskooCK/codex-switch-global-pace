@@ -38,17 +38,13 @@ codex-switch-global-pace          # 打开交互式仪表盘
 
 ## Global Weekly Pace
 
-每个 weekly window 的计算同时考虑剩余配额与 reset 距离：
+仪表盘会把所有具有有效 weekly window 的账号合并为一个 equal-weight pool。填充的 bar
+表示汇总后的实际使用量，`↑ pace` marker 表示汇总后的已用时间，也就是当前理想使用位置。
+meter 下方只显示参与账号数和最早到来的账号 reset。
 
-```text
-effective capacity = 100% + elapsed% - used%
-normal capacity    = included accounts × 100%
-global pace        = sum(effective capacity) / normal capacity × 100%
-```
-
-`100%` 表示正常配速，超过 `100%` 表示有 reserve，低于 `100%` 表示 deficit。
 只要 reset timestamp 有效，即使账号已用到 `100%` 也会纳入。数据或 reset 不可信的账号会计为
-unavailable。当前 API 没有可靠且可比较的 weekly capacity，因此账号采用 equal weighting。
+unavailable，而不会猜测。当前 API 没有可靠且可比较的 weekly capacity，因此账号采用
+equal weighting。
 
 所有 quota meter 都使用同一个相对规则：实际使用量高于按已用时间计算的 pace 时显示黄色，
 等于或低于 pace 时显示绿色。Global meter 对汇总后的使用量和已用时间应用相同规则。

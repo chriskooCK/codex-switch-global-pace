@@ -1,5 +1,12 @@
 # Changelog
 
+## v20260826.5.0 — 2026-08-26
+
+- **Unambiguous Global Weekly summary** — The full and compact dashboards no
+  longer label the synthetic effective-capacity score as pace. The meter keeps
+  aggregate actual usage and its elapsed-time pace marker, while the text
+  summary now contains only the participating account count and nearest reset.
+
 ## v20260826.4.0 — 2026-08-26
 
 - **Focused Global Weekly Pace summary** — The dashboard now keeps only the
