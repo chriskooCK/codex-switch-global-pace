@@ -18,6 +18,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read minimum Rust version
+        id: package
+        shell: bash
+        run: |
+          metadata=$(cargo metadata --locked --no-deps --format-version 1)
+          root=$(jq -r '.workspace_default_members[0]' <<<"$metadata")
+          msrv=$(jq -r --arg root "$root" '.packages[] | select(.id == $root) | .rust_version' <<<"$metadata")
+          if [[ ! "$msrv" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "Cargo.toml must declare a valid package rust-version" >&2
+            exit 1
+          fi
+          echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+      - name: Install minimum Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch head 2026-07-16
+        with:
+          toolchain: ${{ steps.package.outputs.toolchain }}
+      - name: Check all targets with minimum Rust
+        run: cargo check --locked --all-targets --features test-endpoints
+
   quality:
     name: Format and audit
     runs-on: ubuntu-latest
