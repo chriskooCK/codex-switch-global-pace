@@ -117,7 +117,7 @@ pub fn parse_account_info(auth: &Value) -> AccountInfo {
 
     let claims = decode_jwt_payload(id_token).unwrap_or_default();
 
-    // Root claim first, then the profile claim — matches Codex 0.144.1,
+    // Root claim first, then the profile claim — matches the reviewed Codex contract,
     // which falls back to https://api.openai.com/profile.email.
     let email = claims
         .get("email")
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_parse_account_info_email_falls_back_to_profile_claim() {
-        // Codex 0.144.1 reads email from the root claim, then falls back to
+        // Codex reads email from the root claim, then falls back to
         // the https://api.openai.com/profile claim — some id_tokens only
         // carry the latter.
         let auth = json!({

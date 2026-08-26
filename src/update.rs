@@ -3112,10 +3112,7 @@ fn tag_ref_api_url(tag: &str) -> String {
 }
 
 fn git_tag_api_url(sha: &str) -> String {
-    format!(
-        "{}/repos/{REPO_OWNER}/{REPO_NAME}/git/tags/{sha}",
-        GITHUB_API_BASE
-    )
+    format!("{GITHUB_API_BASE}/repos/{REPO_OWNER}/{REPO_NAME}/git/tags/{sha}")
 }
 
 fn normalize_version(version: &str) -> String {

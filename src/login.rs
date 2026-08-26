@@ -228,7 +228,7 @@ async fn obtain_api_key(
     }
 }
 
-/// Body shape must match Codex 0.144.1's `obtain_api_key` token exchange.
+/// Body shape must match Codex's `obtain_api_key` token exchange.
 fn build_api_key_exchange_request(
     client: &reqwest::Client,
     token_url: &str,
@@ -971,7 +971,7 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> Result<serde_j
     use crate::output::format_iso8601;
     let ts = crate::auth::now_unix_secs()?;
 
-    // Same shape Codex 0.144.1 writes on a ChatGPT login: auth_mode is
+    // Same shape Codex writes on a ChatGPT login: auth_mode is
     // persisted and an unknown account_id is null rather than "".
     let account_id_value = if account_id.is_empty() {
         serde_json::Value::Null
@@ -1152,7 +1152,7 @@ mod tests {
             .timestamp();
         assert!(parsed >= before && parsed <= after);
 
-        // Codex 0.144.1 persists auth_mode on ChatGPT logins.
+        // Codex persists auth_mode on ChatGPT logins.
         assert_eq!(
             auth.get("auth_mode").and_then(|v| v.as_str()),
             Some("chatgpt")

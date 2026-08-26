@@ -1177,7 +1177,7 @@ where
     }
 }
 
-/// Build the token refresh request. Codex 0.144.1 sends a JSON body
+/// Build the token refresh request. Codex sends a JSON body
 /// ({client_id, grant_type, refresh_token}) — keep the same shape so the
 /// auth server sees requests identical to the real client's.
 pub(crate) fn build_refresh_request(
