@@ -227,7 +227,7 @@ assert_no_install_transaction_residue() {
 read_checked_daemon_status() {
   local status
   DAEMON_STATUS_ERROR=""
-  if ! status="$("$CANDIDATE_BIN" daemon status --installer-state 7>&- 8>&- 9>&- 2>&1)"; then
+  if ! status="$("$CANDIDATE_BIN" daemon status --installer-state 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1)"; then
     DAEMON_STATUS_ERROR="release-verified daemon state probe failed: ${status}"
     return 1
   fi
@@ -263,7 +263,7 @@ read_checked_daemon_status() {
 
 verify_candidate_version() {
   local candidate="$1" expected="$2" output first_line
-  if ! output="$("$candidate" --version 7>&- 8>&- 9>&- 2>&1)"; then
+  if ! output="$("$candidate" --version 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1)"; then
     CANDIDATE_ERROR="candidate version check failed: ${output}"
     return 1
   fi
@@ -282,12 +282,12 @@ run_installer_file_op() {
   INSTALLER_FILE_OP_RESULT=""
   INSTALLER_FILE_OP_ERROR=""
   if [ "$use_sudo" = true ]; then
-    if ! output="$(sudo "$CANDIDATE_BIN" __installer-file-op "$@" 7>&- 8>&- 9>&- 2>&1)"; then
+    if ! output="$(sudo "$CANDIDATE_BIN" __installer-file-op "$@" 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1)"; then
       INSTALLER_FILE_OP_ERROR="$output"
       return 1
     fi
   else
-    if ! output="$("$CANDIDATE_BIN" __installer-file-op "$@" 7>&- 8>&- 9>&- 2>&1)"; then
+    if ! output="$("$CANDIDATE_BIN" __installer-file-op "$@" 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1)"; then
       INSTALLER_FILE_OP_ERROR="$output"
       return 1
     fi
@@ -703,7 +703,7 @@ commit_held_legacy_install() {
 }
 
 close_daemon_update_boundary_channels() {
-  exec 7>&- 6<&-
+  exec 5>&- 6<&-
 }
 
 wait_daemon_update_boundary() {
@@ -763,11 +763,11 @@ start_daemon_update_boundary() {
     exec "$candidate" __hold-daemon-update-boundary \
       --initial-executable "$initial_executable" \
       --replacement-executable "$replacement_executable" \
-      6>&- 7>&- 8>&- 9>&- < "$control" > "$status"
+      5>&- 6>&- 7>&- 8>&- 9>&- < "$control" > "$status"
   ) &
   pid=$!
   DAEMON_BOUNDARY_PID="$pid"
-  exec 7>"$control"
+  exec 5>"$control"
   exec 6<"$status"
 
   if ! IFS= read -r marker <&6; then
@@ -826,7 +826,7 @@ request_daemon_update_boundary_new_state() {
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not in its stopped replacement phase"
     return 1
   }
-  if ! printf 'new\n' >&7 || ! IFS= read -r marker <&6; then
+  if ! printf 'new\n' >&5 || ! IFS= read -r marker <&6; then
     DAEMON_BOUNDARY_ROLLBACK_SAFE=false
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited while publishing the replacement state"
     return 1
@@ -856,7 +856,7 @@ request_daemon_update_boundary_uninstall_state() {
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not in its stopped uninstall phase"
     return 1
   }
-  if ! printf 'uninstall\n' >&7 || ! IFS= read -r marker <&6; then
+  if ! printf 'uninstall\n' >&5 || ! IFS= read -r marker <&6; then
     DAEMON_BOUNDARY_ROLLBACK_SAFE=false
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited while applying the uninstall state"
     return 1
@@ -887,7 +887,7 @@ restore_daemon_update_boundary_old_state() {
     DAEMON_BOUNDARY_ERROR="daemon lifecycle rollback authority was not retained"
     return 1
   }
-  if ! printf 'rollback\n' >&7 || ! IFS= read -r marker <&6; then
+  if ! printf 'rollback\n' >&5 || ! IFS= read -r marker <&6; then
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before restoring the old state"
     close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
     return 1
@@ -919,7 +919,7 @@ finish_daemon_update_boundary() {
       return 1
       ;;
   esac
-  if ! printf 'finish\n' >&7 || ! IFS= read -r marker <&6; then
+  if ! printf 'finish\n' >&5 || ! IFS= read -r marker <&6; then
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before final state confirmation"
     close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
     return 1
@@ -939,7 +939,7 @@ release_daemon_update_boundary() {
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder was not ready to release final authority"
     return 1
   }
-  if ! printf 'release\n' >&7 || ! IFS= read -r marker <&6; then
+  if ! printf 'release\n' >&5 || ! IFS= read -r marker <&6; then
     DAEMON_BOUNDARY_ERROR="daemon lifecycle holder exited before authority release confirmation"
     close_failed_daemon_update_boundary "$DAEMON_BOUNDARY_ERROR"
     return 1
@@ -1141,6 +1141,9 @@ start_update_lock() {
   local control="${TMP_DIR}/update-lock-${slot}.control"
   local ready="${TMP_DIR}/update-lock-${slot}.ready"
   local marker pid
+  # The daemon lifecycle protocol owns descriptors 5 and 6. Keep every update
+  # authority on its disjoint 7/8/9 set so starting that protocol cannot
+  # close a lock-holder pipe inherited by this installer.
   case "$slot" in
     7|8|9) ;;
     *)
@@ -1152,14 +1155,14 @@ start_update_lock() {
 
   if [ "$use_sudo" = true ]; then
     (
-      exec 7>&- 8>&- 9>&-
+      exec 5>&- 6>&- 7>&- 8>&- 9>&-
       exec < "$control" > "$ready"
       exec sudo env CS_UPDATE_LOCK_TARGET="$target" \
         "$candidate" __hold-update-lock
     ) &
   else
     CS_UPDATE_LOCK_TARGET="$target" \
-      "$candidate" __hold-update-lock 7>&- 8>&- 9>&- \
+      "$candidate" __hold-update-lock 5>&- 6>&- 7>&- 8>&- 9>&- \
       < "$control" > "$ready" &
   fi
   pid=$!
@@ -2118,7 +2121,7 @@ daemon_pid_state_exists() {
 check_candidate_uninstall_owner() {
   SERVICE_OWNER_ERROR=""
   SERVICE_OWNER_ERROR="$("$CANDIDATE_BIN" daemon uninstall \
-    --expected-executable "$1" --check-owner 7>&- 8>&- 9>&- 2>&1)"
+    --expected-executable "$1" --check-owner 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1)"
 }
 
 begin_uninstall_file_transaction() {
@@ -2664,9 +2667,9 @@ INSTALL_BACKUP_TOKEN=""
 INSTALL_ORIGINAL_TOKEN=""
 INSTALL_PUBLISHED_TOKEN=""
 INSTALL_WITH_SUDO=false
+UPDATE_LOCK_PID_7=""
 UPDATE_LOCK_PID_8=""
 UPDATE_LOCK_PID_9=""
-UPDATE_LOCK_PID_7=""
 UPDATE_LOCK_ERROR=""
 INSTALL_DIR_CREATED=false
 NEW_INSTALL_DIR_CLEANUP_ERROR=""
@@ -2934,5 +2937,5 @@ if [ -n "$POST_COMMIT_ERRORS" ]; then
   error "The new install was committed, but cleanup was incomplete: ${POST_COMMIT_ERRORS}."
 fi
 
-info "Installed: $("${INSTALL_DIR}/${BINARY_NAME}" --version 7>&- 8>&- 9>&-)"
+info "Installed: $("${INSTALL_DIR}/${BINARY_NAME}" --version 5>&- 6>&- 7>&- 8>&- 9>&-)"
 info "Run 'codex-switch-global-pace --help' to get started"

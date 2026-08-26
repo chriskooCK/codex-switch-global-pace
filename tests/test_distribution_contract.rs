@@ -1857,9 +1857,9 @@ fn unix_installer_accepts_only_the_candidate_exact_state_tuple() {
         .nth(1)
         .and_then(|section| section.split("verify_candidate_version() {").next())
         .expect("Unix installer exact daemon-state parser");
-    assert!(
-        parser.contains("\"$CANDIDATE_BIN\" daemon status --installer-state 7>&- 8>&- 9>&- 2>&1")
-    );
+    assert!(parser.contains(
+        "\"$CANDIDATE_BIN\" daemon status --installer-state 5>&- 6>&- 7>&- 8>&- 9>&- 2>&1"
+    ));
     for exact in [
         "'running=true service_installed=true')",
         "'running=true service_installed=false')",
@@ -1884,7 +1884,7 @@ fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
         .expect("Unix install transaction section");
     for required in [
         "CS_UPDATE_LOCK_TARGET=\"$target\"",
-        "__hold-update-lock 7>&- 8>&- 9>&-",
+        "__hold-update-lock 5>&- 6>&- 7>&- 8>&- 9>&-",
         "codex-switch-global-pace update lock ready",
         "mkfifo \"$control\" \"$ready\"",
         "start_install_update_locks",
@@ -1898,6 +1898,40 @@ fn unix_installer_holds_the_shared_update_lock_across_the_transaction() {
             "missing update-lock contract `{required}`"
         );
     }
+    let lock_channels = script
+        .split("start_update_lock() {")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("validate_stable_lock_parent_chain() {")
+                .next()
+        })
+        .expect("Unix update-lock channels");
+    for descriptor in [7, 8, 9] {
+        assert!(
+            lock_channels.contains(&format!("exec {descriptor}>\"$control\"")),
+            "update-lock channel {descriptor} is not bound"
+        );
+    }
+    assert!(
+        !lock_channels.contains("exec 5>\"$control\""),
+        "FD 5 belongs exclusively to the daemon lifecycle control channel"
+    );
+    let daemon_channels = script
+        .split("start_daemon_update_boundary() {")
+        .nth(1)
+        .and_then(|section| {
+            section
+                .split("request_daemon_update_boundary_new_state() {")
+                .next()
+        })
+        .expect("Unix daemon lifecycle channels");
+    assert!(daemon_channels.contains("exec 5>\"$control\""));
+    assert!(daemon_channels.contains("exec 6<\"$status\""));
+    assert!(
+        !daemon_channels.contains("exec 7>\"$control\""),
+        "FD 7 belongs exclusively to update-lock authority"
+    );
     assert!(
         !script.contains("read -r -t"),
         "a concurrent installer must wait for the shared lock instead of timing out"
@@ -2522,7 +2556,8 @@ fn unix_uninstall_keeps_its_lock_holder_alive_through_daemon_and_binary_removal(
     fs::set_permissions(&binary, old_permissions).unwrap();
 
     let candidate = home.path().join("verified-candidate");
-    let held = home.path().join("lock-held");
+    let stable_held = home.path().join("stable-lock-held");
+    let target_held = home.path().join("target-lock-held");
     let log = home.path().join("uninstall-log");
     fs::write(
         &candidate,
@@ -2530,14 +2565,15 @@ fn unix_uninstall_keeps_its_lock_holder_alive_through_daemon_and_binary_removal(
 case "$1" in
   __hold-update-lock)
     case "$CS_UPDATE_LOCK_TARGET" in
-      "$STABLE_AUTHORITY_TARGET") ;;
-      "$UNINSTALL_TARGET") : > "$UPDATE_LOCK_HELD" ;;
+      "$STABLE_AUTHORITY_TARGET") lock_marker="$STABLE_LOCK_HELD" ;;
+      "$UNINSTALL_TARGET") lock_marker="$TARGET_LOCK_HELD" ;;
       *) exit 60 ;;
     esac
+    : > "$lock_marker"
     : > "$(dirname "$CS_UPDATE_LOCK_TARGET")/.$(basename "$CS_UPDATE_LOCK_TARGET").self-update.lock"
     printf 'codex-switch-global-pace update lock ready\n'
     cat >/dev/null
-    rm -f "$UPDATE_LOCK_HELD"
+    rm -f "$lock_marker"
     ;;
   __hold-daemon-update-boundary)
     [ "$2" = --initial-executable ] || exit 61
@@ -2549,28 +2585,31 @@ case "$1" in
     while IFS= read -r command; do
       case "$command" in
         uninstall)
-          [ -f "$UPDATE_LOCK_HELD" ] || exit 65
-          [ -f "$LIFECYCLE_HELD" ] || exit 66
-          [ -e "$UNINSTALL_TARGET" ] || exit 67
+          [ -f "$STABLE_LOCK_HELD" ] || exit 65
+          [ -f "$TARGET_LOCK_HELD" ] || exit 66
+          [ -f "$LIFECYCLE_HELD" ] || exit 67
+          [ -e "$UNINSTALL_TARGET" ] || exit 68
           printf 'daemon-uninstalled\n' > "$UNINSTALL_LOG"
           printf 'codex-switch-global-pace daemon update boundary uninstall state ready\n'
           ;;
         finish)
-          [ -f "$UPDATE_LOCK_HELD" ] || exit 68
-          [ -f "$LIFECYCLE_HELD" ] || exit 69
+          [ -f "$STABLE_LOCK_HELD" ] || exit 69
+          [ -f "$TARGET_LOCK_HELD" ] || exit 70
+          [ -f "$LIFECYCLE_HELD" ] || exit 71
           : > "$FINAL_CONFIRMED"
           printf 'codex-switch-global-pace daemon update boundary final state confirmed\n'
           ;;
         release)
-          [ -f "$UPDATE_LOCK_HELD" ] || exit 70
-          [ -f "$LIFECYCLE_HELD" ] || exit 71
-          [ -f "$FINAL_CONFIRMED" ] || exit 72
-          [ ! -e "$UNINSTALL_TARGET" ] || exit 73
+          [ -f "$STABLE_LOCK_HELD" ] || exit 72
+          [ -f "$TARGET_LOCK_HELD" ] || exit 73
+          [ -f "$LIFECYCLE_HELD" ] || exit 74
+          [ -f "$FINAL_CONFIRMED" ] || exit 75
+          [ ! -e "$UNINSTALL_TARGET" ] || exit 76
           printf 'codex-switch-global-pace daemon update boundary lifecycle authority released\n'
           rm -f "$LIFECYCLE_HELD"
           exit 0
           ;;
-        *) exit 74 ;;
+        *) exit 77 ;;
       esac
     done
     exit 70
@@ -2579,12 +2618,12 @@ case "$1" in
     exec "$REAL_INSTALLER_HELPER" "$@"
     ;;
   daemon)
-    [ "$2" = uninstall ] || exit 71
-    [ "$3" = --expected-executable ] || exit 72
-    [ "$4" = "$UNINSTALL_TARGET" ] || exit 73
-    [ "${5:-}" = --check-owner ] || exit 74
+    [ "$2" = uninstall ] || exit 80
+    [ "$3" = --expected-executable ] || exit 81
+    [ "$4" = "$UNINSTALL_TARGET" ] || exit 82
+    [ "${5:-}" = --check-owner ] || exit 83
     ;;
-  *) exit 75 ;;
+  *) exit 84 ;;
 esac
 "#,
     )
@@ -2608,7 +2647,8 @@ esac
             home.path()
                 .join(".codex-switch/codex-switch-global-pace-installer-authority"),
         )
-        .env("UPDATE_LOCK_HELD", &held)
+        .env("STABLE_LOCK_HELD", &stable_held)
+        .env("TARGET_LOCK_HELD", &target_held)
         .env("LIFECYCLE_HELD", home.path().join("lifecycle-held"))
         .env("FINAL_CONFIRMED", home.path().join("final-confirmed"))
         .env("UNINSTALL_LOG", &log)
@@ -2623,7 +2663,8 @@ esac
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!binary.exists());
-    assert!(!held.exists());
+    assert!(!stable_held.exists());
+    assert!(!target_held.exists());
     assert!(!home.path().join("lifecycle-held").exists());
     assert!(home.path().join("final-confirmed").exists());
     assert_eq!(fs::read_to_string(log).unwrap(), "daemon-uninstalled\n");
