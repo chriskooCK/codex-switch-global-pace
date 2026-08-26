@@ -149,7 +149,7 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            cross build --release --locked --target "${{ matrix.target }}"
+            CROSS_CONFIG=Cross.toml cross build --release --locked --target "${{ matrix.target }}"
           else
             cargo build --release --locked --target "${{ matrix.target }}"
           fi
@@ -217,16 +217,6 @@ jobs:
             fi
             (cd artifacts && sha256sum --check "$(basename "$checksum")")
           done
-      - name: Attest release archives
-        id: attest
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
-        with:
-          subject-path: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
-      - name: Add provenance bundle to release assets
-        shell: bash
-        run: cp "${{ steps.attest.outputs.bundle-path }}" artifacts/codex-switch-global-pace-build-provenance.json
       - name: Add installers and install notes
         shell: bash
         run: |
@@ -236,23 +226,200 @@ jobs:
             scripts/install.ps1 > artifacts/install.ps1
           grep -Fqx "PACKAGED_RELEASE_VERSION=\"${RELEASE_VERSION}\"" artifacts/install.sh
           grep -Fqx "\$PackagedReleaseVersion = \"${RELEASE_VERSION}\"" artifacts/install.ps1
+          release_tag="${GITHUB_REF#refs/tags/}"
+          unix_install_args=""
+          if [[ "${{ needs.meta.outputs.is_dev }}" == true ]]; then
+            unix_install_args="--dev"
+          fi
           cat > artifacts/INSTALL.md << 'EOF'
-          ## Quick install
+          ## Verified install
+
+          The reviewed trust anchor is the [source-controlled install guide](https://github.com/chriskooCK/codex-switch-global-pace/blob/__SOURCE_DIGEST__/docs/wiki/Getting-Started.md#install).
+          This release-exact copy is also covered by the provenance bundle, but
+          an unverified copy of these instructions cannot authenticate itself.
+
+          These commands require a current [GitHub CLI](https://cli.github.com/).
+          They verify the installer against this repository, release workflow,
+          and exact tag after peeling annotated tags. Verification failure stops the
+          bootstrap; there is no unverified fallback.
 
           macOS / Linux:
 
           ```bash
-          curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash
+          set -eu
+          repo=chriskooCK/codex-switch-global-pace
+          bootstrap_error() {
+            printf '%s\n' "$1" >&2
+            exit 1
+          }
+          resolve_release_tag_commit() {
+            local tag_to_resolve="$1" endpoint tuple kind sha extra depth=0
+            endpoint="repos/$repo/git/ref/tags/$tag_to_resolve"
+            while [ "$depth" -le 5 ]; do
+              tuple="$(gh api --hostname github.com "$endpoint" \
+                --jq '[.object.type, .object.sha] | @tsv')" \
+                || bootstrap_error "Could not resolve release tag $tag_to_resolve."
+              case "$tuple" in
+                *$'\n'*) bootstrap_error "Release tag $tag_to_resolve returned more than one object record." ;;
+              esac
+              IFS=$'\t' read -r kind sha extra <<< "$tuple"
+              [ -n "$kind" ] && [ -n "$sha" ] && [ -z "${extra:-}" ] \
+                || bootstrap_error "Release tag $tag_to_resolve returned an invalid object record."
+              [ "${#sha}" -eq 40 ] && [[ "$sha" != *[!0-9A-Fa-f]* ]] \
+                || bootstrap_error "Release tag $tag_to_resolve returned an invalid Git object digest."
+              if [ "$kind" = commit ]; then
+                printf '%s\n' "$sha" | tr '[:upper:]' '[:lower:]'
+                return 0
+              fi
+              [ "$kind" = tag ] \
+                || bootstrap_error "Release tag $tag_to_resolve resolved to unsupported Git object type $kind."
+              [ "$depth" -lt 5 ] \
+                || bootstrap_error "Release tag $tag_to_resolve contains more than five nested annotated tags."
+              endpoint="repos/$repo/git/tags/$sha"
+              depth=$((depth + 1))
+            done
+          }
+          tag=__RELEASE_TAG__
+          source_digest=__SOURCE_DIGEST__
+          [ "${#source_digest}" -eq 40 ] || {
+            printf 'Invalid embedded Release source digest.\n' >&2
+            exit 1
+          }
+          case "$source_digest" in
+            *[!0-9a-f]*)
+              printf 'Invalid embedded Release source digest.\n' >&2
+              exit 1
+              ;;
+          esac
+          current_digest="$(resolve_release_tag_commit "$tag")"
+          [ "$current_digest" = "$source_digest" ] || {
+            printf 'Release tag moved; refusing installer execution.\n' >&2
+            exit 1
+          }
+          work="$(mktemp -d)"
+          cleanup() {
+            status=$?
+            rm -f -- \
+              "$work/install.sh" \
+              "$work/codex-switch-global-pace-build-provenance.json" || status=1
+            rmdir -- "$work" || status=1
+            exit "$status"
+          }
+          trap cleanup EXIT
+          gh release download "$tag" --repo "$repo" --dir "$work" \
+            --pattern install.sh \
+            --pattern codex-switch-global-pace-build-provenance.json
+          gh attestation verify "$work/install.sh" \
+            --bundle "$work/codex-switch-global-pace-build-provenance.json" \
+            --repo "$repo" \
+            --signer-workflow "$repo/.github/workflows/release.yml" \
+            --source-ref "refs/tags/$tag" \
+            --source-digest "$source_digest" \
+            --deny-self-hosted-runners
+          confirmed_digest="$(resolve_release_tag_commit "$tag")"
+          [ "$confirmed_digest" = "$source_digest" ] || {
+            printf 'Release tag moved during verification; refusing installer execution.\n' >&2
+            exit 1
+          }
+          bash "$work/install.sh" __UNIX_INSTALL_ARGS__
           ```
 
           Windows PowerShell:
 
           ```powershell
-          irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
+          $ErrorActionPreference = "Stop"
+          $Repo = "chriskooCK/codex-switch-global-pace"
+          function Resolve-ReleaseTagCommit {
+              param([Parameter(Mandatory = $true)][string]$TagToResolve)
+
+              $Endpoint = "repos/$Repo/git/ref/tags/$TagToResolve"
+              foreach ($Depth in 0..5) {
+                  $Response = @(gh api --hostname github.com $Endpoint `
+                      --jq '[.object.type, .object.sha] | @tsv' 2>&1)
+                  $ExitCode = $LASTEXITCODE
+                  if ($ExitCode -ne 0) {
+                      throw "Could not resolve release tag '$TagToResolve': $([string]::Join(' ', $Response))"
+                  }
+                  if ($Response.Count -ne 1) {
+                      throw "Release tag '$TagToResolve' returned $($Response.Count) object records; expected exactly one."
+                  }
+                  $Fields = ([string]$Response[0]).Split([char]"`t")
+                  if ($Fields.Count -ne 2 -or
+                      [string]::IsNullOrWhiteSpace($Fields[0]) -or
+                      $Fields[1] -cnotmatch '\A[0-9A-Fa-f]{40}\z') {
+                      throw "Release tag '$TagToResolve' returned an invalid Git object record."
+                  }
+                  $Kind = $Fields[0]
+                  $Sha = $Fields[1].ToLowerInvariant()
+                  if ($Kind -ceq 'commit') { return $Sha }
+                  if ($Kind -cne 'tag') {
+                      throw "Release tag '$TagToResolve' resolved to unsupported Git object type '$Kind'."
+                  }
+                  if ($Depth -eq 5) {
+                      throw "Release tag '$TagToResolve' contains more than five nested annotated tags."
+                  }
+                  $Endpoint = "repos/$Repo/git/tags/$Sha"
+              }
+              throw "Release tag '$TagToResolve' could not be resolved to a commit."
+          }
+          $Tag = "__RELEASE_TAG__"
+          $SourceDigest = "__SOURCE_DIGEST__"
+          if ($SourceDigest -cnotmatch '\A[0-9a-f]{40}\z') {
+              throw "Invalid embedded Release source digest."
+          }
+          $CurrentDigest = Resolve-ReleaseTagCommit -TagToResolve $Tag
+          if ($CurrentDigest -cne $SourceDigest) {
+              throw "Release tag moved or returned an invalid digest; refusing installer execution."
+          }
+          $Work = Join-Path ([IO.Path]::GetTempPath()) "codex-switch-install-$([guid]::NewGuid().ToString('N'))"
+          New-Item -ItemType Directory -Path $Work | Out-Null
+          try {
+              gh release download $Tag --repo $Repo --dir $Work `
+                  --pattern install.ps1 `
+                  --pattern codex-switch-global-pace-build-provenance.json
+              if ($LASTEXITCODE -ne 0) { throw "Release download failed." }
+              gh attestation verify (Join-Path $Work "install.ps1") `
+                  --bundle (Join-Path $Work "codex-switch-global-pace-build-provenance.json") `
+                  --repo $Repo `
+                  --signer-workflow "$Repo/.github/workflows/release.yml" `
+                  --source-ref "refs/tags/$Tag" `
+                  --source-digest $SourceDigest `
+                  --deny-self-hosted-runners
+              if ($LASTEXITCODE -ne 0) { throw "Installer provenance verification failed." }
+              $ConfirmedDigest = Resolve-ReleaseTagCommit -TagToResolve $Tag
+              if ($ConfirmedDigest -cne $SourceDigest) {
+                  throw "Release tag moved during verification; refusing installer execution."
+              }
+              & (Join-Path $Work "install.ps1")
+          } finally {
+              Remove-Item -LiteralPath (Join-Path $Work "install.ps1") -Force -ErrorAction SilentlyContinue
+              Remove-Item -LiteralPath (Join-Path $Work "codex-switch-global-pace-build-provenance.json") -Force -ErrorAction SilentlyContinue
+              [IO.Directory]::Delete($Work, $false)
+          }
           ```
 
-          The program reuses profiles and configuration under `~/.codex-switch`.
+          The packaged development installer selects the dev channel automatically.
+          Both installers reuse `CODEX_SWITCH_HOME` (default `~/.codex-switch`).
           EOF
+          sed -i \
+            -e "s/__RELEASE_TAG__/${release_tag}/g" \
+            -e "s/__SOURCE_DIGEST__/${GITHUB_SHA}/g" \
+            -e "s/__UNIX_INSTALL_ARGS__/${unix_install_args}/g" \
+            artifacts/INSTALL.md
+          ! grep -Eq '__RELEASE_TAG__|__SOURCE_DIGEST__|__UNIX_INSTALL_ARGS__' artifacts/INSTALL.md
+      - name: Attest release archives and installers
+        id: attest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/INSTALL.md
+            artifacts/install.sh
+            artifacts/install.ps1
+      - name: Add provenance bundle to release assets
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" artifacts/codex-switch-global-pace-build-provenance.json
       - name: Generate release body
         shell: bash
         run: |
@@ -262,9 +429,9 @@ jobs:
 
           Use \`codex-switch-global-pace self-update --dev\` to install, or \`codex-switch-global-pace self-update --stable\` to return to stable.
 
-          macOS / Linux: \`curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh | bash -s -- --dev\`
+          Start with the [source-controlled verified install guide](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/wiki/Getting-Started.md#install). It verifies the installer before execution with no fallback.
 
-          Windows PowerShell: \`\$env:CS_DEV="1"; irm https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.ps1 | iex\`
+          The attached \`INSTALL.md\` is release-exact and attested in the same provenance bundle. The packaged Windows installer selects dev automatically.
 
           Version: \`${RELEASE_VERSION}\`
           EOF
@@ -272,7 +439,9 @@ jobs:
             cat > release_body.md << EOF
           Profiles and configuration under \`~/.codex-switch\` are preserved.
 
-          \`curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/${GITHUB_REF#refs/tags/}/install.sh | bash\`
+          Start with the [source-controlled verified install guide](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/wiki/Getting-Started.md#install). It verifies the installer before execution with no fallback.
+
+          The attached \`INSTALL.md\` is release-exact and attested in the same provenance bundle.
           EOF
           fi
       - name: Verify packaged release version
@@ -434,8 +603,14 @@ jobs:
           done
           if [[ "$verification_mode" == attest ]]; then
             provenance_bundle="$download_dir/codex-switch-global-pace-build-provenance.json"
-            for archive in "$download_dir"/*.tar.gz "$download_dir"/*.zip; do
-              verification=$(gh attestation verify "$archive" \
+            for subject in \
+              "$download_dir"/*.tar.gz \
+              "$download_dir"/*.zip \
+              "$download_dir/INSTALL.md" \
+              "$download_dir/install.sh" \
+              "$download_dir/install.ps1"
+            do
+              verification=$(gh attestation verify "$subject" \
                 --repo "$GITHUB_REPOSITORY" \
                 --bundle "$provenance_bundle" \
                 --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
@@ -453,7 +628,7 @@ jobs:
                   .verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.path == ".github/workflows/release.yml" and
                   any(.verificationResult.statement.predicate.buildDefinition.resolvedDependencies[]?;
                     .digest.gitCommit == $sha))' <<<"$verification" > /dev/null; then
-                echo "Existing release asset $(basename "$archive") is not attested to ${GITHUB_SHA}." >&2
+                echo "Existing release asset $(basename "$subject") is not attested to ${GITHUB_SHA}." >&2
                 exit 1
               fi
             done

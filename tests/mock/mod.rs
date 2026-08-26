@@ -132,6 +132,14 @@ impl MockServer {
         )
     }
 
+    /// The reset-credit consumption URL for setting CS_RESET_CREDITS_CONSUME_URL.
+    pub fn reset_credits_consume_url(&self) -> String {
+        format!(
+            "http://{}/backend-api/wham/rate-limit-reset-credits/consume",
+            self.addr
+        )
+    }
+
     /// The base URL for setting CS_TOKEN_URL.
     pub fn token_url(&self) -> String {
         format!("http://{}/oauth/token", self.addr)

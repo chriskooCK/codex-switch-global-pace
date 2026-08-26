@@ -5,8 +5,6 @@ use anyhow::{Context, Result};
 use reqwest::RequestBuilder;
 use serde::Deserialize;
 
-const ACCOUNTS_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
-
 #[derive(Debug, Deserialize)]
 struct AccountEntry {
     id: String,
@@ -109,10 +107,6 @@ pub(crate) enum WorkspaceLookup {
     Named(String),
 }
 
-fn accounts_check_url() -> String {
-    std::env::var("CS_ACCOUNTS_CHECK_URL").unwrap_or_else(|_| ACCOUNTS_CHECK_URL.to_string())
-}
-
 fn build_accounts_check_request(
     client: &reqwest::Client,
     url: &str,
@@ -133,6 +127,7 @@ fn build_accounts_check_request(
 }
 
 pub(crate) async fn fetch_workspace_name(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: &str,
@@ -141,11 +136,16 @@ pub(crate) async fn fetch_workspace_name(
     if account_id.trim().is_empty() {
         return Ok(WorkspaceLookup::Unlisted);
     }
-    let url = accounts_check_url();
-    let response = build_accounts_check_request(client, &url, access_token, account_id, is_fedramp)
-        .send()
-        .await
-        .with_context(|| "requesting ChatGPT workspace metadata")?;
+    let response = build_accounts_check_request(
+        client,
+        endpoints.accounts_check()?,
+        access_token,
+        account_id,
+        is_fedramp,
+    )
+    .send()
+    .await
+    .with_context(|| "requesting ChatGPT workspace metadata")?;
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!("workspace metadata request failed (HTTP {status})");
@@ -158,10 +158,27 @@ pub(crate) async fn fetch_workspace_name(
 }
 
 pub(crate) async fn refresh_for_auth(auth: &serde_json::Value) -> Result<Option<String>> {
-    refresh_for_auth_if_needed(auth, true).await
+    let endpoints = crate::auth::service_endpoints()?;
+    refresh_for_auth_at(&endpoints, auth).await
+}
+
+pub(crate) async fn refresh_for_auth_at(
+    endpoints: &crate::auth::ServiceEndpoints,
+    auth: &serde_json::Value,
+) -> Result<Option<String>> {
+    refresh_for_auth_if_needed_at(endpoints, auth, true).await
 }
 
 pub(crate) async fn refresh_for_auth_if_needed(
+    auth: &serde_json::Value,
+    force: bool,
+) -> Result<Option<String>> {
+    let endpoints = crate::auth::service_endpoints()?;
+    refresh_for_auth_if_needed_at(&endpoints, auth, force).await
+}
+
+async fn refresh_for_auth_if_needed_at(
+    endpoints: &crate::auth::ServiceEndpoints,
     auth: &serde_json::Value,
     force: bool,
 ) -> Result<Option<String>> {
@@ -182,10 +199,18 @@ pub(crate) async fn refresh_for_auth_if_needed(
         return Ok(None);
     };
     let client = crate::auth::build_http_client()?;
-    remember_workspace_name(&client, access_token, Some(account_id), info.is_fedramp).await
+    remember_workspace_name_at(
+        endpoints,
+        &client,
+        access_token,
+        Some(account_id),
+        info.is_fedramp,
+    )
+    .await
 }
 
-pub(crate) async fn remember_workspace_name(
+async fn remember_workspace_name_at(
+    endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
@@ -194,7 +219,8 @@ pub(crate) async fn remember_workspace_name(
     let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
     };
-    let lookup = fetch_workspace_name(client, access_token, account_id, is_fedramp).await?;
+    let lookup =
+        fetch_workspace_name(endpoints, client, access_token, account_id, is_fedramp).await?;
     // `Unlisted` is not an answer, so it is not recorded — the same reason a
     // failed request is not. Recording it would hide a real workspace name
     // until the record expired.
@@ -245,13 +271,15 @@ mod tests {
     /// loudly. Reaching `Ok` is therefore proof the answer came from cache.
     const UNREACHABLE_ACCOUNTS_CHECK: &str = "http://127.0.0.1:1/";
 
-    /// `CODEX_SWITCH_HOME` is process-global and mutated by other test modules
-    /// under `profile::TEST_ENV_LOCK`; take it for the whole body. Holding it
-    /// across `.await` is safe under `#[tokio::test]`'s current-thread runtime.
+    /// Endpoint variables and `CODEX_SWITCH_HOME` are process-global. Match the
+    /// shared lock order used by the other HTTP tests: endpoint lock first,
+    /// then profile-home lock. Holding both across `.await` is safe under
+    /// `#[tokio::test]`'s current-thread runtime.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_confirmed_absence_is_answered_without_another_request() {
-        let _env_lock = crate::profile::TEST_ENV_LOCK
+        let _url_env_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = crate::fs_ops::create_direct_tempdir().unwrap();
@@ -277,7 +305,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn force_still_asks_the_server_despite_a_recorded_absence() {
-        let _env_lock = crate::profile::TEST_ENV_LOCK
+        let _url_env_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = crate::fs_ops::create_direct_tempdir().unwrap();

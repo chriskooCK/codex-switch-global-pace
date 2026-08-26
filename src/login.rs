@@ -128,6 +128,8 @@ fn redacted_device_poll_log_body(body: &serde_json::Value) -> String {
 /// Run PKCE OAuth flow: open browser → wait for callback → exchange tokens
 pub async fn run_device_auth() -> Result<LoginTokens> {
     crate::auth::ensure_file_credentials_store()?;
+    let endpoints = crate::auth::service_endpoints()?;
+    let token_url = endpoints.token()?;
     let pkce = generate_pkce();
     let state = generate_state();
 
@@ -172,27 +174,35 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
         callback_result.code.len()
     );
 
-    let mut tokens =
-        exchange_code(&callback_result.code, &pkce.code_verifier, &actual_redirect).await?;
+    let mut tokens = exchange_code(
+        &callback_result.code,
+        &pkce.code_verifier,
+        &actual_redirect,
+        token_url,
+    )
+    .await?;
     crate::auth::validate_managed_chatgpt_account(&tokens.id_token)?;
     // Best-effort API key exchange, same as Codex's browser login. Failure
     // leaves OPENAI_API_KEY null, which Codex accepts.
     if let Ok(client) = crate::auth::build_http_client() {
-        tokens.api_key = obtain_api_key(&client, &tokens.id_token).await;
+        tokens.api_key = obtain_api_key(&client, token_url, &tokens.id_token).await;
     }
     Ok(tokens)
 }
 
 /// Exchange the id_token for an API key (`OPENAI_API_KEY`), mirroring
 /// Codex's post-login token exchange.
-async fn obtain_api_key(client: &reqwest::Client, id_token: &str) -> Option<String> {
+async fn obtain_api_key(
+    client: &reqwest::Client,
+    token_url: &str,
+    id_token: &str,
+) -> Option<String> {
     #[derive(Deserialize)]
     struct ExchangeResp {
         access_token: String,
     }
 
-    let token_url = format!("{ISSUER}/oauth/token");
-    let resp = match build_api_key_exchange_request(client, &token_url, id_token)
+    let resp = match build_api_key_exchange_request(client, token_url, id_token)
         .send()
         .await
     {
@@ -419,8 +429,13 @@ async fn handle_callback_connection(
 
 // ── Token exchange ────────────────────────────────────────
 
-async fn exchange_code(code: &str, code_verifier: &str, redirect_uri: &str) -> Result<LoginTokens> {
-    exchange_code_with_redirect(code, code_verifier, redirect_uri).await
+async fn exchange_code(
+    code: &str,
+    code_verifier: &str,
+    redirect_uri: &str,
+    token_url: &str,
+) -> Result<LoginTokens> {
+    exchange_code_with_redirect(code, code_verifier, redirect_uri, token_url).await
 }
 
 /// Transport-level failures (connect/timeout) mean the request never reached the server, so
@@ -447,9 +462,9 @@ async fn exchange_code_with_redirect(
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
+    token_url: &str,
 ) -> Result<LoginTokens> {
     let client = crate::auth::build_http_client()?;
-    let token_url = crate::auth::token_url();
 
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
@@ -465,7 +480,7 @@ async fn exchange_code_with_redirect(
     let resp = loop {
         attempt += 1;
         match client
-            .post(&token_url)
+            .post(token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body.clone())
             .send()
@@ -919,7 +934,14 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
         // Use the standard /oauth/token endpoint with the returned code + verifier
         // The redirect_uri for device flow is the OpenAI deviceauth callback
         let device_redirect = format!("{ISSUER}/deviceauth/callback");
-        let tokens = exchange_code_with_redirect(&auth_code, &verifier, &device_redirect).await?;
+        let endpoints = crate::auth::service_endpoints()?;
+        let tokens = exchange_code_with_redirect(
+            &auth_code,
+            &verifier,
+            &device_redirect,
+            endpoints.token()?,
+        )
+        .await?;
         crate::auth::validate_managed_chatgpt_account(&tokens.id_token)?;
         return Ok(tokens);
     }
@@ -931,7 +953,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
 /// Used by both the CLI `login` flow and the TUI re-login / add flows.
 pub fn build_auth_from_tokens(
     tokens: &LoginTokens,
-) -> (serde_json::Value, crate::jwt::AccountInfo) {
+) -> Result<(serde_json::Value, crate::jwt::AccountInfo)> {
     let temp = serde_json::json!({
         "tokens": {
             "id_token": tokens.id_token,
@@ -942,12 +964,12 @@ pub fn build_auth_from_tokens(
     });
     let info = crate::jwt::parse_account_info(&temp);
     let account_id = info.account_id.as_deref().unwrap_or("").to_string();
-    (build_auth_json(tokens, &account_id), info)
+    Ok((build_auth_json(tokens, &account_id)?, info))
 }
 
-pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Value {
+pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> Result<serde_json::Value> {
     use crate::output::format_iso8601;
-    let ts = crate::auth::now_unix_secs();
+    let ts = crate::auth::now_unix_secs()?;
 
     // Same shape Codex 0.144.1 writes on a ChatGPT login: auth_mode is
     // persisted and an unknown account_id is null rather than "".
@@ -956,7 +978,7 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Va
     } else {
         serde_json::Value::String(account_id.to_string())
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "OPENAI_API_KEY": tokens.api_key,
         "auth_mode": "chatgpt",
         "tokens": {
@@ -965,8 +987,8 @@ pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> serde_json::Va
             "refresh_token": tokens.refresh_token,
             "account_id": account_id_value
         },
-        "last_refresh": format_iso8601(ts)
-    })
+        "last_refresh": format_iso8601(ts)?
+    }))
 }
 
 // ── Browser open ──────────────────────────────────────────
@@ -1098,9 +1120,9 @@ mod tests {
             api_key: None,
         };
 
-        let before = crate::auth::now_unix_secs();
-        let auth = build_auth_json(&tokens, "acct-123");
-        let after = crate::auth::now_unix_secs();
+        let before = crate::auth::now_unix_secs().unwrap();
+        let auth = build_auth_json(&tokens, "acct-123").unwrap();
+        let after = crate::auth::now_unix_secs().unwrap();
 
         assert_eq!(
             auth.pointer("/tokens/id_token").and_then(|v| v.as_str()),
@@ -1184,7 +1206,7 @@ mod tests {
             api_key: Some("sk-test-key".to_string()),
         };
 
-        let auth = build_auth_json(&tokens, "acct-123");
+        let auth = build_auth_json(&tokens, "acct-123").unwrap();
 
         assert_eq!(
             auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()),
@@ -1249,7 +1271,7 @@ mod tests {
             api_key: None,
         };
 
-        let auth = build_auth_json(&tokens, "");
+        let auth = build_auth_json(&tokens, "").unwrap();
 
         // Upstream serializes a missing account_id as null, not "".
         assert!(
@@ -1566,42 +1588,14 @@ mod tests {
     //
     // `exchange_code_with_redirect` is private (the `login` module is not part of the
     // public library API), so these live as unit tests here rather than as an external
-    // `tests/` integration file. CS_TOKEN_URL is process-global and warmup's tests
-    // retarget it too, so every test here takes the crate-wide `auth::URL_ENV_LOCK`
-    // rather than a lock private to this module.
+    // `tests/` integration file. Each test passes its mock URL explicitly, with no
+    // process-global endpoint mutation or cross-module test lock.
 
     mod token_exchange {
         use super::*;
         use axum::{Json, Router, http::StatusCode, routing::post};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use crate::auth::URL_ENV_LOCK as TOKEN_URL_ENV_LOCK;
-
-        struct EnvVarGuard {
-            previous: Option<String>,
-        }
-
-        impl EnvVarGuard {
-            fn set(value: &str) -> Self {
-                let previous = std::env::var("CS_TOKEN_URL").ok();
-                unsafe {
-                    std::env::set_var("CS_TOKEN_URL", value);
-                }
-                Self { previous }
-            }
-        }
-
-        impl Drop for EnvVarGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.previous {
-                        Some(value) => std::env::set_var("CS_TOKEN_URL", value),
-                        None => std::env::remove_var("CS_TOKEN_URL"),
-                    }
-                }
-            }
-        }
 
         /// Bind then immediately drop: the OS gives back a port nothing is listening on
         /// yet, so a connection attempt to it fails fast with "connection refused" — a
@@ -1616,9 +1610,53 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn browser_token_exchanges_use_the_same_explicit_endpoint() {
+            init_test_config();
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let counter = request_count.clone();
+            let app = Router::new().route(
+                "/custom/token",
+                post(move |body: String| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        if body.contains("grant_type=authorization_code") {
+                            Json(serde_json::json!({
+                                "id_token": "id-1",
+                                "access_token": "access-1",
+                                "refresh_token": "refresh-1",
+                            }))
+                        } else {
+                            Json(serde_json::json!({"access_token": "sk-test"}))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let token_url = format!("http://{addr}/custom/token");
+
+            let tokens = exchange_code_with_redirect(
+                "code",
+                "verifier",
+                "http://localhost:1455/auth/callback",
+                &token_url,
+            )
+            .await
+            .expect("authorization-code exchange");
+            let client = crate::auth::build_http_client().unwrap();
+            let api_key = obtain_api_key(&client, &token_url, &tokens.id_token).await;
+
+            assert_eq!(api_key.as_deref(), Some("sk-test"));
+            assert_eq!(request_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
         async fn token_exchange_retries_until_the_transient_failure_clears() {
             init_test_config();
-            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
             let request_count = Arc::new(AtomicUsize::new(0));
             let counter = request_count.clone();
 
@@ -1655,12 +1693,13 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
 
-            let _env = EnvVarGuard::set(&format!("http://{addr}/oauth/token"));
+            let token_url = format!("http://{addr}/oauth/token");
 
             let tokens = exchange_code_with_redirect(
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
+                &token_url,
             )
             .await
             .expect("token exchange should succeed once the transient outage clears");
@@ -1696,15 +1735,15 @@ mod tests {
         #[tokio::test]
         async fn token_exchange_retries_connection_failures_before_giving_up() {
             init_test_config();
-            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
             let port = reserve_closed_port();
-            let _env = EnvVarGuard::set(&format!("http://127.0.0.1:{port}/oauth/token"));
+            let token_url = format!("http://127.0.0.1:{port}/oauth/token");
 
             let started = std::time::Instant::now();
             let err = exchange_code_with_redirect(
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
+                &token_url,
             )
             .await
             .expect_err("an endpoint that never answers must eventually fail");
@@ -1726,7 +1765,6 @@ mod tests {
         #[tokio::test]
         async fn token_exchange_fails_immediately_on_deterministic_bad_request() {
             init_test_config();
-            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
             let request_count = Arc::new(AtomicUsize::new(0));
             let counter = request_count.clone();
 
@@ -1752,12 +1790,13 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
 
-            let _env = EnvVarGuard::set(&format!("http://{addr}/oauth/token"));
+            let token_url = format!("http://{addr}/oauth/token");
 
             let err = exchange_code_with_redirect(
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
+                &token_url,
             )
             .await
             .expect_err("a deterministic 400 must not be swallowed into success");
@@ -1773,7 +1812,6 @@ mod tests {
         #[tokio::test]
         async fn token_exchange_surfaces_object_shaped_error_code_and_message() {
             init_test_config();
-            let _lock = TOKEN_URL_ENV_LOCK.lock().await;
 
             let app = Router::new().route(
                 "/oauth/token",
@@ -1797,12 +1835,13 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
 
-            let _env = EnvVarGuard::set(&format!("http://{addr}/oauth/token"));
+            let token_url = format!("http://{addr}/oauth/token");
 
             let err = exchange_code_with_redirect(
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
+                &token_url,
             )
             .await
             .expect_err("object-shaped error body must still fail with a helpful message");

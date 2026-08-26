@@ -8,13 +8,17 @@ use ratatui::{
 
 use super::app::{App, UsageStatus};
 use super::keymap;
+use super::meter::{percent_marker_offset, usage_meter_line};
 use super::popup;
 use crate::jwt::PlanKind;
 use crate::output::{
     format_local_time, format_reset_short, format_reset_time, reset_credits_count,
 };
 use crate::safe_text;
-use crate::usage::{GlobalWeeklySummary, QuotaPaceState, UsageInfo, quota_pace_state};
+use crate::usage::{
+    GlobalWeeklySummary, QuotaPaceState, UsageAvailability, UsageInfo, quota_pace_state,
+    usage_availability,
+};
 
 // ── RGB-only color palette ───────────────────────────────
 // All colors are explicit RGB to avoid mixing ANSI-16 + 24-bit,
@@ -98,81 +102,6 @@ fn render_usage_bar_row(
     f.render_widget(Paragraph::new(suffix).style(base()), areas.suffix);
 }
 
-/// Map a percentage on a 0..100 meter to its marker cell.
-/// Zero is the first cell and 100 is the last cell.
-fn percent_marker_offset(percent: f64, width: u16) -> Option<u16> {
-    if width == 0 || !percent.is_finite() {
-        return None;
-    }
-
-    let last_cell = width - 1;
-    Some(
-        ((percent.clamp(0.0, 100.0) / 100.0) * f64::from(last_cell))
-            .round()
-            .clamp(0.0, f64::from(last_cell)) as u16,
-    )
-}
-
-fn meter_fill_width(percent: f64, width: u16) -> u16 {
-    debug_assert!(percent.is_finite());
-    // Keep a small nonzero usage segment visible instead of rounding it away.
-    ((percent.clamp(0.0, 100.0) / 100.0) * f64::from(width))
-        .ceil()
-        .clamp(0.0, f64::from(width)) as u16
-}
-
-fn usage_meter_line(
-    fill_percent: f64,
-    marker_offset: Option<u16>,
-    width: u16,
-    fill_style: Style,
-    remaining_style: Style,
-    marker_style: Style,
-) -> Line<'static> {
-    let fill_width = meter_fill_width(fill_percent, width);
-    let mut spans = Vec::new();
-
-    if let Some(marker) = marker_offset {
-        debug_assert!(marker < width);
-        let before_fill = marker.min(fill_width);
-        let before_remaining = marker.saturating_sub(fill_width);
-        let after_fill = fill_width.saturating_sub(marker + 1);
-        let after_remaining = width.saturating_sub(marker + 1 + after_fill);
-
-        if before_fill > 0 {
-            spans.push(Span::styled("█".repeat(before_fill.into()), fill_style));
-        }
-        if before_remaining > 0 {
-            spans.push(Span::styled(
-                "░".repeat(before_remaining.into()),
-                remaining_style,
-            ));
-        }
-        spans.push(Span::styled("|", marker_style));
-        if after_fill > 0 {
-            spans.push(Span::styled("█".repeat(after_fill.into()), fill_style));
-        }
-        if after_remaining > 0 {
-            spans.push(Span::styled(
-                "░".repeat(after_remaining.into()),
-                remaining_style,
-            ));
-        }
-    } else {
-        if fill_width > 0 {
-            spans.push(Span::styled("█".repeat(fill_width.into()), fill_style));
-        }
-        if width > fill_width {
-            spans.push(Span::styled(
-                "░".repeat((width - fill_width).into()),
-                remaining_style,
-            ));
-        }
-    }
-
-    Line::from(spans)
-}
-
 fn render_pace_label(f: &mut Frame, row: Rect, bar: Rect, marker_offset: Option<u16>) {
     let Some(marker_offset) = marker_offset else {
         return;
@@ -246,41 +175,7 @@ fn editable_input_line(
     ])
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AccountUsageState {
-    Available,
-    Limited,
-    Unavailable,
-}
-
-fn account_usage_state(usage: &UsageInfo) -> AccountUsageState {
-    if !usage.parse_issues.is_empty() {
-        return AccountUsageState::Unavailable;
-    }
-    if usage.account_limited {
-        return AccountUsageState::Limited;
-    }
-
-    let windows = [usage.primary.as_ref(), usage.secondary.as_ref()];
-    if windows.iter().all(|window| window.is_none())
-        || windows
-            .iter()
-            .flatten()
-            .any(|window| crate::usage::normalized_quota_usage(window.used_percent).is_none())
-    {
-        return AccountUsageState::Unavailable;
-    }
-
-    if windows.iter().flatten().any(|window| {
-        crate::usage::normalized_quota_usage(window.used_percent).is_some_and(|used| used >= 100.0)
-    }) {
-        AccountUsageState::Limited
-    } else {
-        AccountUsageState::Available
-    }
-}
-
-pub fn render(f: &mut Frame, app: &mut App) {
+pub fn render(f: &mut Frame, app: &mut App, now: i64) {
     let area = f.area();
 
     // Paint the entire area with a solid background first
@@ -312,12 +207,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-    render_account_table(f, app, vertical[0]);
-    let now = crate::auth::now_unix_secs();
+    render_account_table(f, app, vertical[0], now);
     let global_weekly = app.global_weekly_summary(now);
     render_global_weekly_pace(f, &global_weekly, now, vertical[1]);
     if app.detail_visible && detail_height > 0 {
-        render_detail_panel(f, app, vertical[2]);
+        render_detail_panel(f, app, vertical[2], now);
     }
     render_status_bar(f, app, vertical[3]);
 
@@ -326,7 +220,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(state) = app.help_popup.as_mut() {
         render_help_popup(f, state, area);
     } else if let Some(menu) = app.menu.as_mut() {
-        menu.render(f, area);
+        menu.render(f, area, now);
     }
 }
 
@@ -409,7 +303,7 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
                 areas,
                 Line::from(Span::styled("7d", base().fg(C_WHITE))),
                 usage_meter_line(
-                    used,
+                    Some(used),
                     marker_offset,
                     areas.bar.width,
                     base().fg(pace_color),
@@ -503,10 +397,7 @@ fn compact_global_weekly_line(
         let suffix = fitted_segment_suffix(
             display_width(prefix) + display_width(unavailable),
             width,
-            [format!(
-                "{}/{} accounts",
-                summary.included_accounts, summary.excluded_accounts
-            )],
+            compact_account_count_segment(summary),
         );
         return Line::from(vec![
             Span::styled(prefix, base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
@@ -522,10 +413,7 @@ fn compact_global_weekly_line(
     if let Some(next) = next_reset_text(summary, now) {
         segments.push(format!("reset {next}"));
     }
-    segments.push(format!(
-        "{}/{} accounts",
-        summary.included_accounts, summary.excluded_accounts
-    ));
+    segments.extend(compact_account_count_segment(summary));
     segments.push(summary.weighting.as_str().to_string());
     let suffix = fitted_segment_suffix(
         display_width(prefix) + display_width(&pace_text),
@@ -543,15 +431,18 @@ fn compact_global_weekly_line(
     ])
 }
 
+fn compact_account_count_segment(summary: &GlobalWeeklySummary) -> Option<String> {
+    let total = summary
+        .included_accounts
+        .checked_add(summary.excluded_accounts)?;
+    Some(format!("{}/{} accounts", summary.included_accounts, total))
+}
+
 fn next_reset_text(summary: &GlobalWeeklySummary, now: i64) -> Option<String> {
     let alias = summary.next_reset_alias.as_deref()?;
     let resets_at = summary.next_reset_at?;
-    (resets_at > now).then(|| {
-        format!(
-            "{alias} in {}",
-            format_duration_compact((resets_at - now) as u64)
-        )
-    })
+    let remaining = u64::try_from(resets_at.checked_sub(now)?).ok()?;
+    (remaining > 0).then(|| format!("{alias} in {}", format_duration_compact(remaining)))
 }
 
 fn format_duration_compact(seconds: u64) -> String {
@@ -689,7 +580,7 @@ fn table_text_widths(
     widths
 }
 
-fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
+fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
     if app.accounts.is_empty() {
         let block = Block::default()
             .title(" codex-switch-global-pace ")
@@ -769,8 +660,6 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
             let plan_label = safe_display(&entry.info.plan_label_with(effective_plan));
             let plan_style = plan_color(effective_plan, is_selected);
 
-            let now = crate::auth::now_unix_secs();
-
             let (
                 status_text,
                 status_color,
@@ -843,15 +732,23 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                 UsageStatus::Loaded(u) => {
                     let refreshing = app.is_refreshing(&entry.alias);
                     let (p5, p5c) =
-                        quota_table_value(u.primary.as_ref(), "5h", crate::usage::WINDOW_5H_SECS);
+                        quota_table_value(u.primary.as_ref(), crate::usage::WINDOW_5H_SECS, now);
                     let (p7, p7c) =
-                        quota_table_value(u.secondary.as_ref(), "7d", crate::usage::WINDOW_7D_SECS);
+                        quota_table_value(u.secondary.as_ref(), crate::usage::WINDOW_7D_SECS, now);
                     let r5_ts = u.primary.as_ref().and_then(|w| w.resets_at);
-                    let r5 = r5_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
-                    let r5c = r5_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
+                    let r5 = r5_ts
+                        .map(|timestamp| format_reset_short(timestamp, now))
+                        .unwrap_or_else(|| "--".into());
+                    let r5c = r5_ts
+                        .map(|timestamp| reset_timestamp_color(timestamp, now))
+                        .unwrap_or(DIM);
                     let r7_ts = u.secondary.as_ref().and_then(|w| w.resets_at);
-                    let r7 = r7_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
-                    let r7c = r7_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
+                    let r7 = r7_ts
+                        .map(|timestamp| format_reset_short(timestamp, now))
+                        .unwrap_or_else(|| "--".into());
+                    let r7c = r7_ts
+                        .map(|timestamp| reset_timestamp_color(timestamp, now))
+                        .unwrap_or(DIM);
                     let cards = reset_cards_table_text(u);
                     let cards_color = reset_cards_color(u);
                     if refreshing {
@@ -870,10 +767,10 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect) {
                             cards_color,
                         )
                     } else {
-                        let (status, color) = match account_usage_state(u) {
-                            AccountUsageState::Available => ("OK", C_GREEN),
-                            AccountUsageState::Limited => ("Limited", C_RED),
-                            AccountUsageState::Unavailable => ("N/A", DIM),
+                        let (status, color) = match usage_availability(u, &entry.info) {
+                            UsageAvailability::Available => ("OK", C_GREEN),
+                            UsageAvailability::Limited => ("Limited", C_RED),
+                            UsageAvailability::Unavailable => ("N/A", DIM),
                         };
                         (
                             status.into(),
@@ -1048,7 +945,7 @@ fn detail_panel_height(app: &App) -> u16 {
     gauges.saturating_add(2)
 }
 
-fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
+fn render_detail_panel(f: &mut Frame, app: &App, area: Rect, now: i64) {
     let entry = match app
         .selected_account_idx()
         .and_then(|idx| app.accounts.get(idx))
@@ -1094,12 +991,12 @@ fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
             f.render_widget(p, layout[0]);
         }
         UsageStatus::Loaded(u) => {
-            render_usage_gauges(f, u, layout[0]);
+            render_usage_gauges(f, u, layout[0], now);
         }
     }
 }
 
-pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
+pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect, now: i64) {
     if !u.parse_issues.is_empty() {
         let detail = u
             .parse_issues
@@ -1117,7 +1014,6 @@ pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
         );
         return;
     }
-    let now = crate::auth::now_unix_secs();
     let multi_pool = !u.additional_limits.is_empty();
     let mut y = area.y;
     let mut render_pool = |f: &mut Frame,
@@ -1227,90 +1123,124 @@ fn reset_cards_color(u: &UsageInfo) -> Color {
     }
 }
 
-fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    // Rename input takes top priority
-    if let Some(rs) = &app.rename {
-        let line = editable_input_line(
-            " Rename: ",
-            &rs.input,
-            rs.cursor,
-            "  (Enter confirm / Esc cancel)",
-        );
-        f.render_widget(Paragraph::new(line).style(base()), area);
-        return;
-    }
+struct StatusBarContent {
+    lines: Vec<Line<'static>>,
+    show_version: bool,
+}
 
-    // Confirmation prompt
-    if let Some(confirm) = &app.confirm {
-        let msg = match confirm {
-            super::app::ConfirmAction::Switch(prepared) => format!(
-                "Current Codex login is not saved. Switch to '{}' and overwrite it? (y/n)",
-                prepared.alias()
+fn wrapped_status_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+    popup::wrap_line(&line, usize::from(width))
+}
+
+fn confirmation_status_line(confirm: &super::app::ConfirmAction) -> Line<'static> {
+    let message = match confirm {
+        super::app::ConfirmAction::Switch(prepared) => format!(
+            "Current Codex login is not saved. Switch to '{}' and overwrite it? (y/n)",
+            prepared.alias()
+        ),
+        super::app::ConfirmAction::Delete(alias) => {
+            format!("Delete profile '{alias}'? (y/n)")
+        }
+        super::app::ConfirmAction::BatchDelete(aliases) => {
+            format!("Delete {} marked profile(s)? (y/n)", aliases.len())
+        }
+        super::app::ConfirmAction::ConsumeResetCard {
+            alias, expires_at, ..
+        } => format!(
+            "Confirm reset card for '{alias}' expiring {}: y to use, any other key cancels",
+            safe_text::terminal_text(expires_at)
+        ),
+    };
+    Line::from(Span::styled(
+        message,
+        base().fg(C_RED).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn status_bar_content(app: &App, width: u16) -> StatusBarContent {
+    if let Some(rename) = &app.rename {
+        return StatusBarContent {
+            lines: wrapped_status_line(
+                editable_input_line(
+                    " Rename: ",
+                    &rename.input,
+                    rename.cursor,
+                    "  (Enter confirm / Esc cancel)",
+                ),
+                width,
             ),
-            super::app::ConfirmAction::Delete(alias) => {
-                format!("Delete profile '{alias}'? (y/n)")
-            }
-            super::app::ConfirmAction::BatchDelete(aliases) => {
-                format!("Delete {} marked profile(s)? (y/n)", aliases.len())
-            }
-            super::app::ConfirmAction::ConsumeResetCard {
-                alias, expires_at, ..
-            } => {
-                format!(
-                    "Confirm reset card for '{alias}' expiring {}: y to use, any other key cancels",
-                    safe_text::terminal_text(expires_at)
-                )
-            }
+            show_version: false,
         };
-        let line = Line::from(Span::styled(
-            msg,
-            base().fg(C_RED).add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(Paragraph::new(line).style(base()), area);
-        return;
     }
-
+    if let Some(confirm) = &app.confirm {
+        return StatusBarContent {
+            lines: wrapped_status_line(confirmation_status_line(confirm), width),
+            show_version: false,
+        };
+    }
     if app.search_active
-        && let Some(s) = &app.search
+        && let Some(search) = &app.search
     {
-        let line = editable_input_line(" /", &s.query, s.cursor, "  (Enter accept / Esc clear)");
-        f.render_widget(Paragraph::new(line).style(base()), area);
-        return;
-    }
-
-    if let Some(s) = &app.status_msg {
-        let msg = Line::from(Span::styled(
-            s.as_str(),
-            base().fg(status_message_color(app.status_is_error)),
-        ));
-        f.render_widget(
-            Paragraph::new(popup::wrap_line(&msg, area.width as usize)).style(base()),
-            area,
-        );
-        // Status messages own the complete footer. In particular, safety
-        // instructions must never be overwritten by the version indicator.
-        return;
-    } else if !app.marked.is_empty() {
-        let line = Line::from(vec![
-            Span::styled(" ", base()),
-            Span::styled(
-                format!("{}", app.marked.len()),
-                base().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+        return StatusBarContent {
+            lines: wrapped_status_line(
+                editable_input_line(
+                    " /",
+                    &search.query,
+                    search.cursor,
+                    "  (Enter accept / Esc clear)",
+                ),
+                width,
             ),
-            Span::styled(" selected", base().fg(C_YELLOW)),
-            Span::styled(" \u{2014} ", base().fg(DIM)),
-            Span::styled("enter", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
-            Span::styled(" for batch \u{2502} ", base().fg(DIM)),
-            Span::styled("esc", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
-            Span::styled(" to clear", base().fg(DIM)),
-        ]);
-        f.render_widget(Paragraph::new(line).style(base()), area);
-    } else {
-        let lines = build_help_lines(area.width as usize);
-        f.render_widget(Paragraph::new(lines).style(base()), area);
+            show_version: false,
+        };
+    }
+    if let Some(status) = &app.status_msg {
+        return StatusBarContent {
+            lines: wrapped_status_line(
+                Line::from(Span::styled(
+                    status.clone(),
+                    base().fg(status_message_color(app.status_is_error)),
+                )),
+                width,
+            ),
+            show_version: false,
+        };
+    }
+    if !app.marked.is_empty() {
+        return StatusBarContent {
+            lines: wrapped_status_line(
+                Line::from(vec![
+                    Span::styled(" ", base()),
+                    Span::styled(
+                        app.marked.len().to_string(),
+                        base().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" selected", base().fg(C_YELLOW)),
+                    Span::styled(" \u{2014} ", base().fg(DIM)),
+                    Span::styled("enter", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+                    Span::styled(" for batch \u{2502} ", base().fg(DIM)),
+                    Span::styled("esc", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+                    Span::styled(" to clear", base().fg(DIM)),
+                ]),
+                width,
+            ),
+            show_version: true,
+        };
+    }
+    StatusBarContent {
+        lines: build_help_lines(width.into()),
+        show_version: true,
+    }
+}
+
+fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let content = status_bar_content(app, area.width);
+    f.render_widget(Paragraph::new(content.lines).style(base()), area);
+    if !content.show_version {
+        return;
     }
 
-    // Version indicator — always rendered at bottom-right corner
+    // Version indicator is reserved for the ordinary help/selection footer.
     let version = crate::update::current_version();
     let ver_spans: Vec<Span> = if let Some(latest) = &app.update_available {
         vec![
@@ -1347,25 +1277,22 @@ fn render_usage_gauge(
     f: &mut Frame,
     w: &crate::usage::WindowUsage,
     label: &str,
-    window_secs: i64,
+    window_secs: Option<i64>,
     now: i64,
     area: Rect,
 ) {
     let used_percent = crate::usage::normalized_quota_usage(w.used_percent);
-    let (used, quota_text) = match used_percent {
-        Some(used) => (
-            used,
-            format!("  {used:>3.0}% used  {:>3.0}% left", 100.0 - used),
-        ),
-        None => (0.0, "   --% used   --% left".to_string()),
+    let quota_text = match used_percent {
+        Some(used) => format!("  {used:>3.0}% used  {:>3.0}% left", 100.0 - used),
+        None => "   --% used   --% left".to_string(),
     };
-    let pace = crate::usage::pace_percent(w, window_secs);
+    let pace = window_secs.and_then(|duration| crate::usage::pace_percent_at(w, duration, now));
     let marker_pace = crate::usage::visible_pace_marker(used_percent, pace);
     let (reset_str, reset_style) = match w.resets_at {
-        Some(resets_at) => (
-            format_reset_time(resets_at),
-            base().fg(reset_color(resets_at - now)),
-        ),
+        Some(resets_at) => {
+            let reset_style = base().fg(reset_timestamp_color(resets_at, now));
+            (format_reset_time(resets_at, now), reset_style)
+        }
         None => ("--".to_string(), base().fg(DIM)),
     };
 
@@ -1381,7 +1308,7 @@ fn render_usage_gauge(
 
     let pace_pos = marker_pace.and_then(|value| percent_marker_offset(value, bar_width));
     let bar_line = usage_meter_line(
-        used,
+        used_percent,
         pace_pos,
         bar_width,
         used_style,
@@ -1404,13 +1331,13 @@ fn render_usage_gauge(
         ..area
     };
     let reset_text = format!("resets in {reset_str}");
-    let started_text = if window_secs > 0 {
-        w.resets_at
-            .map(|ts| format!("started {}", format_local_time(ts - window_secs)))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let started_text = window_secs
+        .and_then(|duration| {
+            w.resets_at
+                .and_then(|timestamp| timestamp.checked_sub(duration))
+        })
+        .map(|timestamp| format!("started {}", format_local_time(timestamp, now)))
+        .unwrap_or_default();
     let reset_text_width = u16::try_from(display_width(&reset_text)).unwrap_or(u16::MAX);
     let reset_width = if reset_text_width <= reset_area.width {
         reset_text_width
@@ -1454,8 +1381,8 @@ fn render_usage_gauge(
 
 fn quota_table_value(
     window: Option<&crate::usage::WindowUsage>,
-    default_label: &str,
     default_secs: i64,
+    now: i64,
 ) -> (String, Color) {
     let Some(window) = window else {
         return ("--".into(), DIM);
@@ -1464,8 +1391,8 @@ fn quota_table_value(
         return ("--".into(), DIM);
     };
     let remaining = 100.0 - used;
-    let (_, window_secs) = crate::usage::quota_window_spec(window, default_label, default_secs);
-    let pace = crate::usage::pace_percent(window, window_secs);
+    let pace = crate::usage::quota_window_duration_secs(window, default_secs)
+        .and_then(|window_secs| crate::usage::pace_percent_at(window, window_secs, now));
     (
         format!("{remaining:.0}%"),
         quota_pace_color(Some(used), pace),
@@ -1498,6 +1425,10 @@ fn reset_color(remaining_secs: i64) -> Color {
     } else {
         C_RED
     }
+}
+
+fn reset_timestamp_color(timestamp: i64, now: i64) -> Color {
+    timestamp.checked_sub(now).map(reset_color).unwrap_or(DIM)
 }
 
 fn usage_pct_style(color: Color, is_selected: bool) -> Style {
@@ -1584,38 +1515,32 @@ fn format_auto_refresh_remaining(secs: u64) -> String {
 }
 
 fn status_bar_height(app: &App, width: u16) -> usize {
-    if let Some(status) = &app.status_msg {
-        return popup::wrap_line(&Line::from(status.as_str()), width as usize).len();
-    }
-    if app.rename.is_some() || app.confirm.is_some() || app.search_active || !app.marked.is_empty()
-    {
-        return 1;
-    }
-    build_help_lines(width as usize).len()
+    status_bar_content(app, width).lines.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountUsageState, C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
+        C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
         GLOBAL_WEEKLY_COMPACT_HEIGHT, GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT,
-        PACE_LABEL, account_usage_state, editable_input_line, fitted_segment_suffix,
-        global_weekly_panel_height, meter_fill_width, percent_marker_offset, plan_color,
-        quota_pace_color, quota_table_value, render, render_detail_panel,
-        render_global_weekly_pace, render_usage_gauge, render_usage_gauges, status_bar_height,
-        status_message_color, table_text_widths, usage_gauges_height,
+        PACE_LABEL, editable_input_line, fitted_segment_suffix, global_weekly_panel_height,
+        plan_color, quota_pace_color, quota_table_value, render, render_detail_panel,
+        render_global_weekly_pace, render_usage_gauge, render_usage_gauges, reset_timestamp_color,
+        status_bar_height, status_message_color, table_text_widths, usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
-    use crate::tui::app::{AccountEntry, App, UsageStatus};
+    use crate::tui::app::{AccountEntry, App, ConfirmAction, UsageStatus};
+    use crate::tui::meter::percent_marker_offset;
     use crate::usage::{
-        AdditionalRateLimit, GlobalPaceWeighting, GlobalWeeklySummary, UsageError, UsageInfo,
-        UsageParseIssue, WindowUsage,
+        AdditionalRateLimit, GlobalPaceWeighting, GlobalWeeklySummary, UsageAvailability,
+        UsageError, UsageInfo, UsageParseIssue, WindowUsage, usage_availability,
     };
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
     use ratatui::{Terminal, backend::TestBackend};
 
     type MeterBounds = Option<(u16, u16)>;
+    const TEST_NOW: i64 = 1_000_000;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct DashboardGeometry {
@@ -1710,6 +1635,11 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_reset_distance_is_neutral() {
+        assert_eq!(reset_timestamp_color(i64::MAX, i64::MIN), DIM);
+    }
+
+    #[test]
     fn safety_status_wraps_without_version_overdraw_at_supported_widths() {
         let message =
             "account: reset-card consumption may have occurred; verify before retry".to_string();
@@ -1721,7 +1651,9 @@ mod tests {
             let backend = TestBackend::new(width, 18);
             let mut terminal = Terminal::new(backend).unwrap();
 
-            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, TEST_NOW))
+                .unwrap();
 
             let rendered = ((18 - status_height as u16)..18)
                 .map(|y| row_text(terminal.backend(), y).trim_end().to_string())
@@ -1741,6 +1673,31 @@ mod tests {
 
         assert_eq!(status_bar_height(&app, 60), 2);
         assert_eq!(status_bar_height(&app, 80), 1);
+    }
+
+    #[test]
+    fn confirmation_footer_height_and_render_share_the_same_wrapped_model() {
+        let mut app = App::new();
+        app.confirm = Some(ConfirmAction::Delete(
+            "account-with-a-long-alias".to_string(),
+        ));
+        let width = 20;
+        let height = status_bar_height(&app, width);
+        assert!(height > 1);
+        let backend = TestBackend::new(width, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render(frame, &mut app, TEST_NOW))
+            .unwrap();
+
+        let rendered = ((18 - height as u16)..18)
+            .map(|y| row_text(terminal.backend(), y).trim_end().to_string())
+            .collect::<String>();
+        assert!(
+            rendered.contains("Delete profile 'account-with-a-long-alias'? (y/n)"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
@@ -1764,8 +1721,13 @@ mod tests {
             }),
             ..UsageInfo::default()
         };
-        let explicitly_limited = UsageInfo {
+        let broad_limited_incomplete = UsageInfo {
             account_limited: true,
+            ..UsageInfo::default()
+        };
+        let explicit_spend_blocker = UsageInfo {
+            account_limited: true,
+            spend_control_reached: true,
             ..UsageInfo::default()
         };
         let malformed = UsageInfo {
@@ -1774,27 +1736,42 @@ mod tests {
             }],
             ..UsageInfo::default()
         };
+        let plus = AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..AccountInfo::default()
+        };
 
         assert_eq!(
-            account_usage_state(&missing_windows),
-            AccountUsageState::Unavailable
+            usage_availability(&missing_windows, &AccountInfo::default()),
+            UsageAvailability::Unavailable
         );
         assert_eq!(
-            account_usage_state(&missing_percent),
-            AccountUsageState::Unavailable
+            usage_availability(&missing_percent, &AccountInfo::default()),
+            UsageAvailability::Unavailable
         );
         assert_eq!(
-            account_usage_state(&available),
-            AccountUsageState::Available
-        );
-        assert_eq!(account_usage_state(&exhausted), AccountUsageState::Limited);
-        assert_eq!(
-            account_usage_state(&explicitly_limited),
-            AccountUsageState::Limited
+            usage_availability(&available, &AccountInfo::default()),
+            UsageAvailability::Available
         );
         assert_eq!(
-            account_usage_state(&malformed),
-            AccountUsageState::Unavailable
+            usage_availability(&available, &plus),
+            UsageAvailability::Unavailable
+        );
+        assert_eq!(
+            usage_availability(&exhausted, &AccountInfo::default()),
+            UsageAvailability::Limited
+        );
+        assert_eq!(
+            usage_availability(&broad_limited_incomplete, &AccountInfo::default()),
+            UsageAvailability::Unavailable
+        );
+        assert_eq!(
+            usage_availability(&explicit_spend_blocker, &AccountInfo::default()),
+            UsageAvailability::Limited
+        );
+        assert_eq!(
+            usage_availability(&malformed, &AccountInfo::default()),
+            UsageAvailability::Unavailable
         );
     }
 
@@ -1814,7 +1791,9 @@ mod tests {
         let backend = TestBackend::new(100, 12);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, TEST_NOW))
+            .unwrap();
 
         let (x, y) = (0..12)
             .find_map(|y| {
@@ -1855,7 +1834,9 @@ mod tests {
         let backend = TestBackend::new(140, 20);
         let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, TEST_NOW))
+            .unwrap();
 
         let rendered = (0..terminal.backend().buffer().area.height)
             .map(|y| row_text(terminal.backend(), y))
@@ -1879,7 +1860,7 @@ mod tests {
                 limit_name: Some("Pool\u{1b}]52;name\u{7}\nNext".into()),
                 primary: Some(WindowUsage {
                     used_percent: Some(20.0),
-                    resets_at: Some(crate::auth::now_unix_secs() + 3600),
+                    resets_at: Some(TEST_NOW + 3600),
                     window_minutes: Some(300),
                 }),
                 ..AdditionalRateLimit::default()
@@ -1890,7 +1871,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area(), TEST_NOW))
             .unwrap();
 
         let rendered = (0..terminal.backend().buffer().area.height)
@@ -1912,7 +1893,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area(), TEST_NOW))
             .unwrap();
 
         let rendered = (0..terminal.backend().buffer().area.height)
@@ -1958,7 +1939,7 @@ mod tests {
     }
 
     fn dashboard_geometry(width: u16, is_current: bool) -> DashboardGeometry {
-        let now = crate::auth::now_unix_secs();
+        let now = TEST_NOW;
         let usage = UsageInfo {
             primary: Some(WindowUsage {
                 used_percent: Some(35.0),
@@ -1997,6 +1978,7 @@ mod tests {
                     frame,
                     &app,
                     Rect::new(0, GLOBAL_WEEKLY_FULL_HEIGHT, width, 6),
+                    now,
                 );
             })
             .unwrap();
@@ -2029,7 +2011,7 @@ mod tests {
 
     #[test]
     fn quota_table_values_do_not_encode_state_in_the_text() {
-        let now = crate::auth::now_unix_secs();
+        let now = TEST_NOW;
         let ahead = WindowUsage {
             used_percent: Some(20.0),
             resets_at: Some(now + crate::usage::WINDOW_7D_SECS - 60),
@@ -2042,40 +2024,17 @@ mod tests {
         };
 
         assert_eq!(
-            quota_table_value(Some(&ahead), "7d", crate::usage::WINDOW_7D_SECS),
+            quota_table_value(Some(&ahead), crate::usage::WINDOW_7D_SECS, now),
             ("80%".to_string(), C_YELLOW)
         );
         assert_eq!(
-            quota_table_value(Some(&behind), "7d", crate::usage::WINDOW_7D_SECS),
+            quota_table_value(Some(&behind), crate::usage::WINDOW_7D_SECS, now),
             ("80%".to_string(), C_GREEN)
         );
         assert_eq!(
-            quota_table_value(None, "7d", crate::usage::WINDOW_7D_SECS),
+            quota_table_value(None, crate::usage::WINDOW_7D_SECS, now),
             ("--".to_string(), DIM)
         );
-    }
-
-    #[test]
-    fn percentage_markers_use_the_full_zero_to_hundred_axis() {
-        assert_eq!(percent_marker_offset(50.0, 0), None);
-        assert_eq!(percent_marker_offset(f64::NAN, 5), None);
-        assert_eq!(percent_marker_offset(0.0, 1), Some(0));
-        assert_eq!(percent_marker_offset(100.0, 1), Some(0));
-        assert_eq!(percent_marker_offset(-10.0, 5), Some(0));
-        assert_eq!(percent_marker_offset(0.0, 5), Some(0));
-        assert_eq!(percent_marker_offset(50.0, 5), Some(2));
-        assert_eq!(percent_marker_offset(100.0, 5), Some(4));
-        assert_eq!(percent_marker_offset(125.0, 5), Some(4));
-    }
-
-    #[test]
-    fn nonzero_meter_fill_remains_visible_and_stays_within_width() {
-        assert_eq!(meter_fill_width(0.0, 5), 0);
-        assert_eq!(meter_fill_width(0.01, 5), 1);
-        assert_eq!(meter_fill_width(50.0, 5), 3);
-        assert_eq!(meter_fill_width(99.99, 5), 5);
-        assert_eq!(meter_fill_width(100.0, 5), 5);
-        assert_eq!(meter_fill_width(125.0, 5), 5);
     }
 
     #[test]
@@ -2334,7 +2293,7 @@ mod tests {
                             frame,
                             &window,
                             label,
-                            crate::usage::WINDOW_7D_SECS,
+                            Some(crate::usage::WINDOW_7D_SECS),
                             1_000_000,
                             frame.area(),
                         )
@@ -2414,6 +2373,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_global_panel_reports_included_over_total_accounts() {
+        let now = 1_000_000;
+        let summary = global_summary(now);
+        let backend = TestBackend::new(120, GLOBAL_WEEKLY_COMPACT_HEIGHT);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .unwrap();
+
+        assert_eq!(
+            row_text(terminal.backend(), 0).trim_end(),
+            " Global Weekly: 106.7% · +6.7%p · reset work2 in 3h18m · 3/4 accounts · equal"
+        );
+    }
+
+    #[test]
+    fn compact_global_panel_omits_an_unrepresentable_account_total() {
+        let now = 1_000_000;
+        let mut summary = global_summary(now);
+        summary.included_accounts = usize::MAX;
+        summary.excluded_accounts = 1;
+
+        let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
+
+        assert!(!text.contains("accounts"), "{text:?}");
+        assert!(text.contains("equal"), "{text:?}");
+    }
+
+    #[test]
     fn additional_quota_pool_expands_the_main_detail_panel() {
         let window = WindowUsage {
             used_percent: Some(25.0),
@@ -2438,7 +2427,7 @@ mod tests {
 
     #[test]
     fn eighty_by_twenty_four_keeps_every_additional_quota_meter_visible() {
-        let now = crate::auth::now_unix_secs();
+        let now = TEST_NOW;
         let main_weekly = WindowUsage {
             used_percent: Some(25.0),
             resets_at: Some(now + 6 * 24 * 60 * 60),
@@ -2455,6 +2444,7 @@ mod tests {
             window_minutes: Some(7 * 24 * 60),
         };
         let usage = UsageInfo {
+            fetched_at: Some(now),
             secondary: Some(main_weekly),
             additional_limits: vec![AdditionalRateLimit {
                 limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
@@ -2480,7 +2470,7 @@ mod tests {
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app, now)).unwrap();
         let rows = (0..24)
             .map(|y| row_text(terminal.backend(), y))
             .collect::<Vec<_>>();
@@ -2512,7 +2502,7 @@ mod tests {
                 metered_feature: Some("codex_bengalfox".to_string()),
                 primary: Some(WindowUsage {
                     used_percent: Some(8.0),
-                    resets_at: Some(crate::auth::now_unix_secs() + 6 * 24 * 60 * 60),
+                    resets_at: Some(TEST_NOW + 6 * 24 * 60 * 60),
                     window_minutes: Some(7 * 24 * 60),
                 }),
                 ..Default::default()
@@ -2523,7 +2513,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area(), TEST_NOW))
             .unwrap();
 
         let row = (0..10)

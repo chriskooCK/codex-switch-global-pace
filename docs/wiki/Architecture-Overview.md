@@ -22,11 +22,11 @@ flowchart LR
     Codex[Codex CLI] --> CodexAuth
 ```
 
-The application treats local files, command-line input, environment variables, OAuth callbacks, HTTP responses, and release assets as trust boundaries. Internal module calls rely on Rust types and established invariants.
+The application treats local files, command-line input, supported environment configuration, OAuth callbacks, HTTP responses, and release assets as trust boundaries. Production OpenAI service and GitHub API origins are fixed in the binary; endpoint environment variables are compiled only into unit-test builds or debug builds with the `test-endpoints` feature for isolated mock-server tests, and optimized builds reject that feature. A test override creates a sparse endpoint context: every service the test contacts must be set explicitly, and a missing or invalid endpoint fails before a request instead of falling back to production. Internal module calls rely on Rust types and established invariants.
 
 ## Startup and command dispatch
 
-[`src/main.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/main.rs) parses the CLI, initializes configuration and logging, chooses human or JSON output behavior, performs interactive live-auth change detection where appropriate, and dispatches to focused command modules under [`src/commands/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/dev/src/commands).
+[`src/main.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/main.rs) is the thin binary entry point. [`src/app.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/app.rs) parses the CLI, initializes configuration and logging, chooses human or JSON output behavior, performs interactive live-auth change detection where appropriate, and dispatches to focused command modules under [`src/commands/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/dev/src/commands).
 
 Configuration is loaded once from `config.toml`. An existing unreadable or invalid file fails fast with its path; missing configuration uses defaults. CLI proxy configuration has higher priority than file and environment configuration.
 
@@ -36,7 +36,14 @@ Configuration is loaded once from `config.toml`. An existing unreadable or inval
 
 [`src/profile.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/profile.rs) owns aliases, identity deduplication, imports, recoverable deletion, current-profile tracking, and switching. `auth.lock` serializes replacement or synchronization of the live `auth.json`. A compatibility-only `launch.lock` is acquired first so an older `codex-switch` process sharing the same state directory cannot restore staged credentials over a newer switch; this binary does not implement the `launch` command.
 
-Profile identity prefers `account_id` and falls back to email when required for locally authenticated operations. Imports are intentionally create-only: Usage API access proves workspace membership, but a Team workspace ID can belong to several users and cannot authorize overwriting an existing profile. Tokens refreshed while a profile is active are written to both the saved profile and the live auth file under the same switching discipline. A rotated import that loses verifiable identity is written under `recovery/`, outside the selectable profile tree.
+Credential replacement requires an exact `account_id` and email match; an
+email-only or otherwise incomplete identity never authorizes an overwrite.
+Imports are intentionally create-only: Usage API access proves workspace
+membership, but a Team workspace ID can belong to several users and cannot
+authorize overwriting an existing profile. Tokens refreshed while a profile is
+active are written to both the saved profile and the live auth file under the
+same switching discipline. A rotated import that loses verifiable identity is
+written under `recovery/`, outside the selectable profile tree.
 
 ## Usage, refresh, and selection
 
@@ -45,6 +52,7 @@ The [`src/usage/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/d
 | Module | Responsibility |
 |---|---|
 | `api.rs` | Authenticated requests, token refresh, retries, and import validation |
+| `global_pace.rs` | Aggregate comparable weekly windows into the Global Weekly Pace summary |
 | `parse.rs` | Convert service responses into stable quota structures |
 | `reset_credits.rs` | Select and consume reset cards |
 | `scoring.rs` | Pure eligibility, pace, and candidate scoring functions |

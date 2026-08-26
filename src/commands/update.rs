@@ -261,12 +261,6 @@ pub(crate) async fn self_update_cmd(
     // Preserve the migration-specific guidance before any network or lock error.
     ensure_system_install_migrated(use_dev, version, json)?;
 
-    if !check {
-        update::recover_pending_self_update_cleanup_on_startup().context(
-            "a previous Windows self-update cleanup remains pending; exact recovery must succeed before another executable publication",
-        )?;
-    }
-
     if check {
         let current_version = update::current_version().to_string();
         let result = if use_dev {
@@ -285,7 +279,7 @@ pub(crate) async fn self_update_cmd(
                 None => (
                     current_version.clone(),
                     false,
-                    update::detect_install_source().as_str().to_string(),
+                    update::detect_install_source()?.as_str().to_string(),
                 ),
             };
             print_json(&output::JsonSelfUpdate {
@@ -342,6 +336,15 @@ pub(crate) async fn self_update_cmd(
         }
         return Ok(());
     }
+
+    // Capture the cache timestamp before cleanup, daemon, or executable state
+    // can change. Recording a successful commit below is then infallible and
+    // cannot reverse the outcome of an already-completed update.
+    let self_update_record_time = update::capture_self_update_record_time()
+        .context("reading the system clock before self-update mutation")?;
+    update::recover_pending_self_update_cleanup_on_startup().context(
+        "a previous Windows self-update cleanup remains pending; exact recovery must succeed before another executable publication",
+    )?;
 
     let show_progress = !json && update::should_show_download_progress();
     // Serialize the complete daemon snapshot/stop/replace/restart transaction.
@@ -412,7 +415,7 @@ pub(crate) async fn self_update_cmd(
         }
     }
     let result = result_slot.context("self-update coordinator completed without a result")?;
-    update::record_successful_self_update(&result);
+    update::record_successful_self_update(&result, self_update_record_time);
 
     if json {
         print_json(&output::JsonSelfUpdate {

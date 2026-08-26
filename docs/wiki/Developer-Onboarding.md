@@ -15,7 +15,7 @@ Requirements:
 git clone https://github.com/chriskooCK/codex-switch-global-pace.git
 cd codex-switch-global-pace
 git checkout dev
-cargo test --all --locked
+cargo test --all --locked --features test-endpoints
 ```
 
 Development and pull requests normally target `dev`. The `master` branch represents stable releases. Do not confuse the `dev` branch with the rolling `dev` tag.
@@ -42,11 +42,11 @@ Search for the current signature and existing tests before assuming an API or pa
 For a bug or a behavior contract, add the smallest test that fails for the intended reason before changing the implementation:
 
 ```bash
-cargo test descriptive_test_name
+cargo test descriptive_test_name --features test-endpoints
 # Confirm the new test fails for the expected reason.
 
 # Implement the minimum change.
-cargo test descriptive_test_name
+cargo test descriptive_test_name --features test-endpoints
 ```
 
 Pure documentation, configuration-only edits, and visual-only TUI changes do not require an artificial red test. Explain how they were verified instead.
@@ -59,8 +59,8 @@ Before opening a pull request:
 
 ```bash
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --all --locked
+cargo clippy --all-targets --locked --features test-endpoints -- -D warnings
+cargo test --all --locked --features test-endpoints
 cargo audit
 bash -n scripts/install.sh
 ```
@@ -109,6 +109,8 @@ the same pull request as the behavior they describe.
 Use a single failing test or command to reduce the feedback loop. If an assumed path, method, or upstream response shape fails, stop and inspect the source or official upstream contract before retrying.
 
 For HTTP behavior, use the existing mock server and response transformers rather than live personal credentials. For platform service behavior, keep platform-specific command construction testable separately from the real service manager.
+
+Mock HTTP integration tests require the debug-only `test-endpoints` feature shown above. The `CS_*_URL` test variables are compiled only into that context and unit-test builds; optimized builds reject the feature and production binaries always use fixed service origins. Once a test sets any endpoint override, it must explicitly set every endpoint that its execution path contacts. Missing or invalid test endpoints return an error before network I/O and are never filled from production URLs.
 
 ## Release handoff
 

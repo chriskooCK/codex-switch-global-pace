@@ -53,7 +53,7 @@ jobs:
       - name: Build Linux AMD64 release target
         run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Build Linux ARM64 release target
-        run: cross build --release --locked --target aarch64-unknown-linux-musl
+        run: CROSS_CONFIG=Cross.toml cross build --release --locked --target aarch64-unknown-linux-musl
 
   test:
     name: Test (${{ matrix.host }})
@@ -97,8 +97,8 @@ jobs:
             }
           }
       - name: Run tests
-        run: cargo test --all --locked
+        run: cargo test --all --locked --features test-endpoints
       - name: Run Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --locked --features test-endpoints -- -D warnings
       - name: Build debug binary
         run: cargo build --locked

@@ -118,16 +118,19 @@ a weaker fallback.
 
 ## Uninstall
 
+Use the source-controlled [verified bootstrap](Getting-Started.md#install),
+replacing its final channel-dispatch block with the applicable invocation below:
+
 macOS/Linux:
 
 ```bash
-curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.sh | bash -s -- --uninstall
+bash "$work/install.sh" --uninstall
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:CS_UNINSTALL="1"; irm https://github.com/chriskooCK/codex-switch-global-pace/releases/latest/download/install.ps1 | iex
+& (Join-Path $Work "install.ps1") -Uninstall
 ```
 
 The uninstaller always retains `~/.codex-switch`

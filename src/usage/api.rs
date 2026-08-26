@@ -171,17 +171,19 @@ fn format_refresh_error(code: &str, message: Option<&str>) -> String {
     }
 }
 
-fn usage_url() -> String {
-    std::env::var("CS_USAGE_URL").unwrap_or_else(|_| USAGE_URL.to_string())
+fn token_needs_refresh(
+    access_token: &str,
+    id_token: Option<&str>,
+    margin_secs: i64,
+) -> Result<bool> {
+    if crate::jwt::is_token_expiring(access_token, margin_secs)? == Some(true) {
+        return Ok(true);
+    }
+    match id_token {
+        Some(token) => Ok(crate::jwt::is_token_expiring(token, margin_secs)? == Some(true)),
+        None => Ok(false),
+    }
 }
-
-fn token_needs_refresh(access_token: &str, id_token: Option<&str>, margin_secs: i64) -> bool {
-    crate::jwt::is_token_expiring(access_token, margin_secs).unwrap_or(false)
-        || id_token
-            .is_some_and(|token| crate::jwt::is_token_expiring(token, margin_secs).unwrap_or(false))
-}
-
-const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 /// Extract a short summary from an error message for user-facing display.
 /// Looks for "HTTP <status>" patterns; falls back to first line truncated.
@@ -593,6 +595,10 @@ async fn fetch_usage_retried_with_lease(
 
     let mut last_err = String::new();
     let mut last_summary = String::new();
+    let endpoints = auth::service_endpoints().map_err(|error| UsageError {
+        summary: "service endpoint policy invalid".to_string(),
+        detail: format!("[{alias}] could not resolve service endpoints: {error:#}"),
+    })?;
     // A rejected refresh may just mean a concurrent refresh of the same profile
     // won the rotation, so one such rejection buys a single extra round in which
     // the winner's stored token is tried. Granted at most once: two peers each
@@ -666,6 +672,7 @@ async fn fetch_usage_retried_with_lease(
                     }
                 };
             fetch_usage_with_refresh_transactional(
+                &endpoints,
                 alias,
                 &at,
                 id_token.as_deref(),
@@ -766,11 +773,40 @@ pub async fn fetch_usage_with_refresh<F>(
 where
     F: FnMut(&str, RefreshedTokens) -> Result<()>,
 {
+    let endpoints = auth::service_endpoints()?;
+    fetch_usage_with_refresh_at(
+        &endpoints,
+        alias,
+        access_token,
+        id_token,
+        refresh_token,
+        account_id,
+        is_fedramp,
+        persist_rotation,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_usage_with_refresh_at<F>(
+    endpoints: &auth::ServiceEndpoints,
+    alias: &str,
+    access_token: &str,
+    id_token: Option<&str>,
+    refresh_token: Option<&str>,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    persist_rotation: &mut F,
+) -> Result<UsageInfo>
+where
+    F: FnMut(&str, RefreshedTokens) -> Result<()>,
+{
     let mut authorize_rotation = || Ok(());
     let mut persist_authorized = |(): (), presented: &str, resolution: RefreshTokenResolution| {
         persist_unbound_refresh_resolution(alias, presented, resolution, persist_rotation)
     };
     fetch_usage_with_refresh_transactional(
+        endpoints,
         alias,
         access_token,
         id_token,
@@ -790,6 +826,7 @@ where
 /// conditional publication boundary.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_usage_with_refresh_transactional<A, F, T>(
+    endpoints: &auth::ServiceEndpoints,
     alias: &str,
     access_token: &str,
     id_token: Option<&str>,
@@ -804,25 +841,25 @@ where
     F: FnMut(T, &str, RefreshTokenResolution) -> Result<RefreshedTokens>,
 {
     let client = auth::build_http_client()?;
-    let usage_url = usage_url();
+    let usage_url = endpoints.usage()?;
     let mut rejected_refresh: Option<anyhow::Error> = None;
 
     // Refresh when either JWT is near expiry so account identity metadata does
     // not remain stale while the access token is still usable.
     if let Some(rt) = refresh_token
-        && token_needs_refresh(access_token, id_token, 60)
+        && token_needs_refresh(access_token, id_token, 60)?
     {
         info!("[{alias}] token expiring soon, proactively refreshing");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token(alias, &client, id_token, rt).await {
+        match do_refresh_token(endpoints, alias, &client, id_token, rt).await {
             Ok(resolution) => {
                 let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
 
                 let resp = apply_account_routing_headers(
                     client
-                        .get(&usage_url)
+                        .get(usage_url)
                         .header("Authorization", format!("Bearer {bearer}")),
                     account_id,
                     is_fedramp,
@@ -843,7 +880,7 @@ where
                     );
                     let mut usage = parse_usage_checked(&body)?;
                     enrich_reset_credits(
-                        alias, &client, &bearer, account_id, is_fedramp, &mut usage,
+                        endpoints, alias, &client, &bearer, account_id, is_fedramp, &mut usage,
                     )
                     .await;
                     return Ok(usage);
@@ -868,7 +905,7 @@ where
 
     let resp = apply_account_routing_headers(
         client
-            .get(&usage_url)
+            .get(usage_url)
             .header("Authorization", format!("Bearer {access_token}")),
         account_id,
         is_fedramp,
@@ -890,6 +927,7 @@ where
         );
         let mut usage = parse_usage_checked(&body)?;
         enrich_reset_credits(
+            endpoints,
             alias,
             &client,
             access_token,
@@ -914,14 +952,14 @@ where
         info!("[{alias}] got HTTP {status}, attempting token refresh");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token(alias, &client, id_token, rt).await {
+        match do_refresh_token(endpoints, alias, &client, id_token, rt).await {
             Ok(resolution) => {
                 let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
 
                 let resp2 = apply_account_routing_headers(
                     client
-                        .get(&usage_url)
+                        .get(usage_url)
                         .header("Authorization", format!("Bearer {bearer}")),
                     account_id,
                     is_fedramp,
@@ -940,7 +978,7 @@ where
                     })?;
                     let mut usage = parse_usage_checked(&body)?;
                     enrich_reset_credits(
-                        alias, &client, &bearer, account_id, is_fedramp, &mut usage,
+                        endpoints, alias, &client, &bearer, account_id, is_fedramp, &mut usage,
                     )
                     .await;
                     return Ok(usage);
@@ -976,12 +1014,20 @@ where
 {
     let mut refreshed = None;
     let mut validated_account_id = None;
-    let result = validate_import_auth_capturing_refresh(val, &mut refreshed, &mut persist_rotation)
+    let result = match auth::service_endpoints() {
+        Ok(endpoints) => validate_import_auth_capturing_refresh(
+            &endpoints,
+            val,
+            &mut refreshed,
+            &mut persist_rotation,
+        )
         .await
         .map(|(usage, account_id)| {
             validated_account_id = Some(account_id);
             usage
-        });
+        }),
+        Err(error) => Err(error),
+    };
     ImportValidation {
         refreshed,
         validated_account_id,
@@ -1016,6 +1062,7 @@ where
 /// Inner body of [`validate_import_auth`]. Every rotation reaches both
 /// `refreshed` and durable storage before a follow-up usage request.
 async fn validate_import_auth_capturing_refresh<F>(
+    endpoints: &auth::ServiceEndpoints,
     val: &mut serde_json::Value,
     refreshed: &mut Option<RefreshedTokens>,
     persist_rotation: &mut F,
@@ -1040,7 +1087,8 @@ where
                     |_: &str, tokens: RefreshedTokens| -> Result<()> {
                         adopt_refreshed_tokens(val, tokens, refreshed, persist_rotation)
                     };
-                fetch_usage_with_refresh(
+                fetch_usage_with_refresh_at(
+                    endpoints,
                     alias,
                     &at,
                     id_token.as_deref(),
@@ -1051,7 +1099,7 @@ where
                 )
                 .await?
             };
-            if let Err(err) = crate::workspace::refresh_for_auth(val).await {
+            if let Err(err) = crate::workspace::refresh_for_auth_at(endpoints, val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
             Ok((usage, validated_account_id))
@@ -1059,7 +1107,7 @@ where
         (None, Some(rt)) => {
             let client = auth::build_http_client()?;
             let first_resolution =
-                do_refresh_token(alias, &client, id_token.as_deref(), &rt).await?;
+                do_refresh_token(endpoints, alias, &client, id_token.as_deref(), &rt).await?;
             let mut defer_persistence = |_: &str, _: RefreshedTokens| Ok(());
             let first = persist_unbound_refresh_resolution(
                 alias,
@@ -1083,7 +1131,8 @@ where
                     |_: &str, tokens: RefreshedTokens| -> Result<()> {
                         adopt_refreshed_tokens(val, tokens, refreshed, persist_rotation)
                     };
-                fetch_usage_with_refresh(
+                fetch_usage_with_refresh_at(
+                    endpoints,
                     alias,
                     &access_token,
                     Some(&id_token),
@@ -1094,7 +1143,7 @@ where
                 )
                 .await?
             };
-            if let Err(err) = crate::workspace::refresh_for_auth(val).await {
+            if let Err(err) = crate::workspace::refresh_for_auth_at(endpoints, val).await {
                 debug!("workspace metadata unavailable while importing: {err}");
             }
             Ok((usage, validated_account_id))
@@ -1119,15 +1168,16 @@ pub(crate) fn build_refresh_request(
 }
 
 pub(crate) async fn do_refresh_token(
+    endpoints: &auth::ServiceEndpoints,
     alias: &str,
     client: &reqwest::Client,
     current_id_token: Option<&str>,
     refresh_token: &str,
 ) -> Result<RefreshTokenResolution> {
-    let token_url = auth::token_url();
+    let token_url = endpoints.token()?;
     debug!("[{alias}] sending token refresh request to {token_url}");
 
-    let resp = build_refresh_request(client, &token_url, refresh_token)
+    let resp = build_refresh_request(client, token_url, refresh_token)
         .send()
         .await
         .map_err(|error| {
@@ -1228,6 +1278,12 @@ fn opportunistic_start_budget_remaining(deadline: tokio::time::Instant) -> bool 
     tokio::time::Instant::now() < deadline
 }
 
+fn opportunistic_refresh_deadline(budget: std::time::Duration) -> Result<tokio::time::Instant> {
+    tokio::time::Instant::now()
+        .checked_add(budget)
+        .context("opportunistic refresh budget exceeds the runtime timer range")
+}
+
 #[cfg(test)]
 type BeforeOpportunisticRequestHook = Box<dyn FnOnce(tokio::time::Instant) + Send>;
 
@@ -1261,7 +1317,7 @@ fn run_before_opportunistic_request_hook(deadline: tokio::time::Instant) {
 /// silently bricks that profile and the caller has to tell someone. A worker
 /// panic or cancellation is returned through the same channel because its
 /// server-side rotation and persistence outcome cannot be reconstructed.
-pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
+pub async fn refresh_expiring_tokens() -> Result<Vec<TokenPersistFailure>> {
     refresh_expiring_tokens_within(OPPORTUNISTIC_START_BUDGET).await
 }
 
@@ -1291,13 +1347,10 @@ pub async fn refresh_expiring_tokens() -> Vec<TokenPersistFailure> {
 /// just before the budget expired may still hang for the client's full timeout.
 pub async fn refresh_expiring_tokens_within(
     budget: std::time::Duration,
-) -> Vec<TokenPersistFailure> {
-    let profiles = match crate::profile::list_profiles() {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+) -> Result<Vec<TokenPersistFailure>> {
+    let profiles = crate::profile::list_profiles().context("listing profiles for token refresh")?;
 
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs()?;
 
     // Collect current tokens for profiles expiring soon.
     let mut candidates: Vec<(String, std::path::PathBuf, String, i64)> = Vec::new();
@@ -1341,14 +1394,16 @@ pub async fn refresh_expiring_tokens_within(
         let Some(exp) = expiry else {
             continue;
         };
-        let remaining = exp - now;
+        let Some(remaining) = exp.checked_sub(now) else {
+            continue;
+        };
         if remaining < OPPORTUNISTIC_REFRESH_MARGIN {
             candidates.push((alias.clone(), path, rt, exp));
         }
     }
 
     if candidates.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Sort by expiration: soonest first
@@ -1361,22 +1416,15 @@ pub async fn refresh_expiring_tokens_within(
         OPPORTUNISTIC_REFRESH_MARGIN
     );
 
+    let endpoints = auth::service_endpoints()?;
+
     // Build before starting the budget: client construction can synchronously
     // initialize TLS state, but the budget is only for opening rotations.
-    let client = match auth::build_http_client() {
-        Ok(client) => client,
-        Err(error) => {
-            warn!(
-                stage = "client_build_failed",
-                "opportunistic token refresh unavailable: {error:#}"
-            );
-            return Vec::new();
-        }
-    };
+    let client = auth::build_http_client().context("building opportunistic refresh client")?;
 
     // Start refreshes while the budget lasts, then wait for every started one:
     // an in-flight rotation is not cancellable without losing the credential.
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = opportunistic_refresh_deadline(budget)?;
     let mut queued = candidates.into_iter();
     let mut tasks: tokio::task::JoinSet<Option<UsageError>> = tokio::task::JoinSet::new();
     let mut task_aliases = HashMap::new();
@@ -1391,6 +1439,7 @@ pub async fn refresh_expiring_tokens_within(
             };
             let tracked_alias = alias.clone();
             let client = client.clone();
+            let endpoints = endpoints.clone();
             let task = tasks.spawn(async move {
                 let lease_control = crate::profile::ProfileLeaseAcquireControl::new();
                 let lease = match tokio::time::timeout_at(
@@ -1441,7 +1490,21 @@ pub async fn refresh_expiring_tokens_within(
                     return None;
                 }
                 let id_token = auth::extract_id_token(&value);
-                let remaining = exp - auth::now_unix_secs();
+                let remaining = match auth::now_unix_secs()
+                    .and_then(|now| {
+                        exp.checked_sub(now)
+                            .context("token expiration distance exceeds the signed time range")
+                    }) {
+                    Ok(remaining) => remaining,
+                    Err(error) => {
+                        return Some(UsageError {
+                            summary: "system clock unavailable".to_string(),
+                            detail: format!(
+                                "[{alias}] cannot safely time token refresh: {error:#}"
+                            ),
+                        });
+                    }
+                };
                 debug!("[{alias}] token expires in {remaining}s, refreshing");
 
                 // File parsing and task scheduling can spend the remainder of
@@ -1463,6 +1526,7 @@ pub async fn refresh_expiring_tokens_within(
                     return None;
                 }
                 match do_refresh_token(
+                    &endpoints,
                     &alias,
                     &client,
                     id_token.as_deref(),
@@ -1528,7 +1592,7 @@ pub async fn refresh_expiring_tokens_within(
 
     debug_assert!(task_aliases.is_empty());
 
-    failures
+    Ok(failures)
 }
 
 #[cfg(test)]
@@ -1541,6 +1605,18 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn excessive_opportunistic_refresh_budget_is_rejected() {
+        let error = opportunistic_refresh_deadline(std::time::Duration::MAX)
+            .expect_err("an unrepresentable timer budget must not panic or be accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("budget exceeds the runtime timer range"),
+            "{error:#}"
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1633,7 +1709,7 @@ mod tests {
         let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
         let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
 
-        let now = crate::auth::now_unix_secs();
+        let now = crate::auth::now_unix_secs().unwrap();
         let profile_path = crate::profile::profile_auth_path("alice").unwrap();
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
         write_auth_durable(
@@ -1679,11 +1755,11 @@ mod tests {
 
     #[test]
     fn expired_id_token_triggers_refresh_before_access_token_expires() {
-        let now = crate::auth::now_unix_secs();
+        let now = crate::auth::now_unix_secs().unwrap();
         let access = jwt_with_exp(now + 86_400);
         let id = jwt_with_exp(now - 60);
 
-        assert!(token_needs_refresh(&access, Some(&id), 60));
+        assert!(token_needs_refresh(&access, Some(&id), 60).unwrap());
     }
 
     #[test]
@@ -1791,8 +1867,8 @@ mod tests {
         let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
         let profile_path = home.path().join("profiles/late/auth.json");
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
-        let expiring_id = jwt_with_exp_and_identity(crate::auth::now_unix_secs() - 60);
-        let expiring_access = jwt_with_exp(crate::auth::now_unix_secs() - 60);
+        let expiring_id = jwt_with_exp_and_identity(crate::auth::now_unix_secs().unwrap() - 60);
+        let expiring_access = jwt_with_exp(crate::auth::now_unix_secs().unwrap() - 60);
         write_auth_durable(
             &profile_path,
             &json!({
@@ -1809,7 +1885,9 @@ mod tests {
             }
         });
 
-        let failures = refresh_expiring_tokens_within(std::time::Duration::from_millis(20)).await;
+        let failures = refresh_expiring_tokens_within(std::time::Duration::from_millis(20))
+            .await
+            .unwrap();
         server.abort();
 
         assert!(failures.is_empty());
@@ -1873,7 +1951,7 @@ mod tests {
         let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
         let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
 
-        let now = crate::auth::now_unix_secs();
+        let now = crate::auth::now_unix_secs().unwrap();
         let profile = json!({
             "tokens": {
                 "id_token": jwt_with_exp_and_identity(now + 86_400),
@@ -1960,7 +2038,9 @@ mod tests {
         let mut persist = |(): (), _: &str, _: RefreshTokenResolution| -> Result<RefreshedTokens> {
             panic!("an unusable successor must never reach persistence");
         };
+        let endpoints = auth::service_endpoints().unwrap();
         let error = fetch_usage_with_refresh_transactional(
+            &endpoints,
             "alice",
             "old-access",
             Some("old-id"),
@@ -2067,7 +2147,7 @@ mod tests {
         let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{usage_address}/usage"));
         let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{token_address}/token"));
 
-        let now = crate::auth::now_unix_secs();
+        let now = crate::auth::now_unix_secs().unwrap();
         let profile_path = crate::profile::profile_auth_path("alice").unwrap();
         std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
         write_auth_durable(
@@ -2240,7 +2320,7 @@ mod tests {
         std::fs::create_dir_all(&codex_home).unwrap();
         let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
-        let now = crate::auth::now_unix_secs();
+        let now = crate::auth::now_unix_secs().unwrap();
         let profile = json!({
             "tokens": {
                 "id_token": jwt_with_exp_and_identity(now + 86_400),

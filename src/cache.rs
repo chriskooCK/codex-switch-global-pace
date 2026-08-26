@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fs4::{FileExt, TryLockError};
@@ -161,11 +161,25 @@ fn with_cache_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
     with_cache_file_lock_at(&cache_lock_path()?, CACHE_LOCK_WAIT_TIMEOUT, operation)
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+fn timestamp_is_fresh(now: u64, recorded_at: u64, ttl: u64) -> bool {
+    now.checked_sub(recorded_at).is_some_and(|age| age <= ttl)
+}
+
+/// Apply the usage-cache age contract to an in-memory usage sample.
+///
+/// The TUI retains loaded samples after the cache read that produced them, so
+/// render-time consumers must re-check the original observation timestamp.
+/// Missing, pre-epoch, future, or unrepresentable timestamps are not fresh.
+pub(crate) fn usage_is_fresh_at(usage: &UsageInfo, now: i64, ttl: u64) -> bool {
+    let Some(fetched_at) = usage.fetched_at else {
+        return false;
+    };
+    if now < 0 || fetched_at < 0 {
+        return false;
+    }
+    now.checked_sub(fetched_at)
+        .and_then(|age| u64::try_from(age).ok())
+        .is_some_and(|age| age <= ttl)
 }
 
 fn ttl() -> Result<u64> {
@@ -209,9 +223,9 @@ fn publish_cache_at(
         .with_context(|| format!("writing cache file {}", path.display()))
 }
 
-fn to_entry(u: &UsageInfo) -> CacheEntry {
+fn to_entry(u: &UsageInfo, recorded_at: u64) -> CacheEntry {
     CacheEntry {
-        ts: now_secs(),
+        ts: recorded_at,
         primary_used: u.primary.as_ref().and_then(|w| w.used_percent),
         primary_reset: u.primary.as_ref().and_then(|w| w.resets_at),
         primary_window_minutes: u.primary.as_ref().and_then(|w| w.window_minutes),
@@ -233,7 +247,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
     }
 }
 
-fn from_entry(e: &CacheEntry) -> UsageInfo {
+fn from_entry(e: &CacheEntry) -> Option<UsageInfo> {
     use crate::usage::WindowUsage;
     let primary = if e.primary_used.is_some() || e.primary_reset.is_some() {
         Some(WindowUsage {
@@ -253,8 +267,8 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
     } else {
         None
     };
-    UsageInfo {
-        fetched_at: Some(e.ts as i64),
+    Some(UsageInfo {
+        fetched_at: Some(i64::try_from(e.ts).ok()?),
         primary,
         secondary,
         credits_balance: e.credits_balance,
@@ -269,7 +283,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         individual_limit: e.individual_limit.clone(),
         additional_limits: e.additional_limits.clone(),
         parse_issues: e.parse_issues.clone(),
-    }
+    })
 }
 
 /// Get cached usage for an alias if within TTL.
@@ -277,13 +291,17 @@ pub fn get(alias: &str) -> Result<Option<UsageInfo>> {
     with_cache_lock(|| {
         let cache = load_cache_checked()?;
         let ttl = ttl()?;
-        Ok(fresh_usage(&cache, alias, now_secs(), ttl))
+        let now =
+            u64::try_from(auth::now_unix_secs()?).context("converting usage-cache timestamp")?;
+        Ok(fresh_usage(&cache, alias, now, ttl))
     })
 }
 
 fn fresh_usage(cache: &CacheFile, alias: &str, now: u64, ttl: u64) -> Option<UsageInfo> {
     let entry = cache.entries.get(alias)?;
-    (now.saturating_sub(entry.ts) <= ttl).then(|| from_entry(entry))
+    timestamp_is_fresh(now, entry.ts, ttl)
+        .then(|| from_entry(entry))
+        .flatten()
 }
 
 /// Read one consistent fresh-usage snapshot for a batch of aliases.
@@ -296,7 +314,8 @@ pub(crate) fn get_many(aliases: &[String]) -> Result<HashMap<String, UsageInfo>>
     with_cache_lock(|| {
         let cache = load_cache_checked()?;
         let ttl = ttl()?;
-        let now = now_secs();
+        let now =
+            u64::try_from(auth::now_unix_secs()?).context("converting usage-cache timestamp")?;
         Ok(aliases
             .iter()
             .filter_map(|alias| {
@@ -310,7 +329,11 @@ pub(crate) fn get_many(aliases: &[String]) -> Result<HashMap<String, UsageInfo>>
 pub fn put(alias: &str, usage: &UsageInfo) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
-        cache.entries.insert(alias.to_string(), to_entry(usage));
+        let recorded_at =
+            u64::try_from(auth::now_unix_secs()?).context("converting usage-cache timestamp")?;
+        cache
+            .entries
+            .insert(alias.to_string(), to_entry(usage, recorded_at));
         save_cache(&cache)
     })
 }
@@ -341,11 +364,12 @@ fn record_auth_failure(
     refresh_token: &str,
     summary: &str,
     detail: &str,
+    recorded_at: u64,
 ) {
     cache.auth_failures.insert(
         alias.to_string(),
         AuthFailureEntry {
-            ts: now_secs(),
+            ts: recorded_at,
             credential: credential_fingerprint(refresh_token),
             summary: sanitize_for_storage(summary),
             detail: sanitize_for_storage(detail),
@@ -417,12 +441,15 @@ pub fn get_auth_failure(alias: &str, refresh_token: &str) -> Result<Option<Usage
 pub fn put_auth_failure(alias: &str, refresh_token: &str, error: &UsageError) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
+        let recorded_at = u64::try_from(auth::now_unix_secs()?)
+            .context("converting auth-failure cache timestamp")?;
         record_auth_failure(
             &mut cache,
             alias,
             refresh_token,
             &error.summary,
             &error.detail,
+            recorded_at,
         );
         save_cache(&cache)
     })
@@ -445,7 +472,9 @@ pub fn set_workspace_name(account_id: &str, name: Option<&str>) -> Result<()> {
     let name = name.map(str::trim).filter(|name| !name.is_empty());
     with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
-        let changed = update_workspace_name(&mut cache, account_id, name);
+        let recorded_at = u64::try_from(auth::now_unix_secs()?)
+            .context("converting workspace-cache timestamp")?;
+        let changed = update_workspace_name(&mut cache, account_id, name, recorded_at);
         if changed {
             save_cache(&cache)?;
         }
@@ -453,7 +482,12 @@ pub fn set_workspace_name(account_id: &str, name: Option<&str>) -> Result<()> {
     })
 }
 
-fn update_workspace_name(cache: &mut CacheFile, account_id: &str, name: Option<&str>) -> bool {
+fn update_workspace_name(
+    cache: &mut CacheFile,
+    account_id: &str,
+    name: Option<&str>,
+    recorded_at: u64,
+) -> bool {
     match name {
         Some(name) => {
             // A name that arrived retires any record saying there was none.
@@ -470,7 +504,7 @@ fn update_workspace_name(cache: &mut CacheFile, account_id: &str, name: Option<&
             cache.workspace_names.remove(account_id);
             cache
                 .workspace_names_absent
-                .insert(account_id.to_string(), now_secs());
+                .insert(account_id.to_string(), recorded_at);
             true
         }
     }
@@ -483,26 +517,35 @@ fn update_workspace_name(cache: &mut CacheFile, account_id: &str, name: Option<&
 /// `get_workspace_name(..)?.is_none()` instead cannot tell "never looked up"
 /// apart from "looked up, and there is none", so every personal plan answered
 /// the second as if it were the first.
-fn workspace_name_resolved(cache: &CacheFile, account_id: &str) -> bool {
+fn workspace_name_resolved(cache: &CacheFile, account_id: &str, now: u64) -> bool {
     if cache.workspace_names.contains_key(account_id) {
         return true;
     }
     cache
         .workspace_names_absent
         .get(account_id)
-        .is_some_and(|recorded| now_secs().saturating_sub(*recorded) <= WORKSPACE_ABSENCE_TTL)
+        .is_some_and(|recorded| timestamp_is_fresh(now, *recorded, WORKSPACE_ABSENCE_TTL))
 }
 
 /// Public form of [`workspace_name_resolved`].
 pub fn workspace_name_is_known(account_id: &str) -> Result<bool> {
-    with_cache_lock(|| Ok(workspace_name_resolved(&load_cache_checked()?, account_id)))
+    with_cache_lock(|| {
+        let cache = load_cache_checked()?;
+        let now = u64::try_from(auth::now_unix_secs()?)
+            .context("converting workspace-cache timestamp")?;
+        Ok(workspace_name_resolved(&cache, account_id, now))
+    })
 }
 
 /// Both answers from one read: the outer `None` means "not resolved, look it
 /// up"; `Some(inner)` means resolved, where `inner` is the name if there is
 /// one.
-fn resolved_workspace_name(cache: &CacheFile, account_id: &str) -> Option<Option<String>> {
-    workspace_name_resolved(cache, account_id)
+fn resolved_workspace_name(
+    cache: &CacheFile,
+    account_id: &str,
+    now: u64,
+) -> Option<Option<String>> {
+    workspace_name_resolved(cache, account_id, now)
         .then(|| cache.workspace_names.get(account_id).cloned())
 }
 
@@ -515,7 +558,12 @@ fn resolved_workspace_name(cache: &CacheFile, account_id: &str) -> Option<Option
 pub async fn resolved_workspace_name_async(account_id: &str) -> Result<Option<Option<String>>> {
     let account_id = account_id.to_string();
     tokio::task::spawn_blocking(move || {
-        with_cache_lock(|| Ok(resolved_workspace_name(&load_cache_checked()?, &account_id)))
+        with_cache_lock(|| {
+            let cache = load_cache_checked()?;
+            let now = u64::try_from(auth::now_unix_secs()?)
+                .context("converting workspace-cache timestamp")?;
+            Ok(resolved_workspace_name(&cache, &account_id, now))
+        })
     })
     .await
     .context("workspace-cache read worker failed")?
@@ -647,9 +695,8 @@ pub(crate) fn last_used_snapshot_checked() -> Result<HashMap<String, i64>> {
 pub fn set_last_used(alias: &str) -> Result<()> {
     with_cache_lock(|| {
         let mut cache = load_cache_checked()?;
-        cache
-            .last_used
-            .insert(alias.to_string(), crate::auth::now_unix_secs());
+        let now = crate::auth::now_unix_secs()?;
+        cache.last_used.insert(alias.to_string(), now);
         save_cache(&cache).context("writing last_used cache")
     })
 }
@@ -684,6 +731,8 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
+    const TEST_NOW: u64 = 1_800_000_000;
+
     #[test]
     fn test_cache_entry_deserialize_without_credits() {
         let entry: CacheEntry = serde_json::from_value(json!({
@@ -704,7 +753,7 @@ mod tests {
         assert!(!entry.spend_control_reached);
         assert!(entry.parse_issues.is_empty());
 
-        let usage = from_entry(&entry);
+        let usage = from_entry(&entry).expect("test timestamp must fit the usage model");
         assert_eq!(usage.credits_balance, None);
         assert_eq!(usage.unlimited_credits, None);
         assert_eq!(usage.reset_credits_available_count, None);
@@ -733,10 +782,10 @@ mod tests {
             ..Default::default()
         };
 
-        let entry = to_entry(&usage);
+        let entry = to_entry(&usage, TEST_NOW);
         assert!(entry.account_limited);
         assert!(entry.spend_control_reached);
-        let restored = from_entry(&entry);
+        let restored = from_entry(&entry).expect("test timestamp must fit the usage model");
         assert!(restored.account_limited);
         assert!(restored.spend_control_reached);
         assert_eq!(
@@ -752,6 +801,55 @@ mod tests {
     }
 
     #[test]
+    fn future_dated_cache_records_are_never_fresh() {
+        let mut cache = CacheFile::default();
+        cache.entries.insert(
+            "future".to_string(),
+            to_entry(&UsageInfo::default(), TEST_NOW + 1),
+        );
+        cache
+            .workspace_names_absent
+            .insert("future".to_string(), TEST_NOW + 1);
+        cache.entries.insert(
+            "unrepresentable".to_string(),
+            to_entry(&UsageInfo::default(), u64::MAX),
+        );
+
+        assert!(fresh_usage(&cache, "future", TEST_NOW, u64::MAX).is_none());
+        assert!(fresh_usage(&cache, "unrepresentable", u64::MAX, 0).is_none());
+        assert!(!workspace_name_resolved(&cache, "future", TEST_NOW));
+    }
+
+    #[test]
+    fn in_memory_usage_freshness_matches_the_cache_ttl_boundary() {
+        let now = i64::try_from(TEST_NOW).unwrap();
+        let ttl = 300;
+        let usage_at = |fetched_at| UsageInfo {
+            fetched_at,
+            ..UsageInfo::default()
+        };
+
+        assert!(usage_is_fresh_at(&usage_at(Some(now)), now, ttl));
+        assert!(usage_is_fresh_at(
+            &usage_at(Some(now - i64::try_from(ttl).unwrap())),
+            now,
+            ttl
+        ));
+        assert!(!usage_is_fresh_at(
+            &usage_at(Some(now - i64::try_from(ttl).unwrap() - 1)),
+            now,
+            ttl
+        ));
+        assert!(!usage_is_fresh_at(&usage_at(Some(now + 1)), now, ttl));
+        assert!(!usage_is_fresh_at(&usage_at(None), now, ttl));
+        assert!(!usage_is_fresh_at(
+            &usage_at(Some(i64::MIN)),
+            i64::MAX,
+            u64::MAX
+        ));
+    }
+
+    #[test]
     fn a_recorded_verdict_is_readable_while_the_credential_is_unchanged() {
         let mut cache = CacheFile::default();
         record_auth_failure(
@@ -760,6 +858,7 @@ mod tests {
             "refresh_old",
             "re-login required (refresh_token_reused)",
             "detail",
+            TEST_NOW,
         );
 
         let found = auth_failure_for(&cache, "dead", "refresh_old")
@@ -774,7 +873,14 @@ mod tests {
         // alias instead would survive the re-login and keep a working account
         // marked dead.
         let mut cache = CacheFile::default();
-        record_auth_failure(&mut cache, "dead", "refresh_old", "summary", "detail");
+        record_auth_failure(
+            &mut cache,
+            "dead",
+            "refresh_old",
+            "summary",
+            "detail",
+            TEST_NOW,
+        );
 
         assert!(
             auth_failure_for(&cache, "dead", "refresh_new").is_none(),
@@ -785,7 +891,14 @@ mod tests {
     #[test]
     fn renaming_a_profile_carries_its_recorded_verdict() {
         let mut cache = CacheFile::default();
-        record_auth_failure(&mut cache, "old", "refresh_old", "summary", "detail");
+        record_auth_failure(
+            &mut cache,
+            "old",
+            "refresh_old",
+            "summary",
+            "detail",
+            TEST_NOW,
+        );
 
         migrate_alias(&mut cache, "old", "new");
 
@@ -803,14 +916,17 @@ mod tests {
         // acquisitions of a cross-process lock — nor leave a window between
         // them in which another process changes the answer.
         let mut cache = CacheFile::default();
-        assert_eq!(resolved_workspace_name(&cache, "acct"), None);
+        assert_eq!(resolved_workspace_name(&cache, "acct", TEST_NOW), None);
 
-        update_workspace_name(&mut cache, "acct", None);
-        assert_eq!(resolved_workspace_name(&cache, "acct"), Some(None));
-
-        update_workspace_name(&mut cache, "acct", Some("Platform"));
+        update_workspace_name(&mut cache, "acct", None, TEST_NOW);
         assert_eq!(
-            resolved_workspace_name(&cache, "acct"),
+            resolved_workspace_name(&cache, "acct", TEST_NOW),
+            Some(None)
+        );
+
+        update_workspace_name(&mut cache, "acct", Some("Platform"), TEST_NOW);
+        assert_eq!(
+            resolved_workspace_name(&cache, "acct", TEST_NOW),
             Some(Some("Platform".to_string()))
         );
     }
@@ -823,7 +939,14 @@ mod tests {
         // length worth stripping at the point they become durable.
         let mut cache = CacheFile::default();
         let hostile = format!("\u{1b}[31mred\u{1b}[0m\r\n{}", "x".repeat(4096));
-        record_auth_failure(&mut cache, "dead", "refresh_old", &hostile, &hostile);
+        record_auth_failure(
+            &mut cache,
+            "dead",
+            "refresh_old",
+            &hostile,
+            &hostile,
+            TEST_NOW,
+        );
 
         let stored = auth_failure_for(&cache, "dead", "refresh_old").unwrap();
         for field in [&stored.summary, &stored.detail] {
@@ -849,7 +972,14 @@ mod tests {
         // `invalidate` is what makes the forced re-fetch after a reset-card
         // consume actually reach the network.
         let mut cache = CacheFile::default();
-        record_auth_failure(&mut cache, "dead", "refresh_old", "summary", "detail");
+        record_auth_failure(
+            &mut cache,
+            "dead",
+            "refresh_old",
+            "summary",
+            "detail",
+            TEST_NOW,
+        );
 
         assert!(drop_fetch_state(&mut cache, "dead"));
 
@@ -859,11 +989,19 @@ mod tests {
     #[test]
     fn purging_a_profile_drops_usage_selection_history_and_auth_failure() {
         let mut cache = CacheFile::default();
-        cache
-            .entries
-            .insert("reused".to_string(), to_entry(&UsageInfo::default()));
+        cache.entries.insert(
+            "reused".to_string(),
+            to_entry(&UsageInfo::default(), TEST_NOW),
+        );
         cache.last_used.insert("reused".to_string(), 123);
-        record_auth_failure(&mut cache, "reused", "refresh_old", "summary", "detail");
+        record_auth_failure(
+            &mut cache,
+            "reused",
+            "refresh_old",
+            "summary",
+            "detail",
+            TEST_NOW,
+        );
 
         assert!(drop_profile_state(&mut cache, "reused"));
         assert!(!cache.entries.contains_key("reused"));
@@ -947,11 +1085,16 @@ mod tests {
         // Personal plans have no workspace name. The server saying so is an
         // answer; not storing it made every invocation ask the same question.
         let mut cache = CacheFile::default();
-        assert!(!workspace_name_resolved(&cache, "acct-personal"));
+        assert!(!workspace_name_resolved(&cache, "acct-personal", TEST_NOW));
 
-        assert!(update_workspace_name(&mut cache, "acct-personal", None));
+        assert!(update_workspace_name(
+            &mut cache,
+            "acct-personal",
+            None,
+            TEST_NOW,
+        ));
 
-        assert!(workspace_name_resolved(&cache, "acct-personal"));
+        assert!(workspace_name_resolved(&cache, "acct-personal", TEST_NOW));
         assert!(
             !cache.workspace_names.contains_key("acct-personal"),
             "a confirmed absence must not masquerade as a name"
@@ -961,12 +1104,13 @@ mod tests {
     #[test]
     fn a_workspace_name_that_appears_later_supersedes_a_recorded_absence() {
         let mut cache = CacheFile::default();
-        update_workspace_name(&mut cache, "acct", None);
+        update_workspace_name(&mut cache, "acct", None, TEST_NOW);
 
         assert!(update_workspace_name(
             &mut cache,
             "acct",
-            Some("Night City")
+            Some("Night City"),
+            TEST_NOW,
         ));
 
         assert_eq!(
@@ -986,12 +1130,12 @@ mod tests {
         // nothing tells us. Bounding the record is what lets the new name
         // appear without the user knowing to reach for `--force`.
         let mut cache = CacheFile::default();
-        update_workspace_name(&mut cache, "acct", None);
+        update_workspace_name(&mut cache, "acct", None, TEST_NOW);
         cache
             .workspace_names_absent
-            .insert("acct".to_string(), now_secs() - WORKSPACE_ABSENCE_TTL - 1);
+            .insert("acct".to_string(), TEST_NOW - WORKSPACE_ABSENCE_TTL - 1);
 
-        assert!(!workspace_name_resolved(&cache, "acct"));
+        assert!(!workspace_name_resolved(&cache, "acct", TEST_NOW));
     }
 
     #[test]
@@ -1000,9 +1144,15 @@ mod tests {
         assert!(update_workspace_name(
             &mut cache,
             "acct-team",
-            Some("Old Team")
+            Some("Old Team"),
+            TEST_NOW,
         ));
-        assert!(update_workspace_name(&mut cache, "acct-team", None));
+        assert!(update_workspace_name(
+            &mut cache,
+            "acct-team",
+            None,
+            TEST_NOW,
+        ));
         assert!(!cache.workspace_names.contains_key("acct-team"));
     }
 

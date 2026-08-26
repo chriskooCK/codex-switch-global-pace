@@ -1,11 +1,7 @@
 use serde_json::{Value, json};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    codex_switch::auth::now_unix_secs().expect("test clock must be a supported Unix timestamp")
 }
 
 /// Build a complete usage API response JSON matching the real structure.

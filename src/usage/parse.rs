@@ -120,6 +120,70 @@ fn optional_bool(
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct RateLimitFlags {
+    allowed: Option<bool>,
+    limit_reached: Option<bool>,
+}
+
+/// Current responses always name a string plan. Absence remains accepted for
+/// the legacy response shape supported by this project, but an explicitly
+/// present value must follow the current schema.
+fn parse_plan_type(body: &Value) -> std::result::Result<Option<String>, UsageParseIssue> {
+    match body.get("plan_type") {
+        None => Ok(None),
+        Some(Value::String(plan_type)) => Ok(Some(plan_type.clone())),
+        Some(_) => Err(UsageParseIssue::InvalidPlanType {
+            detail: "must be a string when present".to_string(),
+        }),
+    }
+}
+
+/// Validate the scalar availability flags without requiring them from legacy
+/// responses that predate the current backend schema.
+fn parse_rate_limit_flags(body: &Value) -> std::result::Result<RateLimitFlags, UsageParseIssue> {
+    let object = match body.get("rate_limit") {
+        None | Some(Value::Null) => return Ok(RateLimitFlags::default()),
+        Some(Value::Object(object)) => object,
+        Some(_) => {
+            return Err(UsageParseIssue::InvalidRateLimit {
+                detail: "must be an object or null when present".to_string(),
+            });
+        }
+    };
+    let allowed = optional_bool(object, "allowed", "rate_limit").map_err(|error| {
+        UsageParseIssue::InvalidRateLimit {
+            detail: format!("{error:#}"),
+        }
+    })?;
+    let limit_reached = optional_bool(object, "limit_reached", "rate_limit").map_err(|error| {
+        UsageParseIssue::InvalidRateLimit {
+            detail: format!("{error:#}"),
+        }
+    })?;
+    Ok(RateLimitFlags {
+        allowed,
+        limit_reached,
+    })
+}
+
+fn parse_spend_control_reached(body: &Value) -> std::result::Result<Option<bool>, UsageParseIssue> {
+    let object = match body.get("spend_control") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(object)) => object,
+        Some(_) => {
+            return Err(UsageParseIssue::InvalidSpendControl {
+                detail: "must be an object or null when present".to_string(),
+            });
+        }
+    };
+    optional_bool(object, "reached", "spend_control").map_err(|error| {
+        UsageParseIssue::InvalidSpendControl {
+            detail: format!("{error:#}"),
+        }
+    })
+}
+
 fn optional_window(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -262,6 +326,9 @@ pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
                 .with_context(|| format!("usage response contains invalid {name}"))?;
         }
     }
+    parse_plan_type(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
+    parse_rate_limit_flags(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
+    parse_spend_control_reached(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
     rate_limit_reached_type(body).map_err(|issue| anyhow::anyhow!(issue.to_string()))?;
     parse_additional_rate_limits(body)
         .context("usage response contains invalid additional_rate_limits")?;
@@ -271,7 +338,7 @@ pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
         parse_reset_credits_summary(summary)
             .context("usage response contains an invalid reset credits summary")?;
     }
-    let usage = parse_usage(body);
+    let usage = parse_usage(body)?;
     let credits_has_data = body
         .get("credits")
         .and_then(Value::as_object)
@@ -298,7 +365,11 @@ pub(super) fn parse_usage_checked(body: &Value) -> Result<UsageInfo> {
     Ok(usage)
 }
 
-pub fn parse_usage(body: &Value) -> UsageInfo {
+pub fn parse_usage(body: &Value) -> Result<UsageInfo> {
+    Ok(parse_usage_at(body, auth::now_unix_secs()?))
+}
+
+fn parse_usage_at(body: &Value, fetched_at: i64) -> UsageInfo {
     let mut parse_issues = Vec::new();
     let primary_raw = body
         .pointer("/rate_limit/primary_window")
@@ -368,10 +439,27 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
 
     let unlimited_credits = body.pointer("/credits/unlimited").and_then(|v| v.as_bool());
 
-    let plan_type = body
-        .get("plan_type")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let plan_type = match parse_plan_type(body) {
+        Ok(plan_type) => plan_type,
+        Err(issue) => {
+            parse_issues.push(issue);
+            None
+        }
+    };
+    let rate_limit_flags = match parse_rate_limit_flags(body) {
+        Ok(flags) => flags,
+        Err(issue) => {
+            parse_issues.push(issue);
+            RateLimitFlags::default()
+        }
+    };
+    let spend_control_reached = match parse_spend_control_reached(body) {
+        Ok(reached) => reached.unwrap_or(false),
+        Err(issue) => {
+            parse_issues.push(issue);
+            false
+        }
+    };
     let rate_limit_reached_type = match rate_limit_reached_type(body) {
         Ok(reason) => reason,
         Err(issue) => {
@@ -383,16 +471,10 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
             Some(raw)
         }
     };
-    let spend_control_reached = body
-        .pointer("/spend_control/reached")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let mut account_limited = rate_limit_reached_type.is_some()
         || spend_control_reached
-        || body
-            .pointer("/rate_limit/limit_reached")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        || rate_limit_flags.allowed == Some(false)
+        || rate_limit_flags.limit_reached == Some(true);
     let (reset_credits_summary, reset_credits_error) = match reset_credits_summary_value(body) {
         Some(summary) => match parse_reset_credits_summary(summary) {
             Ok(summary) => (Some(summary), None),
@@ -449,7 +531,7 @@ pub fn parse_usage(body: &Value) -> UsageInfo {
         });
 
     UsageInfo {
-        fetched_at: Some(auth::now_unix_secs()),
+        fetched_at: Some(fetched_at),
         primary,
         secondary,
         credits_balance,
@@ -472,6 +554,10 @@ mod tests {
     use super::*;
     use chrono::DateTime;
     use serde_json::json;
+
+    fn parse_usage(body: &Value) -> UsageInfo {
+        super::parse_usage(body).expect("test clock must produce a supported Unix timestamp")
+    }
 
     #[test]
     fn test_parse_usage_full_response() {
@@ -509,9 +595,9 @@ mod tests {
             }
         });
 
-        let before = auth::now_unix_secs();
+        let before = auth::now_unix_secs().unwrap();
         let usage = parse_usage(&body);
-        let after = auth::now_unix_secs();
+        let after = auth::now_unix_secs().unwrap();
 
         assert!(matches!(usage.fetched_at, Some(ts) if ts >= before && ts <= after));
         assert_eq!(
@@ -730,7 +816,10 @@ mod tests {
 
         assert!(usage.account_limited);
         assert!(!usage.spend_control_reached);
-        assert!(!crate::usage::is_available(&usage));
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
     }
 
     #[test]
@@ -849,7 +938,10 @@ mod tests {
             crate::usage::explicit_account_blocker(&usage),
             Some(crate::usage::ExplicitAccountBlocker::MalformedUsageResponse(_))
         ));
-        assert!(!crate::usage::is_available(&usage));
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
     }
 
     #[test]
@@ -932,7 +1024,10 @@ mod tests {
 
         assert!(usage.account_limited);
         assert!(usage.spend_control_reached);
-        assert!(!crate::usage::is_available(&usage));
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
     }
 
     #[test]
@@ -1135,7 +1230,10 @@ mod tests {
         ));
         assert!(usage.account_limited);
         assert!(crate::usage::explicit_account_blocker(&usage).is_some());
-        assert!(!crate::usage::is_available(&usage));
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
     }
 
     #[test]
@@ -1195,7 +1293,108 @@ mod tests {
             Some(crate::usage::ExplicitAccountBlocker::UnrecognizedRateLimitReason(reason))
                 if reason == "future_reason"
         ));
-        assert!(!crate::usage::is_available(&usage));
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
+    }
+
+    #[test]
+    fn legacy_scalar_omissions_remain_valid_but_future_plan_strings_are_preserved() {
+        let legacy = json!({
+            "rate_limit": {
+                "primary_window": {"used_percent": 10.0}
+            },
+            "spend_control": {
+                "individual_limit": {"remaining_percent": 68.0}
+            }
+        });
+        assert!(parse_usage_checked(&legacy).is_ok());
+
+        let future = json!({
+            "plan_type": "future_paid_tier",
+            "rate_limit": {
+                "allowed": true,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 10.0}
+            }
+        });
+        let usage = parse_usage_checked(&future).unwrap();
+        assert_eq!(usage.plan_type.as_deref(), Some("future_paid_tier"));
+        assert_eq!(
+            crate::usage::normalized_plan_kind(&usage, &crate::jwt::AccountInfo::default()),
+            crate::jwt::PlanKind::Unknown
+        );
+    }
+
+    #[test]
+    fn malformed_top_level_scalar_types_are_rejected_and_retained() {
+        for malformed in [json!(null), json!(7), json!(false), json!({})] {
+            let body = json!({
+                "plan_type": malformed,
+                "rate_limit": {"primary_window": {"used_percent": 10.0}}
+            });
+            assert!(parse_usage_checked(&body).is_err());
+            let usage = parse_usage(&body);
+            assert!(matches!(
+                usage.parse_issues.as_slice(),
+                [UsageParseIssue::InvalidPlanType { .. }]
+            ));
+            assert!(crate::usage::explicit_account_blocker(&usage).is_some());
+        }
+
+        for (field, malformed) in [
+            ("allowed", json!("yes")),
+            ("allowed", json!(null)),
+            ("limit_reached", json!(1)),
+            ("limit_reached", json!({})),
+        ] {
+            let mut body = json!({
+                "rate_limit": {"primary_window": {"used_percent": 10.0}}
+            });
+            body["rate_limit"][field] = malformed;
+            assert!(parse_usage_checked(&body).is_err());
+            let usage = parse_usage(&body);
+            assert!(matches!(
+                usage.parse_issues.as_slice(),
+                [UsageParseIssue::InvalidRateLimit { .. }]
+            ));
+            assert!(crate::usage::explicit_account_blocker(&usage).is_some());
+        }
+
+        for malformed in [json!("yes"), json!(null), json!(1), json!({})] {
+            let body = json!({
+                "rate_limit": {"primary_window": {"used_percent": 10.0}},
+                "spend_control": {"reached": malformed}
+            });
+            assert!(parse_usage_checked(&body).is_err());
+            let usage = parse_usage(&body);
+            assert!(matches!(
+                usage.parse_issues.as_slice(),
+                [UsageParseIssue::InvalidSpendControl { .. }]
+            ));
+            assert!(crate::usage::explicit_account_blocker(&usage).is_some());
+        }
+    }
+
+    #[test]
+    fn top_level_allowed_false_is_an_account_limit() {
+        let usage = parse_usage_checked(&json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": false,
+                "limit_reached": false,
+                "primary_window": {"used_percent": 10.0},
+                "secondary_window": {"used_percent": 20.0}
+            }
+        }))
+        .unwrap();
+
+        assert!(usage.account_limited);
+        assert!(!crate::usage::is_available(
+            &usage,
+            &crate::jwt::AccountInfo::default()
+        ));
     }
 
     #[test]
@@ -1217,7 +1416,10 @@ mod tests {
                         .unwrap_or_else(|| body["rate_limit_reached_type"].to_string())
             ));
             assert!(crate::usage::explicit_account_blocker(&usage).is_some());
-            assert!(!crate::usage::is_available(&usage));
+            assert!(!crate::usage::is_available(
+                &usage,
+                &crate::jwt::AccountInfo::default()
+            ));
         }
     }
 }

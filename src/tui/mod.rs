@@ -1,6 +1,7 @@
 pub mod app;
 pub mod keymap;
 pub mod menu;
+mod meter;
 pub mod popup;
 pub mod ui;
 

@@ -209,7 +209,6 @@ struct WarmupPreflightTask {
 }
 
 fn inspect_warmup_candidates(candidates: Vec<WarmupPreflightCandidate>) -> Result<Vec<String>> {
-    let now = crate::auth::now_unix_secs();
     let disk_aliases = candidates
         .iter()
         .filter(|candidate| candidate.loaded_usage.is_none())
@@ -221,6 +220,7 @@ fn inspect_warmup_candidates(candidates: Vec<WarmupPreflightCandidate>) -> Resul
         crate::cache::get_many(&disk_aliases)
             .context("reading cached usage for warmup candidates")?
     };
+    let now = crate::auth::now_unix_secs().context("reading system clock for warmup preflight")?;
     let mut ready = Vec::new();
     for candidate in candidates {
         let usage = match candidate.loaded_usage {
@@ -853,19 +853,19 @@ impl App {
             .map(|auth| {
                 let mut expiries = Vec::new();
                 if let Some(token) = auth::extract_id_token(&auth) {
-                    let expiry = crate::jwt::token_expires_at(&token)
-                        .map(crate::output::format_token_expiry)
-                        .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!("ID token · {expiry}"));
+                    expiries.push(super::menu::AuthExpiry {
+                        name: "ID token".to_string(),
+                        expires_at: crate::jwt::token_expires_at(&token),
+                    });
                 }
                 if let Some(token) = auth
                     .pointer("/tokens/access_token")
                     .and_then(serde_json::Value::as_str)
                 {
-                    let expiry = crate::jwt::token_expires_at(token)
-                        .map(crate::output::format_token_expiry)
-                        .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!("Access token · {expiry}"));
+                    expiries.push(super::menu::AuthExpiry {
+                        name: "Access token".to_string(),
+                        expires_at: crate::jwt::token_expires_at(token),
+                    });
                 }
                 expiries
             })
@@ -1197,14 +1197,16 @@ impl App {
         match self.sort_mode {
             SortMode::Name => {}
             SortMode::Quota => {
-                let quotas: Vec<f64> = (0..self.accounts.len())
-                    .map(|idx| self.get_5h_used_pct(idx))
+                let quotas: Vec<Option<f64>> = (0..self.accounts.len())
+                    .map(|idx| self.quota_used_percent(idx))
                     .collect();
-                self.view_indices.sort_by(|&a, &b| {
-                    quotas[a]
-                        .partial_cmp(&quotas[b])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                self.view_indices
+                    .sort_by(|&a, &b| match (quotas[a], quotas[b]) {
+                        (Some(left), Some(right)) => left.total_cmp(&right),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => std::cmp::Ordering::Equal,
+                    });
             }
             SortMode::Status => {
                 let statuses: Vec<u8> = (0..self.accounts.len())
@@ -1242,16 +1244,20 @@ impl App {
     /// in-memory usage. Search filtering affects only `view_indices`, never this
     /// pool, and this calculation performs no I/O or additional polling.
     pub fn global_weekly_summary(&self, now: i64) -> GlobalWeeklySummary {
+        let cache_ttl = crate::config::get().cache.ttl;
         let inputs: Vec<GlobalPaceAccountInput> = self
             .accounts
             .iter()
             .map(|entry| match &entry.usage {
-                UsageStatus::Loaded(usage) => {
+                UsageStatus::Loaded(usage)
+                    if crate::cache::usage_is_fresh_at(usage, now, cache_ttl) =>
+                {
                     GlobalPaceAccountInput::from_usage(entry.alias.clone(), usage)
                 }
-                UsageStatus::Idle | UsageStatus::Loading | UsageStatus::Error(_) => {
-                    GlobalPaceAccountInput::unavailable(entry.alias.clone())
-                }
+                UsageStatus::Idle
+                | UsageStatus::Loading
+                | UsageStatus::Loaded(_)
+                | UsageStatus::Error(_) => GlobalPaceAccountInput::unavailable(entry.alias.clone()),
             })
             .collect();
         calculate_global_weekly_summary(&inputs, now)
@@ -1472,7 +1478,16 @@ impl App {
                 // Account state may have refreshed while the blocking cache read
                 // was in flight. Recheck every returned alias in memory before
                 // starting any task, then publish the whole batch together.
-                let now = crate::auth::now_unix_secs();
+                let now = match crate::auth::now_unix_secs() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        self.report_warmup_preflight_failure(
+                            origin,
+                            format!("reading system clock for warmup recheck: {error:#}"),
+                        );
+                        return;
+                    }
+                };
                 let aliases = aliases
                     .into_iter()
                     .filter(|alias| {
@@ -1754,23 +1769,30 @@ impl App {
         }
     }
 
-    fn get_5h_used_pct(&self, idx: usize) -> f64 {
-        match &self.accounts[idx].usage {
-            UsageStatus::Loaded(u) => u
-                .primary
-                .as_ref()
-                .and_then(|w| w.used_percent)
-                // free accounts have no 5h window — fall back to 7d usage for sorting
-                .or_else(|| u.secondary.as_ref().and_then(|w| w.used_percent))
-                .unwrap_or(999.0),
-            _ => 999.0,
+    fn quota_used_percent(&self, idx: usize) -> Option<f64> {
+        let entry = &self.accounts[idx];
+        let UsageStatus::Loaded(usage) = &entry.usage else {
+            return None;
+        };
+        if crate::usage::usage_availability(usage, &entry.info)
+            == crate::usage::UsageAvailability::Unavailable
+        {
+            return None;
         }
+        let window = match crate::usage::normalized_plan_kind(usage, &entry.info) {
+            crate::jwt::PlanKind::Free => usage.secondary.as_ref(),
+            crate::jwt::PlanKind::Unknown => None,
+            _ => usage.primary.as_ref(),
+        };
+        window
+            .and_then(|window| window.used_percent)
+            .and_then(|used| crate::usage::normalized_quota_usage(Some(used)))
     }
 
     fn status_order(&self, idx: usize) -> u8 {
         match &self.accounts[idx].usage {
             UsageStatus::Error(_) => 0,
-            UsageStatus::Loaded(u) if !crate::usage::is_available(u) => 1,
+            UsageStatus::Loaded(u) if !crate::usage::is_available(u, &self.accounts[idx].info) => 1,
             UsageStatus::Loaded(_) => 2,
             UsageStatus::Loading => 3,
             UsageStatus::Idle => 4,
@@ -2877,8 +2899,10 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.run_due_auto_refresh();
         app.ensure_models_loaded_for_selected();
 
+        let render_now =
+            crate::auth::now_unix_secs().context("reading system clock for TUI render")?;
         let draw_result = terminal
-            .draw(|f| super::ui::render(f, &mut app))
+            .draw(|f| super::ui::render(f, &mut app, render_now))
             .context("drawing TUI");
         drain_credential_tasks_on_error(&mut app, draw_result).await?;
 
@@ -2958,7 +2982,8 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
                         );
                         // Failure to paint the exit notice must not skip the
                         // credential-safety boundary below.
-                        let _ = terminal.draw(|frame| super::ui::render(frame, &mut app));
+                        let _ =
+                            terminal.draw(|frame| super::ui::render(frame, &mut app, render_now));
                         app.drain_credential_tasks().await;
                     }
                     break;
@@ -3362,7 +3387,7 @@ async fn run_oauth_inner(
             } else {
                 login::run_device_auth().await?
             };
-            let (auth_val, info) = login::build_auth_from_tokens(&tokens);
+            let (auth_val, info) = login::build_auth_from_tokens(&tokens)?;
             let action = profile::save_auth_value(auth_val.clone(), None)?;
             let alias = action.alias().to_string();
             let verb = action.action(); // "created" / "updated"
@@ -3397,7 +3422,7 @@ async fn run_oauth_inner(
             } else {
                 login::run_device_auth().await?
             };
-            let (auth_val, info) = login::build_auth_from_tokens(&tokens);
+            let (auth_val, info) = login::build_auth_from_tokens(&tokens)?;
             profile::replace_profile_auth_and_live_if_current_leased(&lease, &auth_val)?;
             drop(lease);
             let email_disp = info.email.as_deref().unwrap_or("unknown");
@@ -3492,7 +3517,7 @@ fn edit_grapheme_input(input: &mut String, cursor: &mut usize, code: KeyCode) {
 mod tests {
     use super::{
         AccountEntry, AccountTaskKind, App, BatchDeleteReport, ConfirmAction, ModelStatus,
-        STATUS_MESSAGE_MAX_CHARS, SearchState, UsageStatus, WarmupTask,
+        STATUS_MESSAGE_MAX_CHARS, SearchState, SortMode, UsageStatus, WarmupTask,
         batch_relogin_not_attempted, drain_credential_tasks_on_error,
         finish_login_or_stop_after_round, refresh_fetches_loaded_usage,
         refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
@@ -3618,6 +3643,7 @@ mod tests {
     fn global_weekly_summary_uses_all_accounts_not_only_filtered_view() {
         let now = 1_000_000;
         let weekly = |used_percent, elapsed_percent: i64| UsageInfo {
+            fetched_at: Some(now),
             secondary: Some(WindowUsage {
                 used_percent: Some(used_percent),
                 resets_at: Some(
@@ -3657,6 +3683,160 @@ mod tests {
         assert_eq!(summary.excluded_accounts, 1);
         assert!((summary.effective_capacity - 195.0).abs() < 1e-9);
         assert_eq!(summary.next_reset_alias.as_deref(), Some("filtered-out"));
+    }
+
+    #[test]
+    fn global_weekly_summary_excludes_samples_outside_the_cache_ttl() {
+        crate::config::init_defaults_for_tests();
+        let now = 1_000_000;
+        let ttl = crate::config::get().cache.ttl;
+        let ttl = i64::try_from(ttl).expect("default cache TTL fits the timestamp model");
+        let weekly = |fetched_at| UsageInfo {
+            fetched_at,
+            secondary: Some(WindowUsage {
+                used_percent: Some(50.0),
+                resets_at: Some(now + crate::usage::WINDOW_7D_SECS / 2),
+                window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
+            }),
+            ..UsageInfo::default()
+        };
+        let mut app = App::new();
+        app.accounts = [
+            ("boundary", Some(now - ttl)),
+            ("stale", Some(now - ttl - 1)),
+            ("future", Some(now + 1)),
+            ("missing", None),
+        ]
+        .into_iter()
+        .map(|(alias, fetched_at)| AccountEntry {
+            alias: alias.into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(weekly(fetched_at))),
+            is_current: false,
+        })
+        .collect();
+
+        let summary = app.global_weekly_summary(now);
+
+        assert_eq!(summary.included_accounts, 1);
+        assert_eq!(summary.excluded_accounts, 3);
+        assert_eq!(summary.next_reset_alias.as_deref(), Some("boundary"));
+    }
+
+    #[test]
+    fn status_sort_uses_plan_required_quota_shape() {
+        let weekly_only = UsageInfo {
+            secondary: Some(WindowUsage {
+                used_percent: Some(20.0),
+                ..WindowUsage::default()
+            }),
+            ..UsageInfo::default()
+        };
+        let complete = UsageInfo {
+            primary: Some(WindowUsage {
+                used_percent: Some(20.0),
+                ..WindowUsage::default()
+            }),
+            ..weekly_only.clone()
+        };
+        let plus = || AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..AccountInfo::default()
+        };
+        let mut app = App::new();
+        app.accounts = vec![
+            AccountEntry {
+                alias: "free-complete".into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::new(weekly_only.clone())),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "plus-incomplete".into(),
+                info: plus(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    account_limited: true,
+                    ..weekly_only
+                })),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "plus-complete".into(),
+                info: plus(),
+                usage: UsageStatus::Loaded(Box::new(complete)),
+                is_current: false,
+            },
+        ];
+        app.sort_mode = SortMode::Status;
+
+        app.update_view();
+
+        let aliases = app
+            .view_indices
+            .iter()
+            .map(|&index| app.accounts[index].alias.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases,
+            vec!["plus-incomplete", "free-complete", "plus-complete"]
+        );
+    }
+
+    #[test]
+    fn quota_sort_puts_incomplete_paid_samples_after_complete_accounts() {
+        let weekly = |used_percent| WindowUsage {
+            used_percent: Some(used_percent),
+            ..WindowUsage::default()
+        };
+        let plus = || AccountInfo {
+            plan_type: Some("plus".to_string()),
+            ..AccountInfo::default()
+        };
+        let mut app = App::new();
+        app.accounts = vec![
+            AccountEntry {
+                alias: "plus-incomplete".into(),
+                info: plus(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    account_limited: true,
+                    secondary: Some(weekly(5.0)),
+                    ..UsageInfo::default()
+                })),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "plus-complete".into(),
+                info: plus(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    primary: Some(weekly(30.0)),
+                    secondary: Some(weekly(40.0)),
+                    ..UsageInfo::default()
+                })),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "free-complete".into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    secondary: Some(weekly(20.0)),
+                    ..UsageInfo::default()
+                })),
+                is_current: false,
+            },
+        ];
+        app.sort_mode = SortMode::Quota;
+
+        app.update_view();
+
+        let aliases = app
+            .view_indices
+            .iter()
+            .map(|&index| app.accounts[index].alias.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases,
+            vec!["free-complete", "plus-complete", "plus-incomplete"]
+        );
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -3881,7 +4061,10 @@ mod tests {
         crate::cache::put(
             "account",
             &UsageInfo {
-                fetched_at: Some(crate::auth::now_unix_secs()),
+                fetched_at: Some(
+                    crate::auth::now_unix_secs()
+                        .expect("test clock must be a supported Unix timestamp"),
+                ),
                 reset_credits: vec![ResetCredit {
                     id: "possibly-consumed".into(),
                     granted_at: None,

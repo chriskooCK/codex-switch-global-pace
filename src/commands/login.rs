@@ -20,7 +20,7 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
     } else {
         login::run_device_auth().await?
     };
-    let (auth_val, _info) = login::build_auth_from_tokens(&tokens);
+    let (auth_val, _info) = login::build_auth_from_tokens(&tokens)?;
     let workspace_auth = auth_val.clone();
 
     let action = profile::save_auth_value(auth_val, alias)?;
@@ -83,7 +83,7 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
     } else {
         login::run_device_auth().await?
     };
-    let (auth_val, new_info) = login::build_auth_from_tokens(&tokens);
+    let (auth_val, new_info) = login::build_auth_from_tokens(&tokens)?;
     profile::replace_profile_auth_and_live_if_current_leased(&lease, &auth_val)?;
     drop(lease);
     if let Err(err) = workspace::refresh_for_auth(&auth_val).await {

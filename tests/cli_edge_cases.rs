@@ -1,12 +1,19 @@
 mod support;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "test-endpoints")]
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+
+#[cfg(feature = "test-endpoints")]
+use rotated_credential_import_tests::{
+    auth_json_needing_refresh, import_env, run_import, start_rotating_mock,
+};
 
 fn temp_home() -> support::TempDir {
     support::tempdir()
@@ -117,6 +124,7 @@ fn command(home: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+#[cfg(feature = "test-endpoints")]
 #[test]
 fn spawned_binary_honors_app_home_override() {
     let home = temp_home();
@@ -194,6 +202,7 @@ fn json_warmup_with_no_profiles_reports_a_complete_success_object() {
     );
 }
 
+#[cfg(feature = "test-endpoints")]
 fn quarantined_path_from_error(error: &str) -> PathBuf {
     let (_, after_path) = error
         .split_once("credential copy was quarantined at ")
@@ -204,6 +213,7 @@ fn quarantined_path_from_error(error: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+#[cfg(feature = "test-endpoints")]
 fn assert_error_names_recovered_file(error: &str, recovered: &Path) {
     let reported = quarantined_path_from_error(error);
     assert_eq!(
@@ -309,6 +319,7 @@ fn json_use_rejects_untracked_live_auth_without_prompting() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
 }
 
+#[cfg(feature = "test-endpoints")]
 #[test]
 fn json_import_keeps_stdout_machine_readable() {
     let home = temp_home();
@@ -632,6 +643,7 @@ fn delete_rejects_active_profile() {
     );
 }
 
+#[cfg(feature = "test-endpoints")]
 #[test]
 fn import_directory_recursively_validates_and_reports_results() {
     let home = temp_home();
@@ -929,745 +941,750 @@ fn list_progress_counts_only_stale_accounts() {
 // credential the auth server still accepts. These tests drive the real binary
 // against a local auth/usage mock and assert the rotated token reaches disk.
 
-struct MockServer {
-    base_url: String,
-    token_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    _shutdown: tokio::sync::oneshot::Sender<()>,
-    _rt: tokio::runtime::Runtime,
-}
+#[cfg(feature = "test-endpoints")]
+mod rotated_credential_import_tests {
+    use super::*;
 
-#[derive(Clone)]
-struct MockState {
-    rotated_id_token: String,
-    /// Whether the usage endpoint answers the rotated access token or fails it.
-    usage_ok: bool,
-    token_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    /// Access tokens the usage endpoint fails regardless of `usage_ok` --
-    /// lets one file in a directory import fail its usage check without
-    /// forcing every other file in the same run to fail too.
-    fail_access_tokens: std::collections::HashSet<String>,
-    /// Paths replaced by regular files after the refresh request reaches the
-    /// server but before rotated credentials are returned. This keeps import
-    /// preflight healthy and injects a genuine post-rotation persistence
-    /// failure at the boundary the recovery tests exercise.
-    post_rotation_blockers: Vec<PathBuf>,
-}
+    pub(super) struct MockServer {
+        base_url: String,
+        token_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        _shutdown: tokio::sync::oneshot::Sender<()>,
+        _rt: tokio::runtime::Runtime,
+    }
 
-async fn mock_usage_handler(
-    axum::extract::State(state): axum::extract::State<MockState>,
-    headers: axum::http::HeaderMap,
-) -> impl axum::response::IntoResponse {
-    let bearer = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    let ok = state.usage_ok && !state.fail_access_tokens.contains(bearer);
-    if ok {
-        return (
+    #[derive(Clone)]
+    struct MockState {
+        rotated_id_token: String,
+        /// Whether the usage endpoint answers the rotated access token or fails it.
+        usage_ok: bool,
+        token_calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// Access tokens the usage endpoint fails regardless of `usage_ok` --
+        /// lets one file in a directory import fail its usage check without
+        /// forcing every other file in the same run to fail too.
+        fail_access_tokens: std::collections::HashSet<String>,
+        /// Paths replaced by regular files after the refresh request reaches the
+        /// server but before rotated credentials are returned. This keeps import
+        /// preflight healthy and injects a genuine post-rotation persistence
+        /// failure at the boundary the recovery tests exercise.
+        post_rotation_blockers: Vec<PathBuf>,
+    }
+
+    async fn mock_usage_handler(
+        axum::extract::State(state): axum::extract::State<MockState>,
+        headers: axum::http::HeaderMap,
+    ) -> impl axum::response::IntoResponse {
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        let ok = state.usage_ok && !state.fail_access_tokens.contains(bearer);
+        if ok {
+            return (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 12.5,
+                            "limit_window_seconds": 18_000,
+                        }
+                    }
+                })),
+            );
+        }
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"detail": "upstream exploded"})),
+        )
+    }
+
+    async fn mock_token_handler(
+        axum::extract::State(state): axum::extract::State<MockState>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> impl axum::response::IntoResponse {
+        let presented = body
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        state.token_calls.lock().unwrap().push(presented.clone());
+        if presented != "refresh_old" {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error": "refresh_token_reused",
+                    "error_description": "replayed a consumed refresh token",
+                })),
+            );
+        }
+        for path in &state.post_rotation_blockers {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(path, "not a directory").unwrap();
+        }
+        (
             axum::http::StatusCode::OK,
             axum::Json(serde_json::json!({
-                "rate_limit": {
-                    "primary_window": {
-                        "used_percent": 12.5,
-                        "limit_window_seconds": 18_000,
-                    }
-                }
+                "id_token": state.rotated_id_token,
+                "access_token": "access_1",
+                "refresh_token": "refresh_1",
             })),
-        );
-    }
-    (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        axum::Json(serde_json::json!({"detail": "upstream exploded"})),
-    )
-}
-
-async fn mock_token_handler(
-    axum::extract::State(state): axum::extract::State<MockState>,
-    axum::Json(body): axum::Json<Value>,
-) -> impl axum::response::IntoResponse {
-    let presented = body
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    state.token_calls.lock().unwrap().push(presented.clone());
-    if presented != "refresh_old" {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({
-                "error": "refresh_token_reused",
-                "error_description": "replayed a consumed refresh token",
-            })),
-        );
-    }
-    for path in &state.post_rotation_blockers {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, "not a directory").unwrap();
-    }
-    (
-        axum::http::StatusCode::OK,
-        axum::Json(serde_json::json!({
-            "id_token": state.rotated_id_token,
-            "access_token": "access_1",
-            "refresh_token": "refresh_1",
-        })),
-    )
-}
-
-/// Auth server that rotates `refresh_old` -> `refresh_1` exactly once. With
-/// `usage_ok` false every usage call then fails, reproducing "token rotated,
-/// validation failed afterwards"; with it true the failure has to come from a
-/// later step instead.
-fn start_rotating_mock(rotated_id_token: String, usage_ok: bool) -> MockServer {
-    start_rotating_mock_with_failures(rotated_id_token, usage_ok, &[])
-}
-
-/// Same as `start_rotating_mock`, but the usage endpoint also fails for any
-/// bearer token listed in `fail_access_tokens`, independent of `usage_ok`.
-/// Used to make exactly one file in a directory import fail its usage check
-/// while a sibling file in the same run still succeeds normally.
-fn start_rotating_mock_with_failures(
-    rotated_id_token: String,
-    usage_ok: bool,
-    fail_access_tokens: &[&str],
-) -> MockServer {
-    start_rotating_mock_with_options(rotated_id_token, usage_ok, fail_access_tokens, Vec::new())
-}
-
-fn start_rotating_mock_with_blockers(
-    rotated_id_token: String,
-    usage_ok: bool,
-    post_rotation_blockers: Vec<PathBuf>,
-) -> MockServer {
-    start_rotating_mock_with_options(rotated_id_token, usage_ok, &[], post_rotation_blockers)
-}
-
-fn start_rotating_mock_with_options(
-    rotated_id_token: String,
-    usage_ok: bool,
-    fail_access_tokens: &[&str],
-    post_rotation_blockers: Vec<PathBuf>,
-) -> MockServer {
-    let token_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let state = MockState {
-        rotated_id_token,
-        usage_ok,
-        token_calls: token_calls.clone(),
-        fail_access_tokens: fail_access_tokens.iter().map(|s| s.to_string()).collect(),
-        post_rotation_blockers,
-    };
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let listener = rt
-        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = axum::Router::new()
-        .route(
-            "/backend-api/wham/usage",
-            axum::routing::get(mock_usage_handler),
         )
-        .route("/oauth/token", axum::routing::post(mock_token_handler))
-        .with_state(state);
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    rt.spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-    });
-    MockServer {
-        base_url: format!("http://{addr}"),
-        token_calls,
-        _shutdown: shutdown,
-        _rt: rt,
     }
-}
 
-fn expired_jwt() -> String {
-    let exp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        - 3600;
-    jwt(&serde_json::json!({ "exp": exp }))
-}
+    /// Auth server that rotates `refresh_old` -> `refresh_1` exactly once. With
+    /// `usage_ok` false every usage call then fails, reproducing "token rotated,
+    /// validation failed afterwards"; with it true the failure has to come from a
+    /// later step instead.
+    pub(super) fn start_rotating_mock(rotated_id_token: String, usage_ok: bool) -> MockServer {
+        start_rotating_mock_with_failures(rotated_id_token, usage_ok, &[])
+    }
 
-/// An auth.json whose access token already expired, so importing it forces the
-/// proactive token refresh that consumes `refresh_old`.
-fn auth_json_needing_refresh(email: &str, account_id: &str) -> Value {
-    let mut value = auth_json(email, account_id);
-    value["tokens"]["access_token"] = serde_json::json!(expired_jwt());
-    value["tokens"]["refresh_token"] = serde_json::json!("refresh_old");
-    value
-}
+    /// Same as `start_rotating_mock`, but the usage endpoint also fails for any
+    /// bearer token listed in `fail_access_tokens`, independent of `usage_ok`.
+    /// Used to make exactly one file in a directory import fail its usage check
+    /// while a sibling file in the same run still succeeds normally.
+    fn start_rotating_mock_with_failures(
+        rotated_id_token: String,
+        usage_ok: bool,
+        fail_access_tokens: &[&str],
+    ) -> MockServer {
+        start_rotating_mock_with_options(rotated_id_token, usage_ok, fail_access_tokens, Vec::new())
+    }
 
-fn import_env(server: &MockServer) -> Vec<(String, String)> {
-    vec![
-        (
-            "CS_USAGE_URL".to_string(),
-            format!("{}/backend-api/wham/usage", server.base_url),
-        ),
-        (
-            "CS_TOKEN_URL".to_string(),
-            format!("{}/oauth/token", server.base_url),
-        ),
-    ]
-}
+    fn start_rotating_mock_with_blockers(
+        rotated_id_token: String,
+        usage_ok: bool,
+        post_rotation_blockers: Vec<PathBuf>,
+    ) -> MockServer {
+        start_rotating_mock_with_options(rotated_id_token, usage_ok, &[], post_rotation_blockers)
+    }
 
-fn run_import(home: &Path, args: &[&str], server: &MockServer) -> Output {
-    let env = import_env(server);
-    let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    run_with_env(home, args, &pairs)
-}
+    fn start_rotating_mock_with_options(
+        rotated_id_token: String,
+        usage_ok: bool,
+        fail_access_tokens: &[&str],
+        post_rotation_blockers: Vec<PathBuf>,
+    ) -> MockServer {
+        let token_calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = MockState {
+            rotated_id_token,
+            usage_ok,
+            token_calls: token_calls.clone(),
+            fail_access_tokens: fail_access_tokens.iter().map(|s| s.to_string()).collect(),
+            post_rotation_blockers,
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/backend-api/wham/usage",
+                axum::routing::get(mock_usage_handler),
+            )
+            .route("/oauth/token", axum::routing::post(mock_token_handler))
+            .with_state(state);
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        rt.spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+        MockServer {
+            base_url: format!("http://{addr}"),
+            token_calls,
+            _shutdown: shutdown,
+            _rt: rt,
+        }
+    }
 
-#[test]
-fn import_rejects_an_invalid_alias_before_consuming_the_refresh_token() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("alias@example.com", "acct_alias");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-
-    let server = start_rotating_mock(rotated_id_token, true);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "bad/name"],
-        &server,
-    );
-
-    assert!(!output.status.success());
-    assert!(
-        server.token_calls.lock().unwrap().is_empty(),
-        "a deterministic alias failure must be reported before a single-use refresh token is sent"
-    );
-    assert!(
-        !home.join(".codex-switch/recovery").exists(),
-        "a preflight rejection must not need credential recovery"
-    );
-}
-
-#[test]
-fn import_rejects_a_disallowed_workspace_before_consuming_the_refresh_token() {
-    let home = temp_home();
-    fs::create_dir_all(home.join(".codex")).unwrap();
-    fs::write(
-        home.join(".codex/config.toml"),
-        "forced_chatgpt_workspace_id = \"acct_allowed\"\n",
-    )
-    .unwrap();
-    let sample = auth_json_needing_refresh("blocked@example.com", "acct_blocked");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-
-    let server = start_rotating_mock(rotated_id_token, true);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "blocked"],
-        &server,
-    );
-
-    assert!(!output.status.success());
-    assert!(
-        server.token_calls.lock().unwrap().is_empty(),
-        "managed policy must reject the source identity before its refresh token is sent"
-    );
-    let report = parse_stdout_json(&output);
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("managed_policy"),
-        "the rejection must identify the policy boundary: {report}"
-    );
-}
-
-#[test]
-fn import_rejects_a_saved_refresh_token_before_consuming_it() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("duplicate@example.com", "acct_duplicate");
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-
-    let mut saved = sample.clone();
-    saved["tokens"]["access_token"] = serde_json::json!("a-different-access-token");
-    write_json(
-        home.join(".codex-switch/profiles/existing/auth.json"),
-        &saved,
-    );
-
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let server = start_rotating_mock(rotated_id_token, true);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "duplicate"],
-        &server,
-    );
-
-    assert!(!output.status.success());
-    assert!(
-        server.token_calls.lock().unwrap().is_empty(),
-        "a refresh token already owned by a profile must not be sent to the auth server"
-    );
-    let report = parse_stdout_json(&output);
-    assert!(
-        report["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("duplicate_credential"),
-        "{report}"
-    );
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex-switch/profiles/existing/auth.json")),
-        "refresh_old"
-    );
-}
-
-#[test]
-fn import_rejects_the_live_refresh_token_before_consuming_it() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("live@example.com", "acct_live");
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-    write_json(home.join(".codex/auth.json"), &sample);
-
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let server = start_rotating_mock(rotated_id_token, true);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "duplicate"],
-        &server,
-    );
-
-    assert!(!output.status.success());
-    assert!(server.token_calls.lock().unwrap().is_empty());
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex/auth.json")),
-        "refresh_old"
-    );
-}
-
-fn stored_refresh_token(path: &Path) -> String {
-    let raw = fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("reading {} failed: {e}", path.display()));
-    let val: Value = serde_json::from_str(&raw).unwrap();
-    val["tokens"]["refresh_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
-}
-
-/// The rotation happens inside usage validation; when validation then fails the
-/// only credential the auth server still accepts lives in memory. Dropping it
-/// leaves the source file holding a token that can never be redeemed again, so
-/// it has to be written somewhere durable before the failure is reported.
-#[test]
-fn import_persists_rotated_credentials_when_usage_validation_fails() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("rotate@example.com", "acct_rotate");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-
-    let server = start_rotating_mock(rotated_id_token, false);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "donor"],
-        &server,
-    );
-
-    assert!(
-        !output.status.success(),
-        "usage validation failed, so the import must not report success"
-    );
-    assert_eq!(
-        server.token_calls.lock().unwrap().clone(),
-        vec!["refresh_old".to_string()],
-        "a consumed refresh token must never be replayed"
-    );
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex-switch/profiles/donor/auth.json")),
-        "refresh_1",
-        "the rotated refresh token was dropped; the account can no longer authenticate"
-    );
-    let report = parse_stdout_json(&output);
-    assert_eq!(report["ok"], false, "stdout must stay machine-readable");
-    let error = report["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("token_rotated"),
-        "the failure must be tagged as a rotation rescue, got: {error}"
-    );
-    assert!(
-        error.contains("donor"),
-        "the failure must name where the rotated credentials were saved: {error}"
-    );
-}
-
-#[test]
-fn successful_rotated_import_promotes_stage_without_recovery_duplicate() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("promote@example.com", "acct_promote");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-
-    let server = start_rotating_mock(rotated_id_token, true);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "promoted"],
-        &server,
-    );
-
-    assert!(
-        output.status.success(),
-        "validated rotated import should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex-switch/profiles/promoted/auth.json")),
-        "refresh_1"
-    );
-    let recovery_dir = home.join(".codex-switch/recovery");
-    let recovery_files = fs::read_dir(&recovery_dir)
-        .map(|entries| entries.count())
-        .unwrap_or(0);
-    assert_eq!(
-        recovery_files, 0,
-        "successful promotion must move the stage instead of leaving a credential duplicate"
-    );
-}
-
-#[test]
-fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() {
-    let home = temp_home();
-    let mut sample = auth_json("rotate@example.com", "acct_rotate");
-    sample["tokens"]
-        .as_object_mut()
-        .unwrap()
-        .remove("access_token");
-    sample["tokens"]
-        .as_object_mut()
-        .unwrap()
-        .remove("account_id");
-    sample["tokens"]["refresh_token"] = serde_json::json!("refresh_old");
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-
-    let rotated_id_token = jwt(&serde_json::json!({
-        "email": "rotate@example.com",
-        "exp": SystemTime::now()
+    fn expired_jwt() -> String {
+        let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 3600,
-    }));
-    let server = start_rotating_mock(rotated_id_token, false);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "donor"],
-        &server,
-    );
+            .as_secs() as i64
+            - 3600;
+        jwt(&serde_json::json!({ "exp": exp }))
+    }
 
-    assert!(!output.status.success());
-    assert_eq!(
-        server.token_calls.lock().unwrap().clone(),
-        vec!["refresh_old".to_string()]
-    );
-    let recovery_dir = home.join(".codex-switch/recovery");
-    let recovered: Vec<_> = fs::read_dir(&recovery_dir)
-        .expect("rotated credentials must be quarantined even without an account id")
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
-    assert!(
-        !home.join(".codex-switch/profiles/donor").exists(),
-        "unverified recovery credentials must not become an activatable profile"
-    );
-    let report = parse_stdout_json(&output);
-    let error = report["error"].as_str().unwrap_or_default();
-    assert!(error.contains("token_rotated"));
-    assert_error_names_recovered_file(error, &recovered[0]);
-}
+    /// An auth.json whose access token already expired, so importing it forces the
+    /// proactive token refresh that consumes `refresh_old`.
+    pub(super) fn auth_json_needing_refresh(email: &str, account_id: &str) -> Value {
+        let mut value = auth_json(email, account_id);
+        value["tokens"]["access_token"] = serde_json::json!(expired_jwt());
+        value["tokens"]["refresh_token"] = serde_json::json!("refresh_old");
+        value
+    }
 
-/// A directory import prints one line per file. A file whose credentials were
-/// rotated is not an ordinary skip — the source file is now worthless and a
-/// profile appeared — so it must not be rendered like the others.
-#[test]
-fn import_directory_distinguishes_rotated_credentials_from_plain_skips() {
-    let home = temp_home();
-    let root = home.join("to-import");
-    let sample = auth_json_needing_refresh("dirrotate@example.com", "acct_dirrotate");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    write_json(root.join("rotating.json"), &sample);
-    write_json(
-        root.join("invalid-structure.json"),
-        &serde_json::json!({"tokens": {}}),
-    );
-
-    let server = start_rotating_mock(rotated_id_token, false);
-    let output = run_import(&home, &["import", root.to_str().unwrap()], &server);
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let rotated_line = stdout
-        .lines()
-        .find(|line| line.contains("rotating.json"))
-        .unwrap_or_else(|| panic!("no line reported the rotated file:\n{stdout}"));
-    let skipped_line = stdout
-        .lines()
-        .find(|line| line.contains("invalid-structure.json"))
-        .unwrap_or_else(|| panic!("no line reported the invalid file:\n{stdout}"));
-
-    assert!(
-        skipped_line.contains("Skip"),
-        "an ordinary validation failure stays a plain skip: {skipped_line}"
-    );
-    assert!(
-        !rotated_line.contains("Skip"),
-        "a rotated credential must not be reported as an ordinary skip: {rotated_line}"
-    );
-    assert!(
-        rotated_line.contains("Rotated"),
-        "the rotated file needs its own marker: {rotated_line}"
-    );
-    assert!(
-        stdout.contains("refresh token"),
-        "the user must be told the source file's refresh token is now dead:\n{stdout}"
-    );
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex-switch/profiles/dirrotate/auth.json")),
-        "refresh_1",
-        "the rotated refresh token was dropped during a directory import"
-    );
-}
-
-/// The rescue cannot depend on the source file being writable: auth dumps are
-/// routinely copied in read-only, and a rescue that silently no-ops there is
-/// exactly the data loss this guards against.
-#[cfg(unix)]
-#[test]
-fn import_persists_rotated_credentials_when_source_file_is_read_only() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("readonly@example.com", "acct_readonly");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let dir = home.join("readonly");
-    let source = dir.join("donor-auth.json");
-    write_json(&source, &sample);
-    fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-
-    let server = start_rotating_mock(rotated_id_token, false);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "ro"],
-        &server,
-    );
-
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert!(!output.status.success());
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex-switch/profiles/ro/auth.json")),
-        "refresh_1",
-        "a read-only source must not cost the account its rotated credential"
-    );
-    let report = parse_stdout_json(&output);
-    let error = report["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("token_rotated"),
-        "the rescue must still be reported, got: {error}"
-    );
-}
-
-/// If even the profile store cannot take the rotated credential there is
-/// nothing left to save it into. That is the worst case and the one that must
-/// never be quiet: the account is gone unless the user is told now.
-#[test]
-fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-    // Occupy both durable destinations only after preflight and token
-    // presentation, so this remains a post-rotation recovery failure rather
-    // than a deterministic preflight rejection.
-    let server = start_rotating_mock_with_blockers(
-        rotated_id_token,
-        false,
+    pub(super) fn import_env(server: &MockServer) -> Vec<(String, String)> {
         vec![
-            home.join(".codex-switch/profiles"),
-            home.join(".codex-switch/recovery"),
-        ],
-    );
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "lost"],
-        &server,
-    );
+            (
+                "CS_USAGE_URL".to_string(),
+                format!("{}/backend-api/wham/usage", server.base_url),
+            ),
+            (
+                "CS_TOKEN_URL".to_string(),
+                format!("{}/oauth/token", server.base_url),
+            ),
+        ]
+    }
 
-    assert!(!output.status.success());
-    let report = parse_stdout_json(&output);
-    let error = report["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("token_rotation_lost"),
-        "an unsaveable rotation needs its own stage, got: {error}"
-    );
-    assert!(
-        error.contains("sign in again"),
-        "the user must learn the account needs a new login: {error}"
-    );
-}
+    pub(super) fn run_import(home: &Path, args: &[&str], server: &MockServer) -> Output {
+        let env = import_env(server);
+        let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        run_with_env(home, args, &pairs)
+    }
 
-/// The same single-use credential is at stake when validation *succeeds* and
-/// the profile write is what fails. A separate recovery store is still
-/// available, so the rotated token must be quarantined instead of discarded.
-#[test]
-fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("savefail@example.com", "acct_savefail");
-    let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
-    let server = start_rotating_mock_with_blockers(
-        rotated_id_token,
-        true,
-        vec![home.join(".codex-switch/profiles")],
-    );
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "savefail"],
-        &server,
-    );
+    #[test]
+    fn import_rejects_an_invalid_alias_before_consuming_the_refresh_token() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("alias@example.com", "acct_alias");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
 
-    assert!(!output.status.success());
-    assert_eq!(
-        server.token_calls.lock().unwrap().clone(),
-        vec!["refresh_old".to_string()],
-        "the scenario only holds if the credential really was rotated"
-    );
-    let report = parse_stdout_json(&output);
-    let error = report["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("token_rotated"),
-        "a recoverable profile write failure must be reported as quarantined: {error}"
-    );
-    let recovered: Vec<_> = fs::read_dir(home.join(".codex-switch/recovery"))
-        .expect("the rotated credential must fall back to the recovery store")
-        .map(|entry| entry.unwrap().path())
-        .collect();
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
-    assert_error_names_recovered_file(error, &recovered[0]);
-}
+        let server = start_rotating_mock(rotated_id_token, true);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "bad/name"],
+            &server,
+        );
 
-/// The structure check that runs *after* usage validation inspects the value
-/// the auth server just rotated, not the file on disk. A malformed refresh
-/// reply therefore fails a check whose failure arrives when `refresh_old` is
-/// already spent — so reporting it as an ordinary structure error would drop
-/// the only credential the server still accepts.
-#[test]
-fn import_rescues_rotated_credentials_when_the_refreshed_value_is_malformed() {
-    let home = temp_home();
-    let sample = auth_json_needing_refresh("badid@example.com", "acct_badid");
-    let source = home.join("donor-auth.json");
-    write_json(&source, &sample);
+        assert!(!output.status.success());
+        assert!(
+            server.token_calls.lock().unwrap().is_empty(),
+            "a deterministic alias failure must be reported before a single-use refresh token is sent"
+        );
+        assert!(
+            !home.join(".codex-switch/recovery").exists(),
+            "a preflight rejection must not need credential recovery"
+        );
+    }
 
-    // Usage succeeds, so the only thing that can fail afterwards is the
-    // structure check — and it fails because the rotation handed back an
-    // id_token that is not a JWT.
-    let server = start_rotating_mock("not-a-jwt".to_string(), true);
-    let output = run_import(
-        &home,
-        &["--json", "import", source.to_str().unwrap(), "donor"],
-        &server,
-    );
+    #[test]
+    fn import_rejects_a_disallowed_workspace_before_consuming_the_refresh_token() {
+        let home = temp_home();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "forced_chatgpt_workspace_id = \"acct_allowed\"\n",
+        )
+        .unwrap();
+        let sample = auth_json_needing_refresh("blocked@example.com", "acct_blocked");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
 
-    assert!(
-        !output.status.success(),
-        "the refreshed credentials are malformed, so the import must not succeed"
-    );
-    assert_eq!(
-        server.token_calls.lock().unwrap().clone(),
-        vec!["refresh_old".to_string()],
-        "the scenario only holds if the credential really was rotated"
-    );
-    assert_eq!(
-        stored_refresh_token(&home.join(".codex-switch/profiles/donor/auth.json")),
-        "refresh_1",
-        "the rotated refresh token was dropped; the account can no longer authenticate"
-    );
-    let report = parse_stdout_json(&output);
-    let error = report["error"].as_str().unwrap_or_default();
-    assert!(
-        error.contains("token_rotated"),
-        "the failure must be tagged as a rotation rescue, got: {error}"
-    );
-}
+        let server = start_rotating_mock(rotated_id_token, true);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "blocked"],
+            &server,
+        );
 
-/// A `--json` directory import that imports one file fine but loses another
-/// account's rotated credentials (`token_rotation_lost`) must not read as an
-/// overall success: a script that only checks a top-level discovery field,
-/// without walking `skipped[]`, still has to learn an account needs a fresh
-/// login.
-#[test]
-fn json_directory_import_surfaces_lost_credentials_at_top_level() {
-    let home = temp_home();
-    let root = home.join("to-import");
+        assert!(!output.status.success());
+        assert!(
+            server.token_calls.lock().unwrap().is_empty(),
+            "managed policy must reject the source identity before its refresh token is sent"
+        );
+        let report = parse_stdout_json(&output);
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("managed_policy"),
+            "the rejection must identify the policy boundary: {report}"
+        );
+    }
 
-    let lost_sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
-    let rotated_id_token = lost_sample["tokens"]["id_token"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    write_json(root.join("lost-auth.json"), &lost_sample);
-    write_json(
-        root.join("ok-auth.json"),
-        &auth_json_with_access("healthy@example.com", "acct_healthy"),
-    );
+    #[test]
+    fn import_rejects_a_saved_refresh_token_before_consuming_it() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("duplicate@example.com", "acct_duplicate");
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
 
-    // The alias the "lost" identity would rescue into ("lost", derived from
-    // its email) already exists as a plain file instead of a directory, so
-    // creating its profile subdirectory fails -- unlike a permission bit,
-    // this can't be silently repaired by `ensure_private_dir`'s chmod. The
-    // rest of the profile store stays untouched and writable for
-    // "ok-auth.json".
-    fs::create_dir_all(home.join(".codex-switch/profiles")).unwrap();
-    fs::write(home.join(".codex-switch/profiles/lost"), "not a directory").unwrap();
-    fs::write(home.join(".codex-switch/recovery"), "not a directory").unwrap();
+        let mut saved = sample.clone();
+        saved["tokens"]["access_token"] = serde_json::json!("a-different-access-token");
+        write_json(
+            home.join(".codex-switch/profiles/existing/auth.json"),
+            &saved,
+        );
 
-    let server = start_rotating_mock_with_failures(rotated_id_token, true, &["access_1"]);
-    let output = run_import(
-        &home,
-        &["--json", "import", root.to_str().unwrap()],
-        &server,
-    );
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let server = start_rotating_mock(rotated_id_token, true);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "duplicate"],
+            &server,
+        );
 
-    let report = parse_stdout_json(&output);
-    assert_eq!(
-        report["imported"].as_array().unwrap().len(),
-        1,
-        "the healthy file must still import normally: {report}"
-    );
-    let skipped = report["skipped"].as_array().unwrap();
-    assert!(
-        skipped
-            .iter()
-            .any(|item| item["stage"] == "token_rotation_lost"),
-        "expected a token_rotation_lost entry in skipped[]: {report}"
-    );
-    assert_eq!(
-        report["credentials_lost"],
-        serde_json::json!(true),
-        "a lost account must be discoverable from a top-level field alone, without walking \
+        assert!(!output.status.success());
+        assert!(
+            server.token_calls.lock().unwrap().is_empty(),
+            "a refresh token already owned by a profile must not be sent to the auth server"
+        );
+        let report = parse_stdout_json(&output);
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("duplicate_credential"),
+            "{report}"
+        );
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex-switch/profiles/existing/auth.json")),
+            "refresh_old"
+        );
+    }
+
+    #[test]
+    fn import_rejects_the_live_refresh_token_before_consuming_it() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("live@example.com", "acct_live");
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+        write_json(home.join(".codex/auth.json"), &sample);
+
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let server = start_rotating_mock(rotated_id_token, true);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "duplicate"],
+            &server,
+        );
+
+        assert!(!output.status.success());
+        assert!(server.token_calls.lock().unwrap().is_empty());
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex/auth.json")),
+            "refresh_old"
+        );
+    }
+
+    fn stored_refresh_token(path: &Path) -> String {
+        let raw = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("reading {} failed: {e}", path.display()));
+        let val: Value = serde_json::from_str(&raw).unwrap();
+        val["tokens"]["refresh_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The rotation happens inside usage validation; when validation then fails the
+    /// only credential the auth server still accepts lives in memory. Dropping it
+    /// leaves the source file holding a token that can never be redeemed again, so
+    /// it has to be written somewhere durable before the failure is reported.
+    #[test]
+    fn import_persists_rotated_credentials_when_usage_validation_fails() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("rotate@example.com", "acct_rotate");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+
+        let server = start_rotating_mock(rotated_id_token, false);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "donor"],
+            &server,
+        );
+
+        assert!(
+            !output.status.success(),
+            "usage validation failed, so the import must not report success"
+        );
+        assert_eq!(
+            server.token_calls.lock().unwrap().clone(),
+            vec!["refresh_old".to_string()],
+            "a consumed refresh token must never be replayed"
+        );
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex-switch/profiles/donor/auth.json")),
+            "refresh_1",
+            "the rotated refresh token was dropped; the account can no longer authenticate"
+        );
+        let report = parse_stdout_json(&output);
+        assert_eq!(report["ok"], false, "stdout must stay machine-readable");
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("token_rotated"),
+            "the failure must be tagged as a rotation rescue, got: {error}"
+        );
+        assert!(
+            error.contains("donor"),
+            "the failure must name where the rotated credentials were saved: {error}"
+        );
+    }
+
+    #[test]
+    fn successful_rotated_import_promotes_stage_without_recovery_duplicate() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("promote@example.com", "acct_promote");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+
+        let server = start_rotating_mock(rotated_id_token, true);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "promoted"],
+            &server,
+        );
+
+        assert!(
+            output.status.success(),
+            "validated rotated import should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex-switch/profiles/promoted/auth.json")),
+            "refresh_1"
+        );
+        let recovery_dir = home.join(".codex-switch/recovery");
+        let recovery_files = fs::read_dir(&recovery_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            recovery_files, 0,
+            "successful promotion must move the stage instead of leaving a credential duplicate"
+        );
+    }
+
+    #[test]
+    fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() {
+        let home = temp_home();
+        let mut sample = auth_json("rotate@example.com", "acct_rotate");
+        sample["tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("access_token");
+        sample["tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("account_id");
+        sample["tokens"]["refresh_token"] = serde_json::json!("refresh_old");
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+
+        let rotated_id_token = jwt(&serde_json::json!({
+            "email": "rotate@example.com",
+            "exp": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() + 3600,
+        }));
+        let server = start_rotating_mock(rotated_id_token, false);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "donor"],
+            &server,
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(
+            server.token_calls.lock().unwrap().clone(),
+            vec!["refresh_old".to_string()]
+        );
+        let recovery_dir = home.join(".codex-switch/recovery");
+        let recovered: Vec<_> = fs::read_dir(&recovery_dir)
+            .expect("rotated credentials must be quarantined even without an account id")
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
+        assert!(
+            !home.join(".codex-switch/profiles/donor").exists(),
+            "unverified recovery credentials must not become an activatable profile"
+        );
+        let report = parse_stdout_json(&output);
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(error.contains("token_rotated"));
+        assert_error_names_recovered_file(error, &recovered[0]);
+    }
+
+    /// A directory import prints one line per file. A file whose credentials were
+    /// rotated is not an ordinary skip — the source file is now worthless and a
+    /// profile appeared — so it must not be rendered like the others.
+    #[test]
+    fn import_directory_distinguishes_rotated_credentials_from_plain_skips() {
+        let home = temp_home();
+        let root = home.join("to-import");
+        let sample = auth_json_needing_refresh("dirrotate@example.com", "acct_dirrotate");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        write_json(root.join("rotating.json"), &sample);
+        write_json(
+            root.join("invalid-structure.json"),
+            &serde_json::json!({"tokens": {}}),
+        );
+
+        let server = start_rotating_mock(rotated_id_token, false);
+        let output = run_import(&home, &["import", root.to_str().unwrap()], &server);
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let rotated_line = stdout
+            .lines()
+            .find(|line| line.contains("rotating.json"))
+            .unwrap_or_else(|| panic!("no line reported the rotated file:\n{stdout}"));
+        let skipped_line = stdout
+            .lines()
+            .find(|line| line.contains("invalid-structure.json"))
+            .unwrap_or_else(|| panic!("no line reported the invalid file:\n{stdout}"));
+
+        assert!(
+            skipped_line.contains("Skip"),
+            "an ordinary validation failure stays a plain skip: {skipped_line}"
+        );
+        assert!(
+            !rotated_line.contains("Skip"),
+            "a rotated credential must not be reported as an ordinary skip: {rotated_line}"
+        );
+        assert!(
+            rotated_line.contains("Rotated"),
+            "the rotated file needs its own marker: {rotated_line}"
+        );
+        assert!(
+            stdout.contains("refresh token"),
+            "the user must be told the source file's refresh token is now dead:\n{stdout}"
+        );
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex-switch/profiles/dirrotate/auth.json")),
+            "refresh_1",
+            "the rotated refresh token was dropped during a directory import"
+        );
+    }
+
+    /// The rescue cannot depend on the source file being writable: auth dumps are
+    /// routinely copied in read-only, and a rescue that silently no-ops there is
+    /// exactly the data loss this guards against.
+    #[cfg(unix)]
+    #[test]
+    fn import_persists_rotated_credentials_when_source_file_is_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("readonly@example.com", "acct_readonly");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let dir = home.join("readonly");
+        let source = dir.join("donor-auth.json");
+        write_json(&source, &sample);
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let server = start_rotating_mock(rotated_id_token, false);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "ro"],
+            &server,
+        );
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!output.status.success());
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex-switch/profiles/ro/auth.json")),
+            "refresh_1",
+            "a read-only source must not cost the account its rotated credential"
+        );
+        let report = parse_stdout_json(&output);
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("token_rotated"),
+            "the rescue must still be reported, got: {error}"
+        );
+    }
+
+    /// If even the profile store cannot take the rotated credential there is
+    /// nothing left to save it into. That is the worst case and the one that must
+    /// never be quiet: the account is gone unless the user is told now.
+    #[test]
+    fn import_reports_loudly_when_rotated_credentials_cannot_be_saved() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+        // Occupy both durable destinations only after preflight and token
+        // presentation, so this remains a post-rotation recovery failure rather
+        // than a deterministic preflight rejection.
+        let server = start_rotating_mock_with_blockers(
+            rotated_id_token,
+            false,
+            vec![
+                home.join(".codex-switch/profiles"),
+                home.join(".codex-switch/recovery"),
+            ],
+        );
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "lost"],
+            &server,
+        );
+
+        assert!(!output.status.success());
+        let report = parse_stdout_json(&output);
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("token_rotation_lost"),
+            "an unsaveable rotation needs its own stage, got: {error}"
+        );
+        assert!(
+            error.contains("sign in again"),
+            "the user must learn the account needs a new login: {error}"
+        );
+    }
+
+    /// The same single-use credential is at stake when validation *succeeds* and
+    /// the profile write is what fails. A separate recovery store is still
+    /// available, so the rotated token must be quarantined instead of discarded.
+    #[test]
+    fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("savefail@example.com", "acct_savefail");
+        let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+        let server = start_rotating_mock_with_blockers(
+            rotated_id_token,
+            true,
+            vec![home.join(".codex-switch/profiles")],
+        );
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "savefail"],
+            &server,
+        );
+
+        assert!(!output.status.success());
+        assert_eq!(
+            server.token_calls.lock().unwrap().clone(),
+            vec!["refresh_old".to_string()],
+            "the scenario only holds if the credential really was rotated"
+        );
+        let report = parse_stdout_json(&output);
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("token_rotated"),
+            "a recoverable profile write failure must be reported as quarantined: {error}"
+        );
+        let recovered: Vec<_> = fs::read_dir(home.join(".codex-switch/recovery"))
+            .expect("the rotated credential must fall back to the recovery store")
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(stored_refresh_token(&recovered[0]), "refresh_1");
+        assert_error_names_recovered_file(error, &recovered[0]);
+    }
+
+    /// The structure check that runs *after* usage validation inspects the value
+    /// the auth server just rotated, not the file on disk. A malformed refresh
+    /// reply therefore fails a check whose failure arrives when `refresh_old` is
+    /// already spent — so reporting it as an ordinary structure error would drop
+    /// the only credential the server still accepts.
+    #[test]
+    fn import_rescues_rotated_credentials_when_the_refreshed_value_is_malformed() {
+        let home = temp_home();
+        let sample = auth_json_needing_refresh("badid@example.com", "acct_badid");
+        let source = home.join("donor-auth.json");
+        write_json(&source, &sample);
+
+        // Usage succeeds, so the only thing that can fail afterwards is the
+        // structure check — and it fails because the rotation handed back an
+        // id_token that is not a JWT.
+        let server = start_rotating_mock("not-a-jwt".to_string(), true);
+        let output = run_import(
+            &home,
+            &["--json", "import", source.to_str().unwrap(), "donor"],
+            &server,
+        );
+
+        assert!(
+            !output.status.success(),
+            "the refreshed credentials are malformed, so the import must not succeed"
+        );
+        assert_eq!(
+            server.token_calls.lock().unwrap().clone(),
+            vec!["refresh_old".to_string()],
+            "the scenario only holds if the credential really was rotated"
+        );
+        assert_eq!(
+            stored_refresh_token(&home.join(".codex-switch/profiles/donor/auth.json")),
+            "refresh_1",
+            "the rotated refresh token was dropped; the account can no longer authenticate"
+        );
+        let report = parse_stdout_json(&output);
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("token_rotated"),
+            "the failure must be tagged as a rotation rescue, got: {error}"
+        );
+    }
+
+    /// A `--json` directory import that imports one file fine but loses another
+    /// account's rotated credentials (`token_rotation_lost`) must not read as an
+    /// overall success: a script that only checks a top-level discovery field,
+    /// without walking `skipped[]`, still has to learn an account needs a fresh
+    /// login.
+    #[test]
+    fn json_directory_import_surfaces_lost_credentials_at_top_level() {
+        let home = temp_home();
+        let root = home.join("to-import");
+
+        let lost_sample = auth_json_needing_refresh("lost@example.com", "acct_lost");
+        let rotated_id_token = lost_sample["tokens"]["id_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_json(root.join("lost-auth.json"), &lost_sample);
+        write_json(
+            root.join("ok-auth.json"),
+            &auth_json_with_access("healthy@example.com", "acct_healthy"),
+        );
+
+        // The alias the "lost" identity would rescue into ("lost", derived from
+        // its email) already exists as a plain file instead of a directory, so
+        // creating its profile subdirectory fails -- unlike a permission bit,
+        // this can't be silently repaired by `ensure_private_dir`'s chmod. The
+        // rest of the profile store stays untouched and writable for
+        // "ok-auth.json".
+        fs::create_dir_all(home.join(".codex-switch/profiles")).unwrap();
+        fs::write(home.join(".codex-switch/profiles/lost"), "not a directory").unwrap();
+        fs::write(home.join(".codex-switch/recovery"), "not a directory").unwrap();
+
+        let server = start_rotating_mock_with_failures(rotated_id_token, true, &["access_1"]);
+        let output = run_import(
+            &home,
+            &["--json", "import", root.to_str().unwrap()],
+            &server,
+        );
+
+        let report = parse_stdout_json(&output);
+        assert_eq!(
+            report["imported"].as_array().unwrap().len(),
+            1,
+            "the healthy file must still import normally: {report}"
+        );
+        let skipped = report["skipped"].as_array().unwrap();
+        assert!(
+            skipped
+                .iter()
+                .any(|item| item["stage"] == "token_rotation_lost"),
+            "expected a token_rotation_lost entry in skipped[]: {report}"
+        );
+        assert_eq!(
+            report["credentials_lost"],
+            serde_json::json!(true),
+            "a lost account must be discoverable from a top-level field alone, without walking \
          skipped[]: {report}"
-    );
+        );
+    }
 }

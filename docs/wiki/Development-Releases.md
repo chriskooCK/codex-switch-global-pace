@@ -11,18 +11,12 @@ For an existing direct installation:
 codex-switch-global-pace self-update --dev
 ```
 
-For a new macOS or Linux installation:
-
-```bash
-curl -fsSL https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.sh | bash -s -- --dev
-```
-
-For a new Windows installation:
-
-```powershell
-$env:CS_DEV="1"
-irm https://github.com/chriskooCK/codex-switch-global-pace/releases/download/dev/install.ps1 | iex
-```
+For a new installation, use the source-controlled
+[verified bootstrap](Getting-Started.md#install) and change only its documented
+channel value from `stable` to `dev`. It verifies the installer attestation
+against the current `dev` tag commit before execution. The Unix block passes
+`--dev`; the packaged Windows installer recognizes its embedded `-dev` version
+automatically, without a persistent process environment variable.
 
 The installer and updater retain profiles and configuration under
 `~/.codex-switch`. Do not substitute an installer URL from the original

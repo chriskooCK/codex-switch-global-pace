@@ -31,14 +31,6 @@ impl EnvVarGuard {
         }
         Self { key, previous }
     }
-
-    fn remove(key: &'static str) -> Self {
-        let previous = std::env::var(key).ok();
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self { key, previous }
-    }
 }
 
 impl Drop for EnvVarGuard {
@@ -130,7 +122,12 @@ fn score_candidates_from_responses(
                 .unwrap()
                 .3
                 .clone();
-            (alias.clone(), usage::parse_usage(body), account, 0)
+            (
+                alias.clone(),
+                usage::parse_usage(body).expect("test clock must be supported"),
+                account,
+                0,
+            )
         })
         .collect();
     let mut scored = usage::score_candidates(inputs, now, safety_margin_7d, team_priority);
@@ -178,8 +175,13 @@ fn score_candidates_pool_size_counts_successful_responses_not_profiles() {
         })
         .collect();
 
-    let scored =
-        score_candidates_from_responses(&responses, &profiles, false, 20.0, auth::now_unix_secs());
+    let scored = score_candidates_from_responses(
+        &responses,
+        &profiles,
+        false,
+        20.0,
+        auth::now_unix_secs().unwrap(),
+    );
 
     assert_eq!(profiles.len(), 3);
     assert_eq!(scored.len(), 2);
@@ -214,7 +216,7 @@ async fn usage_401_refreshes_json_token_and_retries_with_new_access_token() {
     .await;
     let _usage_url = EnvVarGuard::set("CS_USAGE_URL", server.usage_url());
     let _token_url = EnvVarGuard::set("CS_TOKEN_URL", server.token_url());
-    let _reset_url = EnvVarGuard::remove("CS_RESET_CREDITS_URL");
+    let _reset_url = EnvVarGuard::set("CS_RESET_CREDITS_URL", server.reset_credits_url());
 
     let mut persisted = None;
     let usage = {
@@ -352,7 +354,7 @@ async fn http_healthy_pool_ranking() {
     let server = mock::MockServer::start(entries).await;
 
     let client = reqwest::Client::new();
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs().unwrap();
 
     let responses = fetch_all(&client, &server.usage_url(), &profiles).await;
     let scored = score_from_responses(&responses, &profiles, true, 20.0, now);
@@ -378,7 +380,7 @@ async fn http_team_priority() {
     let server = mock::MockServer::start(entries).await;
 
     let client = reqwest::Client::new();
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs().unwrap();
 
     let responses = fetch_all(&client, &server.usage_url(), &profiles).await;
     let scored = score_from_responses(&responses, &profiles, true, 20.0, now);
@@ -403,7 +405,7 @@ async fn http_drain_window() {
     let server = mock::MockServer::start(entries).await;
 
     let client = reqwest::Client::new();
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs().unwrap();
 
     let responses = fetch_all(&client, &server.usage_url(), &profiles).await;
     let scored = score_from_responses(&responses, &profiles, false, 20.0, now);
@@ -423,7 +425,7 @@ async fn http_seven_day_crisis() {
     let server = mock::MockServer::start(entries).await;
 
     let client = reqwest::Client::new();
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs().unwrap();
 
     let responses = fetch_all(&client, &server.usage_url(), &profiles).await;
     let scored = score_from_responses(&responses, &profiles, false, 20.0, now);
@@ -443,7 +445,7 @@ async fn http_all_exhausted() {
     let server = mock::MockServer::start(entries).await;
 
     let client = reqwest::Client::new();
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs().unwrap();
 
     let responses = fetch_all(&client, &server.usage_url(), &profiles).await;
     // pool_exhausted is computed dynamically inside score_from_responses
@@ -468,7 +470,7 @@ async fn http_timeline_gradual_exhaustion() {
     let server = mock::MockServer::start(entries).await;
 
     let client = reqwest::Client::new();
-    let now = auth::now_unix_secs();
+    let now = auth::now_unix_secs().unwrap();
 
     // Tick 0: A=30%, B=20% — both healthy
     let tick0_responses = fetch_all(&client, &server.usage_url(), &profiles).await;
@@ -548,7 +550,7 @@ async fn http_mock_returns_correct_structure() {
     assert!(body.get("credits").is_some(), "should have credits");
 
     // Parse through the real path
-    let info = usage::parse_usage(&body);
+    let info = usage::parse_usage(&body).expect("test clock must be supported");
     assert!(info.primary.is_some(), "should parse primary window");
     assert!(info.secondary.is_some(), "should parse secondary window");
     assert_eq!(info.primary.as_ref().unwrap().used_percent, Some(0.0));
@@ -569,7 +571,10 @@ async fn http_reset_card_consume_uses_the_exact_confirmed_credit() {
         .unwrap();
 
     let _reset_url_guard = EnvVarGuard::set("CS_RESET_CREDITS_URL", server.reset_credits_url());
-    let _consume_url_guard = EnvVarGuard::remove("CS_RESET_CREDITS_CONSUME_URL");
+    let _consume_url_guard = EnvVarGuard::set(
+        "CS_RESET_CREDITS_CONSUME_URL",
+        server.reset_credits_consume_url(),
+    );
     let _home_guard = EnvVarGuard::set("CODEX_SWITCH_HOME", dir.path().display().to_string());
 
     let confirmed = ResetCredit {
@@ -902,6 +907,10 @@ mod revival {
             &[
                 ("CS_USAGE_URL", &server.usage_url()),
                 ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+                (
+                    "CS_RESET_CREDITS_CONSUME_URL",
+                    &server.reset_credits_consume_url(),
+                ),
             ],
         );
 
@@ -1212,6 +1221,10 @@ mod revival {
             &[
                 ("CS_USAGE_URL", &server.usage_url()),
                 ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+                (
+                    "CS_RESET_CREDITS_CONSUME_URL",
+                    &server.reset_credits_consume_url(),
+                ),
             ],
         );
 
@@ -1265,6 +1278,10 @@ mod revival {
             &[
                 ("CS_USAGE_URL", &server.usage_url()),
                 ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+                (
+                    "CS_RESET_CREDITS_CONSUME_URL",
+                    &server.reset_credits_consume_url(),
+                ),
             ],
         );
 
@@ -1313,6 +1330,10 @@ mod revival {
             &[
                 ("CS_USAGE_URL", &server.usage_url()),
                 ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+                (
+                    "CS_RESET_CREDITS_CONSUME_URL",
+                    &server.reset_credits_consume_url(),
+                ),
             ],
         );
 

@@ -1,4 +1,6 @@
-use super::{UsageInfo, WINDOW_7D_SECS, WindowUsage, explicit_account_blocker};
+use super::{
+    UsageInfo, WINDOW_7D_SECS, WindowUsage, explicit_account_blocker, quota_window_duration_secs,
+};
 
 const WINDOW_7D_MINUTES: i64 = WINDOW_7D_SECS / 60;
 
@@ -38,10 +40,7 @@ impl GlobalPaceAccountInput {
         let Some(window) = main_weekly_window(usage) else {
             return Self::unavailable(alias);
         };
-        let window_duration_secs = match window.window_minutes {
-            Some(minutes) => minutes.checked_mul(60),
-            None => Some(WINDOW_7D_SECS),
-        };
+        let window_duration_secs = quota_window_duration_secs(window, WINDOW_7D_SECS);
 
         Self {
             alias,
@@ -181,29 +180,29 @@ pub fn calculate_global_weekly_summary(
             .then_with(|| left.alias.cmp(&right.alias))
     });
 
-    let capacity_totals = (!accounts.is_empty()
-        && accounts.iter().all(|account| account.capacity.is_some()))
-    .then(|| {
-        accounts
-            .iter()
-            .fold((0.0, 0.0, 0.0, 0.0), |totals, account| {
-                let weight = account.capacity.expect("capacity checked above");
-                let (effective, normal, used, elapsed) = totals;
-                (
-                    effective + weight * account.effective_capacity,
-                    normal + weight * 100.0,
-                    used + weight * account.used_percent,
-                    elapsed + weight * account.elapsed_percent,
-                )
-            })
-    })
-    .filter(|(effective, normal, used, elapsed)| {
-        effective.is_finite()
-            && normal.is_finite()
-            && used.is_finite()
-            && elapsed.is_finite()
-            && *normal > 0.0
-    });
+    let capacity_totals = (!accounts.is_empty())
+        .then(|| {
+            accounts
+                .iter()
+                .try_fold((0.0, 0.0, 0.0, 0.0), |totals, account| {
+                    let weight = account.capacity?;
+                    let (effective, normal, used, elapsed) = totals;
+                    Some((
+                        effective + weight * account.effective_capacity,
+                        normal + weight * 100.0,
+                        used + weight * account.used_percent,
+                        elapsed + weight * account.elapsed_percent,
+                    ))
+                })
+        })
+        .flatten()
+        .filter(|(effective, normal, used, elapsed)| {
+            effective.is_finite()
+                && normal.is_finite()
+                && used.is_finite()
+                && elapsed.is_finite()
+                && *normal > 0.0
+        });
 
     let (
         weighting,
@@ -272,24 +271,19 @@ pub fn calculate_global_weekly_summary(
 ///
 /// Current parsing normalizes primary-only seven-day responses into
 /// `secondary`. The primary fallback keeps this layer robust when it receives a
-/// pre-normalized `UsageInfo` directly. A secondary window without duration is
-/// accepted as the legacy seven-day shape.
+/// pre-normalized `UsageInfo` directly. `secondary` is already the main
+/// long-window slot; model-specific pools live in `additional_limits`, so an
+/// explicit positive duration is authoritative rather than being forced to
+/// exactly seven days. Duration validity is checked by
+/// `quota_window_duration_secs` when the input is assembled.
 fn main_weekly_window(usage: &UsageInfo) -> Option<&WindowUsage> {
-    usage
-        .secondary
-        .as_ref()
-        .filter(|window| {
+    usage.secondary.as_ref().or_else(|| {
+        usage.primary.as_ref().filter(|window| {
             window
                 .window_minutes
-                .is_none_or(|minutes| minutes == WINDOW_7D_MINUTES)
+                .is_some_and(|minutes| minutes >= WINDOW_7D_MINUTES)
         })
-        .or_else(|| {
-            usage.primary.as_ref().filter(|window| {
-                window
-                    .window_minutes
-                    .is_some_and(|minutes| minutes == WINDOW_7D_MINUTES)
-            })
-        })
+    })
 }
 
 #[cfg(test)]
@@ -574,6 +568,25 @@ mod tests {
             GlobalPaceAccountInput::from_usage("five-hour", &five_hour).used_percent,
             None
         );
+    }
+
+    #[test]
+    fn usage_mapping_uses_an_explicit_non_seven_day_secondary_duration() {
+        let duration_secs = 14 * 86_400;
+        let usage = UsageInfo {
+            secondary: Some(WindowUsage {
+                used_percent: Some(50.0),
+                resets_at: Some(NOW + duration_secs / 2),
+                window_minutes: Some(duration_secs / 60),
+            }),
+            ..UsageInfo::default()
+        };
+
+        let input = GlobalPaceAccountInput::from_usage("fourteen-day", &usage);
+        assert_eq!(input.window_duration_secs, Some(duration_secs));
+        let account = calculate_account_weekly_pace(&input, NOW).expect("valid long window");
+        assert!((account.elapsed_percent - 50.0).abs() < 1e-9);
+        assert!((account.effective_capacity - 100.0).abs() < 1e-9);
     }
 
     #[test]

@@ -58,14 +58,17 @@ pub(crate) fn render_progress_bar(
 }
 
 /// Format relative reset time: "~2h17m" or "~4d18h"
-pub(crate) fn format_reset_short_relative(w: &usage::WindowUsage) -> String {
+pub(crate) fn format_reset_short_relative(w: &usage::WindowUsage, now: i64) -> String {
     let Some(resets_at) = w.resets_at else {
         return "--".into();
     };
-    let remaining_secs = (resets_at - crate::auth::now_unix_secs()).max(0) as u64;
-    if remaining_secs == 0 {
+    let Some(remaining_secs) = resets_at.checked_sub(now) else {
+        return "--".into();
+    };
+    if remaining_secs <= 0 {
         return "expired".into();
     }
+    let remaining_secs = remaining_secs as u64;
     if remaining_secs < 3600 {
         format!("~{}m", remaining_secs / 60)
     } else if remaining_secs < 86400 {
@@ -92,11 +95,12 @@ struct QuotaWindowParts {
 
 fn quota_window_parts(
     window: &usage::WindowUsage,
-    window_secs: i64,
+    window_secs: Option<i64>,
     bar_width: usize,
+    now: i64,
 ) -> QuotaWindowParts {
     let used_percent = usage::normalized_quota_usage(window.used_percent);
-    let pace_percent = usage::pace_percent(window, window_secs);
+    let pace_percent = window_secs.and_then(|secs| usage::pace_percent_at(window, secs, now));
     let marker_pace = usage::visible_pace_marker(used_percent, pace_percent);
     let bar = match used_percent {
         Some(used) => render_progress_bar(used, marker_pace, bar_width),
@@ -112,9 +116,14 @@ fn quota_window_parts(
 
 /// Render one additional-limit pool's window as a compact segment, e.g.
 /// "5h [====------] 60% left".
-fn pool_window_segment(default_label: &str, w: &usage::WindowUsage, default_secs: i64) -> String {
+fn pool_window_segment(
+    default_label: &str,
+    w: &usage::WindowUsage,
+    default_secs: i64,
+    now: i64,
+) -> String {
     let (label, window_secs) = usage::quota_window_spec(w, default_label, default_secs);
-    let parts = quota_window_parts(w, window_secs, 10);
+    let parts = quota_window_parts(w, window_secs, 10, now);
     let remaining = parts
         .remaining_percent
         .map(|value| format!("{value:.0}% left"))
@@ -129,7 +138,7 @@ fn pool_window_segment(default_label: &str, w: &usage::WindowUsage, default_secs
 
 /// Print one indented sub-line per additional-limit pool (e.g. per-model
 /// quota pools on Pro 20x accounts). No-op when there are no additional pools.
-pub(crate) fn print_additional_pool_lines(limits: &[usage::AdditionalRateLimit]) {
+pub(crate) fn print_additional_pool_lines(limits: &[usage::AdditionalRateLimit], now: i64) {
     for row in usage::additional_pool_rows(limits) {
         let mut segments = vec![format!(
             "  {} {}",
@@ -137,10 +146,10 @@ pub(crate) fn print_additional_pool_lines(limits: &[usage::AdditionalRateLimit])
             color::dim(&row.limit_name)
         )];
         if let Some(w) = &row.primary {
-            segments.push(pool_window_segment("5h", w, usage::WINDOW_5H_SECS));
+            segments.push(pool_window_segment("5h", w, usage::WINDOW_5H_SECS, now));
         }
         if let Some(w) = &row.secondary {
-            segments.push(pool_window_segment("7d", w, usage::WINDOW_7D_SECS));
+            segments.push(pool_window_segment("7d", w, usage::WINDOW_7D_SECS, now));
         }
         if row.unavailable {
             segments.push(color::error("[exhausted]"));
@@ -154,14 +163,15 @@ fn usage_window_line(
     window: &usage::WindowUsage,
     default_secs: i64,
     bar_width: usize,
+    now: i64,
 ) -> String {
     let (label, window_secs) = usage::quota_window_spec(window, default_label, default_secs);
-    let parts = quota_window_parts(window, window_secs, bar_width);
+    let parts = quota_window_parts(window, window_secs, bar_width, now);
     let remaining = parts
         .remaining_percent
         .map(|value| format!("{value:>3.0}% left"))
         .unwrap_or_else(|| " --% left".to_string());
-    let reset = format_reset_short_relative(window);
+    let reset = format_reset_short_relative(window, now);
     format!(
         "  {label}  {}  {}   {}",
         color::usage_pace(&parts.bar, parts.used_percent, parts.pace_percent),
@@ -170,7 +180,7 @@ fn usage_window_line(
     )
 }
 
-pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
+pub(crate) fn print_usage_line(u: &usage::UsageInfo, now: i64) {
     for issue in &u.parse_issues {
         println!(
             "  {}",
@@ -190,16 +200,16 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
     if let Some(w) = &u.primary {
         println!(
             "{}",
-            usage_window_line("5h", w, usage::WINDOW_5H_SECS, bar_width)
+            usage_window_line("5h", w, usage::WINDOW_5H_SECS, bar_width, now)
         );
     }
     if let Some(w) = &u.secondary {
         println!(
             "{}",
-            usage_window_line("7d", w, usage::WINDOW_7D_SECS, bar_width)
+            usage_window_line("7d", w, usage::WINDOW_7D_SECS, bar_width, now)
         );
     }
-    print_additional_pool_lines(&u.additional_limits);
+    print_additional_pool_lines(&u.additional_limits, now);
     if let Some(balance) = u.credits_balance {
         let unlimited = u.unlimited_credits == Some(true);
         let text = if unlimited {
@@ -221,6 +231,8 @@ mod tests {
     };
     use crate::usage::WindowUsage;
 
+    const TEST_NOW: i64 = 1_800_000_000;
+
     #[test]
     fn progress_bar_clamps_used_and_pace_positions() {
         assert_eq!(render_progress_bar(0.0, None, 10), "----------");
@@ -231,13 +243,12 @@ mod tests {
 
     #[test]
     fn usage_lines_never_append_a_warning_suffix() {
-        let now = crate::auth::now_unix_secs();
         let window = WindowUsage {
             used_percent: Some(20.0),
-            resets_at: Some(now + crate::usage::WINDOW_7D_SECS - 60),
+            resets_at: Some(TEST_NOW + crate::usage::WINDOW_7D_SECS - 60),
             window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
         };
-        let rendered = usage_window_line("7d", &window, crate::usage::WINDOW_7D_SECS, 10);
+        let rendered = usage_window_line("7d", &window, crate::usage::WINDOW_7D_SECS, 10, TEST_NOW);
 
         assert!(!rendered.contains('!'));
         assert!(rendered.contains("80% left"));
@@ -247,10 +258,10 @@ mod tests {
     fn usage_lines_do_not_invent_missing_quota() {
         let window = WindowUsage {
             used_percent: None,
-            resets_at: Some(crate::auth::now_unix_secs() + 60),
+            resets_at: Some(TEST_NOW + 60),
             window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
         };
-        let rendered = usage_window_line("7d", &window, crate::usage::WINDOW_7D_SECS, 10);
+        let rendered = usage_window_line("7d", &window, crate::usage::WINDOW_7D_SECS, 10, TEST_NOW);
 
         assert!(rendered.contains("--% left"));
         assert!(!rendered.contains("100% left"));
@@ -261,10 +272,10 @@ mod tests {
     fn additional_pool_uses_its_reported_window_duration() {
         let window = WindowUsage {
             used_percent: Some(20.0),
-            resets_at: Some(crate::auth::now_unix_secs() + crate::usage::WINDOW_7D_SECS / 2),
+            resets_at: Some(TEST_NOW + crate::usage::WINDOW_7D_SECS / 2),
             window_minutes: Some(crate::usage::WINDOW_7D_SECS / 60),
         };
-        let rendered = pool_window_segment("5h", &window, crate::usage::WINDOW_5H_SECS);
+        let rendered = pool_window_segment("5h", &window, crate::usage::WINDOW_5H_SECS, TEST_NOW);
 
         assert!(rendered.contains("7d ["));
         assert!(!rendered.contains("5h ["));
@@ -272,7 +283,7 @@ mod tests {
 
     fn reset_after(seconds: i64) -> WindowUsage {
         WindowUsage {
-            resets_at: Some(crate::auth::now_unix_secs() + seconds),
+            resets_at: Some(TEST_NOW + seconds),
             ..WindowUsage::default()
         }
     }
@@ -280,19 +291,19 @@ mod tests {
     #[test]
     fn short_relative_reset_uses_minute_hour_and_day_boundaries() {
         assert_eq!(
-            format_reset_short_relative(&reset_after(59 * 60 + 30)),
+            format_reset_short_relative(&reset_after(59 * 60 + 30), TEST_NOW),
             "~59m"
         );
         assert_eq!(
-            format_reset_short_relative(&reset_after(60 * 60 + 30)),
+            format_reset_short_relative(&reset_after(60 * 60 + 30), TEST_NOW),
             "~1h0m"
         );
         assert_eq!(
-            format_reset_short_relative(&reset_after(23 * 60 * 60 + 59 * 60 + 30)),
+            format_reset_short_relative(&reset_after(23 * 60 * 60 + 59 * 60 + 30), TEST_NOW,),
             "~23h59m"
         );
         assert_eq!(
-            format_reset_short_relative(&reset_after(24 * 60 * 60 + 30)),
+            format_reset_short_relative(&reset_after(24 * 60 * 60 + 30), TEST_NOW),
             "~1d0h"
         );
     }
