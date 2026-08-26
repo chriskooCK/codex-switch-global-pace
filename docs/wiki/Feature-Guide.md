@@ -54,13 +54,13 @@ Cached entries are scoped by profile alias and retain their own fetch time.
 Normal reads refresh only stale entries. Use `list -f` or the TUI refresh action when a fresh network read is required.
 
 The Global Weekly Pace box treats every account with a valid weekly window as
-one equal-weight pool. For each account it calculates
-`100 + elapsed_percent - used_percent`; the global value is the average of
-those effective capacities. `100%` is exactly on pace, a higher value is
-reserve, and a lower value is deficit. A fully exhausted account is still
-included when its reset timestamp is valid. Missing, expired, inconsistent, or
-failed weekly data is counted as unavailable instead of being guessed. The box
-also shows the nearest included-account reset.
+one equal-weight pool. Its filled bar is aggregate actual usage, while the
+`↑ pace` marker is aggregate elapsed time and therefore the ideal usage position
+for the current point in the weekly windows. The summary text shows the
+participating account count and nearest included-account reset. A fully
+exhausted account is still included when its reset timestamp is valid. Missing,
+expired, inconsistent, or failed weekly data is counted as unavailable instead
+of being guessed.
 
 Every quota meter uses the same relative state: yellow when actual usage is
 ahead of elapsed-time pace, and green when usage is at or behind pace. The

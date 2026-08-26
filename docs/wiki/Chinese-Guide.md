@@ -2,7 +2,7 @@
 
 > 英文文档是 `codex-switch-global-pace` 的主文档与行为依据。本页提供中文快速入口，不单独维护第二套实现说明。
 
-`codex-switch-global-pace` 用于管理本机多个 OpenAI Codex CLI 登录、查看额度，并在新会话前选择合适账号。Global Weekly Pace 会把所有可用账号的周配额按 reset 时间合并成一个 equal-weight pool；`100%` 是正常配速，以上是 reserve，以下是 deficit。它会操作 Codex 的文件型认证，因此请勿分享 profile、`auth.json`、Token、代理凭据或未经脱敏的 debug 输出。
+`codex-switch-global-pace` 用于管理本机多个 OpenAI Codex CLI 登录、查看额度，并在新会话前选择合适账号。Global Weekly Pace 会把所有可用账号的周配额合并成一个 equal-weight pool；填充的 bar 表示实际使用量，pace marker 表示按已用时间计算的理想使用位置，文字摘要只显示参与账号数和最早 reset。它会操作 Codex 的文件型认证，因此请勿分享 profile、`auth.json`、Token、代理凭据或未经脱敏的 debug 输出。
 
 ## 快速开始
 

@@ -42,20 +42,16 @@ already-running Codex app or CLI after switching.
 
 ## Global Weekly Pace
 
-For every account with a valid weekly window, the dashboard combines remaining
-quota with time until reset:
+The dashboard combines every account with a valid weekly window into one
+equal-weight pool. The filled bar is aggregate actual usage, and the `↑ pace`
+marker is aggregate elapsed time: the ideal amount of the pool to have used by
+now. The text below the meter shows the participating account count and the
+nearest included-account reset.
 
-```text
-effective capacity = 100% + elapsed% - used%
-normal capacity    = included accounts × 100%
-global pace        = sum(effective capacity) / normal capacity × 100%
-```
-
-`100%` is on pace, more than `100%` is reserve, and less than `100%` is a
-deficit. Fully exhausted accounts remain included when their reset timestamp is
-valid. Accounts whose usage or weekly reset cannot be trusted are reported as
-unavailable. The current API does not expose a reliable comparable weekly
-capacity, so accounts are weighted equally.
+Fully exhausted accounts remain included when their reset timestamp is valid.
+Accounts whose usage or weekly reset cannot be trusted are counted as
+unavailable instead of being guessed. The current API does not expose a
+reliable comparable weekly capacity, so accounts are weighted equally.
 
 Quota meters use one relative rule everywhere: yellow means actual usage is
 ahead of the elapsed-time pace, while green means usage is at or behind pace.
