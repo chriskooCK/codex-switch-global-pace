@@ -21,10 +21,13 @@ codex-switch-global-pace import ~/auth-backups
 
 Interactive login updates an existing profile only when both `account_id` and
 email match exactly. An email-only or otherwise incomplete identity cannot
-authorize a credential overwrite. Import is deliberately create-only and never
-updates an existing profile: Usage API validation proves that the bearer can
-access a workspace, but a Team workspace ID can be shared by several users and
-cannot authorize overwriting another saved credential.
+authorize a credential overwrite. Re-login releases the target profile while
+you complete browser or device-code authorization, so quota reads and other
+account maintenance can continue; commit reacquires the profile and verifies
+that its strict identity did not change in the meantime. Import is deliberately
+create-only and never updates an existing profile: Usage API validation proves
+that the bearer can access a workspace, but a Team workspace ID can be shared by
+several users and cannot authorize overwriting another saved credential.
 
 Profile deletion is recoverable. An inactive profile is moved under `deleted-profiles/` after confirmation; the active profile cannot be deleted. See [recovery instructions](Troubleshooting.md#recover-a-deleted-profile).
 
@@ -35,6 +38,9 @@ Interactive commands compare the live `$CODEX_HOME/auth.json` against saved prof
 - A new account (for example after a plain `codex login`) triggers an offer to save it as a profile.
 - A refreshed token for a known account triggers an offer to update that profile.
 - Non-interactive runs (pipes, cron, CI) report the change but never modify state silently.
+
+When the current marker, its saved profile, and live auth are already identical,
+this check reads only that profile instead of scanning every saved account.
 
 ## Observe quota and account state
 
@@ -49,7 +55,10 @@ codex-switch-global-pace
 The usage model includes the main short and weekly windows returned for each
 account, additional model-specific pools, reset cards, spend limits, account
 restrictions, and model capabilities returned by the authenticated service.
-Cached entries are scoped by profile alias and retain their own fetch time.
+Cached usage entries are scoped by profile alias plus the account's verified ID
+and email, carry an exact revision, and retain their own fetch time. Workspace
+metadata is keyed by account ID, so aliases for the same verified account share
+the same cached organization result.
 
 Normal reads refresh only stale entries. Use `list -f` or the TUI refresh action when a fresh network read is required.
 
@@ -69,7 +78,7 @@ the same way. Exhaustion does not create a third warning state: a valid
 comparison still uses yellow or green and keeps its pace marker. Unavailable
 comparisons are neutral, and quota labels carry no warning suffix.
 
-The TUI account detail page is a single scrollable column with identity and organization labels, token expiry times in the local timezone, every quota pool with a pace marker, available reset cards, and the models the account may use. Model names and reasoning-effort capabilities are discovered from the authenticated service at runtime, not hardcoded. The full shortcut list is in the [command reference](Command-Reference.md#tui-shortcuts) and under `h` inside the TUI.
+The TUI account detail page is a single scrollable column with identity and organization labels, token expiry times in the local timezone, every quota pool with a pace marker, available reset cards, and the models the account may use. On startup it requests the selected and active account first and shows core quota before workspace and reset-card metadata. Workspace metadata and selected-account models proceed when that account's own core credential boundary is complete, rather than waiting for every other account. Model names and reasoning-effort capabilities are discovered from the authenticated service at runtime, not hardcoded. The full shortcut list is in the [command reference](Command-Reference.md#tui-shortcuts) and under `h` inside the TUI.
 
 ## Select an account
 
@@ -90,9 +99,11 @@ Selection has two phases:
 1. **Eligibility** requires a valid weekly window and excludes candidates with an exhausted reported window, critically low weekly headroom with a distant reset, or an unsafe Free-plan balance.
 2. **Scoring** ranks the eligible candidates by tier preference (Team accounts get priority by default), optional short-window headroom, weekly sustainability, quota that is close to resetting, and recent use.
 
+Fresh quota probes are saved before scoring, so a later automatic selection can reuse them without another quota request. These quota-only entries are deliberately not exposed as complete reset-card cache data; an exhausted pool enriches them before checking for recovery cards. A fresh complete entry already carries authoritative card details and avoids that extra request, while an approved redemption always performs a forced identity-bound preflight. If another process updates the same account while probes are running, its newer generation is preserved and the candidates are scored again from that result.
+
 If every account is ineligible, the best fallback is reported instead of pretending an account is healthy.
 
-Switching replaces the live `$CODEX_HOME/auth.json` atomically while holding the app's credential transaction. Ordinary CLI and TUI switches are bound to the exact live and profile snapshots observed for that decision. The TUI renders before reconciling live credentials, then saves newer credentials in the background only when the live account strictly matches an existing profile and passes the normal freshness and rollback guards; an untracked live account is reported without being saved. In the TUI, `Enter` then `u` is the complete switch action. If Codex refreshed the currently tracked account, its newer live credentials are saved through the same identity and freshness gate used by explicit profile synchronization before the selected profile is activated. A genuinely untracked live login is never overwritten by that action. Reset-card auto-selection authorizes the exact live snapshot and the target account identity before redemption, then permits only a same-account token rotation during the network request. The final publication rechecks the authorized live bytes and refuses a detected change instead of deliberately overwriting it. Restart Codex after a manual switch because Codex reads the file at startup.
+Switching replaces the live `$CODEX_HOME/auth.json` atomically while holding the app's credential transaction. Ordinary CLI and TUI switches are bound to the exact live and profile snapshots observed for that decision. An interactive untracked-live overwrite prompt does not retain the target profile lease; after approval, the target and live snapshots plus the planned strict identity are revalidated under a newly acquired lease before any switch or reset-card request. The TUI renders before reconciling live credentials, then saves newer credentials in the background only when the live account strictly matches an existing profile and passes the normal freshness and rollback guards; an untracked live account is reported without being saved. In the TUI, `Enter` then `u` is the complete switch action. If Codex refreshed the currently tracked account, its newer live credentials are saved through the same identity and freshness gate used by explicit profile synchronization before the selected profile is activated. A genuinely untracked live login is never overwritten by that action. Reset-card auto-selection authorizes the exact live snapshot and the target account identity before redemption, then permits only a same-account token rotation during the network request. The final publication rechecks the authorized live bytes and refuses a detected change instead of deliberately overwriting it. Restart Codex after a manual switch because Codex reads the file at startup.
 
 ## Recover exhausted accounts
 
@@ -115,7 +126,7 @@ codex-switch-global-pace warmup work
 codex-switch-global-pace --json warmup
 ```
 
-Model names are discovered at runtime rather than maintained as a hardcoded compatibility list. Already-active or unavailable pools are skipped. JSON mode returns every profile result and a top-level `ok` field. Inside the TUI, `W` toggles automatic warmup: it targets the short window when present, or the weekly window for a weekly-only response. The daemon has a separate `auto_warmup` setting.
+Model names are discovered at runtime rather than maintained as a hardcoded compatibility list. Read-only model discovery does not retain the profile lease; warmup reacquires it and verifies the exact credential and token freshness before sending a quota-activating request. Its model cache belongs to the verified account and normalized quota-pool set, not merely the alias, and the TUI can cancel discovery before cache publication or quota activation. Already-active or unavailable pools are skipped. JSON mode returns every profile result and a top-level `ok` field. Inside the TUI, `W` toggles automatic warmup: it targets the short window when present, or the weekly window for a weekly-only response. The daemon has a separate `auto_warmup` setting.
 
 ## Run the background daemon
 

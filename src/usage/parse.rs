@@ -580,6 +580,7 @@ fn parse_usage_at(body: &Value, fetched_at: i64) -> UsageInfo {
         });
 
     UsageInfo {
+        cache_revision: None,
         fetched_at: Some(fetched_at),
         primary,
         secondary,

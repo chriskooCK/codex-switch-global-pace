@@ -37,6 +37,29 @@ impl DaemonGeneration {
     }
 }
 
+/// Immutable receiver for the exact daemon generation published by this
+/// process. Polling reads only the mutable request file; the PID identity is
+/// already known and never reopened on the steady-state path.
+#[derive(Debug)]
+pub(crate) struct ShutdownRequestMonitor {
+    request_path: PathBuf,
+    target: DaemonGeneration,
+}
+
+impl ShutdownRequestMonitor {
+    pub(crate) fn is_requested(&self) -> bool {
+        shutdown_requested_at(&self.request_path, &self.target)
+    }
+
+    #[cfg(test)]
+    fn at(request_path: PathBuf, target: DaemonGeneration) -> Self {
+        Self {
+            request_path,
+            target,
+        }
+    }
+}
+
 enum ShutdownRequestDurability {
     Durable,
     VisibleDurabilityUnconfirmed(anyhow::Error),
@@ -323,7 +346,7 @@ fn shutdown_request_path() -> Result<PathBuf> {
 
 /// Atomically create a PID file using O_CREAT|O_EXCL semantics.
 /// Fails if the file already exists (prevents TOCTOU race).
-pub fn write_pidfile_exclusive() -> Result<()> {
+pub(crate) fn write_pidfile_exclusive() -> Result<ShutdownRequestMonitor> {
     let path = pidfile_path()?;
     let identity = PidIdentity {
         version: 2,
@@ -332,15 +355,20 @@ pub fn write_pidfile_exclusive() -> Result<()> {
         generation: daemon_generation(),
     };
     let request_path = shutdown_request_path()?;
-    let request_path = Some(request_path.as_path());
-    let lock_file = publish_pid_identity_at(&path, request_path, &identity)?;
+    let lock_file = publish_pid_identity_at(&path, Some(&request_path), &identity)?;
 
     let handle = PIDFILE_HANDLE.get_or_init(|| Mutex::new(None));
     let mut guard = handle
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = Some(lock_file);
-    Ok(())
+    Ok(ShutdownRequestMonitor {
+        request_path,
+        target: DaemonGeneration {
+            pid: identity.pid,
+            generation: identity.generation,
+        },
+    })
 }
 
 fn publish_pid_identity_at(
@@ -635,26 +663,14 @@ pub fn request_shutdown(expected: &DaemonGeneration) -> Result<ShutdownRequestOu
     })
 }
 
-pub fn shutdown_requested() -> bool {
-    let Ok(pidfile_path) = pidfile_path() else {
+fn shutdown_requested_at(request_path: &Path, target: &DaemonGeneration) -> bool {
+    let Ok(request_raw) = std::fs::read(request_path) else {
         return false;
     };
-    let Ok(identity_raw) = std::fs::read_to_string(pidfile_path) else {
+    let Ok(request) = serde_json::from_slice::<ShutdownRequest>(&request_raw) else {
         return false;
     };
-    let Some(identity) = parse_pid_identity(&identity_raw) else {
-        return false;
-    };
-    let Ok(request_path) = shutdown_request_path() else {
-        return false;
-    };
-    let Ok(request_raw) = std::fs::read_to_string(request_path) else {
-        return false;
-    };
-    let Ok(request) = serde_json::from_str::<ShutdownRequest>(&request_raw) else {
-        return false;
-    };
-    shutdown_request_matches(&identity, &request)
+    request.version == 1 && request.pid == target.pid && request.generation == target.generation
 }
 
 fn shutdown_request_matches(identity: &PidIdentity, request: &ShutdownRequest) -> bool {
@@ -760,10 +776,10 @@ mod tests {
     use super::publish_pid_identity_at;
     use super::{
         ContendingDaemonIdentity, DaemonAbsenceAcquire, DaemonGeneration, PidIdentity,
-        ShutdownRequest, acquire_daemon_absence_lease_at, acquire_pidfile_lock_at,
-        classify_contending_daemon_identity, cleanup_pidfile_at, parse_pid_identity,
-        pidfile_lock_path_for, read_pid_from_raw, running_pid_checked_at, shutdown_request_matches,
-        try_acquire_daemon_absence_lease_at,
+        ShutdownRequest, ShutdownRequestMonitor, acquire_daemon_absence_lease_at,
+        acquire_pidfile_lock_at, classify_contending_daemon_identity, cleanup_pidfile_at,
+        parse_pid_identity, pidfile_lock_path_for, read_pid_from_raw, running_pid_checked_at,
+        shutdown_request_matches, try_acquire_daemon_absence_lease_at,
     };
     use fs4::FileExt;
     use std::path::PathBuf;
@@ -803,6 +819,46 @@ mod tests {
                 ..matching
             }
         ));
+    }
+
+    #[test]
+    fn shutdown_monitor_uses_its_published_generation_without_a_pidfile_reread() {
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
+        let request_path = dir.path().join("daemon.shutdown");
+        let monitor = ShutdownRequestMonitor::at(
+            request_path.clone(),
+            DaemonGeneration {
+                pid: 4242,
+                generation: "published-generation".to_string(),
+            },
+        );
+
+        std::fs::write(
+            &request_path,
+            serde_json::to_vec(&ShutdownRequest {
+                version: 1,
+                pid: 4242,
+                generation: "published-generation".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(monitor.is_requested());
+
+        std::fs::write(
+            &request_path,
+            serde_json::to_vec(&ShutdownRequest {
+                version: 1,
+                pid: 4242,
+                generation: "stale-generation".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!monitor.is_requested());
+
+        std::fs::remove_file(&request_path).unwrap();
+        assert!(!monitor.is_requested());
     }
 
     #[cfg(windows)]

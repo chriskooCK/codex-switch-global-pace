@@ -83,6 +83,7 @@ jobs:
     needs: [quality, meta]
     env:
       RELEASE_VERSION: ${{ needs.meta.outputs.version }}
+      CS_RELEASE_SOURCE_COMMIT: ${{ github.sha }}
     strategy:
       fail-fast: false
       matrix:

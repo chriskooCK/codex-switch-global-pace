@@ -130,6 +130,9 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
     crate::auth::ensure_file_credentials_store()?;
     let endpoints = crate::auth::service_endpoints()?;
     let token_url = endpoints.token()?;
+    // Establish the complete transport before asking the user to authorize a
+    // one-shot code. The same pool then serves both token exchanges.
+    let client = crate::auth::build_http_client()?;
     let pkce = generate_pkce();
     let state = generate_state();
 
@@ -175,6 +178,7 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
     );
 
     let mut tokens = exchange_code(
+        &client,
         &callback_result.code,
         &pkce.code_verifier,
         &actual_redirect,
@@ -184,9 +188,7 @@ pub async fn run_device_auth() -> Result<LoginTokens> {
     crate::auth::validate_managed_chatgpt_account(&tokens.id_token)?;
     // Best-effort API key exchange, same as Codex's browser login. Failure
     // leaves OPENAI_API_KEY null, which Codex accepts.
-    if let Ok(client) = crate::auth::build_http_client() {
-        tokens.api_key = obtain_api_key(&client, token_url, &tokens.id_token).await;
-    }
+    tokens.api_key = obtain_api_key(&client, token_url, &tokens.id_token).await;
     Ok(tokens)
 }
 
@@ -430,12 +432,13 @@ async fn handle_callback_connection(
 // ── Token exchange ────────────────────────────────────────
 
 async fn exchange_code(
+    client: &reqwest::Client,
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
     token_url: &str,
 ) -> Result<LoginTokens> {
-    exchange_code_with_redirect(code, code_verifier, redirect_uri, token_url).await
+    exchange_code_with_redirect(client, code, code_verifier, redirect_uri, token_url).await
 }
 
 /// Transport-level failures (connect/timeout) mean the request never reached the server, so
@@ -459,13 +462,12 @@ fn token_exchange_retry_backoff(attempt: u32) -> Duration {
 }
 
 async fn exchange_code_with_redirect(
+    client: &reqwest::Client,
     code: &str,
     code_verifier: &str,
     redirect_uri: &str,
     token_url: &str,
 ) -> Result<LoginTokens> {
-    let client = crate::auth::build_http_client()?;
-
     let body = format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
         urlencoding::encode(code),
@@ -936,6 +938,7 @@ pub async fn run_device_code_auth() -> Result<LoginTokens> {
         let device_redirect = format!("{ISSUER}/deviceauth/callback");
         let endpoints = crate::auth::service_endpoints()?;
         let tokens = exchange_code_with_redirect(
+            &client,
             &auth_code,
             &verifier,
             &device_redirect,
@@ -1638,8 +1641,10 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let token_url = format!("http://{addr}/custom/token");
+            let client = crate::auth::build_http_client().unwrap();
 
             let tokens = exchange_code_with_redirect(
+                &client,
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
@@ -1647,7 +1652,6 @@ mod tests {
             )
             .await
             .expect("authorization-code exchange");
-            let client = crate::auth::build_http_client().unwrap();
             let api_key = obtain_api_key(&client, &token_url, &tokens.id_token).await;
 
             assert_eq!(api_key.as_deref(), Some("sk-test"));
@@ -1694,8 +1698,10 @@ mod tests {
             });
 
             let token_url = format!("http://{addr}/oauth/token");
+            let client = crate::auth::build_http_client().unwrap();
 
             let tokens = exchange_code_with_redirect(
+                &client,
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
@@ -1737,9 +1743,11 @@ mod tests {
             init_test_config();
             let port = reserve_closed_port();
             let token_url = format!("http://127.0.0.1:{port}/oauth/token");
+            let client = crate::auth::build_http_client().unwrap();
 
             let started = std::time::Instant::now();
             let err = exchange_code_with_redirect(
+                &client,
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
@@ -1791,8 +1799,10 @@ mod tests {
             });
 
             let token_url = format!("http://{addr}/oauth/token");
+            let client = crate::auth::build_http_client().unwrap();
 
             let err = exchange_code_with_redirect(
+                &client,
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",
@@ -1836,8 +1846,10 @@ mod tests {
             });
 
             let token_url = format!("http://{addr}/oauth/token");
+            let client = crate::auth::build_http_client().unwrap();
 
             let err = exchange_code_with_redirect(
+                &client,
                 "code",
                 "verifier",
                 "http://localhost:1455/auth/callback",

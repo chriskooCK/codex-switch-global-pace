@@ -9,10 +9,82 @@
   visible, a strictly matched existing profile receives newer live Codex
   credentials through the existing identity, freshness, and rollback guards.
   Untracked accounts are reported without being saved under a guessed alias.
+- **Constant-work stable reconciliation** — When the saved current marker, its
+  one profile, and live auth still match byte-for-byte, change detection and
+  automatic tracking avoid enumerating and parsing the complete profile
+  registry. Marker changes are retried from a fresh live snapshot; observation
+  errors still fail instead of being treated as a cache miss.
+- **Non-blocking interactive re-login** — CLI and TUI re-login retain the
+  profile lease only long enough to capture the original strict account
+  identity, release it while the user completes OAuth, then reacquire it and
+  verify the original, current, and incoming identities before committing.
+  Normal account reads and maintenance therefore do not queue behind a
+  minutes-long browser or device-code wait.
+- **Lease-free interactive confirmation** — Automatic `best` / `use`
+  selection no longer retains the target profile lease while waiting for an
+  untracked-live overwrite answer. Approval carries the exact prepared target
+  and live snapshots; the lease is reacquired and both snapshots plus the
+  planned strict identity are revalidated before a switch or reset-card POST.
 - **Read-only usage stays read-only** — An expired ID token no longer forces a
   healthy usage request through the credential-write lock. Proactive rotation
   is based on access-token expiry; 401/403 responses retain the explicit token
   refresh path.
+- **Quota-first account loading** — The TUI schedules the selected and active
+  accounts first and publishes core quota before reset-card enrichment. Each
+  account starts workspace metadata and selected-account model discovery as
+  soon as its own credential persistence and lease release finish, without
+  waiting for an unrelated slow quota request. Startup cache read errors remain
+  visible but no longer suppress the independent network refresh.
+- **State-driven terminal rendering** — Background task presence no longer
+  redraws the TUI ten times per second. Rendering now follows actual state,
+  input, resize, and second-boundary changes while task completion remains
+  polled independently.
+- **Contention-aware network capacity** — Account batches acquire the profile
+  lease and complete local credential, cache, identity, and endpoint
+  preparation before reserving a network slot. Independent workspace and
+  metadata phases release and reacquire capacity at their own HTTP boundary;
+  workspace cache locking and publication happen only after the lookup slot is
+  returned. Usage, reset-card, model-discovery, token-refresh, and warmup
+  requests share that per-process limit and release it during retry backoff and
+  local persistence. Refresh authorization and durable credential publication
+  likewise hold no network slot, and every follow-up request reacquires one.
+  Warmup also releases its profile lease for read-only model discovery, then
+  revalidates the exact credential before its first POST. Resolved models are
+  cached by strict account identity and the normalized quota-pool set, so an
+  alias rebound to another owner cannot inherit the previous owner's model
+  choice. The cached value retains each pool-to-model mapping: if an additional
+  model is retired after the main request succeeds, warmup refreshes official
+  metadata once and retries only targets not already completed instead of
+  repeating successful quota requests or reusing the stale entry forever. TUI
+  cancellation remains safe through model discovery and lease
+  reacquisition; it commits atomically before cache publication or the first
+  quota POST. A locked alias
+  therefore cannot block every runnable account at low concurrency, and a
+  queued TUI read can be cancelled before its first request without crossing a
+  credential mutation.
+- **Exact automatic-selection publication** — Quota-only probes remember the
+  raw cache generation and alias mutation they observed, then publish together
+  through an identity-bound compare-and-swap before scoring. A newer
+  same-account generation is preserved and re-scored unchanged; deletion,
+  rebinding, and absent-state ABA fail closed. Quota-only generations avoid the
+  next automatic-selection quota request without masquerading as complete
+  reset-card cache entries. A fresh complete generation supplies its reset-card
+  details without another metadata request; an approved redemption still uses
+  a forced identity-bound preflight. Known permanently rejected refresh
+  credentials are not presented again during quota or reset-card discovery.
+- **Demand-driven startup maintenance** — Ordinary CLI and TUI file-log path and
+  ACL work starts only when an enabled record actually needs the file branch.
+  Bare-TUI update cleanup and log arming run after the first frame, and a late
+  first-write failure remains visible in the TUI. Daemon start instead verifies
+  its secure log directory, lock, and daily append handle before publishing PID
+  readiness. Contended pending-update recovery reports immediately instead of
+  waiting on the active updater. Once logging starts, secured handles are reused
+  instead of reopened and rehardened for every record; date rollover remains
+  safe across concurrent Windows processes.
+- **Lean daemon shutdown monitoring** — The foreground daemon retains the exact
+  PID generation it published and polls only the mutable shutdown request at a
+  named half-second interval. It no longer reopens and reparses both files ten
+  times per second during the entire daemon lifetime.
 
 ## v20260826.7.0 — 2026-08-26
 

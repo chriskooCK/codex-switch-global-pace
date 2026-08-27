@@ -421,6 +421,27 @@ fn release_reuses_the_exact_source_quality_gate_and_builds_locked() {
 }
 
 #[test]
+fn release_builds_embed_the_exact_workflow_source_commit() {
+    let workflow = repo_file(".github/workflows/release.yml");
+    let cross = repo_file("Cross.toml");
+    let update = repo_file("src/update.rs");
+    let build_job = workflow
+        .split("\n  build:\n")
+        .nth(1)
+        .and_then(|tail| tail.split("\n  release:\n").next())
+        .expect("release workflow build job");
+
+    assert!(build_job.contains(concat!(
+        "    env:\n",
+        "      RELEASE_VERSION: ${{ needs.meta.outputs.version }}\n",
+        "      CS_RELEASE_SOURCE_COMMIT: ${{ github.sha }}"
+    )));
+    assert_eq!(build_job.matches("CS_RELEASE_SOURCE_COMMIT:").count(), 1);
+    assert!(cross.contains("passthrough = [\"CS_RELEASE_SOURCE_COMMIT\"]"));
+    assert!(update.contains("option_env!(\"CS_RELEASE_SOURCE_COMMIT\")"));
+}
+
+#[test]
 fn release_preserves_an_exact_dev_bundle_without_mutating_github_releases() {
     let workflow = repo_file(".github/workflows/release.yml");
 
@@ -5139,7 +5160,7 @@ fn self_update_checks_replace_permission_before_archive_download() {
     assert_before(
         &update,
         "ensure_replace_parent_writable(&executable, platform, &release.tag_name)?",
-        "download_file(&client, &archive_asset.browser_download_url",
+        "download_file(client, &archive_asset.browser_download_url",
     );
     assert!(!update.contains("permission denied? try: sudo codex-switch-global-pace self-update"));
     assert!(!update.contains("retry from PowerShell as Administrator"));
@@ -5187,7 +5208,7 @@ fn self_update_attestation_is_bound_to_the_current_tag_commit() {
     let update = repo_file("src/update.rs");
 
     assert!(update.contains("\"--source-digest\""));
-    assert!(update.contains("fetch_tag_commit_sha(&client, &release.tag_name).await?"));
+    assert!(update.contains("fetch_tag_commit_sha(client, &release.tag_name).await?"));
     assert!(update.contains("if confirmed_digest != source_digest"));
     assert_before(
         &update,
@@ -5640,8 +5661,11 @@ fn windows_self_update_cleanup_is_attested_journaled_and_retryable() {
     assert!(cleanup.contains("OpenProcess(PROCESS_SYNCHRONIZE"));
     assert!(cleanup.contains("WaitForSingleObject(parent.0, INFINITE)"));
     assert!(cleanup.contains("complete_after_revalidation(&cleanup)"));
-    assert!(cleanup.contains("super::acquire_update_lease(public_executable)"));
-    assert!(cleanup.contains("super::recover_pending(&public)"));
+    assert!(cleanup.contains("super::try_acquire_startup_cleanup_lease(public_executable)"));
+    assert!(update.contains("FileExt::try_lock(&file)"));
+    assert!(cleanup.contains("the pending journal was not changed"));
+    assert!(cleanup.contains("super::acquire_update_lease(&cleanup.public_executable)"));
+    assert!(update.contains("cleanup_worker::recover_pending_on_startup(&executable)"));
     assert!(cleanup.contains("remove_exact(&cleanup.backup, &cleanup.backup_token)"));
     assert!(cleanup.contains("journaled backup executable changed before exact removal"));
     assert!(cleanup.contains("an_undeletable_journal_remains_exactly_retryable"));

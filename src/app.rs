@@ -37,6 +37,10 @@ fn installer_owner_check_request(command: &Option<Commands>) -> Option<Option<st
     }
 }
 
+fn should_recover_self_update_cleanup_before_dispatch(command: &Option<Commands>) -> bool {
+    command.is_some() && !matches!(command, Some(Commands::SelfUpdate { check: false, .. }))
+}
+
 fn should_report_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<OutputAlreadyReported>().is_none()
 }
@@ -49,7 +53,7 @@ fn format_post_command_sync_warning(error: &anyhow::Error) -> String {
     format!("Warning: post-command profile sync did not fully complete: {error:#}")
 }
 
-fn format_pending_self_update_cleanup_warning(error: &impl std::fmt::Display) -> String {
+pub(crate) fn format_pending_self_update_cleanup_warning(error: &impl std::fmt::Display) -> String {
     let detail = safe_text::bounded_terminal_text(
         &error.to_string(),
         PENDING_SELF_UPDATE_CLEANUP_WARNING_MAX_CHARS,
@@ -262,6 +266,7 @@ pub async fn run() {
     }
 
     let use_json = cli.json || cli.json_pretty;
+    let is_bare_tui = cli.command.is_none();
     let message_mode = if cli.command.is_none() {
         MessageMode::Silent
     } else if use_json {
@@ -286,11 +291,7 @@ pub async fn run() {
     // commands or the TUI. Surface a bounded warning after output mode is
     // initialized. A mutating self-update skips this best-effort pass because
     // its command boundary performs the same recovery as a hard precondition.
-    let self_update_requires_cleanup = matches!(
-        &cli.command,
-        Some(Commands::SelfUpdate { check: false, .. })
-    );
-    if !self_update_requires_cleanup
+    if should_recover_self_update_cleanup_before_dispatch(&cli.command)
         && let Err(error) = update::recover_pending_self_update_cleanup_on_startup()
     {
         eprintln!(
@@ -317,30 +318,20 @@ pub async fn run() {
         EnvFilter::new(logging::application_filter("error"))
     };
     // Keep diagnostic logs even when the daemon detaches and discards stdio.
-    // File logging failure must not prevent normal account switching.
-    let file_writer = match logging::file_log_writer() {
-        Ok(writer) => Some(writer),
-        Err(error) => {
-            eprintln!(
-                "{}",
-                color::warn(&format!("Warning: file logging is unavailable: {error}"))
-            );
-            None
-        }
-    };
-    if let Some(file_writer) = file_writer {
-        use tracing_subscriber::fmt::writer::MakeWriterExt;
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(std::io::stderr.and(file_writer))
-            .init();
+    // The bare TUI keeps its pre-frame deferral; other commands remain lazy
+    // unless their own lifecycle requires an explicit readiness boundary.
+    let file_writer = if is_bare_tui {
+        logging::deferred_file_log_writer()
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .init();
-    }
+        logging::file_log_writer()
+    };
+    let command_file_writer = file_writer.clone();
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(std::io::stderr.and(file_writer))
+        .init();
     for warning in config::startup_warnings() {
         eprintln!("{}", color::warn(&format!("Warning: {warning}")));
     }
@@ -355,7 +346,7 @@ pub async fn run() {
         std::process::exit(1);
     }
 
-    let result = dispatch(cli.command, use_json).await;
+    let result = dispatch(cli.command, use_json, command_file_writer).await;
 
     if let Err(e) = result {
         if should_report_error(&e) {
@@ -375,7 +366,8 @@ mod error_reporting_tests {
     use super::{
         Cli, Commands, OutputAlreadyReported, PENDING_SELF_UPDATE_CLEANUP_WARNING_MAX_CHARS,
         format_pending_self_update_cleanup_warning, installer_owner_check_request,
-        should_check_auth_change, should_report_error,
+        should_check_auth_change, should_recover_self_update_cleanup_before_dispatch,
+        should_report_error,
     };
     use clap::Parser;
 
@@ -407,6 +399,30 @@ mod error_reporting_tests {
         let cli = Cli::try_parse_from(["codex-switch-global-pace"])
             .expect("bare executable should parse without a subcommand");
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn only_bare_tui_defers_normal_pending_cleanup_recovery() {
+        assert!(!should_recover_self_update_cleanup_before_dispatch(&None));
+        assert!(should_recover_self_update_cleanup_before_dispatch(&Some(
+            Commands::List { force: false }
+        )));
+        assert!(!should_recover_self_update_cleanup_before_dispatch(&Some(
+            Commands::SelfUpdate {
+                check: false,
+                version: None,
+                dev: false,
+                stable: false,
+            }
+        )));
+        assert!(should_recover_self_update_cleanup_before_dispatch(&Some(
+            Commands::SelfUpdate {
+                check: true,
+                version: None,
+                dev: false,
+                stable: false,
+            }
+        )));
     }
 
     #[test]
@@ -552,15 +568,26 @@ mod resync_reporting_tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _codex_home = EnvVarGuard::set("CODEX_HOME", "relative-auth-home");
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let log_dir = root.path().join("logs");
+        let file_log_writer = crate::logging::FileLogWriter::lazy_for_directory(log_dir.clone());
 
-        let error = dispatch(Some(Commands::List { force: false }), false)
-            .await
-            .expect_err("a live-auth path error must stop command dispatch");
+        let error = dispatch(
+            Some(Commands::List { force: false }),
+            false,
+            file_log_writer,
+        )
+        .await
+        .expect_err("a live-auth path error must stop command dispatch");
         let detail = format!("{error:#}");
         assert!(detail.contains("checking live auth changes"), "{detail}");
         assert!(
             detail.contains("CODEX_HOME must be an absolute path"),
             "{detail}"
+        );
+        assert!(
+            !log_dir.exists(),
+            "an ordinary no-log command failure must not initialize file logging"
         );
     }
 
@@ -612,16 +639,20 @@ fn should_check_auth_change(cmd: &Option<Commands>, json: bool) -> bool {
         )
 }
 
-async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
+async fn dispatch(
+    cmd: Option<Commands>,
+    json: bool,
+    file_log_writer: logging::FileLogWriter,
+) -> Result<()> {
     // The TUI reconciles live credentials after its first render so startup can
     // never be held behind a plain-terminal prompt. CLI commands retain their
     // existing interactive synchronization boundary.
-    let auth_check = if should_check_auth_change(&cmd, json) {
+    let auth_preflight_performed = should_check_auth_change(&cmd, json);
+    let auth_check = if auth_preflight_performed {
         check_auth_change()?
     } else {
         AuthCheckResult::NoChange
     };
-    let auth_handled = !matches!(&auth_check, AuthCheckResult::NoChange);
 
     let command_result = match cmd {
         Some(Commands::HoldUpdateLock) => Err(anyhow::anyhow!(
@@ -640,7 +671,9 @@ async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
             alias,
             consume_card,
         }) => commands::use_cmd(alias.as_deref(), json, consume_card).await,
-        Some(Commands::List { force }) => commands::list_cmd(force, json, auth_handled).await,
+        Some(Commands::List { force }) => {
+            commands::list_cmd(force, json, auth_preflight_performed).await
+        }
         Some(Commands::ResetCard { alias, yes }) => {
             commands::reset_card_cmd(&alias, yes, json).await
         }
@@ -660,8 +693,8 @@ async fn dispatch(cmd: Option<Commands>, json: bool) -> Result<()> {
         }) => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await,
         Some(Commands::Warmup { alias }) => commands::warmup_cmd(alias.as_deref(), json).await,
         Some(Commands::Open) => commands::open_cmd(),
-        Some(Commands::Daemon(sub)) => daemon::dispatch(sub, json).await,
-        None => tui::run_tui().await,
+        Some(Commands::Daemon(sub)) => daemon::dispatch(sub, json, file_log_writer).await,
+        None => tui::run_tui(file_log_writer).await,
     };
 
     // Run this even when the command failed: a request may have rotated a
@@ -699,14 +732,24 @@ fn check_auth_change() -> Result<AuthCheckResult> {
 
     if let profile::AuthChange::UnresolvedIdentity { aliases } = &change {
         user_println(&format!(
-            "auth.json or a saved profile carries no account id and its email matches {} profile(s) ({}) — \
-             refusing to update credentials from email alone. \
+            "auth.json and {} saved profile(s) ({}) share only part of the required account identity — \
+             refusing to update credentials without matching both account id and email. \
              Run `codex-switch-global-pace use <alias>` to restore a known profile, \
              or `codex-switch-global-pace login <alias>` to re-authenticate the intended profile.",
             aliases.len(),
             aliases.join(", ")
         ));
-        return Ok(AuthCheckResult::NoChange);
+        return Ok(AuthCheckResult::Detected);
+    }
+
+    if matches!(&change, profile::AuthChange::UnidentifiedAccount) {
+        user_println(
+            "auth.json does not match a saved profile and contains neither account_id nor email — \
+             refusing to bind it to the previous profile marker. \
+             Run `codex-switch-global-pace use <alias>` to restore a known profile, \
+             or `codex-switch-global-pace login <alias>` to authenticate the intended profile.",
+        );
+        return Ok(AuthCheckResult::Detected);
     }
 
     // Non-interactive stdin — don't prompt, don't silently mutate state
@@ -724,6 +767,7 @@ fn check_auth_change() -> Result<AuthCheckResult> {
                 ));
             }
             profile::AuthChange::NoLiveAuth
+            | profile::AuthChange::UnidentifiedAccount
             | profile::AuthChange::UnresolvedIdentity { .. }
             | profile::AuthChange::NoChange => unreachable!(),
         }
@@ -768,6 +812,7 @@ fn check_auth_change() -> Result<AuthCheckResult> {
             }
         }
         profile::AuthChange::NoLiveAuth
+        | profile::AuthChange::UnidentifiedAccount
         | profile::AuthChange::UnresolvedIdentity { .. }
         | profile::AuthChange::NoChange => unreachable!(),
     }

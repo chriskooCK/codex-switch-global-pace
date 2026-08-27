@@ -3,7 +3,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use fs4::FileExt;
+use fs4::{FileExt, TryLockError};
 #[cfg(windows)]
 use rand::Rng as _;
 use semver::Version;
@@ -23,6 +23,8 @@ const SYSTEM_INSTALL_MARKER_NAME: &str = ".codex-switch-global-pace-system-insta
 const UPDATE_CACHE_NAME: &str = "global-pace-update-check.json";
 const UPDATE_TTL_SECS: i64 = 12 * 60 * 60;
 const GITHUB_API_BASE: &str = "https://api.github.com";
+const EMBEDDED_RELEASE_SOURCE_COMMIT: Option<&str> = option_env!("CS_RELEASE_SOURCE_COMMIT");
+const MAX_ANNOTATED_TAG_DEPTH: usize = 5;
 const UPDATE_LOCK_TARGET_ENV: &str = "CS_UPDATE_LOCK_TARGET";
 const UPDATE_LOCK_READY_MARKER: &str = "codex-switch-global-pace update lock ready";
 const INSTALLER_AUTHORITY_TARGET_NAME: &str = "codex-switch-global-pace-installer-authority";
@@ -84,7 +86,7 @@ pub(crate) fn recover_pending_self_update_cleanup_on_startup()
                     .context("locating current executable for cleanup recovery")?,
             )
             .context("resolving current executable for cleanup recovery")?;
-            cleanup_worker::recover_pending(&executable)
+            cleanup_worker::recover_pending_on_startup(&executable)
         })()
         .map_err(|source| PendingSelfUpdateCleanup { source })
     }
@@ -976,9 +978,44 @@ struct GithubAsset {
     browser_download_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DevUpdateDecision {
+    Unavailable,
+    AvailableByVersion,
+    AvailableAtSourceCommit(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevVersionDecision {
+    Unavailable,
+    Available,
+    CompareSourceCommit,
+}
+
+enum ReleaseSourceCommit {
+    ResolveTag,
+    AlreadyResolved(String),
+}
+
 pub async fn check_for_update(force: bool) -> Result<Option<UpdateInfo>> {
     let current_version = current_version().to_string();
     let latest_version = latest_release_version(force).await?;
+    update_info_for_latest(current_version, latest_version)
+}
+
+pub(crate) async fn check_for_update_with_client(
+    force: bool,
+    client: &reqwest::Client,
+) -> Result<Option<UpdateInfo>> {
+    let current_version = current_version().to_string();
+    let latest_version = latest_release_version_with_client(force, client).await?;
+    update_info_for_latest(current_version, latest_version)
+}
+
+fn update_info_for_latest(
+    current_version: String,
+    latest_version: String,
+) -> Result<Option<UpdateInfo>> {
     if !is_newer_version(&latest_version, &current_version)? {
         return Ok(None);
     }
@@ -995,8 +1032,16 @@ pub async fn check_for_update(force: bool) -> Result<Option<UpdateInfo>> {
 /// Dev versions use a `dev` pre-release component. Older timestamped dev
 /// versions remain supported for updates from existing installations.
 pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
+    let client =
+        crate::auth::build_http_client().context("building HTTP client for dev update check")?;
+    check_for_dev_update_with_client(&client).await
+}
+
+pub(crate) async fn check_for_dev_update_with_client(
+    client: &reqwest::Client,
+) -> Result<Option<UpdateInfo>> {
     let current_version = current_version().to_string();
-    let release = match fetch_release_optional(Some("dev"))
+    let release = match fetch_release_optional_with_client(client, Some("dev"))
         .await
         .context("checking dev release")?
     {
@@ -1004,7 +1049,9 @@ pub async fn check_for_dev_update() -> Result<Option<UpdateInfo>> {
         None => return Ok(None), // No dev release exists (404).
     };
     let dev_version = extract_release_version(&release)?;
-    if !is_dev_update_available(&dev_version, &current_version)? {
+    if resolve_dev_update(client, &release.tag_name, &dev_version, &current_version).await?
+        == DevUpdateDecision::Unavailable
+    {
         return Ok(None);
     }
     Ok(Some(UpdateInfo {
@@ -1033,7 +1080,9 @@ pub(crate) async fn self_update(
     let update_lease = lease.0;
 
     let current_version = current_version().to_string();
-    let release = fetch_release(requested_version.as_deref()).await?;
+    let client =
+        crate::auth::build_http_client().context("building HTTP client for self-update")?;
+    let release = fetch_release_with_client(&client, requested_version.as_deref()).await?;
     let latest_version = extract_release_version(&release)?;
 
     if let Some(requested) = requested_version {
@@ -1068,8 +1117,16 @@ pub(crate) async fn self_update(
         });
     }
 
-    let replacement =
-        download_and_replace(&release, &latest_version, show_progress, "", update_lease).await?;
+    let replacement = download_and_replace(
+        &client,
+        &release,
+        &latest_version,
+        show_progress,
+        "",
+        update_lease,
+        ReleaseSourceCommit::ResolveTag,
+    )
+    .await?;
 
     // Keep publication-to-owner transfer free of user code: once the await
     // returns its guarded PendingReplacement, only infallible moves construct
@@ -1126,29 +1183,41 @@ pub(crate) async fn self_update_dev(
     let update_lease = lease.0;
 
     let current_version = current_version().to_string();
-    let release = fetch_release(Some("dev"))
+    let client =
+        crate::auth::build_http_client().context("building HTTP client for dev self-update")?;
+    let release = fetch_release_with_client(&client, Some("dev"))
         .await
         .context("fetching dev release from GitHub")?;
     let dev_version = extract_release_version(&release)?;
 
-    if !is_dev_update_available(&dev_version, &current_version)? {
-        return Ok(SelfUpdateResult {
-            current_version,
-            latest_version: dev_version,
-            install_source,
-            updated: false,
-            replacement: None,
-            replacement_state: SelfUpdateReplacementState::NotReplaced,
-            transaction_lease: Some(update_lease),
-        });
-    }
+    let source_commit =
+        match resolve_dev_update(&client, &release.tag_name, &dev_version, &current_version).await?
+        {
+            DevUpdateDecision::Unavailable => {
+                return Ok(SelfUpdateResult {
+                    current_version,
+                    latest_version: dev_version,
+                    install_source,
+                    updated: false,
+                    replacement: None,
+                    replacement_state: SelfUpdateReplacementState::NotReplaced,
+                    transaction_lease: Some(update_lease),
+                });
+            }
+            DevUpdateDecision::AvailableByVersion => ReleaseSourceCommit::ResolveTag,
+            DevUpdateDecision::AvailableAtSourceCommit(commit) => {
+                ReleaseSourceCommit::AlreadyResolved(commit)
+            }
+        };
 
     let replacement = download_and_replace(
+        &client,
         &release,
         &dev_version,
         show_progress,
         " (dev)",
         update_lease,
+        source_commit,
     )
     .await?;
 
@@ -1204,19 +1273,19 @@ fn extract_release_version(release: &GithubRelease) -> Result<String> {
 
 /// Download, verify, extract and replace the current binary from a GitHub Release.
 async fn download_and_replace(
+    client: &reqwest::Client,
     release: &GithubRelease,
     expected_version: &str,
     show_progress: bool,
     label_suffix: &str,
     update_lease: UpdateLease,
+    release_source_commit: ReleaseSourceCommit,
 ) -> Result<PendingReplacement> {
     let executable =
         fs::canonicalize(std::env::current_exe().context("locating current executable")?)
             .context("resolving current executable")?;
     let platform = current_update_platform();
     ensure_replace_parent_writable(&executable, platform, &release.tag_name)?;
-    let client =
-        crate::auth::build_http_client().context("building HTTP client for self-update")?;
     let archive_name = asset_name();
     let archive_asset = release
         .assets
@@ -1247,15 +1316,18 @@ async fn download_and_replace(
     if show_progress {
         eprintln!("Downloading {}{}...", archive_asset.name, label_suffix);
     }
-    download_file(&client, &archive_asset.browser_download_url, &archive_path).await?;
-    verify_checksum(&client, &checksum_asset.browser_download_url, &archive_path).await?;
+    download_file(client, &archive_asset.browser_download_url, &archive_path).await?;
+    verify_checksum(client, &checksum_asset.browser_download_url, &archive_path).await?;
     download_file(
-        &client,
+        client,
         &provenance_asset.browser_download_url,
         &provenance_path,
     )
     .await?;
-    let source_digest = fetch_tag_commit_sha(&client, &release.tag_name).await?;
+    let source_digest = match release_source_commit {
+        ReleaseSourceCommit::ResolveTag => fetch_tag_commit_sha(client, &release.tag_name).await?,
+        ReleaseSourceCommit::AlreadyResolved(commit) => commit,
+    };
     verify_build_provenance(
         &archive_path,
         &provenance_path,
@@ -1273,7 +1345,7 @@ async fn download_and_replace(
     // Keep the mutable-tag check after every expensive local operation. A dev
     // tag move during extraction or candidate execution must be observed before
     // the one irreversible operation below.
-    let confirmed_digest = fetch_tag_commit_sha(&client, &release.tag_name).await?;
+    let confirmed_digest = fetch_tag_commit_sha(client, &release.tag_name).await?;
     if confirmed_digest != source_digest {
         anyhow::bail!(
             "release tag '{}' moved from {source_digest} to {confirmed_digest} during update; \
@@ -1458,6 +1530,22 @@ fn acquire_update_lease(executable: &Path) -> Result<UpdateLease> {
     })
 }
 
+fn try_acquire_startup_cleanup_lease(executable: &Path) -> Result<Option<UpdateLease>> {
+    let (file, lock_path) = open_update_lock_file(executable)?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => Ok(Some(UpdateLease {
+            _inner: std::sync::Arc::new(UpdateLeaseInner { files: vec![file] }),
+        })),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(error)) => Err(error).with_context(|| {
+            format!(
+                "trying the self-update cleanup recovery lock {}",
+                lock_path.display()
+            )
+        }),
+    }
+}
+
 fn acquire_ordered_update_lease(stable_target: &Path, executable: &Path) -> Result<UpdateLease> {
     let stable_lock_path = transaction_sibling_path(stable_target, ".self-update.lock")?;
     let executable_lock_path = transaction_sibling_path(executable, ".self-update.lock")?;
@@ -1471,6 +1559,13 @@ fn acquire_ordered_update_lease(stable_target: &Path, executable: &Path) -> Resu
 }
 
 fn acquire_update_lock_file(executable: &Path) -> Result<fs::File> {
+    let (file, lock_path) = open_update_lock_file(executable)?;
+    FileExt::lock(&file)
+        .with_context(|| format!("locking self-update transaction {}", lock_path.display()))?;
+    Ok(file)
+}
+
+fn open_update_lock_file(executable: &Path) -> Result<(fs::File, PathBuf)> {
     let lock_path = transaction_sibling_path(executable, ".self-update.lock")?;
     match fs::symlink_metadata(&lock_path) {
         Ok(metadata) if !metadata.file_type().is_file() => anyhow::bail!(
@@ -1491,9 +1586,7 @@ fn acquire_update_lock_file(executable: &Path) -> Result<fs::File> {
         .truncate(false)
         .open(&lock_path)
         .with_context(|| format!("opening self-update lock {}", lock_path.display()))?;
-    FileExt::lock(&file)
-        .with_context(|| format!("locking self-update transaction {}", lock_path.display()))?;
-    Ok(file)
+    Ok((file, lock_path))
 }
 
 fn replace_candidate(
@@ -2780,15 +2873,39 @@ pub fn should_show_download_progress() -> bool {
 }
 
 async fn latest_release_version(force: bool) -> Result<String> {
-    let now = crate::auth::now_unix_secs()?;
-    if !force
-        && let Some(cache) = load_update_cache()?
-        && let Some(version) = fresh_cached_release_version(&cache, now)?
-    {
+    if let Some(version) = cached_latest_release_version(force)? {
         return Ok(version);
     }
 
-    let release = fetch_release(None).await?;
+    let client =
+        crate::auth::build_http_client().context("building HTTP client for update check")?;
+    fetch_latest_release_version_with_client(&client).await
+}
+
+async fn latest_release_version_with_client(
+    force: bool,
+    client: &reqwest::Client,
+) -> Result<String> {
+    if let Some(version) = cached_latest_release_version(force)? {
+        return Ok(version);
+    }
+
+    fetch_latest_release_version_with_client(client).await
+}
+
+fn cached_latest_release_version(force: bool) -> Result<Option<String>> {
+    let now = crate::auth::now_unix_secs()?;
+    if force {
+        return Ok(None);
+    }
+    let Some(cache) = load_update_cache()? else {
+        return Ok(None);
+    };
+    fresh_cached_release_version(&cache, now)
+}
+
+async fn fetch_latest_release_version_with_client(client: &reqwest::Client) -> Result<String> {
+    let release = fetch_release_with_client(client, None).await?;
     let latest_version = extract_release_version(&release)?;
     save_update_cache(&UpdateCache {
         checked_at: crate::auth::now_unix_secs()?,
@@ -2797,26 +2914,28 @@ async fn latest_release_version(force: bool) -> Result<String> {
     Ok(latest_version)
 }
 
-async fn fetch_release(version: Option<&str>) -> Result<GithubRelease> {
-    fetch_release_inner(version).await?.ok_or_else(|| {
-        let requested = version
-            .map(|value| format!(" matching '{value}'"))
-            .unwrap_or_default();
-        anyhow::anyhow!(
-            "self-update is unavailable: {REPO_OWNER}/{REPO_NAME} has no GitHub Release{requested}"
-        )
-    })
+async fn fetch_release_with_client(
+    client: &reqwest::Client,
+    version: Option<&str>,
+) -> Result<GithubRelease> {
+    fetch_release_optional_with_client(client, version)
+        .await?
+        .ok_or_else(|| {
+            let requested = version
+                .map(|value| format!(" matching '{value}'"))
+                .unwrap_or_default();
+            anyhow::anyhow!(
+                "self-update is unavailable: {REPO_OWNER}/{REPO_NAME} has no GitHub Release{requested}"
+            )
+        })
 }
 
 /// Fetch a GitHub Release, returning `Ok(None)` for 404 (release not found)
 /// and propagating all other errors.
-async fn fetch_release_optional(version: Option<&str>) -> Result<Option<GithubRelease>> {
-    fetch_release_inner(version).await
-}
-
-async fn fetch_release_inner(version: Option<&str>) -> Result<Option<GithubRelease>> {
-    let client =
-        crate::auth::build_http_client().context("building HTTP client for update check")?;
+async fn fetch_release_optional_with_client(
+    client: &reqwest::Client,
+    version: Option<&str>,
+) -> Result<Option<GithubRelease>> {
     let url = release_api_url(version);
     let resp = client
         .get(url)
@@ -2845,28 +2964,45 @@ async fn fetch_tag_commit_sha(client: &reqwest::Client, tag: &str) -> Result<Str
         "requesting GitHub release tag reference",
     )
     .await?;
-    let mut object = reference.object;
-    for _ in 0..5 {
+    resolve_tag_commit_sha(tag, reference.object, |tag_object_sha| async move {
+        fetch_github_json::<GithubGitTag>(
+            client,
+            &git_tag_api_url(&tag_object_sha),
+            "resolving annotated GitHub release tag",
+        )
+        .await
+    })
+    .await
+}
+
+async fn resolve_tag_commit_sha<F, Fut>(
+    tag: &str,
+    mut object: GithubGitObject,
+    mut fetch_tag_object: F,
+) -> Result<String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<GithubGitTag>>,
+{
+    for depth in 0..=MAX_ANNOTATED_TAG_DEPTH {
         match object.kind.as_str() {
             "commit" => {
-                validate_commit_sha(&object.sha)?;
-                return Ok(object.sha.to_ascii_lowercase());
+                return normalize_commit_sha(&object.sha, "GitHub release tag commit");
             }
-            "tag" => {
-                let tag_object = fetch_github_json::<GithubGitTag>(
-                    client,
-                    &git_tag_api_url(&object.sha),
-                    "resolving annotated GitHub release tag",
-                )
-                .await?;
-                object = tag_object.object;
+            "tag" if depth < MAX_ANNOTATED_TAG_DEPTH => {
+                let tag_object_sha =
+                    normalize_commit_sha(&object.sha, "GitHub annotated tag object")?;
+                object = fetch_tag_object(tag_object_sha).await?.object;
             }
+            "tag" => anyhow::bail!(
+                "release tag '{tag}' contains more than {MAX_ANNOTATED_TAG_DEPTH} nested annotated tags"
+            ),
             other => anyhow::bail!(
                 "release tag '{tag}' resolved to unsupported Git object type '{other}'"
             ),
         }
     }
-    anyhow::bail!("release tag '{tag}' contains more than 5 nested annotated tags")
+    unreachable!("the bounded tag-resolution loop always returns or fails")
 }
 
 async fn fetch_github_json<T>(client: &reqwest::Client, url: &str, context: &str) -> Result<T>
@@ -2886,11 +3022,11 @@ where
         .with_context(|| format!("parsing GitHub response from {url}"))
 }
 
-fn validate_commit_sha(sha: &str) -> Result<()> {
+fn normalize_commit_sha(sha: &str, source: &str) -> Result<String> {
     if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("GitHub release tag returned an invalid commit SHA: '{sha}'");
+        anyhow::bail!("{source} is not a full hexadecimal Git commit SHA: '{sha}'");
     }
-    Ok(())
+    Ok(sha.to_ascii_lowercase())
 }
 
 async fn download_file(client: &reqwest::Client, url: &str, path: &Path) -> Result<()> {
@@ -3210,28 +3346,95 @@ fn is_older_version(candidate: &str, current: &str) -> Result<bool> {
     Ok(compare_versions(candidate, current)? == std::cmp::Ordering::Less)
 }
 
-fn is_dev_update_available(candidate: &str, current: &str) -> Result<bool> {
+async fn resolve_dev_update(
+    client: &reqwest::Client,
+    release_tag: &str,
+    candidate: &str,
+    current: &str,
+) -> Result<DevUpdateDecision> {
+    let version_decision = dev_version_decision(candidate, current)?;
+    if version_decision != DevVersionDecision::CompareSourceCommit {
+        return complete_dev_update_decision(version_decision, None, None);
+    }
+
+    // Validate the local identity before starting another network request. A
+    // same-version rolling dev binary without release identity cannot safely
+    // claim either that it is current or that it needs replacement.
+    let current_source_commit = embedded_release_source_commit(EMBEDDED_RELEASE_SOURCE_COMMIT)?;
+    let candidate_source_commit = fetch_tag_commit_sha(client, release_tag).await?;
+    complete_dev_update_decision(
+        version_decision,
+        Some(&current_source_commit),
+        Some(&candidate_source_commit),
+    )
+}
+
+fn dev_version_decision(candidate: &str, current: &str) -> Result<DevVersionDecision> {
     let candidate = validate_semver(candidate, "candidate version")?.semver;
     let current = validate_semver(current, "current version")?.semver;
 
     if candidate > current {
-        return Ok(true);
+        return Ok(DevVersionDecision::Available);
     }
     let candidate_is_dev = is_rolling_dev_semver(&candidate);
     let current_is_dev = is_rolling_dev_semver(&current);
+    if candidate == current && candidate_is_dev && current_is_dev {
+        return Ok(DevVersionDecision::CompareSourceCommit);
+    }
     if current_is_dev && candidate_is_dev {
-        return Ok(candidate.major == current.major
-            && candidate.minor == current.minor
-            && candidate.patch == current.patch
-            && candidate.pre.as_str() == "dev"
-            && current.pre.as_str().starts_with("dev."));
+        return Ok(
+            if candidate.major == current.major
+                && candidate.minor == current.minor
+                && candidate.patch == current.patch
+                && candidate.pre.as_str() == "dev"
+                && current.pre.as_str().starts_with("dev.")
+            {
+                DevVersionDecision::Available
+            } else {
+                DevVersionDecision::Unavailable
+            },
+        );
     }
     // Explicit --dev should be able to switch from a stable/base install to the
     // rolling dev build with the same base version, e.g. 20260712.1.0 -> 20260712.1.0-dev.
     if !candidate_is_dev {
-        return Ok(false);
+        return Ok(DevVersionDecision::Unavailable);
     }
-    Ok(version_base(&candidate) >= version_base(&current))
+    Ok(if version_base(&candidate) >= version_base(&current) {
+        DevVersionDecision::Available
+    } else {
+        DevVersionDecision::Unavailable
+    })
+}
+
+fn complete_dev_update_decision(
+    version_decision: DevVersionDecision,
+    current_source_commit: Option<&str>,
+    candidate_source_commit: Option<&str>,
+) -> Result<DevUpdateDecision> {
+    match version_decision {
+        DevVersionDecision::Unavailable => Ok(DevUpdateDecision::Unavailable),
+        DevVersionDecision::Available => Ok(DevUpdateDecision::AvailableByVersion),
+        DevVersionDecision::CompareSourceCommit => {
+            let current = embedded_release_source_commit(current_source_commit)?;
+            let candidate = candidate_source_commit.context(
+                "the rolling dev release source commit was not resolved; update identity cannot be proven",
+            )?;
+            let candidate = normalize_commit_sha(candidate, "rolling dev release source commit")?;
+            if current == candidate {
+                Ok(DevUpdateDecision::Unavailable)
+            } else {
+                Ok(DevUpdateDecision::AvailableAtSourceCommit(candidate))
+            }
+        }
+    }
+}
+
+fn embedded_release_source_commit(value: Option<&str>) -> Result<String> {
+    let value = value.context(
+        "this rolling dev binary has no embedded release source commit; update identity cannot be proven",
+    )?;
+    normalize_commit_sha(value, "embedded release source commit")
 }
 
 fn is_rolling_dev_semver(version: &Version) -> bool {
@@ -4953,7 +5156,7 @@ mod tests {
         let candidate_error = is_newer_version("not-semver", "1.0.0").unwrap_err();
         assert!(format!("{candidate_error:#}").contains("candidate version 'not-semver'"));
 
-        let current_error = is_dev_update_available("1.0.0-dev", "broken").unwrap_err();
+        let current_error = dev_version_decision("1.0.0-dev", "broken").unwrap_err();
         assert!(format!("{current_error:#}").contains("current version 'broken'"));
     }
 
@@ -5015,8 +5218,9 @@ mod tests {
         assert!(is_newer_version("20260712.2.0", "20260712.1.0").unwrap());
         assert!(is_newer_version("20260713.1.0", "20260712.9.0").unwrap());
         assert!(is_newer_version("20260712.1.0", "20260712.1.0-dev.20260712000000").unwrap());
-        assert!(
-            is_dev_update_available("20260712.1.0-dev.20260712000000", "20260712.1.0").unwrap()
+        assert_eq!(
+            dev_version_decision("20260712.1.0-dev.20260712000000", "20260712.1.0").unwrap(),
+            DevVersionDecision::Available
         );
     }
 
@@ -5164,9 +5368,122 @@ mod tests {
 
     #[test]
     fn commit_digest_must_be_a_full_sha1() {
-        validate_commit_sha("0123456789abcdef0123456789abcdef01234567").unwrap();
-        assert!(validate_commit_sha("deadbeef").is_err());
-        assert!(validate_commit_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz").is_err());
+        assert_eq!(
+            normalize_commit_sha("0123456789ABCDEF0123456789ABCDEF01234567", "test commit")
+                .unwrap(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert!(normalize_commit_sha("deadbeef", "test commit").is_err());
+        assert!(
+            normalize_commit_sha("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", "test commit")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn same_dev_semver_uses_the_exact_source_commit_identity() {
+        let version_decision =
+            dev_version_decision("20260827.1.0-dev", "20260827.1.0-dev").unwrap();
+        assert_eq!(version_decision, DevVersionDecision::CompareSourceCommit);
+
+        let current = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(
+            complete_dev_update_decision(version_decision, Some(current), Some(current)).unwrap(),
+            DevUpdateDecision::Unavailable
+        );
+
+        let candidate = "89abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            complete_dev_update_decision(version_decision, Some(current), Some(candidate)).unwrap(),
+            DevUpdateDecision::AvailableAtSourceCommit(candidate.to_string())
+        );
+    }
+
+    #[test]
+    fn same_dev_semver_without_embedded_identity_is_an_error() {
+        let error = complete_dev_update_decision(
+            DevVersionDecision::CompareSourceCommit,
+            None,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("update identity cannot be proven"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn same_dev_semver_with_invalid_embedded_identity_is_an_error() {
+        let error = complete_dev_update_decision(
+            DevVersionDecision::CompareSourceCommit,
+            Some("deadbeef"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("embedded release source commit"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lightweight_release_tag_resolves_directly_to_its_commit() {
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fetches_for_resolver = fetches.clone();
+        let commit = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+        let resolved = resolve_tag_commit_sha(
+            "dev",
+            GithubGitObject {
+                kind: "commit".to_string(),
+                sha: commit.to_string(),
+            },
+            move |_| {
+                fetches_for_resolver.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { anyhow::bail!("a lightweight tag must not fetch an annotated tag object") }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, commit.to_ascii_lowercase());
+        assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn annotated_release_tag_is_peeled_to_its_commit() {
+        let tag_object_sha = "1111111111111111111111111111111111111111";
+        let commit = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+        let requested = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requested_by_resolver = requested.clone();
+
+        let resolved = resolve_tag_commit_sha(
+            "dev",
+            GithubGitObject {
+                kind: "tag".to_string(),
+                sha: tag_object_sha.to_string(),
+            },
+            move |sha| {
+                let requested = requested_by_resolver.clone();
+                async move {
+                    requested.lock().unwrap().push(sha);
+                    Ok(GithubGitTag {
+                        object: GithubGitObject {
+                            kind: "commit".to_string(),
+                            sha: commit.to_string(),
+                        },
+                    })
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved, commit.to_ascii_lowercase());
+        assert_eq!(*requested.lock().unwrap(), vec![tag_object_sha]);
     }
 
     #[test]
@@ -5198,24 +5515,34 @@ mod tests {
 
     #[test]
     fn dev_update_can_switch_from_same_base_stable() {
-        assert!(is_dev_update_available("0.0.20-dev.20260701094804", "0.0.20").unwrap());
-        assert!(
-            is_dev_update_available("0.0.20-dev.20260701094804", "0.0.20-dev.20260701090000")
-                .unwrap()
+        assert_eq!(
+            dev_version_decision("0.0.20-dev.20260701094804", "0.0.20").unwrap(),
+            DevVersionDecision::Available
         );
-        assert!(
-            !is_dev_update_available("0.0.20-dev.20260701094804", "0.0.20-dev.20260701094804")
-                .unwrap()
+        assert_eq!(
+            dev_version_decision("0.0.20-dev.20260701094804", "0.0.20-dev.20260701090000").unwrap(),
+            DevVersionDecision::Available
         );
-        assert!(!is_dev_update_available("0.0.20-dev.20260701094804", "0.0.21").unwrap());
+        assert_eq!(
+            dev_version_decision("0.0.20-dev.20260701094804", "0.0.20-dev.20260701094804").unwrap(),
+            DevVersionDecision::CompareSourceCommit
+        );
+        assert_eq!(
+            dev_version_decision("0.0.20-dev.20260701094804", "0.0.21").unwrap(),
+            DevVersionDecision::Unavailable
+        );
     }
 
     #[test]
     fn short_dev_version_replaces_legacy_timestamped_dev_on_the_same_base() {
-        assert!(
-            is_dev_update_available("20260712.1.0-dev", "20260712.1.0-dev.20260712055522").unwrap()
+        assert_eq!(
+            dev_version_decision("20260712.1.0-dev", "20260712.1.0-dev.20260712055522").unwrap(),
+            DevVersionDecision::Available
         );
-        assert!(!is_dev_update_available("20260712.1.0-dev", "20260712.1.0-dev").unwrap());
+        assert_eq!(
+            dev_version_decision("20260712.1.0-dev", "20260712.1.0-dev").unwrap(),
+            DevVersionDecision::CompareSourceCommit
+        );
     }
 
     #[test]

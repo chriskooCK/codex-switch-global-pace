@@ -157,51 +157,61 @@ pub(crate) async fn fetch_workspace_name(
     Ok(body.workspace_name_for(account_id))
 }
 
-pub(crate) async fn refresh_for_auth(auth: &serde_json::Value) -> Result<Option<String>> {
+#[cfg(test)]
+pub(crate) async fn refresh_state_for_auth(
+    auth: &serde_json::Value,
+) -> Result<crate::cache::WorkspaceState> {
     let endpoints = crate::auth::service_endpoints()?;
-    refresh_for_auth_at(&endpoints, auth).await
+    let client = crate::auth::build_http_client()?;
+    refresh_state_for_auth_at_with_client(&endpoints, auth, &client).await
 }
 
-pub(crate) async fn refresh_for_auth_at(
+/// Resolve workspace metadata without mutating the shared cache.
+///
+/// Long-running callers use this boundary so they can verify request ownership
+/// and generation after the response arrives, release any network permit, then
+/// pass the resolved state to [`publish_workspace_state`].
+pub(crate) async fn lookup_state_for_auth_with_client(
+    auth: &serde_json::Value,
+    client: &reqwest::Client,
+) -> Result<crate::cache::WorkspaceState> {
+    let endpoints = crate::auth::service_endpoints()?;
+    lookup_state_for_auth_at_with_client(&endpoints, auth, client).await
+}
+
+#[cfg(test)]
+async fn refresh_state_for_auth_at_with_client(
     endpoints: &crate::auth::ServiceEndpoints,
     auth: &serde_json::Value,
-) -> Result<Option<String>> {
-    refresh_for_auth_if_needed_at(endpoints, auth, true).await
+    client: &reqwest::Client,
+) -> Result<crate::cache::WorkspaceState> {
+    let state = lookup_state_for_auth_at_with_client(endpoints, auth, client).await?;
+    let info = crate::jwt::parse_account_info(auth);
+    if let Some(account_id) = info.account_id.as_deref() {
+        publish_workspace_state(account_id, &state).await?;
+    }
+    Ok(state)
 }
 
-pub(crate) async fn refresh_for_auth_if_needed(
-    auth: &serde_json::Value,
-    force: bool,
-) -> Result<Option<String>> {
-    let endpoints = crate::auth::service_endpoints()?;
-    refresh_for_auth_if_needed_at(&endpoints, auth, force).await
-}
-
-async fn refresh_for_auth_if_needed_at(
+async fn lookup_state_for_auth_at_with_client(
     endpoints: &crate::auth::ServiceEndpoints,
     auth: &serde_json::Value,
-    force: bool,
-) -> Result<Option<String>> {
+    client: &reqwest::Client,
+) -> Result<crate::cache::WorkspaceState> {
     let info = crate::jwt::parse_account_info(auth);
     let Some(account_id) = info.account_id.as_deref() else {
-        return Ok(None);
+        return Ok(crate::cache::WorkspaceState::Unresolved);
     };
-    if !force
-        && let Some(resolved) = crate::cache::resolved_workspace_name_async(account_id).await?
-    {
-        return Ok(resolved);
-    }
     let Some(access_token) = auth
         .pointer("/tokens/access_token")
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
     else {
-        return Ok(None);
+        return Ok(crate::cache::WorkspaceState::Unresolved);
     };
-    let client = crate::auth::build_http_client()?;
-    remember_workspace_name_at(
+    lookup_workspace_state_at(
         endpoints,
-        &client,
+        client,
         access_token,
         Some(account_id),
         info.is_fedramp,
@@ -209,34 +219,52 @@ async fn refresh_for_auth_if_needed_at(
     .await
 }
 
-async fn remember_workspace_name_at(
+async fn lookup_workspace_state_at(
     endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
     is_fedramp: bool,
-) -> Result<Option<String>> {
+) -> Result<crate::cache::WorkspaceState> {
     let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
-        return Ok(None);
+        return Ok(crate::cache::WorkspaceState::Unresolved);
     };
     let lookup =
         fetch_workspace_name(endpoints, client, access_token, account_id, is_fedramp).await?;
     // `Unlisted` is not an answer, so it is not recorded — the same reason a
     // failed request is not. Recording it would hide a real workspace name
     // until the record expired.
-    let name = match lookup {
-        WorkspaceLookup::Unlisted => return Ok(None),
-        WorkspaceLookup::Unnamed => None,
-        WorkspaceLookup::Named(name) => Some(name),
+    let state = match lookup {
+        WorkspaceLookup::Unlisted => return Ok(crate::cache::WorkspaceState::Unresolved),
+        WorkspaceLookup::Unnamed => crate::cache::WorkspaceState::Absent,
+        WorkspaceLookup::Named(name) => crate::cache::WorkspaceState::Named(name),
     };
+    Ok(state)
+}
+
+/// Publish a completed workspace lookup to the shared cache.
+///
+/// This is deliberately separate from [`lookup_state_for_auth_with_client`]:
+/// cache lock contention is local work and must not consume a network slot.
+pub(crate) async fn publish_workspace_state(
+    account_id: &str,
+    state: &crate::cache::WorkspaceState,
+) -> Result<()> {
+    if matches!(state, crate::cache::WorkspaceState::Unresolved) {
+        return Ok(());
+    }
     let cache_account_id = account_id.to_string();
-    let cache_name = name.clone();
+    let cache_name = match state {
+        crate::cache::WorkspaceState::Named(name) => Some(name.clone()),
+        crate::cache::WorkspaceState::Absent => None,
+        crate::cache::WorkspaceState::Unresolved => unreachable!(),
+    };
     tokio::task::spawn_blocking(move || {
         crate::cache::set_workspace_name(&cache_account_id, cache_name.as_deref())
     })
     .await
     .context("joining workspace cache update")??;
-    Ok(name)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -271,33 +299,83 @@ mod tests {
     /// loudly. Reaching `Ok` is therefore proof the answer came from cache.
     const UNREACHABLE_ACCOUNTS_CHECK: &str = "http://127.0.0.1:1/";
 
-    /// Endpoint variables and `CODEX_SWITCH_HOME` are process-global. Match the
-    /// shared lock order used by the other HTTP tests: endpoint lock first,
-    /// then profile-home lock. Holding both across `.await` is safe under
-    /// `#[tokio::test]`'s current-thread runtime.
     #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
-    async fn a_confirmed_absence_is_answered_without_another_request() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn uncached_lookup_uses_the_supplied_client_without_precommitting() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        crate::config::init_defaults_for_tests();
         let _url_env_lock = crate::auth::URL_ENV_LOCK.lock().await;
         let _profile_env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let _home = EnvVarGuard::set("CODEX_SWITCH_HOME", &home.path().display().to_string());
-        let _url = EnvVarGuard::set("CS_ACCOUNTS_CHECK_URL", UNREACHABLE_ACCOUNTS_CHECK);
 
-        // Exactly what a successful lookup against a personal plan records.
-        crate::cache::set_workspace_name("acct-personal", None).unwrap();
+        let marker_seen = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&marker_seen);
+        let app = axum::Router::new().route(
+            "/accounts",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.store(
+                        headers.get("x-client-marker").and_then(|v| v.to_str().ok())
+                            == Some("workspace"),
+                        Ordering::SeqCst,
+                    );
+                    axum::Json(serde_json::json!({
+                        "accounts": [{
+                            "id": "acct-team",
+                            "name": "Platform",
+                            "structure": "workspace"
+                        }],
+                        "account_ordering": ["acct-team"]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{address}/accounts");
+        let _url = EnvVarGuard::set("CS_ACCOUNTS_CHECK_URL", &url);
 
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-client-marker", "workspace".parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
         let auth = serde_json::json!({
-            "tokens": {"account_id": "acct-personal", "access_token": "at", "id_token": ""}
+            "tokens": {
+                "account_id": "acct-team",
+                "access_token": "access-token",
+                "id_token": ""
+            }
         });
 
-        let name = refresh_for_auth_if_needed(&auth, false)
+        let state = lookup_state_for_auth_with_client(&auth, &client)
             .await
-            .expect("a recorded absence must be answered from cache, not re-requested");
+            .unwrap();
+        assert!(
+            matches!(state, crate::cache::WorkspaceState::Named(ref name) if name == "Platform")
+        );
+        assert!(marker_seen.load(Ordering::SeqCst));
+        let snapshot = crate::cache::get_snapshot(&[], &["acct-team".to_string()]).unwrap();
+        assert_eq!(
+            snapshot.workspaces.get("acct-team"),
+            Some(&crate::cache::WorkspaceState::Unresolved)
+        );
 
-        assert!(name.is_none(), "the account still has no workspace name");
+        publish_workspace_state("acct-team", &state).await.unwrap();
+        server.abort();
+        let snapshot = crate::cache::get_snapshot(&[], &["acct-team".to_string()]).unwrap();
+        assert_eq!(
+            snapshot.workspaces.get("acct-team"),
+            Some(&crate::cache::WorkspaceState::Named("Platform".into()))
+        );
     }
 
     /// The other half of the contract: `--force` is the escape hatch, so it has
@@ -319,7 +397,7 @@ mod tests {
             "tokens": {"account_id": "acct-personal", "access_token": "at", "id_token": ""}
         });
 
-        refresh_for_auth_if_needed(&auth, true)
+        refresh_state_for_auth(&auth)
             .await
             .expect_err("force must bypass the record and fail on the unreachable endpoint");
     }

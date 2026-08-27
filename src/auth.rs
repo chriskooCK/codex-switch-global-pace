@@ -396,6 +396,10 @@ fn validate_cli_auth_credentials_store(codex_home: &Path) -> Result<()> {
         return Ok(());
     };
 
+    validate_cli_auth_credentials_config(&config_path, &config)
+}
+
+fn validate_cli_auth_credentials_config(config_path: &Path, config: &toml::Value) -> Result<()> {
     match config.get("cli_auth_credentials_store") {
         None => {}
         Some(toml::Value::String(mode)) if mode == "file" => {}
@@ -414,7 +418,37 @@ fn validate_cli_auth_credentials_store(codex_home: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CODEX_CONFIG_LOAD_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_CODEX_CONFIG_PARSE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_ACCOUNT_INFO_PARSE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_managed_policy_batch_test_counts() {
+    TEST_CODEX_CONFIG_LOAD_COUNT.with(|count| count.set(0));
+    TEST_CODEX_CONFIG_PARSE_COUNT.with(|count| count.set(0));
+    TEST_ACCOUNT_INFO_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn managed_policy_batch_test_counts() -> (usize, usize, usize) {
+    let loads = TEST_CODEX_CONFIG_LOAD_COUNT.with(std::cell::Cell::get);
+    let parses = TEST_CODEX_CONFIG_PARSE_COUNT.with(std::cell::Cell::get);
+    let account_info = TEST_ACCOUNT_INFO_PARSE_COUNT.with(std::cell::Cell::get);
+    (loads, parses, account_info)
+}
+
 fn load_codex_config(codex_home: &Path) -> Result<Option<(PathBuf, toml::Value)>> {
+    #[cfg(test)]
+    TEST_CODEX_CONFIG_LOAD_COUNT.with(|count| count.set(count.get() + 1));
     let config_path = codex_home.join("config.toml");
     let raw = match std::fs::read_to_string(&config_path) {
         Ok(raw) => raw,
@@ -423,6 +457,8 @@ fn load_codex_config(codex_home: &Path) -> Result<Option<(PathBuf, toml::Value)>
             return Err(err).with_context(|| format!("reading {}", config_path.display()));
         }
     };
+    #[cfg(test)]
+    TEST_CODEX_CONFIG_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     let config =
         toml::from_str(&raw).with_context(|| format!("parsing {}", config_path.display()))?;
     Ok(Some((config_path, config)))
@@ -491,26 +527,55 @@ pub(crate) fn configured_forced_workspace_ids() -> Vec<String> {
     forced_chatgpt_workspace_ids(&config).unwrap_or_default()
 }
 
+/// One immutable view of the Codex managed-account policy for a logical
+/// credential batch. Its parsed config remains private so callers can only
+/// validate account metadata against the exact generation that was loaded.
+pub(crate) struct ManagedAuthPolicySnapshot {
+    codex_home: PathBuf,
+    config: Option<(PathBuf, toml::Value)>,
+}
+
+impl ManagedAuthPolicySnapshot {
+    pub(crate) fn load() -> Result<Self> {
+        let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
+        let config = load_codex_config(&codex_home)?;
+        Ok(Self { codex_home, config })
+    }
+
+    pub(crate) fn validate_account_info(&self, info: &crate::jwt::AccountInfo) -> Result<()> {
+        let Some((_path, config)) = &self.config else {
+            return Ok(());
+        };
+        validate_managed_auth_config(config, info.account_id.as_deref())
+    }
+
+    fn validate_auth_value(&self, auth: &serde_json::Value) -> Result<()> {
+        if self.config.is_none() {
+            return Ok(());
+        }
+        let info = account_info_from_auth_value(auth);
+        self.validate_account_info(&info)
+    }
+
+    pub(crate) fn codex_auth_path(&self) -> Result<PathBuf> {
+        if let Some((config_path, config)) = &self.config {
+            validate_cli_auth_credentials_config(config_path, config)?;
+        }
+        Ok(self.codex_home.join("auth.json"))
+    }
+}
+
 pub(crate) fn validate_managed_chatgpt_account(id_token: &str) -> Result<()> {
-    let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
-    let Some((_config_path, config)) = load_codex_config(&codex_home)? else {
-        return Ok(());
-    };
+    let policy = ManagedAuthPolicySnapshot::load()?;
     let auth = serde_json::json!({"tokens": {"id_token": id_token}});
-    let account_id = crate::jwt::parse_account_info(&auth).account_id;
-    validate_managed_auth_config(&config, account_id.as_deref())
+    policy.validate_auth_value(&auth)
 }
 
 /// Enforce the managed ChatGPT workspace policy for a complete auth value.
 /// Keep this at credential-write boundaries: JWT claims are only a routing
 /// hint until a caller has otherwise authenticated the credentials.
 pub(crate) fn validate_managed_auth_value(auth: &serde_json::Value) -> Result<()> {
-    let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
-    let Some((_config_path, config)) = load_codex_config(&codex_home)? else {
-        return Ok(());
-    };
-    let account_id = crate::jwt::parse_account_info(auth).account_id;
-    validate_managed_auth_config(&config, account_id.as_deref())
+    ManagedAuthPolicySnapshot::load()?.validate_auth_value(auth)
 }
 
 /// ~/.codex-switch/
@@ -540,6 +605,15 @@ pub fn read_auth(path: &Path) -> Result<serde_json::Value> {
     let val: serde_json::Value =
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
     Ok(val)
+}
+
+/// Read and parse an auth file without occupying an async runtime worker while
+/// a synced or security-scanned filesystem services the request.
+pub(crate) async fn read_auth_async(path: &Path) -> Result<serde_json::Value> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_auth(&path))
+        .await
+        .context("auth-file read task failed")?
 }
 
 /// Result of publishing a same-directory private-file candidate.
@@ -2733,6 +2807,8 @@ pub(crate) fn read_account_info_checked(path: &Path) -> Result<crate::jwt::Accou
 /// that supplied the request's bearer token. Callers that already loaded an
 /// auth value must not reopen the path and accidentally mix two generations.
 pub(crate) fn account_info_from_auth_value(value: &serde_json::Value) -> crate::jwt::AccountInfo {
+    #[cfg(test)]
+    TEST_ACCOUNT_INFO_PARSE_COUNT.with(|count| count.set(count.get() + 1));
     crate::jwt::parse_account_info(value)
 }
 

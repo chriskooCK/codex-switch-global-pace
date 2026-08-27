@@ -1,5 +1,5 @@
 use crate::output::{self, print_json};
-use crate::{color, login, profile, workspace};
+use crate::{color, login, profile};
 use anyhow::Result;
 
 // ── login / reauth ────────────────────────────────────────
@@ -21,12 +21,7 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
         login::run_device_auth().await?
     };
     let (auth_val, _info) = login::build_auth_from_tokens(&tokens)?;
-    let workspace_auth = auth_val.clone();
-
     let action = profile::save_auth_value(auth_val, alias)?;
-    if let Err(err) = workspace::refresh_for_auth(&workspace_auth).await {
-        tracing::debug!("workspace metadata unavailable after login: {err}");
-    }
     match action {
         profile::SaveAction::Created(a) => {
             if !json {
@@ -63,18 +58,19 @@ pub(crate) async fn login_cmd(alias: Option<&str>, device: bool, json: bool) -> 
 }
 
 async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
-    let lease = profile::acquire_profile_lease_async(alias.to_string()).await?;
-    let dst = profile::profile_auth_path(alias)?;
-    // Re-check only after the lease is held: a rename/delete may have won the
-    // race between command dispatch and lease acquisition.
-    let old_auth = crate::auth::read_auth(&dst)?;
-    let old_info = crate::auth::account_info_from_auth_value(&old_auth);
+    // Capture only the stable account identity under a short lease. The user
+    // may spend several minutes in OAuth, so unrelated refresh, switch, rename,
+    // and delete operations must not wait behind that interactive pause.
+    let prepared = {
+        let lease = profile::acquire_profile_lease_async(alias.to_string()).await?;
+        profile::prepare_profile_reauth_with_lease(&lease)?
+    };
 
     if !json {
         println!(
             "Re-authorizing profile '{}' ({})...",
             color::bold(alias),
-            crate::safe_text::terminal_text(old_info.email.as_deref().unwrap_or("unknown email"))
+            crate::safe_text::terminal_text(prepared.email())
         );
     }
 
@@ -84,11 +80,9 @@ async fn reauth_profile(alias: &str, device: bool, json: bool) -> Result<()> {
         login::run_device_auth().await?
     };
     let (auth_val, new_info) = login::build_auth_from_tokens(&tokens)?;
-    profile::replace_profile_auth_and_live_if_current_leased(&lease, &auth_val)?;
+    let lease = profile::acquire_profile_lease_async(alias.to_string()).await?;
+    profile::commit_prepared_profile_reauth_with_lease(prepared, &lease, &auth_val)?;
     drop(lease);
-    if let Err(err) = workspace::refresh_for_auth(&auth_val).await {
-        tracing::debug!("workspace metadata unavailable after re-login: {err}");
-    }
 
     if json {
         print_json(&output::JsonOk {

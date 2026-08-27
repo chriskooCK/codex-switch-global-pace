@@ -656,23 +656,29 @@ async fn each_retry_round_presents_the_rotated_refresh_token() {
             ),
             (
                 "access_1".to_string(),
-                vec![reply(
-                    StatusCode::UNAUTHORIZED,
-                    json!({"detail": "expired"}),
-                )],
+                vec![
+                    reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"detail": "transient"}),
+                    ),
+                    reply(StatusCode::UNAUTHORIZED, json!({"detail": "expired"})),
+                ],
             ),
             (
                 "access_2".to_string(),
-                vec![reply(
-                    StatusCode::UNAUTHORIZED,
-                    json!({"detail": "expired"}),
-                )],
+                vec![
+                    reply(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"detail": "transient"}),
+                    ),
+                    reply(StatusCode::UNAUTHORIZED, json!({"detail": "expired"})),
+                ],
             ),
             (
                 "access_3".to_string(),
                 vec![reply(
-                    StatusCode::UNAUTHORIZED,
-                    json!({"detail": "expired"}),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"detail": "transient"}),
                 )],
             ),
         ],
@@ -1943,7 +1949,12 @@ async fn signing_in_again_clears_the_recorded_verdict() {
         .expect_err("the first credential is spent");
 
     // What `login` / `import` leave behind: a different refresh token.
-    write_auth_file(&fx.profile_path, "new_id", &fresh_access, "refresh_new");
+    write_auth_file(
+        &fx.profile_path,
+        &account_id_token(),
+        &fresh_access,
+        "refresh_new",
+    );
 
     let usage = codex_switch::usage::fetch_usage_retried("revived", &fx.profile_path)
         .await

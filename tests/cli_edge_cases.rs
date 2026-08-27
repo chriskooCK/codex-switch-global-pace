@@ -65,6 +65,8 @@ fn write_json(path: impl AsRef<Path>, value: &Value) {
 fn write_cache_entry(
     home: &Path,
     alias: &str,
+    email: &str,
+    account_id: &str,
     ts: u64,
     primary_used: Option<f64>,
     primary_reset: Option<i64>,
@@ -72,6 +74,8 @@ fn write_cache_entry(
     let cache = serde_json::json!({
         "entries": {
             alias: {
+                "account_id": account_id,
+                "email": email,
                 "ts": ts,
                 "primary_used": primary_used,
                 "primary_reset": primary_reset,
@@ -86,6 +90,8 @@ fn write_cache_entry(
 fn write_weekly_cache_entry(
     home: &Path,
     alias: &str,
+    email: &str,
+    account_id: &str,
     ts: u64,
     secondary_used: f64,
     secondary_reset: i64,
@@ -93,6 +99,8 @@ fn write_weekly_cache_entry(
     let cache = serde_json::json!({
         "entries": {
             alias: {
+                "account_id": account_id,
+                "email": email,
                 "ts": ts,
                 "primary_used": null,
                 "primary_reset": null,
@@ -775,7 +783,15 @@ fn json_list_uses_per_account_cached_refresh_time() {
     )
     .unwrap();
 
-    write_cache_entry(&home, "ivy", 1_710_000_000, Some(42.0), Some(1_710_001_800));
+    write_cache_entry(
+        &home,
+        "ivy",
+        "ivy@example.com",
+        "acct_ivy",
+        1_710_000_000,
+        Some(42.0),
+        Some(1_710_001_800),
+    );
 
     let output = run(&home, &["--json", "list"]);
     assert!(output.status.success());
@@ -814,6 +830,8 @@ fn json_list_adds_global_weekly_without_changing_profile_items() {
     write_weekly_cache_entry(
         &home,
         "pace",
+        "pace@example.com",
+        "acct_pace",
         now,
         50.0,
         i64::try_from(now).unwrap() + 3 * 86_400 + 12 * 3_600,
@@ -923,7 +941,15 @@ fn list_progress_counts_only_stale_accounts() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    write_cache_entry(&home, "fresh", now, Some(10.0), Some(now as i64 + 3600));
+    write_cache_entry(
+        &home,
+        "fresh",
+        "fresh@example.com",
+        "acct_fresh",
+        now,
+        Some(10.0),
+        Some(now as i64 + 3600),
+    );
 
     let output = run_with_env(&home, &["list"], &[("CS_PROGRESS_FORCE", "1")]);
     assert!(output.status.success());
