@@ -41,6 +41,12 @@ pub enum UsageStatus {
     Error(UsageError),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CachedUsageApplication {
+    RequestedRefresh,
+    Startup,
+}
+
 fn retained_usage_by_alias(accounts: Vec<AccountEntry>) -> HashMap<String, UsageStatus> {
     accounts
         .into_iter()
@@ -2289,37 +2295,53 @@ impl App {
     }
 
     fn refresh_indices(&mut self, target_indices: &[usize], refresh: Refresh) {
-        let cached = if matches!(refresh, Refresh::Cached) {
-            let mut loaded = Vec::with_capacity(target_indices.len());
-            for &i in target_indices {
-                let Some(entry) = self.accounts.get(i) else {
-                    continue;
-                };
-                match crate::cache::get(&entry.alias) {
-                    Ok(value) => loaded.push((i, value)),
+        if matches!(refresh, Refresh::Cached) {
+            let aliases = target_indices
+                .iter()
+                .filter_map(|&i| self.accounts.get(i).map(|entry| entry.alias.clone()))
+                .collect::<Vec<_>>();
+            if !aliases.is_empty() {
+                let cached = match crate::cache::get_many(&aliases) {
+                    Ok(cached) => cached,
                     Err(error) => {
-                        self.set_status_error(
-                            format!("Could not read usage cache for {}: {error:#}", entry.alias),
-                            6,
-                        );
+                        self.set_status_error(format!("Could not read usage cache: {error:#}"), 6);
                         return;
                     }
-                }
-            }
-            loaded
-        } else {
-            Vec::new()
-        };
-
-        for &i in target_indices {
-            let entry = &mut self.accounts[i];
-            if let UsageStatus::Error(_) = &entry.usage {
-                entry.usage = UsageStatus::Idle;
+                };
+                self.apply_cached_usage(cached, CachedUsageApplication::RequestedRefresh);
             }
         }
-        for (i, value) in cached {
-            if let Some(cached) = value {
-                self.accounts[i].usage = UsageStatus::Loaded(Box::new(cached));
+
+        self.start_refresh_indices(target_indices, refresh);
+    }
+
+    fn apply_cached_usage(
+        &mut self,
+        mut cached: HashMap<String, UsageInfo>,
+        application: CachedUsageApplication,
+    ) {
+        let mut changed = false;
+        for entry in &mut self.accounts {
+            let can_apply = matches!(entry.usage, UsageStatus::Idle | UsageStatus::Loading)
+                || matches!(application, CachedUsageApplication::RequestedRefresh)
+                    && matches!(entry.usage, UsageStatus::Error(_));
+            if can_apply && let Some(usage) = cached.remove(&entry.alias) {
+                entry.usage = UsageStatus::Loaded(Box::new(usage));
+                changed = true;
+            }
+        }
+        if changed {
+            self.update_view();
+        }
+    }
+
+    fn start_refresh_indices(&mut self, target_indices: &[usize], refresh: Refresh) {
+        for &i in target_indices {
+            let Some(entry) = self.accounts.get_mut(i) else {
+                continue;
+            };
+            if let UsageStatus::Error(_) = &entry.usage {
+                entry.usage = UsageStatus::Idle;
             }
         }
         for &i in target_indices {
@@ -3273,21 +3295,63 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         .context("drawing initial TUI frame")?;
 
     app.start_startup_auth_reconciliation();
+    // Cache IO does not authorize credential-bearing work, so overlap it with
+    // reconciliation and gate only the follow-up requests on both results.
+    let startup_aliases = app
+        .accounts
+        .iter()
+        .map(|entry| entry.alias.clone())
+        .collect::<Vec<_>>();
+    let mut startup_usage_cache = (!startup_aliases.is_empty())
+        .then(|| tokio::task::spawn_blocking(move || crate::cache::get_many(&startup_aliases)));
     app.start_update_check();
-    let mut startup_settled = false;
+    let mut startup_auth_settled = false;
+    let mut startup_usage_ready = startup_usage_cache.is_none();
+    let mut startup_usage_error = None;
+    let mut startup_usage_settled = false;
 
     loop {
-        if !startup_settled {
+        if startup_usage_cache
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            let task = startup_usage_cache
+                .take()
+                .expect("finished startup cache task is present");
+            match task.await {
+                Ok(Ok(cached)) => app.apply_cached_usage(cached, CachedUsageApplication::Startup),
+                Ok(Err(error)) => {
+                    startup_usage_error = Some(format!("Could not read usage cache: {error:#}"));
+                }
+                Err(error) => {
+                    startup_usage_error = Some(format!(
+                        "Usage cache task failed: {}",
+                        crate::task_batch::join_failure_detail(&error)
+                    ));
+                }
+            }
+            startup_usage_ready = true;
+        }
+
+        if !startup_auth_settled {
             match app.poll_startup_auth_reconciliation().await {
                 StartupAuthPoll::Pending => {}
                 StartupAuthPoll::Ready => {
-                    startup_settled = true;
-                    if !app.accounts.is_empty() {
-                        app.refresh(Refresh::Cached);
-                    }
+                    startup_auth_settled = true;
                 }
-                StartupAuthPoll::Blocked => startup_settled = true,
+                StartupAuthPoll::Blocked => startup_auth_settled = true,
             }
+        }
+        if !startup_usage_settled && startup_auth_settled && startup_usage_ready {
+            if app.startup_auth_state == StartupAuthState::Ready {
+                if let Some(error) = startup_usage_error.take() {
+                    app.set_status_error(error, 6);
+                } else if !app.accounts.is_empty() {
+                    let target_indices = app.view_indices.clone();
+                    app.start_refresh_indices(&target_indices, Refresh::Cached);
+                }
+            }
+            startup_usage_settled = true;
         }
         app.poll_results();
         app.poll_warmup_preflight_result().await;
@@ -3299,7 +3363,9 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.poll_update();
         app.tick();
         if app.startup_auth_state == StartupAuthState::Ready {
-            app.run_due_auto_refresh();
+            if startup_usage_settled {
+                app.run_due_auto_refresh();
+            }
             app.ensure_models_loaded_for_selected();
         }
 
@@ -3933,11 +3999,12 @@ fn edit_grapheme_input(input: &mut String, cursor: &mut usize, code: KeyCode) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountEntry, AccountTaskKind, App, BatchDeleteReport, ConfirmAction, ModelStatus,
-        STATUS_MESSAGE_MAX_CHARS, SearchState, SortMode, UsageStatus, WarmupTask,
-        batch_relogin_not_attempted, dispatch_menu_use, drain_credential_tasks_on_error,
-        finish_login_or_stop_after_round, refresh_fetches_loaded_usage,
-        refresh_forces_negative_caches, reset_card_failure_from_outcome, retained_usage_by_alias,
+        AccountEntry, AccountTaskKind, App, BatchDeleteReport, CachedUsageApplication,
+        ConfirmAction, ModelStatus, STATUS_MESSAGE_MAX_CHARS, SearchState, SortMode, UsageStatus,
+        WarmupTask, batch_relogin_not_attempted, dispatch_menu_use,
+        drain_credential_tasks_on_error, finish_login_or_stop_after_round,
+        refresh_fetches_loaded_usage, refresh_forces_negative_caches,
+        reset_card_failure_from_outcome, retained_usage_by_alias,
     };
     use crate::{
         jwt::{AccountInfo, OrgInfo},
@@ -6788,6 +6855,75 @@ mod tests {
             retained.get("account"),
             Some(UsageStatus::Loaded(_))
         ));
+    }
+
+    #[test]
+    fn startup_cache_only_fills_accounts_without_a_settled_result() {
+        let account = |alias: &str, usage| AccountEntry {
+            alias: alias.into(),
+            info: AccountInfo::default(),
+            usage,
+            is_current: false,
+        };
+        let usage = |fetched_at| UsageInfo {
+            fetched_at: Some(fetched_at),
+            ..UsageInfo::default()
+        };
+        let mut app = App::new();
+        app.accounts = vec![
+            account("idle", UsageStatus::Idle),
+            account("loading", UsageStatus::Loading),
+            account("loaded", UsageStatus::Loaded(Box::new(usage(30)))),
+            account(
+                "error",
+                UsageStatus::Error(crate::usage::UsageError {
+                    summary: "new failure".into(),
+                    detail: "keep the settled network result".into(),
+                }),
+            ),
+        ];
+        let cached = ["idle", "loading", "loaded", "error"]
+            .into_iter()
+            .map(|alias| (alias.to_string(), usage(10)))
+            .collect();
+
+        app.apply_cached_usage(cached, CachedUsageApplication::Startup);
+
+        assert!(matches!(
+            &app.accounts[0].usage,
+            UsageStatus::Loaded(usage) if usage.fetched_at == Some(10)
+        ));
+        assert!(matches!(
+            &app.accounts[1].usage,
+            UsageStatus::Loaded(usage) if usage.fetched_at == Some(10)
+        ));
+        assert!(matches!(
+            &app.accounts[2].usage,
+            UsageStatus::Loaded(usage) if usage.fetched_at == Some(30)
+        ));
+        assert!(matches!(&app.accounts[3].usage, UsageStatus::Error(_)));
+    }
+
+    #[test]
+    fn explicit_cached_refresh_can_restore_an_account_from_error() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Error(crate::usage::UsageError {
+                summary: "old failure".into(),
+                detail: "replace from the requested cache read".into(),
+            }),
+            is_current: false,
+        });
+        app.apply_cached_usage(
+            [("account".into(), UsageInfo::default())]
+                .into_iter()
+                .collect(),
+            CachedUsageApplication::RequestedRefresh,
+        );
+
+        assert!(matches!(app.accounts[0].usage, UsageStatus::Loaded(_)));
     }
 
     #[test]
