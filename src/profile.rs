@@ -2067,10 +2067,15 @@ pub struct ImportReport {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthChange {
+    /// No live Codex credential file exists.
+    NoLiveAuth,
     /// Live auth.json belongs to a completely new account.
     NewAccount,
     /// Live auth.json matches an existing profile's identity but tokens differ.
     TokensUpdated { alias: String },
+    /// The live credential resembles saved profiles but lacks enough identity
+    /// information to bind it safely.
+    UnresolvedIdentity { aliases: Vec<String> },
     /// No actionable change.
     NoChange,
 }
@@ -2081,13 +2086,16 @@ pub enum AuthChange {
 /// explicit user action and is never saved under a guessed alias.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum TuiAuthReconciliation {
+    NoLiveAuth,
     NoChange,
     ProfileUpdated { alias: String },
     UntrackedAccount,
+    UnresolvedIdentity { aliases: Vec<String> },
 }
 
 pub(crate) fn reconcile_live_auth_for_tui() -> Result<TuiAuthReconciliation> {
     match detect_auth_change()? {
+        AuthChange::NoLiveAuth => Ok(TuiAuthReconciliation::NoLiveAuth),
         AuthChange::NoChange => Ok(TuiAuthReconciliation::NoChange),
         AuthChange::TokensUpdated { alias } => {
             update_profile_from_live(&alias)
@@ -2095,6 +2103,9 @@ pub(crate) fn reconcile_live_auth_for_tui() -> Result<TuiAuthReconciliation> {
             Ok(TuiAuthReconciliation::ProfileUpdated { alias })
         }
         AuthChange::NewAccount => Ok(TuiAuthReconciliation::UntrackedAccount),
+        AuthChange::UnresolvedIdentity { aliases } => {
+            Ok(TuiAuthReconciliation::UnresolvedIdentity { aliases })
+        }
     }
 }
 
@@ -2130,16 +2141,16 @@ fn read_live_auth_snapshot_for_detection(path: &Path) -> Result<Option<Vec<u8>>>
 /// Compare live auth.json against all saved profiles.
 /// - Exact byte match → NoChange
 /// - Identity match (email + account_id) but different content → TokensUpdated
-/// - Email resembles any profile while account_id is incomplete → NoChange (reported)
+/// - Email resembles any profile while account_id is incomplete → UnresolvedIdentity
 /// - No identity match → NewAccount
 ///
-/// A genuinely absent live file is `NoChange`. Path resolution, reads,
+/// A genuinely absent live file is `NoLiveAuth`. Path resolution, reads,
 /// parsing, marker inspection, and saved-profile scans are observation
 /// failures and are returned to the caller instead of impersonating absence.
 pub fn detect_auth_change() -> Result<AuthChange> {
     let auth_path = codex_auth_path().context("resolving the live auth path")?;
     let Some(live_snapshot) = read_live_auth_snapshot_for_detection(&auth_path)? else {
-        return Ok(AuthChange::NoChange);
+        return Ok(AuthChange::NoLiveAuth);
     };
     let val: serde_json::Value = serde_json::from_slice(&live_snapshot).with_context(|| {
         format!(
@@ -2219,17 +2230,9 @@ pub fn detect_auth_change() -> Result<AuthChange> {
     }
     match incomplete_identity_matches.as_slice() {
         [] => Ok(AuthChange::NewAccount),
-        incomplete => {
-            user_println(&format!(
-                "auth.json or a saved profile carries no account id and its email matches {} profile(s) ({}) — \
-                 refusing to update credentials from email alone. \
-                 Run `codex-switch-global-pace use <alias>` to restore a known profile, \
-                 or `codex-switch-global-pace login <alias>` to re-authenticate the intended profile.",
-                incomplete.len(),
-                incomplete.join(", ")
-            ));
-            Ok(AuthChange::NoChange)
-        }
+        incomplete => Ok(AuthChange::UnresolvedIdentity {
+            aliases: incomplete.to_vec(),
+        }),
     }
 }
 
@@ -4776,11 +4779,11 @@ mod tests {
     // ── Basic branch coverage ────────────────────────────────
 
     #[test]
-    fn detect_no_auth_file_returns_no_change() {
+    fn detect_no_auth_file_returns_no_live_auth() {
         let _env = TestEnv::new();
         assert!(matches!(
             super::detect_auth_change().unwrap(),
-            super::AuthChange::NoChange
+            super::AuthChange::NoLiveAuth
         ));
     }
 
@@ -5039,7 +5042,8 @@ mod tests {
         write_auth_durable(&live, &updated);
         assert!(matches!(
             super::detect_auth_change().unwrap(),
-            super::AuthChange::NoChange
+            super::AuthChange::UnresolvedIdentity { aliases }
+                if aliases == ["fb-profile"]
         ));
     }
 
@@ -5631,7 +5635,8 @@ mod tests {
         ));
 
         match super::detect_auth_change().unwrap() {
-            super::AuthChange::NoChange => {}
+            super::AuthChange::UnresolvedIdentity { aliases }
+                if aliases == ["oai001", "oai001_20x"] => {}
             other => panic!("ambiguous email match must not select a profile, got {other:?}"),
         }
     }

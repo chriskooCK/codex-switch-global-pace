@@ -690,7 +690,22 @@ fn check_auth_change() -> Result<AuthCheckResult> {
     use std::io::{self, IsTerminal};
 
     let change = profile::detect_auth_change().context("checking live auth changes")?;
-    if matches!(change, profile::AuthChange::NoChange) {
+    if matches!(
+        change,
+        profile::AuthChange::NoChange | profile::AuthChange::NoLiveAuth
+    ) {
+        return Ok(AuthCheckResult::NoChange);
+    }
+
+    if let profile::AuthChange::UnresolvedIdentity { aliases } = &change {
+        user_println(&format!(
+            "auth.json or a saved profile carries no account id and its email matches {} profile(s) ({}) — \
+             refusing to update credentials from email alone. \
+             Run `codex-switch-global-pace use <alias>` to restore a known profile, \
+             or `codex-switch-global-pace login <alias>` to re-authenticate the intended profile.",
+            aliases.len(),
+            aliases.join(", ")
+        ));
         return Ok(AuthCheckResult::NoChange);
     }
 
@@ -708,7 +723,9 @@ fn check_auth_change() -> Result<AuthCheckResult> {
                     "auth.json credentials changed for profile '{alias}' (use `codex-switch-global-pace list` interactively to update)."
                 ));
             }
-            profile::AuthChange::NoChange => unreachable!(),
+            profile::AuthChange::NoLiveAuth
+            | profile::AuthChange::UnresolvedIdentity { .. }
+            | profile::AuthChange::NoChange => unreachable!(),
         }
         return Ok(AuthCheckResult::Detected);
     }
@@ -750,7 +767,9 @@ fn check_auth_change() -> Result<AuthCheckResult> {
                 }
             }
         }
-        profile::AuthChange::NoChange => unreachable!(),
+        profile::AuthChange::NoLiveAuth
+        | profile::AuthChange::UnresolvedIdentity { .. }
+        | profile::AuthChange::NoChange => unreachable!(),
     }
 
     let Some(alias) = synced_alias else {
