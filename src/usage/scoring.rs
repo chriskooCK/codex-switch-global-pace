@@ -581,6 +581,7 @@ mod tests {
 
     fn usage_with(primary: Option<WindowUsage>, secondary: Option<WindowUsage>) -> UsageInfo {
         UsageInfo {
+            cache_revision: None,
             fetched_at: None,
             primary,
             secondary,

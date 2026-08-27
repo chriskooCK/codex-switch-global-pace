@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -9,11 +12,181 @@ use tracing::{debug, info, warn};
 use crate::auth::{self, CLIENT_ID, format_reqwest_error};
 
 use super::parse::parse_usage_checked;
-use super::reset_credits::enrich_reset_credits;
+use super::reset_credits::{ResetCreditRequestAuth, enrich_reset_credits};
 use super::{
     ImportValidation, MAX_RETRIES, RETRY_DELAY, Refresh, RefreshOutcomeUnknown, RefreshedTokens,
     TerminalAuthError, TokenPersistFailure, UsageError, UsageInfo,
 };
+
+#[derive(Debug, thiserror::Error)]
+#[error("network limiter closed")]
+pub(super) struct NetworkLimiterClosed;
+
+pub(crate) type FirstNetworkPermit = Pin<
+    Box<dyn Future<Output = Result<Option<tokio::sync::OwnedSemaphorePermit>>> + Send + 'static>,
+>;
+
+/// Build the ordinary, non-cancellable admission wait used by CLI and daemon
+/// callers. TUI callers wrap the same wait in their safe cancellation race.
+pub(crate) fn first_network_permit(limiter: Arc<tokio::sync::Semaphore>) -> FirstNetworkPermit {
+    Box::pin(async move {
+        limiter
+            .acquire_owned()
+            .await
+            .map(Some)
+            .map_err(|_| NetworkLimiterClosed.into())
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("network wait cancelled before the first request")]
+pub(crate) struct NetworkWaitCancelled;
+
+pub(crate) fn network_wait_was_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<NetworkWaitCancelled>().is_some()
+}
+
+pub(crate) fn network_wait_cancelled_error() -> anyhow::Error {
+    NetworkWaitCancelled.into()
+}
+
+/// Consume one caller-defined admission wait at the first actual HTTP
+/// exchange, then reacquire shared network capacity for later exchanges.
+///
+/// The deferred first wait means local authorization and request construction
+/// do not occupy capacity, while the permit obtained by that one admission is
+/// used directly by the request instead of being returned and reacquired. Each
+/// exchange retains its permit through the response-body read and releases it
+/// before credential persistence, retry backoff, or local cache work.
+pub(crate) struct NetworkPermitBudget {
+    first: Option<FirstNetworkPermit>,
+    limiter: Option<Arc<tokio::sync::Semaphore>>,
+    unlimited: bool,
+    first_wait_cancelled: bool,
+}
+
+impl NetworkPermitBudget {
+    pub(crate) fn new(first: FirstNetworkPermit) -> Self {
+        Self {
+            first: Some(first),
+            limiter: None,
+            unlimited: false,
+            first_wait_cancelled: false,
+        }
+    }
+
+    pub(super) fn unlimited() -> Self {
+        Self {
+            first: None,
+            limiter: None,
+            unlimited: true,
+            first_wait_cancelled: false,
+        }
+    }
+
+    pub(crate) fn first_wait_was_cancelled(&self) -> bool {
+        self.first_wait_cancelled
+    }
+
+    pub(crate) async fn acquire(&mut self) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        if self.unlimited {
+            return Ok(None);
+        }
+        if self.first_wait_cancelled {
+            return Err(NetworkWaitCancelled.into());
+        }
+        if let Some(first) = self.first.take() {
+            let Some(permit) = first.await? else {
+                self.first_wait_cancelled = true;
+                return Err(NetworkWaitCancelled.into());
+            };
+            self.limiter = Some(Arc::clone(permit.semaphore()));
+            return Ok(Some(permit));
+        }
+
+        self.limiter
+            .as_ref()
+            .context("network budget was used before its first permit")?
+            .clone()
+            .acquire_owned()
+            .await
+            .map(Some)
+            .map_err(|_| NetworkLimiterClosed.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResetCreditEnrichment {
+    Inline,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageCacheWrite {
+    Store,
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsageObservationPolicy {
+    reset_credit_enrichment: ResetCreditEnrichment,
+    cache_write: UsageCacheWrite,
+}
+
+const COMPLETE_USAGE_POLICY: UsageObservationPolicy = UsageObservationPolicy {
+    reset_credit_enrichment: ResetCreditEnrichment::Inline,
+    cache_write: UsageCacheWrite::Store,
+};
+
+const CORE_PROBE_POLICY: UsageObservationPolicy = UsageObservationPolicy {
+    reset_credit_enrichment: ResetCreditEnrichment::Deferred,
+    cache_write: UsageCacheWrite::Skip,
+};
+
+#[derive(Debug)]
+pub(crate) struct UsageObservation {
+    pub(crate) usage: UsageInfo,
+    pub(crate) binding: crate::jwt::StrictAccountBinding,
+}
+
+/// A metadata-complete usage refresh prepared entirely under a profile lease.
+/// The shared budget's first admission is not polled until execution reaches
+/// an actual HTTP exchange.
+pub(crate) struct PreparedFullUsageRequest {
+    inner: PreparedUsageRequest,
+}
+
+/// Credential and routing state prepared under a profile lease before a
+/// caller enters the scarce network budget.
+pub(crate) struct PreparedCoreUsageRequest {
+    state: PreparedCoreUsageState,
+}
+
+enum PreparedCoreUsageState {
+    Cached(UsageInfo),
+    Network(PreparedUsageRequest),
+}
+
+impl PreparedCoreUsageRequest {
+    pub(crate) fn cached_usage(&self) -> Option<&UsageInfo> {
+        match &self.state {
+            PreparedCoreUsageState::Cached(usage) => Some(usage),
+            PreparedCoreUsageState::Network(_) => None,
+        }
+    }
+}
+
+struct PreparedUsageRequest {
+    alias: String,
+    profile_path: std::path::PathBuf,
+    cache_binding: crate::jwt::StrictAccountBinding,
+    account_id: Option<String>,
+    is_fedramp: bool,
+    id_token: Option<String>,
+    access_token: String,
+    refresh_token: Option<String>,
+    endpoints: auth::ServiceEndpoints,
+}
 
 /// A successful HTTP response whose JSON does not satisfy the usage schema.
 /// Repeating the same read cannot turn that payload into trustworthy quota
@@ -22,6 +195,83 @@ use super::{
 #[error("{detail}")]
 struct InvalidUsageResponse {
     detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageRequestFailureKind {
+    Transport,
+    DeterministicRequest,
+    Http(reqwest::StatusCode),
+}
+
+/// A usage/refresh request failure whose retryability is determined by what
+/// actually happened on the wire, not by parsing its display text. The outer
+/// loop may retry transport failures and explicitly transient HTTP responses;
+/// every other status is a deterministic result for the presented bearer.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+struct UsageRequestFailure {
+    kind: UsageRequestFailureKind,
+    detail: String,
+}
+
+impl UsageRequestFailure {
+    fn request(context: &str, error: &reqwest::Error) -> anyhow::Error {
+        let kind = if error.is_builder()
+            || error.is_redirect()
+            || error.is_status()
+            || error.is_decode()
+        {
+            UsageRequestFailureKind::DeterministicRequest
+        } else {
+            UsageRequestFailureKind::Transport
+        };
+        Self {
+            kind,
+            detail: format_reqwest_error(context, error).to_string(),
+        }
+        .into()
+    }
+
+    fn transport(context: &str, error: &reqwest::Error) -> anyhow::Error {
+        Self {
+            kind: UsageRequestFailureKind::Transport,
+            detail: format_reqwest_error(context, error).to_string(),
+        }
+        .into()
+    }
+
+    fn http(status: reqwest::StatusCode, detail: String) -> anyhow::Error {
+        Self {
+            kind: UsageRequestFailureKind::Http(status),
+            detail,
+        }
+        .into()
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self.kind {
+            UsageRequestFailureKind::Transport => true,
+            UsageRequestFailureKind::DeterministicRequest => false,
+            UsageRequestFailureKind::Http(status) => {
+                matches!(
+                    status,
+                    reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+                ) || status.is_server_error()
+            }
+        }
+    }
+}
+
+fn usage_response_json_error(context: &str, error: &reqwest::Error) -> anyhow::Error {
+    if error.is_decode() {
+        InvalidUsageResponse {
+            detail: format!("{context}: {error}"),
+        }
+        .into()
+    } else {
+        UsageRequestFailure::transport(context, error)
+    }
 }
 
 fn parse_checked_usage_response(body: &Value) -> Result<UsageInfo> {
@@ -163,7 +413,7 @@ fn is_terminal_auth_failure(code: &str, status: reqwest::StatusCode) -> bool {
 ///
 /// Keyed by the token rather than the alias so that signing in again clears it
 /// without every credential-writing path having to remember to.
-async fn remember_terminal_verdict(
+pub(super) async fn remember_terminal_verdict(
     alias: &str,
     code: &str,
     refresh_token: Option<&str>,
@@ -180,6 +430,25 @@ async fn remember_terminal_verdict(
     {
         warn!("[{alias}] could not record the terminal auth verdict in cache: {cache_error:#}");
     }
+}
+
+/// Return a standing auth-server verdict for this exact credential.
+///
+/// Cache-read failures are terminal for an unattended refresh decision: when
+/// we cannot prove that a single-use token is still eligible, submitting it
+/// would risk replaying a credential the server already rejected.
+pub(super) async fn cached_terminal_auth_verdict(
+    alias: &str,
+    refresh_token: &str,
+) -> std::result::Result<Option<UsageError>, UsageError> {
+    crate::cache::get_auth_failure_async(alias, refresh_token)
+        .await
+        .map_err(|error| UsageError {
+            summary: "auth cache unreadable".to_string(),
+            detail: format!(
+                "[{alias}] could not safely decide whether this credential was already rejected: {error:#}"
+            ),
+        })
 }
 
 fn format_refresh_error(code: &str, message: Option<&str>) -> String {
@@ -240,32 +509,190 @@ pub async fn fetch_usage_retried_force(
     fetch_usage_retried_inner(alias, profile_path, Refresh::Forced).await
 }
 
-/// Usage discovery performed as one stage of a larger credential operation
-/// that already owns this profile's lease (currently warmup). Acquiring again
-/// would deadlock because the OS lease is deliberately non-reentrant.
-pub(crate) async fn fetch_usage_retried_unattended_leased(
+/// Perform one explicit usage lookup and return the strict identity derived
+/// from the same auth snapshot that supplied its request credentials. A
+/// confirmation flow can carry that binding across its consent gap without a
+/// separate preflight auth read.
+pub(crate) async fn fetch_usage_observation_force_with_existing_lease_and_client(
     alias: &str,
     profile_path: &Path,
     lease: &crate::profile::ProfileLease,
-) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_with_lease(alias, profile_path, Refresh::Unattended, lease).await
+    expected_binding: Option<&crate::jwt::StrictAccountBinding>,
+    client: &reqwest::Client,
+) -> std::result::Result<UsageObservation, UsageError> {
+    ensure_usage_configuration()?;
+    fetch_usage_observation_with_lease_and_client(
+        alias,
+        profile_path,
+        Refresh::Forced,
+        lease,
+        expected_binding,
+        client,
+        COMPLETE_USAGE_POLICY,
+    )
+    .await
 }
 
-/// TUI usage discovery after its cancellable lease-acquisition phase has
-/// completed. Cache semantics remain identical to the ordinary entry points;
-/// the caller owns the lease so shutdown can distinguish pre-network waiting
-/// from credential work that must be drained.
-pub(crate) async fn fetch_usage_retried_with_existing_lease(
+pub(crate) async fn fetch_usage_retried_with_existing_lease_and_client(
     alias: &str,
     profile_path: &Path,
     refresh: Refresh,
     lease: &crate::profile::ProfileLease,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+    client: &reqwest::Client,
 ) -> std::result::Result<UsageInfo, UsageError> {
     ensure_usage_configuration()?;
-    if let Some(cached) = usage_cache_hit(alias, refresh).await? {
+    if let Some(cached) =
+        usage_cache_hit(alias, profile_path, refresh, Some(expected_binding)).await?
+    {
         return Ok(cached);
     }
-    fetch_usage_retried_with_lease(alias, profile_path, refresh, lease).await
+    fetch_usage_observation_with_lease_and_client(
+        alias,
+        profile_path,
+        refresh,
+        lease,
+        Some(expected_binding),
+        client,
+        COMPLETE_USAGE_POLICY,
+    )
+    .await
+    .map(|observation| observation.usage)
+}
+
+/// Probe current quota for an unattended decision without reading or writing
+/// the usage cache and without contacting the dedicated reset-credit endpoint.
+///
+/// This is deliberately cache-neutral: a daemon decision must not replace a
+/// metadata-complete cache entry with its quota-only response. Token rotation
+/// and persistence still happen under the caller-owned profile lease.
+pub(crate) async fn probe_core_usage_unattended_with_existing_lease_and_client(
+    alias: &str,
+    profile_path: &Path,
+    lease: &crate::profile::ProfileLease,
+    expected_binding: Option<&crate::jwt::StrictAccountBinding>,
+    client: &reqwest::Client,
+) -> std::result::Result<UsageInfo, UsageError> {
+    ensure_usage_configuration()?;
+    fetch_usage_observation_with_lease_and_client(
+        alias,
+        profile_path,
+        Refresh::Unattended,
+        lease,
+        expected_binding,
+        client,
+        CORE_PROBE_POLICY,
+    )
+    .await
+    .map(|observation| observation.usage)
+}
+
+/// Prepare the cache-neutral automatic-selection quota request without holding
+/// a network permit. The caller must keep `lease` alive and pass the same lease
+/// to [`execute_prepared_core_usage_with_existing_lease_and_client`].
+pub(crate) async fn prepare_core_usage_unattended_with_existing_lease(
+    alias: &str,
+    profile_path: &Path,
+    lease: &crate::profile::ProfileLease,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+) -> std::result::Result<PreparedCoreUsageRequest, UsageError> {
+    ensure_usage_configuration()?;
+    prepare_usage_request(
+        alias,
+        profile_path,
+        Refresh::Unattended,
+        lease,
+        Some(expected_binding),
+    )
+    .await
+    .map(|inner| PreparedCoreUsageRequest {
+        state: PreparedCoreUsageState::Network(inner),
+    })
+}
+
+/// Resolve cache and credential state under the caller-owned profile lease,
+/// before a TUI worker enters the scarce network budget. A cache hit is carried
+/// as a ready result so it never acquires a permit at all.
+pub(crate) async fn prepare_core_usage_with_existing_lease(
+    alias: &str,
+    profile_path: &Path,
+    refresh: Refresh,
+    lease: &crate::profile::ProfileLease,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+) -> std::result::Result<PreparedCoreUsageRequest, UsageError> {
+    ensure_usage_configuration()?;
+    if let Some(cached) =
+        usage_cache_hit(alias, profile_path, refresh, Some(expected_binding)).await?
+    {
+        return Ok(PreparedCoreUsageRequest {
+            state: PreparedCoreUsageState::Cached(cached),
+        });
+    }
+    prepare_usage_request(alias, profile_path, refresh, lease, Some(expected_binding))
+        .await
+        .map(|inner| PreparedCoreUsageRequest {
+            state: PreparedCoreUsageState::Network(inner),
+        })
+}
+
+/// Execute a request prepared by
+/// [`prepare_core_usage_unattended_with_existing_lease`]. The shared budget
+/// releases each request permit before terminal-verdict or cache work begins.
+pub(crate) async fn execute_prepared_core_usage_with_existing_lease_and_client(
+    prepared: PreparedCoreUsageRequest,
+    lease: &crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    network: &mut NetworkPermitBudget,
+) -> std::result::Result<UsageInfo, UsageError> {
+    let inner = match prepared.state {
+        PreparedCoreUsageState::Cached(usage) => return Ok(usage),
+        PreparedCoreUsageState::Network(inner) => inner,
+    };
+    execute_prepared_usage_request(
+        inner,
+        lease,
+        client,
+        ResetCreditEnrichment::Deferred,
+        UsageCacheWrite::Skip,
+        network,
+    )
+    .await
+    .map(|observation| observation.usage)
+}
+
+/// Prepare a metadata-complete usage refresh without consuming network
+/// capacity. Unlike the core-only probe, execution enriches reset-card data
+/// and publishes the resulting identity-bound cache entry.
+pub(crate) async fn prepare_full_usage_with_existing_lease(
+    alias: &str,
+    profile_path: &Path,
+    refresh: Refresh,
+    lease: &crate::profile::ProfileLease,
+    expected_binding: Option<&crate::jwt::StrictAccountBinding>,
+) -> std::result::Result<PreparedFullUsageRequest, UsageError> {
+    ensure_usage_configuration()?;
+    prepare_usage_request(alias, profile_path, refresh, lease, expected_binding)
+        .await
+        .map(|inner| PreparedFullUsageRequest { inner })
+}
+
+/// Execute a prepared metadata-complete refresh. The shared budget releases
+/// each request permit before independent disk-cache publication begins.
+pub(crate) async fn execute_prepared_full_usage_with_existing_lease_and_client(
+    prepared: PreparedFullUsageRequest,
+    lease: &crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    network: &mut NetworkPermitBudget,
+) -> std::result::Result<UsageObservation, UsageError> {
+    execute_prepared_usage_request(
+        prepared.inner,
+        lease,
+        client,
+        ResetCreditEnrichment::Inline,
+        UsageCacheWrite::Store,
+        network,
+    )
+    .await
 }
 
 /// Write credentials the auth server just rotated back to the profile.
@@ -385,10 +812,13 @@ fn resolve_refreshed_tokens(
         if is_terminal_auth_failure(&code, status) {
             return Err(TerminalAuthError { code, message }.into());
         }
-        anyhow::bail!(
-            "token refresh failed: {}",
-            format_refresh_error(&code, message.as_deref())
-        );
+        return Err(UsageRequestFailure::http(
+            status,
+            format!(
+                "token refresh failed: {}",
+                format_refresh_error(&code, message.as_deref())
+            ),
+        ));
     }
 
     // Only a structured OAuth error proves that the server rejected the
@@ -491,17 +921,40 @@ async fn fetch_usage_retried_inner(
     refresh: Refresh,
 ) -> std::result::Result<UsageInfo, UsageError> {
     ensure_usage_configuration()?;
-    if let Some(cached) = usage_cache_hit(alias, refresh).await? {
+    let lease = acquire_usage_profile_lease(alias).await?;
+    if let Some(cached) = usage_cache_hit(alias, profile_path, refresh, None).await? {
         return Ok(cached);
     }
 
-    let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+    let client = build_usage_http_client(alias)?;
+    fetch_usage_retried_with_lease_and_client(
+        alias,
+        profile_path,
+        refresh,
+        &lease,
+        &client,
+        ResetCreditEnrichment::Inline,
+        UsageCacheWrite::Store,
+    )
+    .await
+}
+
+fn build_usage_http_client(alias: &str) -> std::result::Result<reqwest::Client, UsageError> {
+    auth::build_http_client().map_err(|error| UsageError {
+        summary: "HTTP client unavailable".to_string(),
+        detail: format!("[{alias}] could not build HTTP client: {error:#}"),
+    })
+}
+
+async fn acquire_usage_profile_lease(
+    alias: &str,
+) -> std::result::Result<crate::profile::ProfileLease, UsageError> {
+    crate::profile::acquire_profile_lease_async(alias.to_string())
         .await
         .map_err(|error| UsageError {
             summary: "profile lock failed".to_string(),
             detail: format!("[{alias}] could not lock profile for usage refresh: {error:#}"),
-        })?;
-    fetch_usage_retried_with_lease(alias, profile_path, refresh, &lease).await
+        })
 }
 
 fn ensure_usage_configuration() -> std::result::Result<(), UsageError> {
@@ -515,13 +968,39 @@ fn ensure_usage_configuration() -> std::result::Result<(), UsageError> {
 
 async fn usage_cache_hit(
     alias: &str,
+    profile_path: &Path,
     refresh: Refresh,
+    expected_binding: Option<&crate::jwt::StrictAccountBinding>,
 ) -> std::result::Result<Option<UsageInfo>, UsageError> {
     if refresh.skips_usage_cache() {
         debug!("{alias}: {refresh:?} refresh, bypassing the usage cache");
         return Ok(None);
     }
-    match crate::cache::get_async(alias)
+    let binding = auth::read_auth_async(profile_path)
+        .await
+        .map(|value| crate::auth::account_info_from_auth_value(&value))
+        .map_err(|error| UsageError {
+            summary: "auth file unreadable".to_string(),
+            detail: format!(
+                "[{alias}] could not verify identity before reading usage cache: {error:#}"
+            ),
+        })?
+        .strict_binding()
+        .ok_or_else(|| UsageError {
+            summary: "account identity incomplete".to_string(),
+            detail: format!(
+                "[{alias}] usage cache requires a verified account id and email identity"
+            ),
+        })?;
+    if expected_binding.is_some_and(|expected| expected != &binding) {
+        return Err(UsageError {
+            summary: "profile identity changed".to_string(),
+            detail: format!(
+                "[{alias}] profile identity changed while the usage request was queued"
+            ),
+        });
+    }
+    match crate::cache::get_bound_async(alias, &binding)
         .await
         .map_err(|error| UsageError {
             summary: "usage cache unreadable".to_string(),
@@ -538,12 +1017,61 @@ async fn usage_cache_hit(
     }
 }
 
-async fn fetch_usage_retried_with_lease(
+async fn fetch_usage_retried_with_lease_and_client(
     alias: &str,
     profile_path: &Path,
     refresh: Refresh,
     lease: &crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    reset_credit_enrichment: ResetCreditEnrichment,
+    cache_write: UsageCacheWrite,
 ) -> std::result::Result<UsageInfo, UsageError> {
+    fetch_usage_observation_with_lease_and_client(
+        alias,
+        profile_path,
+        refresh,
+        lease,
+        None,
+        client,
+        UsageObservationPolicy {
+            reset_credit_enrichment,
+            cache_write,
+        },
+    )
+    .await
+    .map(|observation| observation.usage)
+}
+
+async fn fetch_usage_observation_with_lease_and_client(
+    alias: &str,
+    profile_path: &Path,
+    refresh: Refresh,
+    lease: &crate::profile::ProfileLease,
+    expected_binding: Option<&crate::jwt::StrictAccountBinding>,
+    client: &reqwest::Client,
+    policy: UsageObservationPolicy,
+) -> std::result::Result<UsageObservation, UsageError> {
+    let prepared =
+        prepare_usage_request(alias, profile_path, refresh, lease, expected_binding).await?;
+    let mut network = NetworkPermitBudget::unlimited();
+    execute_prepared_usage_request(
+        prepared,
+        lease,
+        client,
+        policy.reset_credit_enrichment,
+        policy.cache_write,
+        &mut network,
+    )
+    .await
+}
+
+async fn prepare_usage_request(
+    alias: &str,
+    profile_path: &Path,
+    refresh: Refresh,
+    lease: &crate::profile::ProfileLease,
+    expected_binding: Option<&crate::jwt::StrictAccountBinding>,
+) -> std::result::Result<PreparedUsageRequest, UsageError> {
     if lease.alias() != alias {
         return Err(UsageError {
             summary: "profile lock mismatch".to_string(),
@@ -554,7 +1082,7 @@ async fn fetch_usage_retried_with_lease(
         });
     }
 
-    let val = auth::read_auth(profile_path).map_err(|e| {
+    let val = auth::read_auth_async(profile_path).await.map_err(|e| {
         let detail = format!("failed to read auth file {}: {e}", profile_path.display());
         UsageError {
             summary: "auth file unreadable".into(),
@@ -562,36 +1090,35 @@ async fn fetch_usage_retried_with_lease(
         }
     })?;
     let account_info = crate::jwt::parse_account_info(&val);
+    let cache_binding = account_info.strict_binding().ok_or_else(|| UsageError {
+        summary: "account identity incomplete".to_string(),
+        detail: format!("[{alias}] usage refresh requires a verified account id and email"),
+    })?;
+    if expected_binding.is_some_and(|expected| expected != &cache_binding) {
+        return Err(UsageError {
+            summary: "profile identity changed".to_string(),
+            detail: format!(
+                "[{alias}] profile identity changed while the usage request was queued"
+            ),
+        });
+    }
     let account_id = account_info.account_id;
     let is_fedramp = account_info.is_fedramp;
-    let mut id_token = auth::extract_id_token(&val);
+    let id_token = auth::extract_id_token(&val);
     let (access_token, refresh_token) = auth::extract_tokens(&val);
-    let mut refresh_token = refresh_token;
 
     // A verdict the auth server already named stands until the credential is
     // replaced, so re-presenting it buys nothing but the round trip. Only an
     // explicit user force skips this — see [`Refresh`].
     if !refresh.may_re_present_a_rejected_credential()
         && let Some(rt) = refresh_token.as_deref()
+        && let Some(known) = cached_terminal_auth_verdict(alias, rt).await?
     {
-        match crate::cache::get_auth_failure_async(alias, rt).await {
-            Ok(Some(known)) => {
-                debug!("{alias}: credential already rejected by the auth server, not retrying");
-                return Err(known);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return Err(UsageError {
-                    summary: "auth cache unreadable".to_string(),
-                    detail: format!(
-                        "[{alias}] could not safely decide whether this credential was already rejected: {error:#}"
-                    ),
-                });
-            }
-        }
+        debug!("{alias}: credential already rejected by the auth server, not retrying");
+        return Err(known);
     }
 
-    let mut at = match access_token {
+    let access_token = match access_token {
         Some(t) => t,
         None => {
             return Err(UsageError {
@@ -601,12 +1128,56 @@ async fn fetch_usage_retried_with_lease(
         }
     };
 
-    let mut last_err = String::new();
-    let mut last_summary = String::new();
     let endpoints = auth::service_endpoints().map_err(|error| UsageError {
         summary: "service endpoint policy invalid".to_string(),
         detail: format!("[{alias}] could not resolve service endpoints: {error:#}"),
     })?;
+    Ok(PreparedUsageRequest {
+        alias: alias.to_string(),
+        profile_path: profile_path.to_path_buf(),
+        cache_binding,
+        account_id,
+        is_fedramp,
+        id_token,
+        access_token,
+        refresh_token,
+        endpoints,
+    })
+}
+
+async fn execute_prepared_usage_request(
+    prepared: PreparedUsageRequest,
+    lease: &crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    reset_credit_enrichment: ResetCreditEnrichment,
+    cache_write: UsageCacheWrite,
+    network: &mut NetworkPermitBudget,
+) -> std::result::Result<UsageObservation, UsageError> {
+    let PreparedUsageRequest {
+        alias,
+        profile_path,
+        cache_binding,
+        account_id,
+        is_fedramp,
+        mut id_token,
+        access_token,
+        mut refresh_token,
+        endpoints,
+    } = prepared;
+    if lease.alias() != alias {
+        return Err(UsageError {
+            summary: "profile lock mismatch".to_string(),
+            detail: format!(
+                "prepared usage request for '{alias}' received lease for '{}'",
+                lease.alias()
+            ),
+        });
+    }
+    let alias = alias.as_str();
+    let profile_path = profile_path.as_path();
+    let mut at = access_token;
+    let mut last_err = String::new();
+    let mut last_summary = String::new();
     // A rejected refresh may just mean a concurrent refresh of the same profile
     // won the rotation, so one such rejection buys a single extra round in which
     // the winner's stored token is tried. Granted at most once: two peers each
@@ -681,6 +1252,7 @@ async fn fetch_usage_retried_with_lease(
                 };
             fetch_usage_with_refresh_transactional(
                 &endpoints,
+                client,
                 alias,
                 &at,
                 id_token.as_deref(),
@@ -689,6 +1261,8 @@ async fn fetch_usage_retried_with_lease(
                 is_fedramp,
                 &mut authorize_rotation,
                 &mut persist_before_follow_up,
+                reset_credit_enrichment,
+                network,
             )
             .await
         };
@@ -714,10 +1288,31 @@ async fn fetch_usage_retried_with_lease(
 
         match result {
             Ok(usage) => {
-                if let Err(error) = crate::cache::put_async(alias, &usage).await {
-                    warn!("[{alias}] usage succeeded, but caching the result failed: {error:#}");
+                if cache_write == UsageCacheWrite::Skip {
+                    return Ok(UsageObservation {
+                        usage,
+                        binding: cache_binding,
+                    });
                 }
-                return Ok(usage);
+                let usage = match crate::cache::put_bound_versioned_async(
+                    alias,
+                    &cache_binding,
+                    &usage,
+                )
+                .await
+                {
+                    Ok(versioned) => versioned,
+                    Err(error) => {
+                        warn!(
+                            "[{alias}] usage succeeded, but caching the result failed: {error:#}"
+                        );
+                        usage
+                    }
+                };
+                return Ok(UsageObservation {
+                    usage,
+                    binding: cache_binding,
+                });
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -755,6 +1350,26 @@ async fn fetch_usage_retried_with_lease(
                 if e.downcast_ref::<RefreshOutcomeUnknown>().is_some() {
                     return Err(UsageError::refresh_outcome_unknown(alias, &e));
                 }
+                if e.downcast_ref::<NetworkLimiterClosed>().is_some() {
+                    return Err(UsageError {
+                        summary: "usage limiter closed".to_string(),
+                        detail: format!("[{alias}] usage retry could not reserve network capacity"),
+                    });
+                }
+                let Some(request_failure) = e.downcast_ref::<UsageRequestFailure>() else {
+                    warn!("[{alias}] usage request failed without retry: {msg}");
+                    return Err(UsageError {
+                        summary: extract_error_summary(&msg),
+                        detail: msg,
+                    });
+                };
+                if !request_failure.is_retryable() {
+                    warn!("[{alias}] Usage API response rejected without retry: {msg}");
+                    return Err(UsageError {
+                        summary: extract_error_summary(&msg),
+                        detail: msg,
+                    });
+                }
                 last_summary = extract_error_summary(&msg);
                 last_err = msg;
             }
@@ -789,8 +1404,10 @@ where
     F: FnMut(&str, RefreshedTokens) -> Result<()>,
 {
     let endpoints = auth::service_endpoints()?;
+    let client = auth::build_http_client()?;
     fetch_usage_with_refresh_at(
         &endpoints,
+        &client,
         alias,
         access_token,
         id_token,
@@ -805,6 +1422,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn fetch_usage_with_refresh_at<F>(
     endpoints: &auth::ServiceEndpoints,
+    client: &reqwest::Client,
     alias: &str,
     access_token: &str,
     id_token: Option<&str>,
@@ -816,12 +1434,14 @@ async fn fetch_usage_with_refresh_at<F>(
 where
     F: FnMut(&str, RefreshedTokens) -> Result<()>,
 {
+    let mut network = NetworkPermitBudget::unlimited();
     let mut authorize_rotation = || Ok(());
     let mut persist_authorized = |(): (), presented: &str, resolution: RefreshTokenResolution| {
         persist_unbound_refresh_resolution(alias, presented, resolution, persist_rotation)
     };
     fetch_usage_with_refresh_transactional(
         endpoints,
+        client,
         alias,
         access_token,
         id_token,
@@ -830,18 +1450,90 @@ where
         is_fedramp,
         &mut authorize_rotation,
         &mut persist_authorized,
+        ResetCreditEnrichment::Inline,
+        &mut network,
     )
     .await
 }
 
-/// Internal variant that obtains a commit authorization immediately before
-/// each refresh request and carries that exact value to the persistence step.
-/// Ordinary usage GETs therefore remain independent of live-auth filesystem
-/// state, while no single-use refresh token can be spent without a prepared
-/// conditional publication boundary.
+#[allow(clippy::too_many_arguments)]
+async fn finish_usage_fetch(
+    endpoints: &auth::ServiceEndpoints,
+    client: &reqwest::Client,
+    alias: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    reset_credit_enrichment: ResetCreditEnrichment,
+    network: &mut NetworkPermitBudget,
+    mut usage: UsageInfo,
+) -> UsageInfo {
+    if reset_credit_enrichment == ResetCreditEnrichment::Inline {
+        enrich_reset_credits(
+            endpoints,
+            alias,
+            client,
+            ResetCreditRequestAuth::new(access_token, account_id, is_fedramp),
+            &mut usage,
+            network,
+        )
+        .await;
+    }
+    usage
+}
+
+struct BufferedUsageResponse {
+    status: reqwest::StatusCode,
+    body: Option<Value>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_usage_request(
+    client: &reqwest::Client,
+    usage_url: &str,
+    bearer: &str,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    request_context: &'static str,
+    body_context: &'static str,
+    network: &mut NetworkPermitBudget,
+) -> Result<BufferedUsageResponse> {
+    let request = apply_account_routing_headers(
+        client
+            .get(usage_url)
+            .header("Authorization", format!("Bearer {bearer}")),
+        account_id,
+        is_fedramp,
+    );
+    let (status, body) = {
+        let _permit = network.acquire().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| UsageRequestFailure::request(request_context, &error))?;
+        let status = response.status();
+        let body = if status.is_success() {
+            Some(response.json().await.map_err(|error| {
+                usage_response_json_error(&format!("{body_context} (HTTP {status})"), &error)
+            })?)
+        } else {
+            None
+        };
+        (status, body)
+    };
+    Ok(BufferedUsageResponse { status, body })
+}
+
+/// Internal variant that obtains a commit authorization before waiting for
+/// each refresh request's network slot and carries that exact value to the
+/// persistence step. Ordinary usage GETs therefore remain independent of
+/// live-auth filesystem state, while no single-use refresh token can be spent
+/// without a prepared conditional publication boundary and no scarce network
+/// slot is occupied by the authorization or durable write.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_usage_with_refresh_transactional<A, F, T>(
     endpoints: &auth::ServiceEndpoints,
+    client: &reqwest::Client,
     alias: &str,
     access_token: &str,
     id_token: Option<&str>,
@@ -850,14 +1542,16 @@ async fn fetch_usage_with_refresh_transactional<A, F, T>(
     is_fedramp: bool,
     authorize_rotation: &mut A,
     persist_rotation: &mut F,
+    reset_credit_enrichment: ResetCreditEnrichment,
+    network: &mut NetworkPermitBudget,
 ) -> Result<UsageInfo>
 where
     A: FnMut() -> Result<T>,
     F: FnMut(T, &str, RefreshTokenResolution) -> Result<RefreshedTokens>,
 {
-    let client = auth::build_http_client()?;
     let usage_url = endpoints.usage()?;
     let mut rejected_refresh: Option<anyhow::Error> = None;
+    let mut retryable_proactive_refresh: Option<anyhow::Error> = None;
 
     // Usage authorization depends on the access token. An expired ID token is
     // not a reason to serialize a healthy read through the credential-write
@@ -868,40 +1562,51 @@ where
         info!("[{alias}] token expiring soon, proactively refreshing");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token(endpoints, alias, &client, id_token, rt).await {
+        match do_refresh_token_with_network(endpoints, alias, client, id_token, rt, network).await {
             Ok(resolution) => {
                 let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
 
-                let resp = apply_account_routing_headers(
-                    client
-                        .get(usage_url)
-                        .header("Authorization", format!("Bearer {bearer}")),
+                let response = send_usage_request(
+                    client,
+                    usage_url,
+                    &bearer,
                     account_id,
                     is_fedramp,
+                    "Usage API request failed",
+                    "failed to parse usage response",
+                    network,
                 )
-                .send()
-                .await
-                .map_err(|e| format_reqwest_error("Usage API request failed", &e))?;
+                .await?;
 
-                let status = resp.status();
+                let status = response.status;
                 debug!("[{alias}] Usage API (after proactive refresh): HTTP {status}");
                 if status.is_success() {
-                    let body: Value = resp.json().await.map_err(|e| {
-                        anyhow::anyhow!("failed to parse usage response (HTTP {status}): {e}")
-                    })?;
+                    let body = response
+                        .body
+                        .expect("successful usage response must carry its buffered body");
                     debug!(
                         "[{alias}] Usage API raw body (proactive): {}",
                         crate::auth::redact_sensitive_log_body(&body)
                     );
-                    let mut usage = parse_checked_usage_response(&body)?;
-                    enrich_reset_credits(
-                        endpoints, alias, &client, &bearer, account_id, is_fedramp, &mut usage,
+                    let usage = parse_checked_usage_response(&body)?;
+                    return Ok(finish_usage_fetch(
+                        endpoints,
+                        client,
+                        alias,
+                        &bearer,
+                        account_id,
+                        is_fedramp,
+                        reset_credit_enrichment,
+                        network,
+                        usage,
                     )
-                    .await;
-                    return Ok(usage);
+                    .await);
                 }
-                anyhow::bail!("Usage API failed (HTTP {status}) after proactive token refresh");
+                return Err(UsageRequestFailure::http(
+                    status,
+                    format!("Usage API failed (HTTP {status}) after proactive token refresh"),
+                ));
             }
             Err(e) => {
                 if e.downcast_ref::<RefreshOutcomeUnknown>().is_some() {
@@ -910,6 +1615,14 @@ where
                 if e.downcast_ref::<TerminalAuthError>().is_some() {
                     info!("[{alias}] proactive token refresh rejected permanently: {e:#}");
                     rejected_refresh = Some(e);
+                } else if e
+                    .downcast_ref::<UsageRequestFailure>()
+                    .is_some_and(UsageRequestFailure::is_retryable)
+                {
+                    info!(
+                        "[{alias}] proactive token refresh failed transiently, trying with existing token before a delayed retry: {e:#}"
+                    );
+                    retryable_proactive_refresh = Some(e);
                 } else {
                     info!(
                         "[{alias}] proactive token refresh failed, trying with existing token: {e:#}"
@@ -919,46 +1632,60 @@ where
         }
     }
 
-    let resp = apply_account_routing_headers(
-        client
-            .get(usage_url)
-            .header("Authorization", format!("Bearer {access_token}")),
+    let response = send_usage_request(
+        client,
+        usage_url,
+        access_token,
         account_id,
         is_fedramp,
+        "Usage API request failed",
+        "failed to parse usage response",
+        network,
     )
-    .send()
-    .await
-    .map_err(|e| format_reqwest_error("Usage API request failed", &e))?;
+    .await?;
 
-    let status = resp.status();
+    let status = response.status;
     debug!("[{alias}] Usage API: HTTP {status}");
     if status.is_success() {
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to parse usage response (HTTP {status}): {e}"))?;
+        let body = response
+            .body
+            .expect("successful usage response must carry its buffered body");
         debug!(
             "[{alias}] Usage API raw body: {}",
             crate::auth::redact_sensitive_log_body(&body)
         );
-        let mut usage = parse_checked_usage_response(&body)?;
-        enrich_reset_credits(
+        let usage = parse_checked_usage_response(&body)?;
+        return Ok(finish_usage_fetch(
             endpoints,
+            client,
             alias,
-            &client,
             access_token,
             account_id,
             is_fedramp,
-            &mut usage,
+            reset_credit_enrichment,
+            network,
+            usage,
         )
-        .await;
-        return Ok(usage);
+        .await);
     }
 
     // The auth server already rejected this refresh token moments ago; asking
     // again can only re-trigger reuse detection and add a round trip.
     if let Some(e) = rejected_refresh {
         return Err(e.context(format!("Usage API failed (HTTP {status})")));
+    }
+
+    // A proactive refresh that received an explicitly transient response did
+    // not rotate the credential. If the old bearer is also rejected, return
+    // that typed failure to the outer loop so its retry delay is observed;
+    // immediately entering the reactive branch would submit the same refresh
+    // token twice back-to-back (especially harmful after HTTP 429).
+    if (status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN)
+        && let Some(error) = retryable_proactive_refresh
+    {
+        return Err(error.context(format!(
+            "Usage API failed (HTTP {status}) after a transient proactive token refresh failure"
+        )));
     }
 
     // If 401/403 and we have a refresh_token, try to refresh
@@ -968,38 +1695,47 @@ where
         info!("[{alias}] got HTTP {status}, attempting token refresh");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token(endpoints, alias, &client, id_token, rt).await {
+        match do_refresh_token_with_network(endpoints, alias, client, id_token, rt, network).await {
             Ok(resolution) => {
                 let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
 
-                let resp2 = apply_account_routing_headers(
-                    client
-                        .get(usage_url)
-                        .header("Authorization", format!("Bearer {bearer}")),
+                let response = send_usage_request(
+                    client,
+                    usage_url,
+                    &bearer,
                     account_id,
                     is_fedramp,
+                    "Usage API retry request failed",
+                    "failed to parse usage response after refresh",
+                    network,
                 )
-                .send()
-                .await
-                .map_err(|e| format_reqwest_error("Usage API retry request failed", &e))?;
+                .await?;
 
-                let status2 = resp2.status();
+                let status2 = response.status;
                 debug!("[{alias}] Usage API (after token refresh): HTTP {status2}");
                 if status2.is_success() {
-                    let body: Value = resp2.json().await.map_err(|e| {
-                        anyhow::anyhow!(
-                            "failed to parse usage response after refresh (HTTP {status2}): {e}"
-                        )
-                    })?;
-                    let mut usage = parse_checked_usage_response(&body)?;
-                    enrich_reset_credits(
-                        endpoints, alias, &client, &bearer, account_id, is_fedramp, &mut usage,
+                    let body = response
+                        .body
+                        .expect("successful usage response must carry its buffered body");
+                    let usage = parse_checked_usage_response(&body)?;
+                    return Ok(finish_usage_fetch(
+                        endpoints,
+                        client,
+                        alias,
+                        &bearer,
+                        account_id,
+                        is_fedramp,
+                        reset_credit_enrichment,
+                        network,
+                        usage,
                     )
-                    .await;
-                    return Ok(usage);
+                    .await);
                 }
-                anyhow::bail!("Usage API still failed (HTTP {status2}) after token refresh");
+                return Err(UsageRequestFailure::http(
+                    status2,
+                    format!("Usage API still failed (HTTP {status2}) after token refresh"),
+                ));
             }
             Err(e) => {
                 info!("[{alias}] token refresh failed: {e:#}");
@@ -1012,7 +1748,10 @@ where
         }
     }
 
-    anyhow::bail!("Usage API failed (HTTP {status}), no refresh_token available");
+    Err(UsageRequestFailure::http(
+        status,
+        format!("Usage API failed (HTTP {status}), no refresh_token available"),
+    ))
 }
 
 /// Validate an auth.json being imported, refreshing its credentials if needed.
@@ -1023,7 +1762,30 @@ where
 /// token only in memory. See [`ImportValidation`].
 pub async fn validate_import_auth<F>(
     val: &mut serde_json::Value,
+    persist_rotation: F,
+) -> ImportValidation
+where
+    F: FnMut(&serde_json::Value) -> Result<()>,
+{
+    let client = match auth::build_http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            return ImportValidation {
+                refreshed: None,
+                validated_account_id: None,
+                result: Err(error.context("building import-validation HTTP client")),
+            };
+        }
+    };
+    validate_import_auth_with_client(val, persist_rotation, &client).await
+}
+
+/// As [`validate_import_auth`], reusing a caller-owned HTTP client for token,
+/// usage, reset-credit, and workspace requests.
+pub async fn validate_import_auth_with_client<F>(
+    val: &mut serde_json::Value,
     mut persist_rotation: F,
+    client: &reqwest::Client,
 ) -> ImportValidation
 where
     F: FnMut(&serde_json::Value) -> Result<()>,
@@ -1033,6 +1795,7 @@ where
     let result = match auth::service_endpoints() {
         Ok(endpoints) => validate_import_auth_capturing_refresh(
             &endpoints,
+            client,
             val,
             &mut refreshed,
             &mut persist_rotation,
@@ -1079,6 +1842,7 @@ where
 /// `refreshed` and durable storage before a follow-up usage request.
 async fn validate_import_auth_capturing_refresh<F>(
     endpoints: &auth::ServiceEndpoints,
+    client: &reqwest::Client,
     val: &mut serde_json::Value,
     refreshed: &mut Option<RefreshedTokens>,
     persist_rotation: &mut F,
@@ -1105,6 +1869,7 @@ where
                     };
                 fetch_usage_with_refresh_at(
                     endpoints,
+                    client,
                     alias,
                     &at,
                     id_token.as_deref(),
@@ -1115,15 +1880,11 @@ where
                 )
                 .await?
             };
-            if let Err(err) = crate::workspace::refresh_for_auth_at(endpoints, val).await {
-                debug!("workspace metadata unavailable while importing: {err}");
-            }
             Ok((usage, validated_account_id))
         }
         (None, Some(rt)) => {
-            let client = auth::build_http_client()?;
             let first_resolution =
-                do_refresh_token(endpoints, alias, &client, id_token.as_deref(), &rt).await?;
+                do_refresh_token(endpoints, alias, client, id_token.as_deref(), &rt).await?;
             let mut defer_persistence = |_: &str, _: RefreshedTokens| Ok(());
             let first = persist_unbound_refresh_resolution(
                 alias,
@@ -1149,6 +1910,7 @@ where
                     };
                 fetch_usage_with_refresh_at(
                     endpoints,
+                    client,
                     alias,
                     &access_token,
                     Some(&id_token),
@@ -1159,9 +1921,6 @@ where
                 )
                 .await?
             };
-            if let Err(err) = crate::workspace::refresh_for_auth_at(endpoints, val).await {
-                debug!("workspace metadata unavailable while importing: {err}");
-            }
             Ok((usage, validated_account_id))
         }
         (None, None) => anyhow::bail!("auth.json missing access_token and refresh_token"),
@@ -1190,28 +1949,51 @@ pub(crate) async fn do_refresh_token(
     current_id_token: Option<&str>,
     refresh_token: &str,
 ) -> Result<RefreshTokenResolution> {
+    let mut network = NetworkPermitBudget::unlimited();
+    do_refresh_token_with_network(
+        endpoints,
+        alias,
+        client,
+        current_id_token,
+        refresh_token,
+        &mut network,
+    )
+    .await
+}
+
+pub(crate) async fn do_refresh_token_with_network(
+    endpoints: &auth::ServiceEndpoints,
+    alias: &str,
+    client: &reqwest::Client,
+    current_id_token: Option<&str>,
+    refresh_token: &str,
+    network: &mut NetworkPermitBudget,
+) -> Result<RefreshTokenResolution> {
     let token_url = endpoints.token()?;
     debug!("[{alias}] sending token refresh request to {token_url}");
 
-    let resp = build_refresh_request(client, token_url, refresh_token)
-        .send()
-        .await
-        .map_err(|error| {
+    let request = build_refresh_request(client, token_url, refresh_token);
+    let (status, body_text) = {
+        let _permit = network.acquire().await?;
+        let resp = request.send().await.map_err(|error| {
             let detail = format_reqwest_error("token refresh request failed", &error).to_string();
             refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
                 "token refresh request transport failed after submission began: {detail}"
             )))
         })?;
 
-    let status = resp.status();
-    debug!("[{alias}] token refresh response: HTTP {status}");
+        let status = resp.status();
 
-    // Read raw body first so we can log it on parse failure
-    let body_text = resp.text().await.map_err(|error| {
-        refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
-            "failed to read token refresh response body (HTTP {status})"
-        )))
-    })?;
+        // Read raw body before returning the permit: a truncated response can
+        // leave a single-use refresh-token outcome unknowable.
+        let body_text = resp.text().await.map_err(|error| {
+            refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
+                "failed to read token refresh response body (HTTP {status})"
+            )))
+        })?;
+        (status, body_text)
+    };
+    debug!("[{alias}] token refresh response: HTTP {status}");
 
     let r: RefreshResponse = serde_json::from_str(&body_text).map_err(|error| {
         // A token refresh body may contain access/refresh/id tokens; redact them
@@ -1337,6 +2119,14 @@ pub async fn refresh_expiring_tokens() -> Result<Vec<TokenPersistFailure>> {
     refresh_expiring_tokens_within(OPPORTUNISTIC_START_BUDGET).await
 }
 
+/// As [`refresh_expiring_tokens`], reusing a caller-owned HTTP client across
+/// every profile selected for the opportunistic batch.
+pub async fn refresh_expiring_tokens_with_client(
+    client: &reqwest::Client,
+) -> Result<Vec<TokenPersistFailure>> {
+    refresh_expiring_tokens_within_with_client(OPPORTUNISTIC_START_BUDGET, client).await
+}
+
 /// As [`refresh_expiring_tokens`], with an explicit start budget.
 ///
 /// `budget` bounds how long this may wait for a profile lease and **open** new
@@ -1364,12 +2154,49 @@ pub async fn refresh_expiring_tokens() -> Result<Vec<TokenPersistFailure>> {
 pub async fn refresh_expiring_tokens_within(
     budget: std::time::Duration,
 ) -> Result<Vec<TokenPersistFailure>> {
+    let candidates = opportunistic_refresh_candidates()?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let endpoints = auth::service_endpoints()?;
+    // Build before starting the budget: client construction can synchronously
+    // initialize TLS state, but the budget is only for opening rotations.
+    let client = auth::build_http_client().context("building opportunistic refresh client")?;
+    run_opportunistic_refresh_batch(candidates, budget, endpoints, &client).await
+}
+
+/// As [`refresh_expiring_tokens_within`], reusing a caller-owned HTTP client.
+pub async fn refresh_expiring_tokens_within_with_client(
+    budget: std::time::Duration,
+    client: &reqwest::Client,
+) -> Result<Vec<TokenPersistFailure>> {
+    let candidates = opportunistic_refresh_candidates()?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let endpoints = auth::service_endpoints()?;
+    run_opportunistic_refresh_batch(candidates, budget, endpoints, client).await
+}
+
+type OpportunisticRefreshCandidate = (String, std::path::PathBuf, String, i64);
+
+fn opportunistic_token_expiry(access_token: &str, id_token: Option<&str>) -> Option<i64> {
+    [
+        crate::jwt::token_expires_at(access_token),
+        id_token.and_then(crate::jwt::token_expires_at),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
+fn opportunistic_refresh_candidates() -> Result<Vec<OpportunisticRefreshCandidate>> {
     let profiles = crate::profile::list_profiles().context("listing profiles for token refresh")?;
 
     let now = auth::now_unix_secs()?;
 
     // Collect current tokens for profiles expiring soon.
-    let mut candidates: Vec<(String, std::path::PathBuf, String, i64)> = Vec::new();
+    let mut candidates = Vec::new();
     for alias in &profiles {
         let path = match crate::profile::profile_auth_path(alias) {
             Ok(p) => p,
@@ -1383,30 +2210,7 @@ pub async fn refresh_expiring_tokens_within(
         let id_token = auth::extract_id_token(&val);
         let Some(at) = access_token else { continue };
         let Some(rt) = refresh_token else { continue };
-        // Expiry alone says nothing about whether the credential can still be
-        // rotated. Without this, every dead profile is refreshed again here —
-        // after `list` has already printed its final screen, so the user waits
-        // on a request whose answer is known and not even displayed.
-        match crate::cache::get_auth_failure(alias, &rt) {
-            Ok(Some(_)) => {
-                debug!("[{alias}] skipping opportunistic refresh: credential already rejected");
-                continue;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                warn!(
-                    "[{alias}] skipping opportunistic refresh because the auth-failure cache could not be read: {error:#}"
-                );
-                continue;
-            }
-        }
-        let expiry = [
-            crate::jwt::token_expires_at(&at),
-            id_token.as_deref().and_then(crate::jwt::token_expires_at),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+        let expiry = opportunistic_token_expiry(&at, id_token.as_deref());
         let Some(exp) = expiry else {
             continue;
         };
@@ -1418,9 +2222,22 @@ pub async fn refresh_expiring_tokens_within(
         }
     }
 
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
+    // Expiry alone says nothing about whether the credential can still be
+    // rotated. Read every standing refusal from one immutable cache snapshot;
+    // otherwise one contended lock can impose the full timeout per alias.
+    let credentials = candidates
+        .iter()
+        .map(|(alias, _, refresh_token, _)| (alias.clone(), refresh_token.clone()))
+        .collect::<HashMap<_, _>>();
+    let rejected = crate::cache::get_auth_failures(&credentials)
+        .context("reading auth-failure cache for token refresh candidates")?;
+    candidates.retain(|(alias, _, _, _)| {
+        let rejected = rejected.contains_key(alias);
+        if rejected {
+            debug!("[{alias}] skipping opportunistic refresh: credential already rejected");
+        }
+        !rejected
+    });
 
     // Sort by expiration: soonest first
     candidates.sort_by_key(|c| c.3);
@@ -1432,12 +2249,15 @@ pub async fn refresh_expiring_tokens_within(
         OPPORTUNISTIC_REFRESH_MARGIN
     );
 
-    let endpoints = auth::service_endpoints()?;
+    Ok(candidates)
+}
 
-    // Build before starting the budget: client construction can synchronously
-    // initialize TLS state, but the budget is only for opening rotations.
-    let client = auth::build_http_client().context("building opportunistic refresh client")?;
-
+async fn run_opportunistic_refresh_batch(
+    candidates: Vec<OpportunisticRefreshCandidate>,
+    budget: std::time::Duration,
+    endpoints: auth::ServiceEndpoints,
+    client: &reqwest::Client,
+) -> Result<Vec<TokenPersistFailure>> {
     // Start refreshes while the budget lasts, then wait for every started one:
     // an in-flight rotation is not cancellable without losing the credential.
     let deadline = opportunistic_refresh_deadline(budget)?;
@@ -1450,7 +2270,7 @@ pub async fn refresh_expiring_tokens_within(
         while tasks.len() < OPPORTUNISTIC_REFRESH_CONCURRENCY
             && tokio::time::Instant::now() < deadline
         {
-            let Some((alias, path, rt, exp)) = queued.next() else {
+            let Some((alias, path, rt, _discovered_expiry)) = queued.next() else {
                 break;
             };
             let tracked_alias = alias.clone();
@@ -1497,7 +2317,8 @@ pub async fn refresh_expiring_tokens_within(
                         return None;
                     }
                 };
-                let (_, current_refresh_token) = auth::extract_tokens(&value);
+                let (current_access_token, current_refresh_token) = auth::extract_tokens(&value);
+                let current_access_token = current_access_token?;
                 let current_refresh_token = current_refresh_token?;
                 if current_refresh_token != rt {
                     debug!(
@@ -1506,9 +2327,17 @@ pub async fn refresh_expiring_tokens_within(
                     return None;
                 }
                 let id_token = auth::extract_id_token(&value);
+                let Some(current_expiry) =
+                    opportunistic_token_expiry(&current_access_token, id_token.as_deref())
+                else {
+                    debug!(
+                        "[{alias}] opportunistic refresh skipped: current tokens have no expiry"
+                    );
+                    return None;
+                };
                 let remaining = match auth::now_unix_secs()
                     .and_then(|now| {
-                        exp.checked_sub(now)
+                        current_expiry.checked_sub(now)
                             .context("token expiration distance exceeds the signed time range")
                     }) {
                     Ok(remaining) => remaining,
@@ -1521,6 +2350,12 @@ pub async fn refresh_expiring_tokens_within(
                         });
                     }
                 };
+                if remaining >= OPPORTUNISTIC_REFRESH_MARGIN {
+                    debug!(
+                        "[{alias}] opportunistic refresh skipped: current tokens expire in {remaining}s"
+                    );
+                    return None;
+                }
                 debug!("[{alias}] token expires in {remaining}s, refreshing");
 
                 // File parsing and task scheduling can spend the remainder of
@@ -1616,6 +2451,7 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use serde_json::json;
@@ -1681,6 +2517,1167 @@ mod tests {
             .to_string(),
         );
         format!("header.{payload}.signature")
+    }
+
+    fn valid_usage_body() -> Value {
+        json!({
+            "plan_type": "pro",
+            "rate_limit": null,
+            "credits": null,
+            "spend_control": null,
+            "additional_rate_limits": null,
+            "rate_limit_reached_type": null
+        })
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn deterministic_usage_400_stops_after_one_request() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let calls = Arc::clone(&server_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::BAD_REQUEST
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+
+        let now = auth::now_unix_secs().unwrap();
+        let alias = "usage_400";
+        let profile_path = crate::profile::profile_auth_path(alias).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400)
+                }
+            }),
+        );
+        let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+            .await
+            .unwrap();
+        let error = probe_core_usage_unattended_with_existing_lease_and_client(
+            alias,
+            &profile_path,
+            &lease,
+            None,
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect_err("a deterministic 400 must fail without an outer retry");
+        server.abort();
+
+        assert!(error.detail.contains("HTTP 400 Bad Request"), "{error:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_usage_http_statuses_are_retried() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+        let now = auth::now_unix_secs().unwrap();
+
+        for (case, status) in [
+            ("timeout", StatusCode::REQUEST_TIMEOUT),
+            ("rate_limit", StatusCode::TOO_MANY_REQUESTS),
+            ("server_error", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let server_calls = Arc::clone(&calls);
+            let app = Router::new().route(
+                "/usage",
+                get(move || {
+                    let calls = Arc::clone(&server_calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            status.into_response()
+                        } else {
+                            axum::Json(valid_usage_body()).into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+
+            let alias = format!("usage_transient_{case}");
+            let profile_path = crate::profile::profile_auth_path(&alias).unwrap();
+            std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+            write_auth_durable(
+                &profile_path,
+                &json!({
+                    "tokens": {
+                        "id_token": jwt_with_exp_and_identity(now + 86_400),
+                        "access_token": jwt_with_exp(now + 86_400)
+                    }
+                }),
+            );
+            let lease = crate::profile::acquire_profile_lease_async(alias.clone())
+                .await
+                .unwrap();
+            let usage = probe_core_usage_unattended_with_existing_lease_and_client(
+                &alias,
+                &profile_path,
+                &lease,
+                None,
+                &reqwest::Client::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{case} should retry: {error:?}"));
+            server.abort();
+
+            assert_eq!(usage.plan_type.as_deref(), Some("pro"), "{case}");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{case}");
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_backoff_releases_the_network_permit() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let (first_attempt_tx, mut first_attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let calls = Arc::clone(&server_calls);
+                let first_attempt_tx = first_attempt_tx.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        first_attempt_tx.send(()).unwrap();
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    } else {
+                        axum::Json(valid_usage_body()).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+
+        let alias = "retry_permit_boundary";
+        let now = auth::now_unix_secs().unwrap();
+        let profile_path = crate::profile::profile_auth_path(alias).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400)
+                }
+            }),
+        );
+        let binding = auth::account_info_from_auth_value(&auth::read_auth(&profile_path).unwrap())
+            .strict_binding()
+            .unwrap();
+        let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+            .await
+            .unwrap();
+        let prepared = prepare_core_usage_with_existing_lease(
+            alias,
+            &profile_path,
+            Refresh::Forced,
+            &lease,
+            &binding,
+        )
+        .await
+        .unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let client = reqwest::Client::new();
+        let mut network = NetworkPermitBudget::new(first_network_permit(limiter.clone()));
+        let refresh = tokio::spawn(async move {
+            execute_prepared_core_usage_with_existing_lease_and_client(
+                prepared,
+                &lease,
+                &client,
+                &mut network,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_attempt_rx.recv())
+            .await
+            .expect("first usage attempt did not reach the server")
+            .expect("first-attempt channel closed");
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            limiter.clone().acquire_owned(),
+        )
+        .await
+        .expect("retry backoff retained the only network permit")
+        .unwrap();
+        tokio::time::sleep(RETRY_DELAY + std::time::Duration::from_millis(100)).await;
+        assert!(
+            !refresh.is_finished(),
+            "the retry must reserve fresh capacity before its second request"
+        );
+        drop(recovered);
+
+        refresh.await.unwrap().unwrap();
+        server.abort();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_admission_cancellation_is_consumed_once() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let first_polls = Arc::clone(&polls);
+        let first: FirstNetworkPermit = Box::pin(async move {
+            first_polls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        });
+        let mut network = NetworkPermitBudget::new(first);
+
+        let first_error = network.acquire().await.unwrap_err();
+        assert!(network_wait_was_cancelled(&first_error));
+        assert!(network.first_wait_was_cancelled());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+
+        let second_error = network
+            .acquire()
+            .await
+            .expect_err("a cancelled first admission must not be polled again");
+        assert!(network_wait_was_cancelled(&second_error));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_authorization_and_persistence_release_network_capacity() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let (token_request_tx, mut token_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (usage_request_tx, mut usage_request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let now = auth::now_unix_secs().unwrap();
+        let id_token = jwt_with_exp_and_identity(now + 86_400);
+        let refreshed_id_token = id_token.clone();
+        let refreshed_access_token = jwt_with_exp(now + 86_400);
+        let token_response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_token_response_gate = Arc::clone(&token_response_gate);
+        let app = Router::new()
+            .route(
+                "/token",
+                post(move || {
+                    let requested = token_request_tx.clone();
+                    let id_token = refreshed_id_token.clone();
+                    let access_token = refreshed_access_token.clone();
+                    let response_gate = Arc::clone(&server_token_response_gate);
+                    async move {
+                        requested.send(()).unwrap();
+                        response_gate.acquire().await.unwrap().forget();
+                        axum::Json(json!({
+                            "id_token": id_token,
+                            "access_token": access_token,
+                            "refresh_token": "rotated-refresh"
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/usage",
+                get(move || {
+                    let requested = usage_request_tx.clone();
+                    async move {
+                        requested.send(()).unwrap();
+                        axum::Json(valid_usage_body())
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let (authorization_started_tx, authorization_started_rx) = tokio::sync::oneshot::channel();
+        let (authorization_release_tx, authorization_release_rx) = std::sync::mpsc::channel();
+        let (persistence_started_tx, persistence_started_rx) = tokio::sync::oneshot::channel();
+        let (persistence_release_tx, persistence_release_rx) = std::sync::mpsc::channel();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let (first_wait_started_tx, mut first_wait_started_rx) = tokio::sync::oneshot::channel();
+        let first_wait_limiter = limiter.clone();
+        let first_permit: FirstNetworkPermit = Box::pin(async move {
+            first_wait_started_tx.send(()).unwrap();
+            first_wait_limiter
+                .acquire_owned()
+                .await
+                .map(Some)
+                .map_err(|_| NetworkLimiterClosed.into())
+        });
+        let endpoints = auth::service_endpoints().unwrap();
+        let expired_access_token = jwt_with_exp(now - 1);
+        let refresh_id_token = id_token.clone();
+        let refresh = tokio::spawn(async move {
+            let mut network = NetworkPermitBudget::new(first_permit);
+            let mut authorization_started_tx = Some(authorization_started_tx);
+            let mut authorize_rotation = move || {
+                authorization_started_tx
+                    .take()
+                    .expect("authorization runs once")
+                    .send(())
+                    .unwrap();
+                authorization_release_rx.recv().unwrap();
+                Ok(())
+            };
+            let mut persistence_started_tx = Some(persistence_started_tx);
+            let mut persist_rotation =
+                move |(): (), _: &str, resolution: RefreshTokenResolution| {
+                    persistence_started_tx
+                        .take()
+                        .expect("persistence runs once")
+                        .send(())
+                        .unwrap();
+                    persistence_release_rx.recv().unwrap();
+                    match resolution {
+                        RefreshTokenResolution::Validated(tokens) => Ok(tokens),
+                        RefreshTokenResolution::RotatedButInvalid { .. } => {
+                            panic!("the fixture must return valid refreshed credentials")
+                        }
+                    }
+                };
+            fetch_usage_with_refresh_transactional(
+                &endpoints,
+                &reqwest::Client::new(),
+                "permit-boundary",
+                &expired_access_token,
+                Some(&refresh_id_token),
+                Some("initial-refresh"),
+                None,
+                false,
+                &mut authorize_rotation,
+                &mut persist_rotation,
+                ResetCreditEnrichment::Deferred,
+                &mut network,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), authorization_started_rx)
+            .await
+            .expect("refresh authorization did not start")
+            .unwrap();
+        assert!(matches!(
+            first_wait_started_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let authorization_capacity = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            limiter.clone().acquire_owned(),
+        )
+        .await
+        .expect("blocked authorization retained the only network permit")
+        .unwrap();
+        authorization_release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_wait_started_rx)
+            .await
+            .expect("first network admission was not polled after authorization")
+            .unwrap();
+        let overtaker = tokio::spawn(limiter.clone().acquire_owned());
+        drop(authorization_capacity);
+        tokio::time::timeout(std::time::Duration::from_secs(1), token_request_rx.recv())
+            .await
+            .expect("the first admission permit was returned and reacquired behind another waiter")
+            .expect("token-request channel closed");
+        assert!(
+            !overtaker.is_finished(),
+            "another waiter acquired capacity while the first HTTP exchange was reading its body"
+        );
+        overtaker.abort();
+        let _ = overtaker.await;
+        token_response_gate.add_permits(1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), persistence_started_rx)
+            .await
+            .expect("credential persistence did not start")
+            .unwrap();
+        let persistence_capacity = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            limiter.clone().acquire_owned(),
+        )
+        .await
+        .expect("blocked persistence retained the only network permit")
+        .unwrap();
+        persistence_release_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                usage_request_rx.recv(),
+            )
+            .await
+            .is_err(),
+            "the follow-up usage request started without reacquiring network capacity"
+        );
+        drop(persistence_capacity);
+        tokio::time::timeout(std::time::Duration::from_secs(1), usage_request_rx.recv())
+            .await
+            .expect("usage request did not start after capacity was returned")
+            .expect("usage-request channel closed");
+
+        let usage = refresh.await.unwrap().unwrap();
+        server.abort();
+        assert_eq!(usage.plan_type.as_deref(), Some("pro"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn transient_proactive_refresh_is_not_replayed_before_outer_retry() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let now = auth::now_unix_secs().unwrap();
+        let access_token = jwt_with_exp(now + 30);
+        let id_token = jwt_with_exp_and_identity(now + 86_400);
+
+        for (case, transient_status) in [
+            ("timeout", StatusCode::REQUEST_TIMEOUT),
+            ("rate_limit", StatusCode::TOO_MANY_REQUESTS),
+            ("server_error", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let usage_calls = Arc::new(AtomicUsize::new(0));
+            let token_calls = Arc::new(AtomicUsize::new(0));
+            let usage_server_calls = Arc::clone(&usage_calls);
+            let token_server_calls = Arc::clone(&token_calls);
+            let app = Router::new()
+                .route(
+                    "/usage",
+                    get(move || {
+                        let calls = Arc::clone(&usage_server_calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::UNAUTHORIZED
+                        }
+                    }),
+                )
+                .route(
+                    "/token",
+                    post(move || {
+                        let calls = Arc::clone(&token_server_calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                transient_status,
+                                axum::Json(json!({"error": "temporarily_unavailable"})),
+                            )
+                                .into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+            let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+            let endpoints = auth::service_endpoints().unwrap();
+            let mut network = NetworkPermitBudget::unlimited();
+            let mut authorize_rotation = || Ok(());
+            let mut persist_rotation =
+                |(): (), _: &str, _: RefreshTokenResolution| -> Result<RefreshedTokens> {
+                    panic!("a failed refresh must never reach persistence")
+                };
+            let error = fetch_usage_with_refresh_transactional(
+                &endpoints,
+                &reqwest::Client::new(),
+                case,
+                &access_token,
+                Some(&id_token),
+                Some("same-refresh"),
+                None,
+                false,
+                &mut authorize_rotation,
+                &mut persist_rotation,
+                ResetCreditEnrichment::Deferred,
+                &mut network,
+            )
+            .await
+            .expect_err("the typed transient refresh failure must reach the outer retry loop");
+            server.abort();
+
+            let request_failure = error
+                .downcast_ref::<UsageRequestFailure>()
+                .unwrap_or_else(|| panic!("{case}: typed request failure was lost: {error:#}"));
+            assert!(request_failure.is_retryable(), "{case}: {error:#}");
+            assert_eq!(usage_calls.load(Ordering::SeqCst), 1, "{case}");
+            assert_eq!(
+                token_calls.load(Ordering::SeqCst),
+                1,
+                "{case}: the same refresh token was replayed before the outer retry delay"
+            );
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn supplied_client_is_shared_by_usage_and_reset_credit_requests() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let marker_hits = Arc::new(AtomicUsize::new(0));
+        let usage_hits = Arc::clone(&marker_hits);
+        let credits_hits = Arc::clone(&marker_hits);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move |headers: axum::http::HeaderMap| {
+                    let hits = Arc::clone(&usage_hits);
+                    async move {
+                        if headers.get("x-client-marker").and_then(|v| v.to_str().ok())
+                            == Some("shared")
+                        {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        axum::Json(json!({
+                            "plan_type": "pro",
+                            "rate_limit": null,
+                            "credits": null,
+                            "spend_control": null,
+                            "additional_rate_limits": null,
+                            "rate_limit_reached_type": null
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/credits",
+                get(move |headers: axum::http::HeaderMap| {
+                    let hits = Arc::clone(&credits_hits);
+                    async move {
+                        if headers.get("x-client-marker").and_then(|v| v.to_str().ok())
+                            == Some("shared")
+                        {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        axum::Json(json!({
+                            "available_count": 1,
+                            "credits": [{"id": "credit-1", "status": "available"}]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _credits_url =
+            EnvVarGuard::set("CS_RESET_CREDITS_URL", format!("http://{address}/credits"));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-client-marker", "shared".parse().unwrap());
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
+        let mut persist = |_: &str, _: RefreshedTokens| Ok(());
+        let usage = fetch_usage_with_refresh_at(
+            &auth::service_endpoints().unwrap(),
+            &client,
+            "alice",
+            "access-token",
+            None,
+            None,
+            Some("account-1"),
+            false,
+            &mut persist,
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(marker_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(usage.reset_credits_available_count, Some(1));
+        assert_eq!(usage.reset_credits.len(), 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn full_usage_cache_publication_does_not_hold_the_network_permit() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let (credits_finished_tx, mut credits_finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/usage", get(|| async { axum::Json(valid_usage_body()) }))
+            .route(
+                "/credits",
+                get(move || {
+                    let finished = credits_finished_tx.clone();
+                    async move {
+                        let response = axum::Json(json!({
+                            "available_count": 1,
+                            "credits": [{"id": "credit-1", "status": "available"}]
+                        }));
+                        finished.send(()).unwrap();
+                        response
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _credits_url =
+            EnvVarGuard::set("CS_RESET_CREDITS_URL", format!("http://{address}/credits"));
+
+        let alias = "cache_boundary";
+        let now = crate::auth::now_unix_secs().unwrap();
+        let profile_path = crate::profile::profile_auth_path(alias).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400)
+                }
+            }),
+        );
+        let binding = crate::auth::account_info_from_auth_value(
+            &crate::auth::read_auth(&profile_path).unwrap(),
+        )
+        .strict_binding()
+        .unwrap();
+        let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+            .await
+            .unwrap();
+        let prepared = prepare_full_usage_with_existing_lease(
+            alias,
+            &profile_path,
+            Refresh::Forced,
+            &lease,
+            Some(&binding),
+        )
+        .await
+        .unwrap();
+
+        let cache_lock_holder = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(home.path().join("cache.lock"))
+            .unwrap();
+        fs4::FileExt::lock(&cache_lock_holder).unwrap();
+
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let client = reqwest::Client::new();
+        let mut network = NetworkPermitBudget::new(first_network_permit(limiter.clone()));
+        let refresh = tokio::spawn(async move {
+            execute_prepared_full_usage_with_existing_lease_and_client(
+                prepared,
+                &lease,
+                &client,
+                &mut network,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            credits_finished_rx.recv(),
+        )
+        .await
+        .expect("full usage refresh did not finish its network phase")
+        .expect("reset-credit completion channel closed");
+
+        let recovered_permit = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            limiter.clone().acquire_owned(),
+        )
+        .await
+        .expect("cache publication retained the only network permit")
+        .unwrap();
+        assert!(
+            !refresh.is_finished(),
+            "the cache lock should still be holding the refresh after its permit was released"
+        );
+        drop(recovered_permit);
+        fs4::FileExt::unlock(&cache_lock_holder).unwrap();
+
+        refresh.await.unwrap().unwrap();
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn quota_first_api_returns_before_blocked_reset_credit_enrichment() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let (credits_started_tx, mut credits_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let credits_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let handler_gate = Arc::clone(&credits_gate);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(|| async {
+                    axum::Json(json!({
+                        "plan_type": "pro",
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 12.0,
+                                "reset_at": 4_102_444_800_i64,
+                                "limit_window_seconds": 18_000
+                            }
+                        },
+                        "credits": null,
+                        "spend_control": null,
+                        "additional_rate_limits": null,
+                        "rate_limit_reached_type": null
+                    }))
+                }),
+            )
+            .route(
+                "/credits",
+                get(move || {
+                    let started = credits_started_tx.clone();
+                    let gate = Arc::clone(&handler_gate);
+                    async move {
+                        started.send(()).unwrap();
+                        let permit = gate.acquire_owned().await.unwrap();
+                        permit.forget();
+                        axum::Json(json!({
+                            "available_count": 1,
+                            "credits": [{"id": "credit-1", "status": "available"}]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _credits_url =
+            EnvVarGuard::set("CS_RESET_CREDITS_URL", format!("http://{address}/credits"));
+
+        let now = crate::auth::now_unix_secs().unwrap();
+        let profile_path = crate::profile::profile_auth_path("quota_first").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400)
+                }
+            }),
+        );
+        let lease = crate::profile::acquire_profile_lease_async("quota_first".to_string())
+            .await
+            .unwrap();
+        let binding = auth::account_info_from_auth_value(&auth::read_auth(&profile_path).unwrap())
+            .strict_binding()
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let prepared = prepare_core_usage_with_existing_lease(
+            "quota_first",
+            &profile_path,
+            Refresh::Forced,
+            &lease,
+            &binding,
+        )
+        .await
+        .unwrap();
+        let mut network = NetworkPermitBudget::new(first_network_permit(std::sync::Arc::new(
+            tokio::sync::Semaphore::new(1),
+        )));
+        let core_usage = execute_prepared_core_usage_with_existing_lease_and_client(
+            prepared,
+            &lease,
+            &client,
+            &mut network,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            credits_started_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty),
+            "the quota-first call must not contact the reset-credit endpoint"
+        );
+        assert_eq!(
+            core_usage
+                .primary
+                .as_ref()
+                .and_then(|window| window.used_percent),
+            Some(12.0)
+        );
+        assert_eq!(core_usage.cache_revision, None);
+        assert!(
+            crate::cache::get_bound("quota_first", &binding)
+                .unwrap()
+                .is_none(),
+            "the TUI core helper must return before publishing a cache generation"
+        );
+
+        let auth_value = auth::read_auth(&profile_path).unwrap();
+        let enrichment_client = client.clone();
+        let enrichment = tokio::spawn(async move {
+            let mut usage = core_usage;
+            crate::usage::enrich_reset_credits_for_auth_with_client(
+                "quota_first",
+                &auth_value,
+                &mut usage,
+                &enrichment_client,
+            )
+            .await;
+            usage
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), credits_started_rx.recv())
+            .await
+            .expect("reset-credit enrichment did not reach the mock endpoint")
+            .expect("reset-credit start channel closed unexpectedly");
+        assert!(
+            !enrichment.is_finished(),
+            "enrichment should still be waiting on the blocked credits response"
+        );
+        credits_gate.add_permits(1);
+        let enriched = enrichment.await.unwrap();
+        server.abort();
+
+        assert_eq!(enriched.reset_credits_error, None);
+        assert_eq!(enriched.reset_credits_available_count, Some(1));
+        assert_eq!(enriched.reset_credits.len(), 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unattended_core_probe_bypasses_and_preserves_metadata_complete_cache() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let reset_credit_calls = Arc::new(AtomicUsize::new(0));
+        let reset_credit_server_calls = Arc::clone(&reset_credit_calls);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(|| async {
+                    axum::Json(json!({
+                        "plan_type": "pro",
+                        "rate_limit": {
+                            "primary_window": {
+                                "used_percent": 12.0,
+                                "reset_at": 4_102_444_800_i64,
+                                "limit_window_seconds": 18_000
+                            }
+                        },
+                        "credits": null,
+                        "spend_control": null,
+                        "additional_rate_limits": null,
+                        "rate_limit_reached_type": null
+                    }))
+                }),
+            )
+            .route(
+                "/credits",
+                get(move || {
+                    let calls = Arc::clone(&reset_credit_server_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"available_count": 0, "credits": []}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _credits_url =
+            EnvVarGuard::set("CS_RESET_CREDITS_URL", format!("http://{address}/credits"));
+
+        let now = crate::auth::now_unix_secs().unwrap();
+        let profile_path = crate::profile::profile_auth_path("daemon_probe").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        let auth_value = json!({
+            "tokens": {
+                "id_token": jwt_with_exp_and_identity(now + 86_400),
+                "access_token": jwt_with_exp(now + 86_400)
+            }
+        });
+        write_auth_durable(&profile_path, &auth_value);
+        let binding = auth::account_info_from_auth_value(&auth_value)
+            .strict_binding()
+            .unwrap();
+        let cached = crate::cache::put_bound_versioned(
+            "daemon_probe",
+            &binding,
+            &UsageInfo {
+                primary: Some(crate::usage::WindowUsage {
+                    used_percent: Some(77.0),
+                    ..crate::usage::WindowUsage::default()
+                }),
+                reset_credits_available_count: Some(3),
+                ..UsageInfo::default()
+            },
+        )
+        .unwrap();
+        let cached_revision = cached.cache_revision.clone();
+
+        let lease = crate::profile::acquire_profile_lease_async("daemon_probe".to_string())
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+        let probed = probe_core_usage_unattended_with_existing_lease_and_client(
+            "daemon_probe",
+            &profile_path,
+            &lease,
+            Some(&binding),
+            &client,
+        )
+        .await
+        .unwrap();
+        drop(lease);
+
+        assert_eq!(
+            probed
+                .primary
+                .as_ref()
+                .and_then(|window| window.used_percent),
+            Some(12.0),
+            "the decision probe must bypass the cached quota"
+        );
+        assert_eq!(reset_credit_calls.load(Ordering::SeqCst), 0);
+        let still_cached = crate::cache::get_bound("daemon_probe", &binding)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still_cached
+                .primary
+                .as_ref()
+                .and_then(|window| window.used_percent),
+            Some(77.0)
+        );
+        assert_eq!(still_cached.reset_credits_available_count, Some(3));
+        assert_eq!(still_cached.cache_revision, cached_revision);
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn expected_binding_mismatch_is_rejected_before_network_io() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&usage_calls);
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let calls = Arc::clone(&server_calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "plan_type": "pro",
+                        "rate_limit": null,
+                        "credits": null,
+                        "spend_control": null,
+                        "additional_rate_limits": null,
+                        "rate_limit_reached_type": null
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+
+        let now = crate::auth::now_unix_secs().unwrap();
+        let profile_path = crate::profile::profile_auth_path("rebound").unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400)
+                }
+            }),
+        );
+        let expected = crate::jwt::StrictAccountBinding {
+            account_id: "acct-previous-owner".to_string(),
+            email: "previous@example.com".to_string(),
+        };
+        let lease = crate::profile::acquire_profile_lease_async("rebound".to_string())
+            .await
+            .unwrap();
+
+        let error = probe_core_usage_unattended_with_existing_lease_and_client(
+            "rebound",
+            &profile_path,
+            &lease,
+            Some(&expected),
+            &reqwest::Client::new(),
+        )
+        .await
+        .expect_err("a rebound alias must be rejected before its usage request");
+        server.abort();
+
+        assert_eq!(error.summary, "profile identity changed");
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_refreshed_bearer_does_not_rotate_a_second_time() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        for (case, rejected_status) in [
+            ("unauthorized", StatusCode::UNAUTHORIZED),
+            ("forbidden", StatusCode::FORBIDDEN),
+        ] {
+            let usage_calls = Arc::new(AtomicUsize::new(0));
+            let token_calls = Arc::new(AtomicUsize::new(0));
+            let usage_server_calls = Arc::clone(&usage_calls);
+            let token_server_calls = Arc::clone(&token_calls);
+            let now = auth::now_unix_secs().unwrap();
+            let refreshed_id = jwt_with_exp_and_identity(now + 172_800);
+            let refreshed_access = jwt_with_exp(now + 172_800);
+            let app = Router::new()
+                .route(
+                    "/usage",
+                    get(move || {
+                        let calls = Arc::clone(&usage_server_calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            rejected_status
+                        }
+                    }),
+                )
+                .route(
+                    "/token",
+                    post(move || {
+                        let calls = Arc::clone(&token_server_calls);
+                        let id_token = refreshed_id.clone();
+                        let access_token = refreshed_access.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(json!({
+                                "id_token": id_token,
+                                "access_token": access_token,
+                                "refresh_token": "new-refresh"
+                            }))
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+            let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+            let alias = format!("rejected_refreshed_{case}");
+            let profile_path = crate::profile::profile_auth_path(&alias).unwrap();
+            std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+            let initial_auth = json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 86_400),
+                    "access_token": jwt_with_exp(now + 86_400),
+                    "refresh_token": "old-refresh"
+                }
+            });
+            write_auth_durable(&profile_path, &initial_auth);
+            write_auth_durable(&crate::auth::codex_auth_path().unwrap(), &initial_auth);
+
+            let error = fetch_usage_retried_force(&alias, &profile_path)
+                .await
+                .expect_err("a rejected newly refreshed bearer must be terminal");
+            server.abort();
+
+            assert!(
+                error.detail.contains(&format!("HTTP {rejected_status}")),
+                "{case}: {error:?}"
+            );
+            assert_eq!(usage_calls.load(Ordering::SeqCst), 2, "{case}");
+            assert_eq!(token_calls.load(Ordering::SeqCst), 1, "{case}");
+        }
     }
 
     async fn run_ambiguous_refresh_response(
@@ -1785,6 +3782,103 @@ mod tests {
         assert!(access_token_needs_refresh(&access, 60).unwrap());
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn opportunistic_refresh_rechecks_current_expiry_after_candidate_discovery() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", codex_home.display().to_string());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let now = auth::now_unix_secs().unwrap();
+        let response_id = jwt_with_exp_and_identity(now + 172_800);
+        let response_access = jwt_with_exp(now + 172_800);
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let calls = Arc::clone(&server_calls);
+                let id_token = response_id.clone();
+                let access_token = response_access.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(json!({
+                        "id_token": id_token,
+                        "access_token": access_token,
+                        "refresh_token": "rotated-refresh"
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let alias = "expiry_rechecked";
+        let profile_path = crate::profile::profile_auth_path(alias).unwrap();
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": jwt_with_exp_and_identity(now + 30),
+                    "access_token": jwt_with_exp(now + 30),
+                    "refresh_token": "same-refresh"
+                }
+            }),
+        );
+
+        let candidates = opportunistic_refresh_candidates().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, alias);
+
+        let fresh_id = jwt_with_exp_and_identity(now + 86_400);
+        let fresh_access = jwt_with_exp(now + 86_400);
+        write_auth_durable(
+            &profile_path,
+            &json!({
+                "tokens": {
+                    "id_token": fresh_id,
+                    "access_token": fresh_access,
+                    "refresh_token": "same-refresh"
+                }
+            }),
+        );
+
+        let failures = run_opportunistic_refresh_batch(
+            candidates,
+            std::time::Duration::from_secs(1),
+            auth::service_endpoints().unwrap(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert!(failures.is_empty());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "fresh access/id tokens must cancel the stale candidate before rotation"
+        );
+        let stored = auth::read_auth(&profile_path).unwrap();
+        assert_eq!(
+            stored
+                .pointer("/tokens/refresh_token")
+                .and_then(Value::as_str),
+            Some("same-refresh")
+        );
+    }
+
     #[test]
     fn final_opportunistic_request_boundary_rejects_an_expired_deadline() {
         let now = tokio::time::Instant::now();
@@ -1862,6 +3956,7 @@ mod tests {
         let _env_lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
         let home = crate::fs_ops::create_direct_tempdir().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
@@ -2062,8 +4157,11 @@ mod tests {
             panic!("an unusable successor must never reach persistence");
         };
         let endpoints = auth::service_endpoints().unwrap();
+        let client = auth::build_http_client().unwrap();
+        let mut network = NetworkPermitBudget::unlimited();
         let error = fetch_usage_with_refresh_transactional(
             &endpoints,
+            &client,
             "alice",
             "old-access",
             Some("old-id"),
@@ -2072,6 +4170,8 @@ mod tests {
             false,
             &mut authorize,
             &mut persist,
+            ResetCreditEnrichment::Inline,
+            &mut network,
         )
         .await
         .expect_err("a blank successor makes the refresh outcome unknown");

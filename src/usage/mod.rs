@@ -10,13 +10,24 @@ mod parse;
 mod reset_credits;
 mod scoring;
 
+#[allow(unused_imports)]
 pub(crate) use api::{
-    apply_account_routing_headers, do_refresh_token, fetch_usage_retried_unattended_leased,
-    fetch_usage_retried_with_existing_lease, persist_refresh_resolution,
+    FirstNetworkPermit, NetworkPermitBudget, PreparedCoreUsageRequest, PreparedFullUsageRequest,
+    UsageObservation, apply_account_routing_headers, do_refresh_token,
+    do_refresh_token_with_network, execute_prepared_core_usage_with_existing_lease_and_client,
+    execute_prepared_full_usage_with_existing_lease_and_client,
+    fetch_usage_observation_force_with_existing_lease_and_client,
+    fetch_usage_retried_with_existing_lease_and_client, first_network_permit,
+    network_wait_cancelled_error, network_wait_was_cancelled, persist_refresh_resolution,
+    prepare_core_usage_unattended_with_existing_lease, prepare_core_usage_with_existing_lease,
+    prepare_full_usage_with_existing_lease,
+    probe_core_usage_unattended_with_existing_lease_and_client,
 };
 pub use api::{
     fetch_usage_retried, fetch_usage_retried_force, fetch_usage_retried_unattended,
-    refresh_expiring_tokens, validate_import_auth,
+    refresh_expiring_tokens, refresh_expiring_tokens_with_client,
+    refresh_expiring_tokens_within_with_client, validate_import_auth,
+    validate_import_auth_with_client,
 };
 // Re-exported for the lib target's public API (used by integration tests via
 // `codex_switch::usage::X`); the binary target doesn't call these through this
@@ -32,11 +43,17 @@ pub use global_pace::{
 };
 #[allow(unused_imports)]
 pub use parse::parse_usage;
-pub use reset_credits::{consume_reset_credit_by_id, earliest_reset_credit};
+#[allow(unused_imports)]
 pub(crate) use reset_credits::{
-    consume_reset_credit_by_id_leased, reset_credit_expiry_sort_key,
+    ConsumeResetCreditError, PreparedResetCreditConsumeRequest, PreparedResetCreditEnrichment,
+    consume_reset_credit_by_id_leased_with_client, enrich_reset_credits_for_auth_with_client,
+    execute_prepared_reset_credit_consume_with_existing_lease_and_client,
+    execute_prepared_reset_credit_enrichment_with_existing_lease_and_client,
+    prepare_reset_credit_consume_with_existing_lease,
+    prepare_reset_credit_enrichment_with_existing_lease, reset_credit_expiry_sort_key,
     validate_reset_credit_preflight,
 };
+pub use reset_credits::{consume_reset_credit_by_id, earliest_reset_credit};
 #[allow(unused_imports)]
 pub use scoring::visible_pace_percent_at;
 pub(crate) use scoring::{
@@ -187,6 +204,10 @@ pub struct ConsumedResetCredit {
 
 #[derive(Debug, Default, Clone)]
 pub struct UsageInfo {
+    /// Opaque revision of the exact disk-cache entry that supplied or stored
+    /// this value. Deferred metadata uses it to avoid updating a newer quota
+    /// snapshot.
+    pub(crate) cache_revision: Option<String>,
     pub fetched_at: Option<i64>,
     pub primary: Option<WindowUsage>,   // 5h window
     pub secondary: Option<WindowUsage>, // 7d window
@@ -503,6 +524,7 @@ pub const MIN_WARMUP_ELAPSED_SECS: i64 = 5 * 60;
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+pub(super) const ACCESS_TOKEN_REFRESH_MARGIN_SECS: i64 = 60;
 
 /// How much of the cache a usage fetch may skip.
 ///

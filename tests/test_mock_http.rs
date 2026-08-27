@@ -55,6 +55,32 @@ fn init_test_config() {
     });
 }
 
+fn jwt(payload: &serde_json::Value) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let json_bytes = serde_json::to_vec(payload).unwrap();
+    format!("x.{}.y", URL_SAFE_NO_PAD.encode(json_bytes))
+}
+
+fn auth_json_with_access(email: &str, account_id: &str, access_token: &str) -> serde_json::Value {
+    let claims = json!({
+        "email": email,
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "plus",
+            "chatgpt_account_id": account_id,
+            "chatgpt_user_id": format!("user_{account_id}"),
+            "organizations": [],
+        }
+    });
+    json!({
+        "tokens": {
+            "id_token": jwt(&claims),
+            "refresh_token": "dummy-refresh",
+            "access_token": access_token,
+            "account_id": account_id,
+        }
+    })
+}
+
 /// Create a temp directory with fake profile auth.json files.
 /// Returns (temp_dir, vec of (alias, path, token, JWT account info)).
 fn setup_profiles(
@@ -329,9 +355,11 @@ async fn usage_retry_exhaustion_returns_last_error_after_three_attempts() {
     let auth_path = dir.path().join("auth.json");
     std::fs::write(
         &auth_path,
-        serde_json::to_vec(&json!({
-            "tokens": {"access_token": "retry_exhausted"}
-        }))
+        serde_json::to_vec(&auth_json_with_access(
+            "retry-exhausted@mock.test",
+            "acct_retry_exhausted",
+            "retry_exhausted",
+        ))
         .unwrap(),
     )
     .unwrap();
@@ -374,9 +402,11 @@ async fn invalid_usage_schema_is_not_retried_as_a_network_failure() {
     let auth_path = dir.path().join("auth.json");
     std::fs::write(
         &auth_path,
-        serde_json::to_vec(&json!({
-            "tokens": {"access_token": "invalid_schema"}
-        }))
+        serde_json::to_vec(&auth_json_with_access(
+            "invalid-schema@mock.test",
+            "acct_invalid_schema",
+            "invalid_schema",
+        ))
         .unwrap(),
     )
     .unwrap();
@@ -453,9 +483,11 @@ async fn nullable_weekly_only_pro_response_is_usable_end_to_end() {
     let auth_path = dir.path().join("auth.json");
     std::fs::write(
         &auth_path,
-        serde_json::to_vec(&json!({
-            "tokens": {"access_token": "nullable_weekly_pro"}
-        }))
+        serde_json::to_vec(&auth_json_with_access(
+            "nullable-weekly-pro@mock.test",
+            "acct_nullable_weekly_pro",
+            "nullable_weekly_pro",
+        ))
         .unwrap(),
     )
     .unwrap();
@@ -750,6 +782,7 @@ async fn http_reset_card_consume_uses_the_exact_confirmed_credit() {
 // ── reset-card-aware auto-switching (spawned binary, end-to-end) ──
 
 mod revival {
+    use super::auth_json_with_access;
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::{get, post};
@@ -765,32 +798,6 @@ mod revival {
 
     fn temp_home() -> crate::support::TempDir {
         crate::support::tempdir()
-    }
-
-    fn jwt(payload: &Value) -> String {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        let json_bytes = serde_json::to_vec(payload).unwrap();
-        format!("x.{}.y", URL_SAFE_NO_PAD.encode(json_bytes))
-    }
-
-    fn auth_json_with_access(email: &str, account_id: &str, access_token: &str) -> Value {
-        let claims = json!({
-            "email": email,
-            "https://api.openai.com/auth": {
-                "chatgpt_plan_type": "plus",
-                "chatgpt_account_id": account_id,
-                "chatgpt_user_id": format!("user_{account_id}"),
-                "organizations": [],
-            }
-        });
-        json!({
-            "tokens": {
-                "id_token": jwt(&claims),
-                "refresh_token": "dummy-refresh",
-                "access_token": access_token,
-                "account_id": account_id,
-            }
-        })
     }
 
     fn write_json(path: impl AsRef<Path>, value: &Value) {
@@ -817,13 +824,11 @@ mod revival {
         primary_used: f64,
         reset_credits: &[(&str, Option<&str>)],
     ) {
+        let email = format!("{alias}@mock.test");
+        let account_id = format!("acct_{alias}");
         write_json(
             home.join(format!(".codex-switch/profiles/{alias}/auth.json")),
-            &auth_json_with_access(
-                &format!("{alias}@mock.test"),
-                &format!("acct_{alias}"),
-                access_token,
-            ),
+            &auth_json_with_access(&email, &account_id, access_token),
         );
 
         let credits: Vec<Value> = reset_credits
@@ -844,6 +849,8 @@ mod revival {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| json!({"entries": {}}));
         cache["entries"][alias] = json!({
+            "account_id": account_id,
+            "email": email,
             "ts": now,
             "primary_used": primary_used,
             "primary_reset": now as i64 + 7200,
@@ -1637,7 +1644,7 @@ mod revival {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn explicit_reset_card_rechecks_hard_blocker_under_lease_before_consume() {
+    async fn explicit_reset_card_rejects_hard_blocker_under_lease_before_consume() {
         let home = temp_home();
         write_long_ttl_config(&home);
         write_cached_profile(
@@ -1647,14 +1654,10 @@ mod revival {
             100.0,
             &[("reset_credit_1", Some("2026-07-08T00:00:00Z"))],
         );
-        let initial = mock::transformer::base_response("plus", 100.0, 1800, 50.0, 604800);
-        let mut blocked = initial.clone();
+        let mut blocked = mock::transformer::base_response("plus", 100.0, 1800, 50.0, 604800);
         blocked["rate_limit_reached_type"] = json!({"type": "workspace_owner_credits_depleted"});
-        let usage_server = mock::MockServer::start(vec![(
-            "tok_card_holder".to_string(),
-            vec![initial, blocked],
-        )])
-        .await;
+        let usage_server =
+            mock::MockServer::start(vec![("tok_card_holder".to_string(), vec![blocked])]).await;
         let (consume_url, consume_requests, consume_server) = counting_consume_url().await;
         let profile_path = home.join(".codex-switch/profiles/card_holder/auth.json");
         let profile_before = fs::read(&profile_path).unwrap();
@@ -1670,7 +1673,7 @@ mod revival {
         );
 
         assert!(!output.status.success());
-        assert_eq!(usage_server.request_count("tok_card_holder"), 2);
+        assert_eq!(usage_server.request_count("tok_card_holder"), 1);
         assert_eq!(
             consume_requests.load(Ordering::SeqCst),
             0,

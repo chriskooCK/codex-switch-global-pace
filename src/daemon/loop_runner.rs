@@ -4,14 +4,7 @@ use super::state::{self, DaemonState, PendingSwitch, SwitchRecord};
 use crate::signals::ShutdownListener;
 use crate::{auth, cache, config, profile, task_batch, usage, warmup};
 
-async fn shutdown_request_received() {
-    loop {
-        if super::pidfile::shutdown_requested() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
+const SHUTDOWN_REQUEST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Outcome of one monitor poll.
 enum PollOutcome {
@@ -78,38 +71,30 @@ fn switch_defer_reason(
 struct CandidateProfile {
     alias: String,
     path: std::path::PathBuf,
-    info: crate::jwt::AccountInfo,
-    last_used: i64,
+    binding: crate::jwt::StrictAccountBinding,
 }
 
-fn preflight_candidate_profiles_with(
-    profiles: &[String],
-    current: &str,
-    last_used: &std::collections::HashMap<String, i64>,
-    mut resolve_path: impl FnMut(&str) -> Result<std::path::PathBuf>,
-    mut read_info: impl FnMut(&str, &std::path::Path) -> Result<crate::jwt::AccountInfo>,
+fn preflight_candidate_profiles(
+    accounts: Vec<profile::ProfileAccountSnapshot>,
 ) -> Result<Vec<CandidateProfile>> {
-    let mut candidates = Vec::with_capacity(profiles.len().saturating_sub(1));
-    for alias in profiles {
-        if alias == current {
-            continue;
-        }
-        let path = resolve_path(alias)
-            .with_context(|| format!("resolving candidate profile path: {alias}"))?;
-        let info = read_info(alias, &path)
-            .with_context(|| format!("reading candidate profile metadata: {alias}"))?;
+    let mut candidates = Vec::with_capacity(accounts.len());
+    for profile::ProfileAccountSnapshot { alias, path, info } in accounts {
+        let binding = info.strict_binding().with_context(|| {
+            format!("candidate profile '{alias}' requires a verified account id and email identity")
+        })?;
         candidates.push(CandidateProfile {
-            alias: alias.clone(),
+            alias,
             path,
-            info,
-            last_used: last_used.get(alias).copied().unwrap_or(0),
+            binding,
         });
     }
     Ok(candidates)
 }
 
 /// Main daemon event loop: periodically checks usage and switches account when needed.
-pub async fn run_daemon_loop() -> Result<()> {
+pub async fn run_daemon_loop(
+    shutdown_request: super::pidfile::ShutdownRequestMonitor,
+) -> Result<()> {
     // Registered before anything else can block: from here on every signal is
     // recorded, even while a branch body is busy.
     let mut shutdown = ShutdownListener::new()?;
@@ -119,6 +104,7 @@ pub async fn run_daemon_loop() -> Result<()> {
     let token_secs = cfg.daemon.token_check_interval_secs;
     let cache_refresh_secs = cfg.daemon.cache_refresh_interval_secs;
     let auto_warmup = cfg.daemon.auto_warmup;
+    let client = auth::build_http_client().context("building daemon HTTP client")?;
 
     let mut poll_interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -130,6 +116,8 @@ pub async fn run_daemon_loop() -> Result<()> {
         cache_refresh_period,
     );
     cache_refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut shutdown_request_interval = tokio::time::interval(SHUTDOWN_REQUEST_POLL_INTERVAL);
+    shutdown_request_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut st = DaemonState {
         pid: std::process::id(),
@@ -161,7 +149,7 @@ pub async fn run_daemon_loop() -> Result<()> {
                     st.backoff_until = None;
                 }
 
-                match check_and_switch().await {
+                match check_and_switch(&client).await {
                     Ok(outcome) => {
                         st.consecutive_failures = 0;
                         st.last_error = None;
@@ -217,7 +205,7 @@ pub async fn run_daemon_loop() -> Result<()> {
             _ = token_interval.tick() => {
                 // Runs unattended on a timer: a lost write here bricks the
                 // profile with nobody watching, so it gets ERROR, not debug.
-                match usage::refresh_expiring_tokens().await {
+                match usage::refresh_expiring_tokens_with_client(&client).await {
                     Ok(failures) => for failure in failures {
                         // `detail` already opens with `[alias]` and carries the
                         // underlying IO/permission cause; the field makes the
@@ -230,7 +218,7 @@ pub async fn run_daemon_loop() -> Result<()> {
                 }
             }
             _ = cache_refresh_interval.tick() => {
-                match refresh_profile_cache(auto_warmup).await {
+                match refresh_profile_cache(auto_warmup, &client).await {
                     Ok(summary) => tracing::debug!(
                         "Cache refresh completed: refreshed={}, warmed={}, failed={}",
                         summary.refreshed,
@@ -246,9 +234,11 @@ pub async fn run_daemon_loop() -> Result<()> {
                 tracing::info!("Received shutdown signal, exiting daemon loop");
                 break;
             }
-            _ = shutdown_request_received() => {
-                tracing::info!("Received generation-bound shutdown request, exiting daemon loop");
-                break;
+            _ = shutdown_request_interval.tick() => {
+                if shutdown_request.is_requested() {
+                    tracing::info!("Received generation-bound shutdown request, exiting daemon loop");
+                    break;
+                }
             }
         }
     }
@@ -256,27 +246,43 @@ pub async fn run_daemon_loop() -> Result<()> {
 }
 
 /// Check current account usage and switch to a better candidate if threshold exceeded.
-async fn check_and_switch() -> Result<PollOutcome> {
+async fn check_and_switch(client: &reqwest::Client) -> Result<PollOutcome> {
     let profiles = profile::list_profiles()?;
     if profiles.len() < 2 {
         return Ok(PollOutcome::NoAction);
     }
 
-    let Some(current) = profile::sync_current_from_live()? else {
+    let Some(synced_registry) = profile::sync_current_from_live_with_registry()? else {
         tracing::debug!("No saved profile matches the live Codex authentication");
         return Ok(PollOutcome::NoAction);
     };
+    let current = synced_registry.current().to_string();
 
     let cfg = config::get();
     let safety_7d = cfg.use_cfg.safety_margin_7d;
     let threshold = cfg.daemon.switch_threshold;
-    let now = auth::now_unix_secs()?;
 
-    // 1. Force-fetch current account's usage (bypass cache)
+    // 1. Probe current quota without replacing a metadata-complete cache entry.
     let current_path = profile::profile_auth_path(&current)?;
-    let current_usage = usage::fetch_usage_retried_unattended(&current, &current_path)
+    let current_lease = profile::acquire_profile_lease_async(current.clone())
         .await
-        .map_err(|e| anyhow::anyhow!("{}", e.detail))?;
+        .with_context(|| format!("locking current profile for automatic ranking: {current}"))?;
+    let current_usage = usage::probe_core_usage_unattended_with_existing_lease_and_client(
+        &current,
+        &current_path,
+        &current_lease,
+        None,
+        client,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{}", e.detail))?;
+    let current_auth = auth::read_auth_async(&current_path)
+        .await
+        .with_context(|| {
+            format!("reading current profile metadata after automatic quota probe: {current}")
+        })?;
+    let current_info = auth::account_info_from_auth_value(&current_auth);
+    drop(current_lease);
 
     // 2. Check if current account exceeds threshold
     // Weekly-only responses have no normalized primary window, so use their
@@ -306,21 +312,23 @@ async fn check_and_switch() -> Result<PollOutcome> {
         threshold,
     );
 
-    let last_used = cache::last_used_snapshot_checked()
-        .context("loading profile-selection history for automatic ranking")?;
-    let current_info = auth::read_account_info_checked(&current_path).with_context(|| {
-        format!("reading current profile metadata for automatic ranking: {current}")
-    })?;
-
     // 3. Fetch all other candidates concurrently
     let team_priority = cfg.use_cfg.team_priority;
-    let candidates = preflight_candidate_profiles_with(
-        &profiles,
-        &current,
-        &last_used,
-        profile::profile_auth_path,
-        |_alias, path| auth::read_account_info_checked(path),
-    )?;
+    let candidate_accounts = synced_registry
+        .into_candidate_accounts()
+        .context("parsing candidate metadata from the synchronized profile registry")?;
+    let candidates = preflight_candidate_profiles(candidate_accounts)?;
+    let mut account_ids = candidates
+        .iter()
+        .map(|candidate| candidate.binding.account_id.clone())
+        .collect::<Vec<_>>();
+    if let Some(account_id) = current_info.account_id.clone() {
+        account_ids.push(account_id);
+    }
+    account_ids.sort();
+    account_ids.dedup();
+    let ranking_cache = cache::ranking_snapshot_checked(&account_ids)
+        .context("loading cache metadata for automatic ranking")?;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.network.max_concurrent));
     let mut tasks = tokio::task::JoinSet::new();
     let mut task_aliases = std::collections::HashMap::new();
@@ -328,13 +336,55 @@ async fn check_and_switch() -> Result<PollOutcome> {
     for candidate in candidates {
         let tracked_alias = candidate.alias.clone();
         let semaphore = semaphore.clone();
+        let client = client.clone();
         let task = tasks.spawn(async move {
-            let _permit = semaphore
-                .acquire_owned()
+            let lease = profile::acquire_profile_lease_async(candidate.alias.clone())
                 .await
-                .context("candidate usage limiter closed")?;
-            let fetched = usage::fetch_usage_retried(&candidate.alias, &candidate.path).await;
-            Ok::<_, anyhow::Error>((candidate.info, candidate.last_used, fetched))
+                .with_context(|| {
+                    format!(
+                        "locking candidate profile for automatic ranking: {}",
+                        candidate.alias
+                    )
+                })?;
+            let prepared = match usage::prepare_core_usage_unattended_with_existing_lease(
+                &candidate.alias,
+                &candidate.path,
+                &lease,
+                &candidate.binding,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return Ok::<_, anyhow::Error>(Err(error)),
+            };
+            let mut network =
+                usage::NetworkPermitBudget::new(usage::first_network_permit(semaphore));
+            let fetched = match usage::execute_prepared_core_usage_with_existing_lease_and_client(
+                prepared,
+                &lease,
+                &client,
+                &mut network,
+            )
+            .await
+            {
+                Ok(fetched) => fetched,
+                Err(error) => return Ok::<_, anyhow::Error>(Err(error)),
+            };
+            let auth_after = auth::read_auth_async(&candidate.path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "reading candidate profile metadata after automatic quota probe: {}",
+                        candidate.alias
+                    )
+                })?;
+            let info = auth::account_info_from_auth_value(&auth_after);
+            anyhow::ensure!(
+                info.strict_binding() == Some(candidate.binding),
+                "candidate profile '{}' changed identity during automatic ranking",
+                candidate.alias
+            );
+            Ok::<_, anyhow::Error>(Ok((info, fetched)))
         });
         let previous = task_aliases.insert(task.id(), tracked_alias);
         debug_assert!(previous.is_none());
@@ -342,23 +392,16 @@ async fn check_and_switch() -> Result<PollOutcome> {
 
     // 4. Score everything uniformly (same helper as CLI `use`); the current
     // account goes first so it can be split back off after scoring.
-    let mut items = vec![(
-        current.clone(),
-        current_usage.clone(),
-        current_info,
-        last_used.get(&current).copied().unwrap_or(0),
-    )];
+    let mut observations = vec![(current.clone(), current_usage.clone(), current_info)];
     let outcomes = task_batch::drain_named_tasks(&mut tasks, &mut task_aliases, |_| {}).await;
     let mut worker_failures = Vec::new();
     for outcome in outcomes {
         match outcome {
             task_batch::NamedTaskOutcome::Completed { alias, value } => match value {
-                Ok((info, alias_last_used, fetched)) => match fetched {
-                    Ok(fetched) => items.push((alias, fetched, info, alias_last_used)),
-                    Err(error) => {
-                        tracing::warn!("[{alias}] fetch failed: {}", error.summary);
-                    }
-                },
+                Ok(Ok((info, fetched))) => observations.push((alias, fetched, info)),
+                Ok(Err(error)) => {
+                    tracing::warn!("[{alias}] fetch failed: {}", error.summary);
+                }
                 Err(error) => worker_failures.push((alias, format!("{error:#}"))),
             },
             task_batch::NamedTaskOutcome::Failed { alias, detail } => {
@@ -373,7 +416,19 @@ async fn check_and_switch() -> Result<PollOutcome> {
         ));
     }
 
-    let mut scored = usage::score_candidates(items, now, safety_7d, team_priority);
+    let mut items = Vec::with_capacity(observations.len());
+    for (alias, usage, mut info) in observations {
+        if let Some(account_id) = info.account_id.as_deref()
+            && let Some(workspace) = ranking_cache.workspaces.get(account_id)
+        {
+            cache::apply_workspace_state(&mut info, workspace);
+        }
+        let last_used = ranking_cache.last_used.get(&alias).copied().unwrap_or(0);
+        items.push((alias, usage, info, last_used));
+    }
+
+    let scoring_time = auth::now_unix_secs()?;
+    let mut scored = usage::score_candidates(items, scoring_time, safety_7d, team_priority);
     let current_scored = scored.remove(0);
     let current_score = current_scored.score;
 
@@ -441,7 +496,7 @@ async fn check_and_switch() -> Result<PollOutcome> {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_usage_percent_for_switch, poll_backoff_secs, preflight_candidate_profiles_with,
+        current_usage_percent_for_switch, poll_backoff_secs, preflight_candidate_profiles,
         switch_defer_reason,
     };
     use crate::daemon::codex_process::CodexActivity;
@@ -568,36 +623,60 @@ mod tests {
     }
 
     #[test]
-    fn automatic_selection_preflights_every_candidate_before_spawning_workers() {
-        let profiles = vec![
-            "current".to_string(),
-            "alice".to_string(),
-            "bob".to_string(),
+    fn automatic_selection_uses_retained_candidate_path_and_binding() {
+        let candidates =
+            preflight_candidate_profiles(vec![crate::profile::ProfileAccountSnapshot {
+                alias: "alice".to_string(),
+                path: std::path::PathBuf::from("retained/alice/auth.json"),
+                info: crate::jwt::AccountInfo {
+                    account_id: Some("acct-alice".to_string()),
+                    email: Some("alice@example.com".to_string()),
+                    ..crate::jwt::AccountInfo::default()
+                },
+            }])
+            .unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].alias, "alice");
+        assert_eq!(
+            candidates[0].path,
+            std::path::PathBuf::from("retained/alice/auth.json")
+        );
+        assert_eq!(candidates[0].binding.account_id, "acct-alice");
+        assert_eq!(candidates[0].binding.email, "alice@example.com");
+    }
+
+    #[test]
+    fn automatic_selection_preflights_every_retained_candidate_before_spawning_workers() {
+        let accounts = vec![
+            crate::profile::ProfileAccountSnapshot {
+                alias: "alice".to_string(),
+                path: std::path::PathBuf::from("alice"),
+                info: crate::jwt::AccountInfo {
+                    account_id: Some("acct-alice".to_string()),
+                    email: Some("alice@example.com".to_string()),
+                    ..crate::jwt::AccountInfo::default()
+                },
+            },
+            crate::profile::ProfileAccountSnapshot {
+                alias: "bob".to_string(),
+                path: std::path::PathBuf::from("bob"),
+                info: crate::jwt::AccountInfo {
+                    account_id: Some("acct-bob".to_string()),
+                    email: None,
+                    ..crate::jwt::AccountInfo::default()
+                },
+            },
         ];
-        let path_reads = AtomicUsize::new(0);
-        let info_reads = AtomicUsize::new(0);
 
-        let error = preflight_candidate_profiles_with(
-            &profiles,
-            "current",
-            &std::collections::HashMap::new(),
-            |alias| {
-                path_reads.fetch_add(1, Ordering::SeqCst);
-                Ok(std::path::PathBuf::from(alias))
-            },
-            |alias, _path| {
-                info_reads.fetch_add(1, Ordering::SeqCst);
-                if alias == "bob" {
-                    anyhow::bail!("injected later metadata failure");
-                }
-                Ok(crate::jwt::AccountInfo::default())
-            },
-        )
-        .expect_err("a later preflight failure must reject the complete candidate batch");
+        let error = preflight_candidate_profiles(accounts)
+            .expect_err("a later incomplete identity must reject the complete candidate batch");
 
-        assert!(format!("{error:#}").contains("injected later metadata failure"));
-        assert_eq!(path_reads.load(Ordering::SeqCst), 2);
-        assert_eq!(info_reads.load(Ordering::SeqCst), 2);
+        assert!(
+            format!("{error:#}").contains("candidate profile 'bob'"),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("account id and email"));
     }
 }
 
@@ -608,13 +687,15 @@ struct CacheRefreshSummary {
     failed: usize,
 }
 
-async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary> {
+async fn refresh_profile_cache(
+    auto_warmup: bool,
+    client: &reqwest::Client,
+) -> Result<CacheRefreshSummary> {
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
         return Ok(CacheRefreshSummary::default());
     }
 
-    let now = auth::now_unix_secs()?;
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
         config::get().network.max_concurrent,
     ));
@@ -622,34 +703,96 @@ async fn refresh_profile_cache(auto_warmup: bool) -> Result<CacheRefreshSummary>
 
     for alias in profiles {
         let sem = semaphore.clone();
+        let client = client.clone();
         tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire_owned().await else {
-                return (
-                    alias,
-                    false,
-                    false,
-                    Some("usage limiter closed".to_string()),
-                );
-            };
             let path = match profile::profile_auth_path(&alias) {
                 Ok(path) => path,
                 Err(e) => return (alias, false, false, Some(e.to_string())),
             };
-
-            let usage = match usage::fetch_usage_retried_unattended(&alias, &path).await {
-                Ok(usage) => usage,
-                Err(e) => return (alias, false, false, Some(e.summary)),
+            let lease = match profile::acquire_profile_lease_async(alias.clone()).await {
+                Ok(lease) => lease,
+                Err(error) => return (alias, false, false, Some(error.to_string())),
             };
 
-            if !auto_warmup || usage::usage_has_active_warmup_window(&usage, now) {
+            let prepared = match usage::prepare_full_usage_with_existing_lease(
+                &alias,
+                &path,
+                usage::Refresh::Unattended,
+                &lease,
+                None,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(e) => return (alias, false, false, Some(e.summary)),
+            };
+            let mut network =
+                usage::NetworkPermitBudget::new(usage::first_network_permit(sem.clone()));
+            let observation =
+                match usage::execute_prepared_full_usage_with_existing_lease_and_client(
+                    prepared,
+                    &lease,
+                    &client,
+                    &mut network,
+                )
+                .await
+                {
+                    Ok(observation) => observation,
+                    Err(e) => return (alias, false, false, Some(e.summary)),
+                };
+
+            if !auto_warmup {
+                return (alias, true, false, None);
+            }
+            let now = match auth::now_unix_secs() {
+                Ok(now) => now,
+                Err(error) => return (alias, true, false, Some(error.to_string())),
+            };
+            if usage::usage_has_active_warmup_window(&observation.usage, now) {
                 return (alias, true, false, None);
             }
 
-            if let Err(e) = warmup::warmup_account(&alias, &path).await {
-                return (alias, true, false, Some(format!("warmup failed: {e}")));
-            }
+            let lease = match warmup::warmup_account_leased_with_client_after_usage_preflight(
+                &alias,
+                &path,
+                lease,
+                &client,
+                &observation.binding,
+                Some(observation.usage),
+                warmup::first_network_permit(sem.clone()),
+            )
+            .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return (alias, true, false, Some(format!("warmup failed: {error}")));
+                }
+            };
 
-            if let Err(e) = usage::fetch_usage_retried_unattended(&alias, &path).await {
+            let post_warmup = usage::prepare_full_usage_with_existing_lease(
+                &alias,
+                &path,
+                usage::Refresh::Unattended,
+                &lease,
+                Some(&observation.binding),
+            )
+            .await;
+            let post_warmup = match post_warmup {
+                Ok(prepared) => {
+                    let mut network =
+                        usage::NetworkPermitBudget::new(usage::first_network_permit(sem));
+                    usage::execute_prepared_full_usage_with_existing_lease_and_client(
+                        prepared,
+                        &lease,
+                        &client,
+                        &mut network,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(e) = post_warmup {
                 tracing::warn!("[{alias}] post-warmup cache refresh failed: {}", e.summary);
             }
             (alias, true, true, None)

@@ -30,6 +30,13 @@ The application treats local files, command-line input, supported environment co
 
 Configuration is loaded once from `config.toml`. An existing unreadable or invalid file fails fast with its path; missing configuration uses defaults. CLI proxy configuration has higher priority than file and environment configuration.
 
+The bare TUI launches profile enumeration on the blocking pool, paints its first
+frame without waiting for it, and starts live-auth reconciliation, cache
+loading, HTTP-client construction, file-log arming, and pending self-update
+cleanup through tracked work that cannot delay that frame. Every task retains
+its normal failure reporting. Ordinary CLI file logging is also demand-driven:
+a command that emits no enabled log record does no log-path or ACL work.
+
 ## Authentication and profile ownership
 
 [`src/auth.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/auth.rs) resolves `CODEX_HOME`, validates the Codex credential-store contract, reads and atomically writes authentication JSON, rotates live-auth backups, and builds network clients. It does not own profile selection.
@@ -38,6 +45,16 @@ Configuration is loaded once from `config.toml`. An existing unreadable or inval
 
 Credential replacement requires an exact `account_id` and email match; an
 email-only or otherwise incomplete identity never authorizes an overwrite.
+Interactive re-login captures that strict identity under a short profile
+lease, releases the lease during the browser or device-code wait, and validates
+the initial, current, and incoming identities after reacquiring it for commit.
+Interactive overwrite confirmation follows the same ownership shape: the
+prepared target and live snapshots cross the lease-free stdin wait, then a new
+lease and the auth transaction revalidate them before any switch or reset-card
+side effect.
+The common unchanged live-auth path checks only the current marker and that
+profile before avoiding a full registry scan; concurrent marker movement causes
+a bounded fresh observation rather than publishing stale state.
 Imports are intentionally create-only: Usage API access proves workspace
 membership, but a Team workspace ID can belong to several users and cannot
 authorize overwriting an existing profile. Tokens refreshed while a profile is
@@ -58,13 +75,24 @@ The [`src/usage/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/d
 | `scoring.rs` | Pure eligibility, pace, and candidate scoring functions |
 | `mod.rs` | Shared domain types and public module surface |
 
-[`src/cache.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/cache.rs) persists usage and workspace-name data. It also records two negative results, so a known answer is not requested again on every invocation: credentials the auth server has permanently refused, kept until the credential itself is replaced, and accounts confirmed to have no workspace name, kept for a day. `--force` bypasses both, and is the only thing that does: the daemon's periodic refresh takes current usage numbers but leaves a recorded refusal standing, since re-presenting a spent credential on a timer cannot produce a different answer. Cache file updates use an in-process mutex and a cross-process file lock, then replace the file atomically.
+[`src/cache.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/cache.rs) persists usage, workspace metadata, selection history, and rejected-credential verdicts. Usage belongs to a profile alias plus its verified account ID and email; batch readers obtain one identity-checked snapshot, and deferred enrichment uses an exact revision or raw-generation compare-and-swap so it cannot overwrite a newer quota result or cross an alias rebind. Alias-scoped mutation tombstones distinguish a genuinely unchanged absence from create-then-delete ABA. Automatic selection can reuse a fresh quota-only generation, but ordinary usage readers require the complete metadata marker; only quota-only candidates need reset-card enrichment, while a fresh complete entry avoids that extra request and any approved redemption is still forcibly revalidated. CAS conflicts return the newer same-account value unchanged and selection is scored again from that authoritative result. Workspace names and confirmed absence are keyed by account ID and both remain fresh for one day; lookup releases its network slot before the cache lock and publication step. A permanently refused credential is remembered only until that exact credential is replaced. `--force` bypasses the negative results, and is the only thing that does: the daemon's periodic refresh takes current usage numbers but leaves a recorded refusal standing, since re-presenting a spent credential on a timer cannot produce a different answer. Cache file updates use an in-process mutex and a cross-process file lock, then replace the file atomically.
 
 Selection has two phases. Eligibility excludes candidates with missing authoritative quota data, exhausted windows, critical weekly state with a distant reset, or an unsafe Free-plan balance. Scoring then combines tier preference, pace-aware headroom, weekly sustainability, expiring quota value, and recency. The shared scoring path is used by both interactive commands and the daemon.
 
 ## TUI and output contracts
 
-[`src/tui/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/dev/src/tui) separates application state, key bindings, menus, popups, and rendering. Network or filesystem actions suspend or update the terminal deliberately rather than running inside rendering functions.
+[`src/tui/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/dev/src/tui) separates application state, key bindings, menus, popups, and rendering. Network or filesystem actions suspend or update the terminal deliberately rather than running inside rendering functions. Startup prioritizes selected and active accounts, publishes core quota immediately, and starts each workspace lookup only after that alias's credential persistence and lease release; an unrelated slow quota request does not hold back ready workspace metadata or selected-account model discovery. Reset-card metadata remains deferred without hiding the quota result, and a startup cache read error is reported without suppressing the independent network refresh. Credential tasks can be cancelled while safely waiting for their first shared network slot, workspace reads release their profile lease before the read-only HTTP phase, and reset-card, model-discovery, token-refresh, usage, and warmup requests acquire the same process-local limit only around each HTTP operation. Retry delays and local cache or credential persistence do not retain that slot. The event loop polls work independently but redraws only for state, input, resize, or second-boundary changes.
+
+Warmup releases the alias lease during a network model-list lookup. Before the
+first quota-activating POST, it reacquires the lease and rechecks the strict
+identity, exact credential snapshot, and token freshness; an invalidated lookup
+is neither published to the model cache nor used for a request. Model results
+and duplicate-fetch locks use the strict account binding plus the normalized
+quota-pool set rather than the mutable alias. TUI cancellation can therefore
+stop the read-only lookup or lease reacquisition, with one atomic commit before
+cache publication and quota mutation. The cache retains pool-to-model mappings;
+an explicit unsupported-model response invalidates them and triggers at most
+one official re-resolution while preserving already completed pool targets.
 
 [`src/output.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/output.rs) owns JSON response types and human formatting. In JSON mode stdout must contain only structured output; human diagnostics and progress are routed to stderr. This separation is part of the automation contract and is covered by integration tests.
 
@@ -72,7 +100,7 @@ Selection has two phases. Eligibility excludes candidates with missing authorita
 
 [`src/daemon/`](https://github.com/chriskooCK/codex-switch-global-pace/tree/dev/src/daemon) separates orchestration, polling, process detection, notifications, PID-file ownership, service-manager integration, and persisted state.
 
-The loop uses independent timers for account polling, cache refresh, and token checks. Recoverable failures are exposed through state and bounded backoff. A pending switch is retained while an interactive Codex session is detected and retried later.
+The loop uses independent timers for account polling, cache refresh, and token checks. Recoverable failures are exposed through state and bounded backoff. A pending switch is retained while an interactive Codex session is detected and retried later. Before a daemon parent spawns a child or a foreground daemon publishes PID readiness, file logging validates its secure directory, lock file, and current daily append handle. The foreground process then keeps the exact PID generation it published; graceful-stop polling reads only the mutable generation-bound request file rather than reopening the immutable PID identity on every tick.
 
 Service managers start the binary in foreground mode:
 

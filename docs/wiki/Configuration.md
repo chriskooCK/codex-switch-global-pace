@@ -32,10 +32,10 @@ Accounts are added by logging in with `codex-switch-global-pace login` or by imp
 | `$CODEX_SWITCH_HOME/profiles/<alias>/auth.json` | Saved profile authentication. |
 | `$CODEX_SWITCH_HOME/deleted-profiles/` | Recoverable deleted profiles. |
 | `$CODEX_SWITCH_HOME/current` | Current alias marker. |
-| `$CODEX_SWITCH_HOME/cache.json` | Per-profile usage cache. |
+| `$CODEX_SWITCH_HOME/cache.json` | Identity-bound usage, workspace metadata, rejected-credential verdicts, and selection history. |
 | `$CODEX_SWITCH_HOME/config.toml` | Optional settings. |
 | `$CODEX_SWITCH_HOME/daemon-state.json` | Last Beta daemon state snapshot. |
-| `$CODEX_SWITCH_HOME/logs/` | Diagnostic logs: one file per day, 3 calendar days retained, 10 MiB total cap. |
+| `$CODEX_SWITCH_HOME/logs/` | Diagnostic logs: one file per day, 3 calendar days retained, with a 10 MiB maintenance target. |
 | `$CODEX_SWITCH_HOME/*.lock` | Cross-process coordination files. |
 
 Unset variables default to `~/.codex` and `~/.codex-switch` respectively (`%USERPROFILE%\.codex-switch` on Windows).
@@ -103,6 +103,13 @@ the poll interval validation includes its maximum 16× failure backoff. Unknown
 tables or keys are rejected so a misspelling cannot silently select a default,
 and a configured proxy URL is parsed at this same startup boundary.
 
+`network.max_concurrent` is the shared HTTP-request limit inside each process.
+Usage, token refresh, reset-card, workspace, model-discovery, and warmup work
+acquires it for each request and returns it before retry sleep or local cache and
+credential persistence. Refresh authorization and profile/auth transaction
+waits also happen outside the limit; a follow-up HTTP request must acquire fresh
+capacity. It is not a cross-process global limit.
+
 The legacy `[use] mode` and `[use] min_remaining` keys are ignored and produce a startup warning; the unified scoring algorithm replaced the old selection modes.
 The removed `[launch]` table is also ignored with a startup warning and can be deleted from existing configuration files.
 
@@ -141,7 +148,7 @@ Do not commit credentials in configuration files.
 
 ## Logging
 
-Every command writes diagnostic logs to `$CODEX_SWITCH_HOME/logs/`, one file per calendar day, keeping 3 days and at most 10 MiB. Level resolution: `--debug` wins over `RUST_LOG`, which wins over `daemon.log_level`; the default is `error`. `daemon.log_level` applies only to `daemon` commands — it does not change logging for `list`, `use`, or other commands.
+Enabled diagnostic records are written to `$CODEX_SWITCH_HOME/logs/`, one file per calendar day, keeping 3 days with a 10 MiB maintenance target. To avoid a directory scan for every record, each writer process runs size and age maintenance on its first record and then after either 60 seconds or 1 MiB of appended records. Concurrent writers or an existing oversized directory can therefore remain above the target until a scheduled maintenance pass. Ordinary CLI and TUI commands that emit no enabled record do not initialize the log path. `daemon start` is the deliberate exception: before spawning or publishing PID readiness, it validates the secure log directory, lock, and current daily append handle without emitting a synthetic record or running retention. Once active, secured handles are reused until date rollover rather than reopened for every record. Level resolution: `--debug` wins over `RUST_LOG`, which wins over `daemon.log_level`; the default is `error`. `daemon.log_level` applies only to `daemon` commands — it does not change logging for `list`, `use`, or other commands.
 
 ## Platform integration
 

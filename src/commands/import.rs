@@ -1,7 +1,7 @@
 use super::render::print_usage_line;
 use crate::output::{self, ProgressReporter, account_to_json, print_json, usage_to_json};
 use crate::{auth, color, profile, usage};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Validation failed, but the auth server had already rotated the credentials
 /// and they were rescued into a profile.
@@ -130,8 +130,12 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
         }
     }
 
+    // Build once before processing any source. A later per-file client failure
+    // must not leave earlier directory entries with consumed refresh tokens.
+    let client = auth::build_http_client().context("building import-validation HTTP client")?;
+
     if single_file_input {
-        let imported = match import_one_file(&files[0], alias).await {
+        let imported = match import_one_file(&files[0], alias, &client).await {
             Ok(imported) => imported,
             Err(failure) => anyhow::bail!("{}: {}", failure.stage, failure.error),
         };
@@ -166,7 +170,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
     };
 
     for (idx, file) in files.into_iter().enumerate() {
-        match import_one_file(&file, None).await {
+        match import_one_file(&file, None, &client).await {
             Ok(success) => report.imported.push(success),
             Err(failure) => report.skipped.push(failure),
         }
@@ -280,6 +284,7 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
 async fn import_one_file(
     source: &std::path::Path,
     alias: Option<&str>,
+    client: &reqwest::Client,
 ) -> std::result::Result<profile::ImportSuccess, profile::ImportFailure> {
     let mut val = auth::read_auth(source).map_err(|e| profile::ImportFailure {
         source: source.to_path_buf(),
@@ -319,14 +324,18 @@ async fn import_one_file(
         .map(profile::alias_from_email);
 
     let mut rotation_stage: Option<profile::ImportRotationStage> = None;
-    let validation = usage::validate_import_auth(&mut val, |rotated| {
-        if let Some(stage) = rotation_stage.as_mut() {
-            stage.persist(rotated)
-        } else {
-            rotation_stage = Some(profile::stage_import_rotation(rotated)?);
-            Ok(())
-        }
-    })
+    let validation = usage::validate_import_auth_with_client(
+        &mut val,
+        |rotated| {
+            if let Some(stage) = rotation_stage.as_mut() {
+                stage.persist(rotated)
+            } else {
+                rotation_stage = Some(profile::stage_import_rotation(rotated)?);
+                Ok(())
+            }
+        },
+        client,
+    )
     .await;
     let usage::ImportValidation {
         refreshed,

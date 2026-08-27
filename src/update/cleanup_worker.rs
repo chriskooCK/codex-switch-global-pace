@@ -470,13 +470,18 @@ fn path_entry_exists(path: &std::path::Path) -> Result<bool> {
     }
 }
 
-pub(super) fn recover_pending(public_executable: &std::path::Path) -> Result<bool> {
+pub(super) fn recover_pending_on_startup(public_executable: &std::path::Path) -> Result<bool> {
     let path = journal_path(public_executable)?;
     if !path_entry_exists(&path)? {
         return Ok(false);
     }
-    let _lease = super::acquire_update_lease(public_executable)
-        .context("locking self-update cleanup recovery")?;
+    let Some(_lease) = super::try_acquire_startup_cleanup_lease(public_executable)
+        .context("trying the self-update cleanup recovery lease")?
+    else {
+        anyhow::bail!(
+            "another self-update transaction currently holds the cleanup lease; the pending journal was not changed"
+        );
+    };
     if !path_entry_exists(&path)? {
         return Ok(false);
     }
@@ -839,6 +844,50 @@ mod tests {
     }
 
     #[test]
+    fn contended_startup_recovery_returns_without_touching_the_journal() {
+        let temp =
+            crate::fs_ops::create_direct_tempdir().expect("create contended cleanup fixture");
+        let public = temp.path().join("public.exe");
+        std::fs::write(&public, b"published executable").expect("write public fixture");
+        let journal = super::journal_path(&public).expect("derive cleanup journal");
+        let journal_bytes = b"{pending cleanup fixture";
+        std::fs::write(&journal, journal_bytes).expect("write pending cleanup journal");
+        let journal_token =
+            crate::fs_ops::token_for_path(&journal).expect("bind pending cleanup journal");
+        let lease = super::super::acquire_update_lease(&public)
+            .expect("hold the active self-update transaction lease");
+
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let recovery_public = public.clone();
+        let recovery = std::thread::spawn(move || {
+            result_tx
+                .send(super::recover_pending_on_startup(&recovery_public))
+                .expect("report startup recovery result");
+        });
+        let prompt_result = result_rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lease);
+        recovery.join().expect("join startup recovery fixture");
+        let error = prompt_result
+            .expect("startup cleanup waited for the active update transaction")
+            .expect_err("contended startup cleanup unexpectedly acquired the update lease");
+
+        assert!(
+            format!("{error:#}").contains("currently holds the cleanup lease"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&journal).expect("read retained cleanup journal"),
+            journal_bytes,
+            "contended startup recovery changed the pending journal"
+        );
+        assert_eq!(
+            crate::fs_ops::token_for_path(&journal).expect("rebind retained cleanup journal"),
+            journal_token,
+            "contended startup recovery replaced the pending journal"
+        );
+    }
+
+    #[test]
     fn an_undeletable_journal_remains_exactly_retryable() {
         use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
@@ -871,7 +920,7 @@ mod tests {
             .share_mode(FILE_SHARE_READ)
             .open(&journal)
             .expect("pin journal against delete");
-        let error = super::recover_pending(&public)
+        let error = super::recover_pending_on_startup(&public)
             .expect_err("a pinned journal cannot be consumed conclusively");
         assert!(
             format!("{error:#}").contains("cleanup journal"),
@@ -893,7 +942,7 @@ mod tests {
 
         drop(pin);
         assert!(
-            super::recover_pending(&public).expect("retry exact cleanup"),
+            super::recover_pending_on_startup(&public).expect("retry exact cleanup"),
             "the retained journal was not retried"
         );
         assert!(!journal.exists(), "retry left the journal behind");
@@ -912,7 +961,7 @@ mod tests {
         let journal = super::journal_path(&public).expect("derive journal path");
         std::fs::write(&journal, b"{not valid json").expect("write malformed journal");
 
-        let error = super::recover_pending(&public)
+        let error = super::recover_pending_on_startup(&public)
             .expect_err("malformed cleanup authority must fail closed");
         assert!(format!("{error:#}").contains("parsing cleanup journal"));
         assert!(journal.exists(), "malformed journal was silently discarded");

@@ -119,7 +119,11 @@ pub(super) async fn prepare(
 pub(super) async fn synchronize_live(
     target_alias: String,
     lease_control: profile::ProfileLeaseAcquireControl,
-    background_leases: Vec<(String, profile::ProfileLeaseAcquireControl)>,
+    background_cancellations: Vec<(
+        String,
+        profile::ProfileLeaseAcquireControl,
+        Vec<super::app::SafeTaskCancellation>,
+    )>,
 ) -> (String, TaskResult) {
     let started = Instant::now();
     let mut lease_wait = Duration::ZERO;
@@ -137,11 +141,14 @@ pub(super) async fn synchronize_live(
                     "current Codex login is not saved; switch stopped without overwriting it"
                 )
             })?;
-        for (_, control) in background_leases
+        for (_, lease_control, safe_controls) in background_cancellations
             .iter()
-            .filter(|(alias, _)| alias == &active_alias)
+            .filter(|(alias, _, _)| alias == &active_alias)
         {
-            control.cancel_waiting();
+            lease_control.cancel_waiting();
+            for control in safe_controls {
+                let _ = control.request();
+            }
         }
         let lease_started = Instant::now();
         let lease_result =

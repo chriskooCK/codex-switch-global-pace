@@ -3,7 +3,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
 /// Single organization/workspace entry
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct OrgInfo {
     #[allow(dead_code)]
     pub id: String,
@@ -13,7 +13,7 @@ pub struct OrgInfo {
     pub is_default: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AccountInfo {
     pub email: Option<String>,
     pub plan_type: Option<String>,
@@ -23,6 +23,17 @@ pub struct AccountInfo {
     pub user_id: Option<String>,
     pub workspace_name: Option<String>,
     pub organizations: Vec<OrgInfo>,
+}
+
+/// Stable binding for read-only account state and asynchronous results.
+///
+/// Both components are required so an alias that is deleted and recreated for
+/// another workspace cannot inherit cache entries or late task results from
+/// its previous owner.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct StrictAccountBinding {
+    pub(crate) account_id: String,
+    pub(crate) email: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +87,18 @@ impl PlanKind {
 }
 
 impl AccountInfo {
+    pub(crate) fn strict_binding(&self) -> Option<StrictAccountBinding> {
+        let account_id = self.account_id.as_deref()?.trim();
+        let email = self.email.as_deref()?.trim();
+        if account_id.is_empty() || email.is_empty() {
+            return None;
+        }
+        Some(StrictAccountBinding {
+            account_id: account_id.to_string(),
+            email: email.to_lowercase(),
+        })
+    }
+
     pub fn plan_label(&self) -> String {
         self.plan_label_with(self.plan_type.as_deref())
     }
@@ -303,6 +326,47 @@ mod tests {
         };
 
         assert!(!info.is_free());
+    }
+
+    #[test]
+    fn strict_binding_requires_both_trimmed_components_and_normalizes_email_case() {
+        let complete = AccountInfo {
+            account_id: Some("  acct-1  ".to_string()),
+            email: Some("  User@Example.COM  ".to_string()),
+            ..AccountInfo::default()
+        };
+        assert_eq!(
+            complete.strict_binding(),
+            Some(StrictAccountBinding {
+                account_id: "acct-1".to_string(),
+                email: "user@example.com".to_string(),
+            })
+        );
+
+        for incomplete in [
+            AccountInfo {
+                account_id: None,
+                email: Some("user@example.com".to_string()),
+                ..AccountInfo::default()
+            },
+            AccountInfo {
+                account_id: Some("acct-1".to_string()),
+                email: None,
+                ..AccountInfo::default()
+            },
+            AccountInfo {
+                account_id: Some("   ".to_string()),
+                email: Some("user@example.com".to_string()),
+                ..AccountInfo::default()
+            },
+            AccountInfo {
+                account_id: Some("acct-1".to_string()),
+                email: Some("   ".to_string()),
+                ..AccountInfo::default()
+            },
+        ] {
+            assert!(incomplete.strict_binding().is_none());
+        }
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
 use tracing::{debug, warn};
 
 /// The models one warmup should touch, keyed by account *and* by the quota
@@ -13,21 +15,210 @@ use tracing::{debug, warn};
 /// request and the additional-pool requests are answered by a single `/models`
 /// response, so caching only the first one made every warmup fetch that
 /// response twice — and with no additional pools, threw the second away.
-static MODEL_CACHE: LazyLock<Mutex<HashMap<String, Vec<String>>>> =
+static MODEL_CACHE: LazyLock<Mutex<HashMap<WarmupModelCacheKey, WarmupModelSelection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 // Serialize duplicate fetches for the same account without blocking unrelated accounts.
-static MODEL_FETCH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+static MODEL_FETCH_LOCKS: LazyLock<Mutex<HashMap<WarmupModelCacheKey, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn model_cache_get(cache: &HashMap<String, Vec<String>>, key: &str) -> Option<Vec<String>> {
+pub(crate) type FirstNetworkPermit = crate::usage::FirstNetworkPermit;
+
+/// Build the ordinary, non-cancellable first-request wait used by CLI and
+/// daemon warmups. TUI callers supply the same future shape with their existing
+/// safe-cancellation race around this first request.
+pub(crate) fn first_network_permit(limiter: Arc<Semaphore>) -> FirstNetworkPermit {
+    crate::usage::first_network_permit(limiter)
+}
+
+pub(crate) fn network_wait_was_cancelled(error: &anyhow::Error) -> bool {
+    crate::usage::network_wait_was_cancelled(error)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("warmup cancelled before its first quota request")]
+struct WarmupSideEffectCancelled;
+
+pub(crate) fn warmup_wait_was_cancelled(error: &anyhow::Error) -> bool {
+    network_wait_was_cancelled(error) || error.downcast_ref::<WarmupSideEffectCancelled>().is_some()
+}
+
+type WarmupCancellation = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type WarmupCommit = Box<dyn FnOnce() -> bool + Send + 'static>;
+
+/// TUI warmups may stop while `/models` is still read-only or while restoring
+/// the alias lease afterward. The commit callback is the single atomic boundary
+/// after which model-cache publication and quota POSTs must drain normally.
+/// CLI and daemon callers use the uncancellable form.
+struct WarmupSideEffectBoundary {
+    cancellation: Option<WarmupCancellation>,
+    commit: Option<WarmupCommit>,
+}
+
+impl WarmupSideEffectBoundary {
+    fn uncancellable() -> Self {
+        Self {
+            cancellation: None,
+            commit: None,
+        }
+    }
+
+    fn cancellable(
+        cancellation: impl Future<Output = ()> + Send + 'static,
+        commit: impl FnOnce() -> bool + Send + 'static,
+    ) -> Self {
+        Self {
+            cancellation: Some(Box::pin(cancellation)),
+            commit: Some(Box::new(commit)),
+        }
+    }
+
+    async fn run_until_commit<T>(&mut self, work: impl Future<Output = Result<T>>) -> Result<T> {
+        let result = if let Some(cancellation) = self.cancellation.as_mut() {
+            tokio::select! {
+                result = work => result,
+                _ = cancellation.as_mut() => return Err(WarmupSideEffectCancelled.into()),
+            }
+        } else {
+            work.await
+        }?;
+        self.commit()?;
+        Ok(result)
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        self.cancellation = None;
+        let Some(commit) = self.commit.take() else {
+            return Ok(());
+        };
+        anyhow::ensure!(commit(), WarmupSideEffectCancelled);
+        Ok(())
+    }
+}
+
+pub(crate) struct WarmupExecutionControls {
+    first_permit: FirstNetworkPermit,
+    side_effect_boundary: WarmupSideEffectBoundary,
+}
+
+impl WarmupExecutionControls {
+    fn uncancellable(first_permit: FirstNetworkPermit) -> Self {
+        Self {
+            first_permit,
+            side_effect_boundary: WarmupSideEffectBoundary::uncancellable(),
+        }
+    }
+
+    pub(crate) fn cancellable(
+        first_permit: FirstNetworkPermit,
+        cancellation: impl Future<Output = ()> + Send + 'static,
+        commit: impl FnOnce() -> bool + Send + 'static,
+    ) -> Self {
+        Self {
+            first_permit,
+            side_effect_boundary: WarmupSideEffectBoundary::cancellable(cancellation, commit),
+        }
+    }
+}
+
+/// Own the first caller-defined admission wait, then reacquire from that same
+/// semaphore for later requests. Direct warmup permits are requested
+/// immediately before HTTP and returned before retry delay or local model-cache
+/// work; the prepared usage executor applies the same boundary to its retries
+/// and usage-cache publication.
+type NetworkBudget = crate::usage::NetworkPermitBudget;
+
+#[derive(Clone, Copy)]
+struct WarmupRequestAuth<'a> {
+    access_token: &'a str,
+    account_id: Option<&'a str>,
+    is_fedramp: bool,
+}
+
+struct WarmupPreflight {
+    binding: crate::jwt::StrictAccountBinding,
+    initial_auth: serde_json::Value,
+    cached_usage: Option<crate::usage::UsageInfo>,
+}
+
+/// The exact credential state authorized to cross a lease-free model lookup.
+/// A warmup may use this snapshot for the read-only `/models` request, but it
+/// must reacquire the alias lease and prove the snapshot is still current before
+/// sending the first side-effecting warmup POST.
+struct WarmupCredentialSnapshot {
+    auth: serde_json::Value,
+    id_token: Option<String>,
+    access_token: String,
+    refresh_token: Option<String>,
+    account_id: Option<String>,
+    is_fedramp: bool,
+}
+
+impl WarmupCredentialSnapshot {
+    fn from_auth(
+        alias: &str,
+        auth: serde_json::Value,
+        expected_binding: &crate::jwt::StrictAccountBinding,
+        identity_error: &str,
+    ) -> Result<Self> {
+        let info = crate::auth::account_info_from_auth_value(&auth);
+        anyhow::ensure!(
+            info.strict_binding().as_ref() == Some(expected_binding),
+            "{alias}: {identity_error}"
+        );
+        let account_id = info.account_id;
+        let is_fedramp = info.is_fedramp;
+        let (access_token, refresh_token) = crate::auth::extract_tokens(&auth);
+        let access_token = access_token
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
+        let refresh_token = refresh_token.filter(|token| !token.is_empty());
+        let id_token = crate::auth::extract_id_token(&auth);
+        Ok(Self {
+            auth,
+            id_token,
+            access_token,
+            refresh_token,
+            account_id,
+            is_fedramp,
+        })
+    }
+
+    fn request_auth(&self) -> WarmupRequestAuth<'_> {
+        WarmupRequestAuth {
+            access_token: &self.access_token,
+            account_id: self.account_id.as_deref(),
+            is_fedramp: self.is_fedramp,
+        }
+    }
+
+    fn ensure_fresh_for_post(&self, alias: &str) -> Result<()> {
+        anyhow::ensure!(
+            crate::jwt::is_token_expiring(&self.access_token, 60)? != Some(true),
+            "{alias}: access token expired or became too close to expiry during model discovery"
+        );
+        Ok(())
+    }
+}
+
+fn model_cache_get(
+    cache: &HashMap<WarmupModelCacheKey, WarmupModelSelection>,
+    key: &WarmupModelCacheKey,
+) -> Option<WarmupModelSelection> {
     cache.get(key).cloned()
 }
 
-fn model_cache_set(cache: &mut HashMap<String, Vec<String>>, key: &str, models: Vec<String>) {
-    cache.insert(key.to_string(), models);
+fn model_cache_set(
+    cache: &mut HashMap<WarmupModelCacheKey, WarmupModelSelection>,
+    key: &WarmupModelCacheKey,
+    models: WarmupModelSelection,
+) {
+    cache.insert(key.clone(), models);
 }
 
-fn model_cache_invalidate(cache: &mut HashMap<String, Vec<String>>, key: &str) {
+fn model_cache_invalidate(
+    cache: &mut HashMap<WarmupModelCacheKey, WarmupModelSelection>,
+    key: &WarmupModelCacheKey,
+) {
     cache.remove(key);
 }
 
@@ -167,32 +358,40 @@ pub(crate) fn sorted_models_for_display(models: &[ModelEntry]) -> Vec<&ModelEntr
 }
 
 /// Fetch and parse the full model list from the `/models` endpoint.
-pub(crate) async fn fetch_models(
+async fn fetch_models(
     endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
-    access_token: &str,
-    account_id: Option<&str>,
-    is_fedramp: bool,
+    auth: WarmupRequestAuth<'_>,
+    network: &mut NetworkBudget,
 ) -> Result<Vec<ModelEntry>> {
     for attempt in 1..=3 {
-        let response =
-            build_models_request(endpoints, client, access_token, account_id, is_fedramp)?
-                .send()
-                .await;
+        let request = build_models_request(
+            endpoints,
+            client,
+            auth.access_token,
+            auth.account_id,
+            auth.is_fedramp,
+        )?;
+        let permit = network.acquire().await?;
+        let response = request.send().await;
         match response {
             Ok(resp) if resp.status().is_success() => {
                 let body: serde_json::Value = resp.json().await?;
+                drop(permit);
                 return parse_models_body(&body);
             }
             Ok(resp) => {
                 let status = resp.status();
                 let retryable = status.is_server_error() || status.as_u16() == 429;
+                drop(resp);
+                drop(permit);
                 if !retryable || attempt == 3 {
                     bail!("models endpoint returned {status}");
                 }
                 warn!("models fetch attempt {attempt}/3 returned {status}; retrying");
             }
             Err(error) => {
+                drop(permit);
                 if attempt == 3 {
                     return Err(crate::auth::format_reqwest_error(
                         "models fetch failed after 3 attempts",
@@ -207,24 +406,16 @@ pub(crate) async fn fetch_models(
     unreachable!("models fetch loop always returns")
 }
 
-/// Resolve every model this warmup should touch, from one `/models` response:
-/// the main-pool model first, then one per additional quota pool.
+/// Resolve every model this warmup should touch from one `/models` response.
 async fn fetch_warmup_models(
     endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
-    access_token: &str,
-    account_id: Option<&str>,
-    is_fedramp: bool,
+    auth: WarmupRequestAuth<'_>,
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> Result<Vec<String>> {
-    let models = fetch_models(endpoints, client, access_token, account_id, is_fedramp).await?;
-    let selected = select_warmup_models(&models, additional_limits)?;
-    if selected.is_empty() {
-        return require_official_model(Err(anyhow::anyhow!(
-            "official models endpoint returned no main-pool model"
-        )));
-    }
-    Ok(selected)
+    network: &mut NetworkBudget,
+) -> Result<WarmupModelSelection> {
+    let models = fetch_models(endpoints, client, auth, network).await?;
+    require_official_model(select_warmup_models(&models, additional_limits))
 }
 
 fn require_official_model<T>(result: Result<T>) -> Result<T> {
@@ -241,28 +432,50 @@ fn normalized_pool_name(value: &str) -> String {
 
 /// The cache key for one account's resolved warmup model set.
 ///
-/// The alias alone is not enough to name the entry: the resolved set bakes in
-/// the additional pools that existed when it was built. A process that outlives
-/// a pool change — the daemon with `auto_warmup`, which runs for days — would
-/// otherwise keep warming the old set, and a pool the account just gained would
-/// never get its quota window opened until someone restarted the daemon. That
-/// failure is silent: nothing errors, so nothing invalidates the entry either.
+/// A strict account binding prevents an alias that is rebound to a different
+/// owner from inheriting its predecessor's models. The resolved set also bakes
+/// in the additional pools that existed when it was built. A process that
+/// outlives a pool change — the daemon with `auto_warmup`, which runs for days —
+/// would otherwise keep warming the old set, and a pool the account just gained
+/// would never get its quota window opened until someone restarted the daemon.
+/// That failure is silent: nothing errors, so nothing invalidates the entry.
 ///
-/// Only the pools `select_warmup_models` acts on take part, and they are sorted,
-/// so an upstream reordering does not needlessly discard a good entry.
+/// Only the pools `select_warmup_models` acts on take part, and they form a
+/// normalized set, so upstream duplication or reordering does not needlessly
+/// discard a good entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WarmupModelCacheKey {
+    binding: crate::jwt::StrictAccountBinding,
+    model_pools: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedPoolModel {
+    pool_keys: Vec<String>,
+    model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarmupModelSelection {
+    main: String,
+    additional: Vec<SelectedPoolModel>,
+}
+
 fn warmup_cache_key(
-    alias: &str,
+    binding: &crate::jwt::StrictAccountBinding,
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> String {
+) -> WarmupModelCacheKey {
     let mut pools: Vec<String> = additional_limits
         .iter()
         .filter(|limit| is_model_quota_limit(limit))
         .map(|limit| normalized_pool_name(limit.limit_name.as_deref().unwrap_or_default()))
         .collect();
     pools.sort_unstable();
-    // Unit separator: cannot appear in an alias or a normalized pool name, so
-    // no pool list can be confused with a different account's key.
-    format!("{alias}\u{1f}{}", pools.join("\u{1e}"))
+    pools.dedup();
+    WarmupModelCacheKey {
+        binding: binding.clone(),
+        model_pools: pools,
+    }
 }
 
 fn is_model_quota_limit(limit: &crate::usage::AdditionalRateLimit) -> bool {
@@ -300,7 +513,7 @@ fn matching_model_for_limit<'a>(
 fn select_warmup_models(
     models: &[ModelEntry],
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> Result<Vec<String>> {
+) -> Result<WarmupModelSelection> {
     let visible: Vec<&ModelEntry> = models
         .iter()
         .filter(|m| m.visibility.as_deref() != Some("hide"))
@@ -314,12 +527,12 @@ fn select_warmup_models(
         .iter()
         .filter(|limit| is_model_quota_limit(limit))
         .collect();
-    let additional_models: Vec<&ModelEntry> = model_limits
+    let matched_limits: Vec<(&crate::usage::AdditionalRateLimit, &ModelEntry)> = model_limits
         .iter()
         .copied()
-        .filter_map(|limit| matching_model_for_limit(&visible, limit))
+        .filter_map(|limit| matching_model_for_limit(&visible, limit).map(|model| (limit, model)))
         .collect();
-    if additional_models.len() != model_limits.len() {
+    if matched_limits.len() != model_limits.len() {
         let unmatched = model_limits
             .iter()
             .copied()
@@ -329,9 +542,9 @@ fn select_warmup_models(
             .join(", ");
         bail!("no model matched quota pool(s): {unmatched}");
     }
-    let additional_slugs: HashSet<&str> = additional_models
+    let additional_slugs: HashSet<&str> = matched_limits
         .iter()
-        .map(|model| model.slug.as_str())
+        .map(|(_, model)| model.slug.as_str())
         .collect();
     let main_candidates: Vec<&ModelEntry> = visible
         .iter()
@@ -351,66 +564,101 @@ fn select_warmup_models(
                 .iter()
                 .min_by_key(|m| m.priority.unwrap_or(i64::MAX))
         })
-        .map(|m| m.slug.clone());
+        .map(|m| m.slug.clone())
+        .context("official models endpoint returned no main-pool model")?;
 
-    let mut selected: Vec<String> = main.into_iter().collect();
-    for model in additional_models {
-        if !selected.contains(&model.slug) {
-            selected.push(model.slug.clone());
+    let mut additional: Vec<SelectedPoolModel> = Vec::new();
+    for (limit, model) in matched_limits {
+        let pool_key = normalized_pool_name(limit.limit_name.as_deref().unwrap_or_default());
+        if let Some(group) = additional
+            .iter_mut()
+            .find(|group| group.model == model.slug)
+        {
+            group.pool_keys.push(pool_key);
+        } else {
+            additional.push(SelectedPoolModel {
+                pool_keys: vec![pool_key],
+                model: model.slug.clone(),
+            });
         }
     }
+    for group in &mut additional {
+        group.pool_keys.sort_unstable();
+        group.pool_keys.dedup();
+    }
+    additional.sort_by(|left, right| {
+        left.pool_keys
+            .cmp(&right.pool_keys)
+            .then_with(|| left.model.cmp(&right.model))
+    });
 
+    let selected = WarmupModelSelection { main, additional };
     debug!("warmup: models selected from API: {selected:?}");
     Ok(selected)
 }
 
+/// A freshly fetched model list is not published to the process cache until
+/// the caller has revalidated the profile after its lease-free HTTP phase.
+/// Keeping the per-key fetch guard here also prevents a second warmup from
+/// observing or duplicating an unvalidated result.
+struct WarmupModelResolution {
+    models: WarmupModelSelection,
+    pending_cache_key: Option<WarmupModelCacheKey>,
+    _fetch_guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl WarmupModelResolution {
+    fn cached(models: WarmupModelSelection) -> Self {
+        Self {
+            models,
+            pending_cache_key: None,
+            _fetch_guard: None,
+        }
+    }
+
+    async fn publish(self) -> WarmupModelSelection {
+        let Self {
+            models,
+            pending_cache_key,
+            _fetch_guard,
+        } = self;
+        if let Some(cache_key) = pending_cache_key {
+            model_cache_set(&mut *MODEL_CACHE.lock().await, &cache_key, models.clone());
+        }
+        models
+    }
+}
+
 async fn resolve_warmup_models(
     endpoints: &crate::auth::ServiceEndpoints,
-    cache_key: &str,
+    cache_key: &WarmupModelCacheKey,
     client: &reqwest::Client,
-    access_token: &str,
-    account_id: Option<&str>,
-    is_fedramp: bool,
+    auth: WarmupRequestAuth<'_>,
     additional_limits: &[crate::usage::AdditionalRateLimit],
-) -> Result<Vec<String>> {
+    network: &mut NetworkBudget,
+) -> Result<WarmupModelResolution> {
     if let Some(models) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
-        return Ok(models);
+        return Ok(WarmupModelResolution::cached(models));
     }
 
     let fetch_lock = {
         let mut locks = MODEL_FETCH_LOCKS.lock().await;
         locks
-            .entry(cache_key.to_string())
+            .entry(cache_key.clone())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     };
-    let _fetch_guard = fetch_lock.lock().await;
+    let fetch_guard = fetch_lock.lock_owned().await;
     if let Some(models) = model_cache_get(&*MODEL_CACHE.lock().await, cache_key) {
-        return Ok(models);
+        return Ok(WarmupModelResolution::cached(models));
     }
 
-    let models = fetch_warmup_models(
-        endpoints,
-        client,
-        access_token,
-        account_id,
-        is_fedramp,
-        additional_limits,
-    )
-    .await?;
-    model_cache_set(&mut *MODEL_CACHE.lock().await, cache_key, models.clone());
-    Ok(models)
-}
-
-/// Split a resolved set into the main-pool model and the additional-pool ones.
-///
-/// `fetch_warmup_models` rejects an empty set, so the `None` arm is only
-/// reachable through a cache entry that was never produced that way.
-fn split_main_model(models: &[String]) -> Result<(&str, &[String])> {
-    models
-        .split_first()
-        .map(|(main, additional)| (main.as_str(), additional))
-        .ok_or_else(|| anyhow::anyhow!("no warmup model was resolved"))
+    let models = fetch_warmup_models(endpoints, client, auth, additional_limits, network).await?;
+    Ok(WarmupModelResolution {
+        models,
+        pending_cache_key: Some(cache_key.clone()),
+        _fetch_guard: Some(fetch_guard),
+    })
 }
 
 fn build_body(model: &str) -> serde_json::Value {
@@ -434,61 +682,277 @@ fn build_body(model: &str) -> serde_json::Value {
 fn make_request(
     endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
-    access_token: &str,
-    account_id: Option<&str>,
-    is_fedramp: bool,
+    auth: WarmupRequestAuth<'_>,
     body: &serde_json::Value,
 ) -> Result<reqwest::RequestBuilder> {
     Ok(crate::usage::apply_account_routing_headers(
         client
             .post(endpoints.responses()?)
-            .bearer_auth(access_token)
+            .bearer_auth(auth.access_token)
             .header("Content-Type", "application/json"),
-        account_id,
-        is_fedramp,
+        auth.account_id,
+        auth.is_fedramp,
     )
     .json(body))
 }
 
-/// Warm one request per additional quota pool.
+struct WarmupResponse {
+    status: reqwest::StatusCode,
+    error_text: Option<String>,
+}
+
+/// Send and consume one warmup response while holding exactly one network
+/// permit. Returning this buffered status ensures every caller releases the
+/// permit before cache invalidation, token persistence, or another request.
+async fn send_warmup_request(
+    endpoints: &crate::auth::ServiceEndpoints,
+    client: &reqwest::Client,
+    auth: WarmupRequestAuth<'_>,
+    body: &serde_json::Value,
+    error_context: &'static str,
+    network: &mut NetworkBudget,
+) -> Result<WarmupResponse> {
+    let request = make_request(endpoints, client, auth, body)?;
+    let _permit = network.acquire().await?;
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| crate::auth::format_reqwest_error(error_context, &error))?;
+    let status = response.status();
+    let error_text = if status.is_success() {
+        // Quota activation is server-side. One chunk proves streaming began;
+        // the remainder is intentionally discarded.
+        let _ = response.chunk().await;
+        None
+    } else {
+        Some(response.text().await.unwrap_or_default())
+    };
+    Ok(WarmupResponse { status, error_text })
+}
+
+/// Warm one request per distinct additional model. The cached selection keeps
+/// its pool identities so models shared by multiple pools stay grouped.
 ///
 /// Takes the models already resolved for this warmup rather than fetching the
 /// list again: both halves come from the same `/models` answer, and
 /// `select_warmup_models` already excludes the main-pool model from this slice.
+enum AdditionalWarmupOutcome {
+    Complete,
+    Unsupported {
+        completed_models: HashSet<String>,
+        model: String,
+        status: reqwest::StatusCode,
+        snippet: String,
+    },
+}
+
 async fn warmup_additional_models(
     endpoints: &crate::auth::ServiceEndpoints,
     client: &reqwest::Client,
-    access_token: &str,
-    account_id: Option<&str>,
-    is_fedramp: bool,
-    additional_models: &[String],
-) -> Result<()> {
-    for model in additional_models {
-        let body = build_body(model);
+    auth: WarmupRequestAuth<'_>,
+    additional_models: &[SelectedPoolModel],
+    network: &mut NetworkBudget,
+) -> Result<AdditionalWarmupOutcome> {
+    let mut completed_models = HashSet::new();
+    for selected in additional_models {
+        let body = build_body(&selected.model);
         debug!(
-            "warmup additional pool POST → {} (model={model})",
-            endpoints.responses()?
+            "warmup additional pool POST → {} (model={})",
+            endpoints.responses()?,
+            selected.model
         );
-        let mut resp = make_request(
+        let response = send_warmup_request(
             endpoints,
             client,
-            access_token,
-            account_id,
-            is_fedramp,
+            auth,
             &body,
-        )?
-        .send()
-        .await
-        .map_err(|e| crate::auth::format_reqwest_error("additional warmup failed", &e))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            "additional warmup failed",
+            network,
+        )
+        .await?;
+        if !response.status.is_success() {
+            let status = response.status;
+            let text = response.error_text.unwrap_or_default();
             let snippet: String = text.chars().take(160).collect();
-            bail!("additional model {model}: HTTP {status} — {snippet}");
+            if status == reqwest::StatusCode::BAD_REQUEST && text.contains("not supported") {
+                return Ok(AdditionalWarmupOutcome::Unsupported {
+                    completed_models,
+                    model: selected.model.clone(),
+                    status,
+                    snippet,
+                });
+            }
+            bail!(
+                "additional model {}: HTTP {status} — {snippet}",
+                selected.model
+            );
         }
-        let _ = resp.chunk().await;
+        completed_models.insert(selected.model.clone());
     }
-    Ok(())
+    Ok(AdditionalWarmupOutcome::Complete)
+}
+
+async fn reacquire_warmup_snapshot_after_model_discovery(
+    alias: &str,
+    profile_path: &Path,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+    expected_snapshot: &WarmupCredentialSnapshot,
+) -> Result<(crate::profile::ProfileLease, WarmupCredentialSnapshot)> {
+    let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+        .await
+        .with_context(|| format!("{alias}: failed to reacquire profile after model discovery"))?;
+    let auth = crate::auth::read_auth_async(profile_path)
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("{alias}: cannot revalidate auth after model discovery: {error}")
+        })?;
+    let current = WarmupCredentialSnapshot::from_auth(
+        alias,
+        auth,
+        expected_binding,
+        "profile identity changed during model discovery",
+    )?;
+    anyhow::ensure!(
+        current.auth == expected_snapshot.auth,
+        "{alias}: profile credentials changed during model discovery"
+    );
+    current.ensure_fresh_for_post(alias)?;
+    Ok((lease, current))
+}
+
+struct WarmupModelDiscoveryContext<'a> {
+    alias: &'a str,
+    profile_path: &'a Path,
+    expected_binding: &'a crate::jwt::StrictAccountBinding,
+    endpoints: &'a crate::auth::ServiceEndpoints,
+    cache_key: &'a WarmupModelCacheKey,
+    client: &'a reqwest::Client,
+    additional_limits: &'a [crate::usage::AdditionalRateLimit],
+}
+
+/// Reuse an already validated cache hit under the current lease. When network
+/// discovery is needed, release the lease and restore the side-effect boundary
+/// only after the alias, credential snapshot, and token freshness have all been
+/// revalidated. A freshly fetched model list remains unpublished until that
+/// proof succeeds.
+async fn discover_warmup_models_between_leases(
+    context: &WarmupModelDiscoveryContext<'_>,
+    lease: crate::profile::ProfileLease,
+    snapshot: WarmupCredentialSnapshot,
+    network: &mut NetworkBudget,
+    side_effect_boundary: &mut WarmupSideEffectBoundary,
+) -> Result<(
+    crate::profile::ProfileLease,
+    WarmupCredentialSnapshot,
+    WarmupModelSelection,
+)> {
+    if let Some(models) = model_cache_get(&*MODEL_CACHE.lock().await, context.cache_key) {
+        snapshot.ensure_fresh_for_post(context.alias)?;
+        side_effect_boundary.commit()?;
+        return Ok((lease, snapshot, models));
+    }
+
+    drop(lease);
+    let (resolution, lease, current) = side_effect_boundary
+        .run_until_commit(async {
+            let resolution = resolve_warmup_models(
+                context.endpoints,
+                context.cache_key,
+                context.client,
+                snapshot.request_auth(),
+                context.additional_limits,
+                network,
+            )
+            .await?;
+            let (lease, current) = reacquire_warmup_snapshot_after_model_discovery(
+                context.alias,
+                context.profile_path,
+                context.expected_binding,
+                &snapshot,
+            )
+            .await?;
+            Ok((resolution, lease, current))
+        })
+        .await?;
+    let models = resolution.publish().await;
+    Ok((lease, current, models))
+}
+
+async fn finish_additional_warmup_with_one_model_refresh(
+    context: &WarmupModelDiscoveryContext<'_>,
+    lease: crate::profile::ProfileLease,
+    snapshot: WarmupCredentialSnapshot,
+    additional_models: &[SelectedPoolModel],
+    network: &mut NetworkBudget,
+    side_effect_boundary: &mut WarmupSideEffectBoundary,
+) -> Result<crate::profile::ProfileLease> {
+    let stale = match warmup_additional_models(
+        context.endpoints,
+        context.client,
+        snapshot.request_auth(),
+        additional_models,
+        network,
+    )
+    .await?
+    {
+        AdditionalWarmupOutcome::Complete => return Ok(lease),
+        AdditionalWarmupOutcome::Unsupported {
+            completed_models,
+            model,
+            status,
+            snippet,
+        } => (completed_models, model, status, snippet),
+    };
+
+    let (completed_models, stale_model, stale_status, stale_snippet) = stale;
+    debug!(
+        "[{}] additional model {:?} returned {}; refreshing the official model set",
+        context.alias, stale_model, stale_status
+    );
+    model_cache_invalidate(&mut *MODEL_CACHE.lock().await, context.cache_key);
+    let (lease, snapshot, refreshed) = discover_warmup_models_between_leases(
+        context,
+        lease,
+        snapshot,
+        network,
+        side_effect_boundary,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "{}: failed to refresh models after additional model {stale_model:?} was rejected ({stale_status}: {stale_snippet})",
+            context.alias
+        )
+    })?;
+    let remaining: Vec<SelectedPoolModel> = refreshed
+        .additional
+        .into_iter()
+        .filter(|selected| !completed_models.contains(&selected.model))
+        .collect();
+
+    match warmup_additional_models(
+        context.endpoints,
+        context.client,
+        snapshot.request_auth(),
+        &remaining,
+        network,
+    )
+    .await?
+    {
+        AdditionalWarmupOutcome::Complete => Ok(lease),
+        AdditionalWarmupOutcome::Unsupported {
+            model,
+            status,
+            snippet,
+            ..
+        } => {
+            model_cache_invalidate(&mut *MODEL_CACHE.lock().await, context.cache_key);
+            bail!(
+                "{}: additional model {model}: HTTP {status} after model refresh — {snippet}",
+                context.alias
+            )
+        }
+    }
 }
 
 /// Send a minimal completion request to trigger the quota window countdown for a profile.
@@ -496,31 +960,184 @@ async fn warmup_additional_models(
 /// The 5-hour and 7-day windows only start after the first real API call.
 /// This sends the lightest valid request ("ping") and discards the response body,
 /// which is enough for the server to stamp the window start time.
+#[cfg(test)]
 pub async fn warmup_account(alias: &str, profile_path: &Path) -> Result<()> {
     let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
         .await
         .with_context(|| format!("{alias}: failed to lock profile for warmup"))?;
-    warmup_account_leased(alias, profile_path, &lease).await
+    let lease = warmup_account_leased(alias, profile_path, lease).await?;
+    drop(lease);
+    Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn warmup_account_leased(
     alias: &str,
     profile_path: &Path,
-    lease: &crate::profile::ProfileLease,
-) -> Result<()> {
+    lease: crate::profile::ProfileLease,
+) -> Result<crate::profile::ProfileLease> {
     if lease.alias() != alias {
         anyhow::bail!(
             "warmup for '{alias}' received profile lease for '{}'",
             lease.alias()
         );
     }
+    let client = crate::auth::build_http_client()?;
+    warmup_account_leased_with_client(alias, profile_path, lease, &client).await
+}
+
+#[cfg(test)]
+pub(crate) async fn warmup_account_leased_with_client(
+    alias: &str,
+    profile_path: &Path,
+    lease: crate::profile::ProfileLease,
+    client: &reqwest::Client,
+) -> Result<crate::profile::ProfileLease> {
+    if lease.alias() != alias {
+        anyhow::bail!(
+            "warmup for '{alias}' received profile lease for '{}'",
+            lease.alias()
+        );
+    }
+    let initial_auth = crate::auth::read_auth_async(profile_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
+    let binding = crate::auth::account_info_from_auth_value(&initial_auth)
+        .strict_binding()
+        .with_context(|| {
+            format!("{alias}: warmup requires a verified account id and email identity")
+        })?;
+    let cached_usage = crate::cache::get_bound_async(alias, &binding).await?;
+    let mut side_effect_boundary = WarmupSideEffectBoundary::uncancellable();
+    warmup_account_leased_with_client_from_usage_preflight(
+        alias,
+        profile_path,
+        lease,
+        client,
+        WarmupPreflight {
+            binding,
+            initial_auth,
+            cached_usage,
+        },
+        &mut NetworkBudget::new(first_network_permit(Arc::new(Semaphore::new(1)))),
+        &mut side_effect_boundary,
+    )
+    .await
+}
+
+/// Warm an account after the caller has already completed an identity-bound
+/// usage-cache preflight.
+///
+/// `cached_usage` must be the exact result of that preflight for
+/// `expected_binding`: `Some` carries the proven cache hit and `None` carries a
+/// proven miss. This path deliberately does not consult the cache again. It is
+/// intended for callers such as the TUI that inspect a batch before acquiring
+/// each profile lease.
+pub(crate) async fn warmup_account_leased_with_client_after_usage_preflight(
+    alias: &str,
+    profile_path: &Path,
+    lease: crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+    cached_usage: Option<crate::usage::UsageInfo>,
+    first_permit: FirstNetworkPermit,
+) -> Result<crate::profile::ProfileLease> {
+    warmup_account_leased_with_client_after_usage_preflight_with_controls(
+        alias,
+        profile_path,
+        lease,
+        client,
+        expected_binding,
+        cached_usage,
+        WarmupExecutionControls::uncancellable(first_permit),
+    )
+    .await
+}
+
+pub(crate) async fn warmup_account_leased_with_client_after_usage_preflight_with_controls(
+    alias: &str,
+    profile_path: &Path,
+    lease: crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+    cached_usage: Option<crate::usage::UsageInfo>,
+    controls: WarmupExecutionControls,
+) -> Result<crate::profile::ProfileLease> {
+    let WarmupExecutionControls {
+        first_permit,
+        mut side_effect_boundary,
+    } = controls;
+    if lease.alias() != alias {
+        anyhow::bail!(
+            "warmup for '{alias}' received profile lease for '{}'",
+            lease.alias()
+        );
+    }
+    let initial_auth = crate::auth::read_auth_async(profile_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
+    anyhow::ensure!(
+        crate::auth::account_info_from_auth_value(&initial_auth).strict_binding()
+            == Some(expected_binding.clone()),
+        "{alias}: profile identity changed after warmup cache preflight"
+    );
+    let mut network = NetworkBudget::new(first_permit);
+    warmup_account_leased_with_client_from_usage_preflight(
+        alias,
+        profile_path,
+        lease,
+        client,
+        WarmupPreflight {
+            binding: expected_binding.clone(),
+            initial_auth,
+            cached_usage,
+        },
+        &mut network,
+        &mut side_effect_boundary,
+    )
+    .await
+}
+
+async fn warmup_account_leased_with_client_from_usage_preflight(
+    alias: &str,
+    profile_path: &Path,
+    lease: crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    preflight: WarmupPreflight,
+    network: &mut NetworkBudget,
+    side_effect_boundary: &mut WarmupSideEffectBoundary,
+) -> Result<crate::profile::ProfileLease> {
+    let WarmupPreflight {
+        binding,
+        initial_auth,
+        cached_usage,
+    } = preflight;
     let endpoints = crate::auth::service_endpoints()?;
-    let usage = match crate::cache::get(alias)? {
-        Some(usage) => Some(usage),
+    let (usage, auth) = match cached_usage {
+        Some(usage) => (Some(usage), initial_auth),
         None => {
-            match crate::usage::fetch_usage_retried_unattended_leased(alias, profile_path, lease)
-                .await
+            let usage = match crate::usage::prepare_core_usage_unattended_with_existing_lease(
+                alias,
+                profile_path,
+                &lease,
+                &binding,
+            )
+            .await
             {
+                Ok(prepared) => {
+                    let result =
+                        crate::usage::execute_prepared_core_usage_with_existing_lease_and_client(
+                            prepared, &lease, client, network,
+                        )
+                        .await;
+                    if network.first_wait_was_cancelled() {
+                        return Err(crate::usage::network_wait_cancelled_error());
+                    }
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            let usage = match usage {
                 Ok(usage) => Some(usage),
                 Err(error) => {
                     warn!(
@@ -529,27 +1146,22 @@ pub(crate) async fn warmup_account_leased(
                     );
                     None
                 }
-            }
+            };
+            let refreshed_auth = crate::auth::read_auth_async(profile_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
+            (usage, refreshed_auth)
         }
     };
     let additional_limits = usage
         .map(|usage| usage.additional_limits)
         .unwrap_or_default();
-    let val = crate::auth::read_auth(profile_path)
-        .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
-
-    let (at, rt) = crate::auth::extract_tokens(&val);
-    let mut id_token = crate::auth::extract_id_token(&val);
-    let mut access_token = at
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
-    let mut refresh_token = rt.filter(|s| !s.is_empty());
-
-    let info = crate::auth::account_info_from_auth_value(&val);
-    let account_id = info.account_id;
-    let is_fedramp = info.is_fedramp;
-
-    let client = crate::auth::build_http_client()?;
+    let mut snapshot = WarmupCredentialSnapshot::from_auth(
+        alias,
+        auth,
+        &binding,
+        "profile identity changed during warmup preparation",
+    )?;
 
     // Set when the pre-warmup proactive refresh below is rejected by the auth
     // server outright (e.g. `refresh_token_reused`): that refresh_token is now
@@ -558,30 +1170,46 @@ pub(crate) async fn warmup_account_leased(
     let mut rejected_refresh: Option<anyhow::Error> = None;
 
     // Pre-refresh: if token is about to expire, refresh proactively
-    if let Some(ref rt) = refresh_token
-        && crate::jwt::is_token_expiring(&access_token, 60)? == Some(true)
+    if let Some(refresh_token) = snapshot.refresh_token.clone()
+        && crate::jwt::is_token_expiring(&snapshot.access_token, 60)? == Some(true)
     {
         debug!("[{alias}] access_token expiring soon, refreshing before warmup");
         let activation_authorization =
-            crate::profile::authorize_fresh_credentials_activation(lease).with_context(|| {
+            crate::profile::authorize_fresh_credentials_activation(&lease).with_context(|| {
                 format!(
                     "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                 )
             })?;
-        match crate::usage::do_refresh_token(&endpoints, alias, &client, id_token.as_deref(), rt)
-            .await
-        {
+        let refresh_result = crate::usage::do_refresh_token_with_network(
+            &endpoints,
+            alias,
+            client,
+            snapshot.id_token.as_deref(),
+            &refresh_token,
+            network,
+        )
+        .await;
+        match refresh_result {
             Ok(resolution) => {
-                let refreshed = crate::usage::persist_refresh_resolution(
-                    lease,
+                crate::usage::persist_refresh_resolution(
+                    &lease,
                     activation_authorization,
-                    rt,
+                    &refresh_token,
                     resolution,
                 )
                 .map_err(|error| anyhow::anyhow!(error.detail))?;
-                access_token = refreshed.access_token;
-                id_token = Some(refreshed.id_token);
-                refresh_token = Some(refreshed.refresh_token);
+                let refreshed_auth =
+                    crate::auth::read_auth_async(profile_path)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("{alias}: cannot read refreshed auth: {error}")
+                        })?;
+                snapshot = WarmupCredentialSnapshot::from_auth(
+                    alias,
+                    refreshed_auth,
+                    &binding,
+                    "profile identity changed while refreshed credentials were persisted",
+                )?;
             }
             Err(e) => {
                 if e.downcast_ref::<crate::usage::RefreshOutcomeUnknown>()
@@ -605,20 +1233,26 @@ pub(crate) async fn warmup_account_leased(
 
     // One `/models` answer covers both the main-pool request below and every
     // additional-pool request after it.
-    let cache_key = warmup_cache_key(alias, &additional_limits);
-    let selected_models = resolve_warmup_models(
-        &endpoints,
-        &cache_key,
-        &client,
-        &access_token,
-        account_id.as_deref(),
-        is_fedramp,
-        &additional_limits,
+    let cache_key = warmup_cache_key(&binding, &additional_limits);
+    let model_discovery = WarmupModelDiscoveryContext {
+        alias,
+        profile_path,
+        expected_binding: &binding,
+        endpoints: &endpoints,
+        cache_key: &cache_key,
+        client,
+        additional_limits: &additional_limits,
+    };
+    let (mut lease, mut snapshot, selected_models) = discover_warmup_models_between_leases(
+        &model_discovery,
+        lease,
+        snapshot,
+        network,
+        side_effect_boundary,
     )
     .await
     .with_context(|| format!("{alias}: failed to select a supported warmup model"))?;
-    let (model, additional_models) = split_main_model(&selected_models)
-        .with_context(|| format!("{alias}: failed to select a supported warmup model"))?;
+    let model = selected_models.main.as_str();
     let body = build_body(model);
 
     debug!(
@@ -626,87 +1260,82 @@ pub(crate) async fn warmup_account_leased(
         endpoints.responses()?
     );
 
-    let mut resp = make_request(
+    let response = send_warmup_request(
         &endpoints,
-        &client,
-        &access_token,
-        account_id.as_deref(),
-        is_fedramp,
+        client,
+        snapshot.request_auth(),
         &body,
-    )?
-    .send()
-    .await
-    .map_err(|e| crate::auth::format_reqwest_error("warmup request failed", &e))?;
+        "warmup request failed",
+        network,
+    )
+    .await?;
 
-    let status = resp.status();
+    let status = response.status;
     debug!("[{alias}] warmup status: {status}");
 
     match status.as_u16() {
         200 => {
-            // Quota window is triggered server-side on request receipt.
-            // Read one chunk to confirm streaming started, then drop.
-            let _ = resp.chunk().await;
-            warmup_additional_models(
-                &endpoints,
-                &client,
-                &access_token,
-                account_id.as_deref(),
-                is_fedramp,
-                additional_models,
+            finish_additional_warmup_with_one_model_refresh(
+                &model_discovery,
+                lease,
+                snapshot,
+                &selected_models.additional,
+                network,
+                side_effect_boundary,
             )
             .await
         }
         400 => {
-            let text = resp.text().await.unwrap_or_default();
+            let text = response.error_text.unwrap_or_default();
             if text.contains("not supported") {
                 // Model deprecated — clear cache, fetch fresh model list, retry once
                 debug!(
                     "[{alias}] model {model:?} not supported, refreshing model cache and retrying"
                 );
                 model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
-                let refreshed_models = resolve_warmup_models(
-                    &endpoints,
-                    &cache_key,
-                    &client,
-                    &access_token,
-                    account_id.as_deref(),
-                    is_fedramp,
-                    &additional_limits,
-                )
-                .await
-                .with_context(|| {
-                    format!("{alias}: failed to refresh the supported warmup model")
-                })?;
-                let (new_model, new_additional_models) = split_main_model(&refreshed_models)
+                let (reacquired_lease, current_snapshot, refreshed_models) =
+                    discover_warmup_models_between_leases(
+                        &model_discovery,
+                        lease,
+                        snapshot,
+                        network,
+                        side_effect_boundary,
+                    )
+                    .await
                     .with_context(|| {
                         format!("{alias}: failed to refresh the supported warmup model")
                     })?;
+                lease = reacquired_lease;
+                snapshot = current_snapshot;
+                let new_model = refreshed_models.main.as_str();
                 let retry_body = build_body(new_model);
-                let mut retry_resp = make_request(
+                let retry_response = send_warmup_request(
                     &endpoints,
-                    &client,
-                    &access_token,
-                    account_id.as_deref(),
-                    is_fedramp,
+                    client,
+                    snapshot.request_auth(),
                     &retry_body,
-                )?
-                .send()
-                .await
-                .map_err(|e| crate::auth::format_reqwest_error("warmup retry failed", &e))?;
-                let retry_status = retry_resp.status();
+                    "warmup retry failed",
+                    network,
+                )
+                .await?;
+                let retry_status = retry_response.status;
                 if retry_status.is_success() {
-                    let _ = retry_resp.chunk().await;
-                    return warmup_additional_models(
-                        &endpoints,
-                        &client,
-                        &access_token,
-                        account_id.as_deref(),
-                        is_fedramp,
-                        new_additional_models,
+                    return finish_additional_warmup_with_one_model_refresh(
+                        &model_discovery,
+                        lease,
+                        snapshot,
+                        &refreshed_models.additional,
+                        network,
+                        side_effect_boundary,
                     )
                     .await;
                 }
-                let retry_text = retry_resp.text().await.unwrap_or_default();
+                let retry_text = retry_response.error_text.unwrap_or_default();
+                if retry_status == reqwest::StatusCode::BAD_REQUEST
+                    && retry_text.contains("not supported")
+                {
+                    model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+                }
                 let snippet: String = retry_text.chars().take(160).collect();
                 bail!("{alias}: HTTP {retry_status} after model refresh — {snippet}")
             }
@@ -723,60 +1352,76 @@ pub(crate) async fn warmup_account_leased(
                 )));
             }
             // Retry once with refreshed token
-            if let Some(ref rt) = refresh_token {
+            if let Some(refresh_token) = snapshot.refresh_token.clone() {
                 debug!("[{alias}] got {status}, attempting token refresh and retry");
                 let activation_authorization =
-                    crate::profile::authorize_fresh_credentials_activation(lease).with_context(
+                    crate::profile::authorize_fresh_credentials_activation(&lease).with_context(
                         || {
                             format!(
                                 "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                             )
                         },
                     )?;
-                match crate::usage::do_refresh_token(
+                let refresh_result = crate::usage::do_refresh_token_with_network(
                     &endpoints,
                     alias,
-                    &client,
-                    id_token.as_deref(),
-                    rt,
+                    client,
+                    snapshot.id_token.as_deref(),
+                    &refresh_token,
+                    network,
                 )
-                .await
-                {
+                .await;
+                match refresh_result {
                     Ok(resolution) => {
-                        let refreshed = crate::usage::persist_refresh_resolution(
-                            lease,
+                        crate::usage::persist_refresh_resolution(
+                            &lease,
                             activation_authorization,
-                            rt,
+                            &refresh_token,
                             resolution,
                         )
                         .map_err(|error| anyhow::anyhow!(error.detail))?;
-                        let mut retry_resp = make_request(
+                        let refreshed_auth = crate::auth::read_auth_async(profile_path)
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "{alias}: cannot read refreshed auth after warmup retry: {error}"
+                                )
+                            })?;
+                        snapshot = WarmupCredentialSnapshot::from_auth(
+                            alias,
+                            refreshed_auth,
+                            &binding,
+                            "profile identity changed while warmup retry credentials were persisted",
+                        )?;
+                        let retry_response = send_warmup_request(
                             &endpoints,
-                            &client,
-                            &refreshed.access_token,
-                            account_id.as_deref(),
-                            is_fedramp,
+                            client,
+                            snapshot.request_auth(),
                             &body,
-                        )?
-                        .send()
-                        .await
-                        .map_err(|e| {
-                            crate::auth::format_reqwest_error("warmup retry failed", &e)
-                        })?;
-                        let retry_status = retry_resp.status();
+                            "warmup retry failed",
+                            network,
+                        )
+                        .await?;
+                        let retry_status = retry_response.status;
                         if retry_status.is_success() {
-                            let _ = retry_resp.chunk().await;
-                            return warmup_additional_models(
-                                &endpoints,
-                                &client,
-                                &refreshed.access_token,
-                                account_id.as_deref(),
-                                is_fedramp,
-                                additional_models,
+                            return finish_additional_warmup_with_one_model_refresh(
+                                &model_discovery,
+                                lease,
+                                snapshot,
+                                &selected_models.additional,
+                                network,
+                                side_effect_boundary,
                             )
                             .await;
                         }
-                        bail!("{alias}: HTTP {retry_status} after token refresh retry")
+                        let retry_text = retry_response.error_text.unwrap_or_default();
+                        if retry_status == reqwest::StatusCode::BAD_REQUEST
+                            && retry_text.contains("not supported")
+                        {
+                            model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+                        }
+                        let snippet: String = retry_text.chars().take(160).collect();
+                        bail!("{alias}: HTTP {retry_status} after token refresh retry — {snippet}")
                     }
                     Err(e) => bail!("{alias}: authentication failed and token refresh failed: {e}"),
                 }
@@ -787,31 +1432,51 @@ pub(crate) async fn warmup_account_leased(
         }
         429 => bail!("{alias}: rate limited"),
         code => {
-            let text = resp.text().await.unwrap_or_default();
+            let text = response.error_text.unwrap_or_default();
             let snippet: String = text.chars().take(160).collect();
             bail!("{alias}: HTTP {code} — {snippet}")
         }
     }
 }
 
-/// Fetch the full model list for a profile (for display, e.g. the TUI detail
-/// panel). Unlike `warmup_account`, this never sends a warmup ping — it only
-/// refreshes an expiring access token before calling the `/models` endpoint.
-pub(crate) async fn fetch_models_for_profile_leased(
+pub(crate) struct PreparedModelRequest {
+    endpoints: crate::auth::ServiceEndpoints,
+    access_token: String,
+    account_id: Option<String>,
+    is_fedramp: bool,
+    network: NetworkBudget,
+}
+
+/// Resolve and, when necessary, durably refresh the credential needed for a
+/// model-list request. The profile lease is consumed here and released before
+/// a prepared value can reach the read-only HTTP phase.
+pub(crate) async fn prepare_models_for_profile_leased_with_client(
     alias: &str,
     profile_path: &Path,
-    lease: &crate::profile::ProfileLease,
-) -> Result<Vec<ModelEntry>> {
+    lease: crate::profile::ProfileLease,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+    client: &reqwest::Client,
+    first_permit: FirstNetworkPermit,
+) -> Result<PreparedModelRequest> {
     if lease.alias() != alias {
         anyhow::bail!(
             "model discovery for '{alias}' received profile lease for '{}'",
             lease.alias()
         );
     }
-    let endpoints = crate::auth::service_endpoints()?;
-    let val = crate::auth::read_auth(profile_path)
+    let val = crate::auth::read_auth_async(profile_path)
+        .await
         .map_err(|e| anyhow::anyhow!("{alias}: cannot read auth: {e}"))?;
+    let info = crate::auth::account_info_from_auth_value(&val);
+    let actual_binding = info
+        .strict_binding()
+        .context("profile auth is missing a complete account id and email identity")?;
+    anyhow::ensure!(
+        actual_binding == *expected_binding,
+        "{alias}: profile identity changed while model discovery was waiting for its credential lease"
+    );
 
+    let endpoints = crate::auth::service_endpoints()?;
     let (at, rt) = crate::auth::extract_tokens(&val);
     let id_token = crate::auth::extract_id_token(&val);
     let mut access_token = at
@@ -819,29 +1484,34 @@ pub(crate) async fn fetch_models_for_profile_leased(
         .ok_or_else(|| anyhow::anyhow!("{alias}: no access_token in profile"))?;
     let refresh_token = rt.filter(|s| !s.is_empty());
 
-    let info = crate::auth::account_info_from_auth_value(&val);
     let account_id = info.account_id;
     let is_fedramp = info.is_fedramp;
-
-    let client = crate::auth::build_http_client()?;
+    let mut network = NetworkBudget::new(first_permit);
 
     if let Some(ref rt) = refresh_token
         && crate::jwt::is_token_expiring(&access_token, 60)? == Some(true)
     {
         let activation_authorization =
-            crate::profile::authorize_fresh_credentials_activation(lease).with_context(|| {
+            crate::profile::authorize_fresh_credentials_activation(&lease).with_context(|| {
                 format!(
                     "{alias}: token refresh was not started because exact live-auth activation could not be authorized"
                 )
             })?;
-        match crate::usage::do_refresh_token(&endpoints, alias, &client, id_token.as_deref(), rt)
-            .await
-        {
+        let refresh_result = crate::usage::do_refresh_token_with_network(
+            &endpoints,
+            alias,
+            client,
+            id_token.as_deref(),
+            rt,
+            &mut network,
+        )
+        .await;
+        match refresh_result {
             Ok(resolution) => {
                 // No degrade here: the refresh *worked*, so the old token this
                 // would fall back to has already been invalidated server-side.
                 let refreshed = crate::usage::persist_refresh_resolution(
-                    lease,
+                    &lease,
                     activation_authorization,
                     rt,
                     resolution,
@@ -868,44 +1538,142 @@ pub(crate) async fn fetch_models_for_profile_leased(
         }
     }
 
+    // No credential mutation remains after this point. Releasing the profile
+    // boundary before the read-only request keeps a slow model endpoint from
+    // delaying an unrelated switch, rename, or delete of this alias.
+    drop(lease);
+
+    Ok(PreparedModelRequest {
+        endpoints,
+        access_token,
+        account_id,
+        is_fedramp,
+        network,
+    })
+}
+
+/// Execute only the safe-to-cancel, read-only portion of model discovery.
+pub(crate) async fn fetch_prepared_models_with_client(
+    prepared: PreparedModelRequest,
+    client: &reqwest::Client,
+) -> Result<Vec<ModelEntry>> {
+    let PreparedModelRequest {
+        endpoints,
+        access_token,
+        account_id,
+        is_fedramp,
+        mut network,
+    } = prepared;
     fetch_models(
         &endpoints,
-        &client,
-        &access_token,
-        account_id.as_deref(),
-        is_fedramp,
+        client,
+        WarmupRequestAuth {
+            access_token: &access_token,
+            account_id: account_id.as_deref(),
+            is_fedramp,
+        },
+        &mut network,
     )
     .await
+}
+
+#[cfg(test)]
+async fn fetch_models_for_profile_leased_with_client(
+    alias: &str,
+    profile_path: &Path,
+    lease: crate::profile::ProfileLease,
+    expected_binding: &crate::jwt::StrictAccountBinding,
+    client: &reqwest::Client,
+) -> Result<Vec<ModelEntry>> {
+    let prepared = prepare_models_for_profile_leased_with_client(
+        alias,
+        profile_path,
+        lease,
+        expected_binding,
+        client,
+        first_network_permit(Arc::new(Semaphore::new(1))),
+    )
+    .await?;
+    fetch_prepared_models_with_client(prepared, client).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_first_network_permit() -> FirstNetworkPermit {
+        // A single slot makes accidental permit retention deterministic in
+        // tests while exercising the same production acquisition path.
+        first_network_permit(Arc::new(Semaphore::new(1)))
+    }
+
+    fn cache_binding(account_id: &str, email: &str) -> crate::jwt::StrictAccountBinding {
+        crate::jwt::StrictAccountBinding {
+            account_id: account_id.to_string(),
+            email: email.to_string(),
+        }
+    }
+
+    fn test_selection(main: &str, additional: &[(&str, &str)]) -> WarmupModelSelection {
+        WarmupModelSelection {
+            main: main.to_string(),
+            additional: additional
+                .iter()
+                .map(|(pool, model)| SelectedPoolModel {
+                    pool_keys: vec![normalized_pool_name(pool)],
+                    model: (*model).to_string(),
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn test_model_cache_keys_are_isolated_per_account() {
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-        model_cache_set(&mut cache, "account-a", vec!["model-a".to_string()]);
+        let account_a = warmup_cache_key(&cache_binding("account-a", "a@example.com"), &[]);
+        let account_b = warmup_cache_key(&cache_binding("account-b", "b@example.com"), &[]);
+        let mut cache = HashMap::new();
+        model_cache_set(&mut cache, &account_a, test_selection("model-a", &[]));
 
         assert_eq!(
-            model_cache_get(&cache, "account-a"),
-            Some(vec!["model-a".to_string()])
+            model_cache_get(&cache, &account_a),
+            Some(test_selection("model-a", &[]))
         );
-        assert_eq!(model_cache_get(&cache, "account-b"), None);
+        assert_eq!(model_cache_get(&cache, &account_b), None);
+    }
+
+    #[test]
+    fn cached_models_are_not_reused_after_same_alias_account_rebind() {
+        let previous_owner = warmup_cache_key(&cache_binding("account-a", "old@example.com"), &[]);
+        let rebound_owner = warmup_cache_key(&cache_binding("account-b", "new@example.com"), &[]);
+        let mut cache = HashMap::new();
+        model_cache_set(
+            &mut cache,
+            &previous_owner,
+            test_selection("old-owner-model", &[]),
+        );
+
+        assert_eq!(model_cache_get(&cache, &rebound_owner), None);
+        assert_eq!(
+            model_cache_get(&cache, &previous_owner),
+            Some(test_selection("old-owner-model", &[])),
+            "rebinding an alias must isolate the new owner without mutating the old owner's entry"
+        );
     }
 
     #[test]
     fn test_model_cache_invalidation_only_affects_target_key() {
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-        model_cache_set(&mut cache, "account-a", vec!["model-a".to_string()]);
-        model_cache_set(&mut cache, "account-b", vec!["model-b".to_string()]);
+        let account_a = warmup_cache_key(&cache_binding("account-a", "a@example.com"), &[]);
+        let account_b = warmup_cache_key(&cache_binding("account-b", "b@example.com"), &[]);
+        let mut cache = HashMap::new();
+        model_cache_set(&mut cache, &account_a, test_selection("model-a", &[]));
+        model_cache_set(&mut cache, &account_b, test_selection("model-b", &[]));
 
-        model_cache_invalidate(&mut cache, "account-a");
+        model_cache_invalidate(&mut cache, &account_a);
 
-        assert_eq!(model_cache_get(&cache, "account-a"), None);
+        assert_eq!(model_cache_get(&cache, &account_a), None);
         assert_eq!(
-            model_cache_get(&cache, "account-b"),
-            Some(vec!["model-b".to_string()])
+            model_cache_get(&cache, &account_b),
+            Some(test_selection("model-b", &[]))
         );
     }
 
@@ -914,20 +1682,13 @@ mod tests {
     /// to retrieve it is unnecessary.
     #[test]
     fn test_model_cache_round_trips_the_whole_selected_set() {
-        let mut cache: HashMap<String, Vec<String>> = HashMap::new();
-        let selected = vec!["gpt-5-mini".to_string(), "gpt-5-spark".to_string()];
-        model_cache_set(&mut cache, "account-a", selected.clone());
+        let key = warmup_cache_key(&cache_binding("account-a", "a@example.com"), &[]);
+        let mut cache = HashMap::new();
+        let selected = test_selection("gpt-5-mini", &[("gpt-5-spark", "gpt-5-spark")]);
+        model_cache_set(&mut cache, &key, selected.clone());
 
-        let cached = model_cache_get(&cache, "account-a").expect("entry must round-trip");
-        let (main, additional) = split_main_model(&cached).unwrap();
-
-        assert_eq!(main, "gpt-5-mini");
-        assert_eq!(additional, ["gpt-5-spark".to_string()]);
-    }
-
-    #[test]
-    fn test_split_main_model_rejects_an_empty_selection() {
-        assert!(split_main_model(&[]).is_err());
+        let cached = model_cache_get(&cache, &key).expect("entry must round-trip");
+        assert_eq!(cached, selected);
     }
 
     fn model_pool(limit_name: &str) -> crate::usage::AdditionalRateLimit {
@@ -944,8 +1705,14 @@ mod tests {
     #[test]
     fn cache_key_separates_accounts_that_share_a_pool_set() {
         assert_ne!(
-            warmup_cache_key("alice", &[model_pool("gpt-5-mini")]),
-            warmup_cache_key("bob", &[model_pool("gpt-5-mini")])
+            warmup_cache_key(
+                &cache_binding("account-a", "a@example.com"),
+                &[model_pool("gpt-5-mini")]
+            ),
+            warmup_cache_key(
+                &cache_binding("account-b", "b@example.com"),
+                &[model_pool("gpt-5-mini")]
+            )
         );
     }
 
@@ -953,8 +1720,9 @@ mod tests {
     /// thing that re-resolves the model list for a long-running daemon.
     #[test]
     fn cache_key_changes_when_a_pool_is_added() {
-        let before = warmup_cache_key("alice", &[]);
-        let after = warmup_cache_key("alice", &[model_pool("gpt-5-mini")]);
+        let binding = cache_binding("account-a", "a@example.com");
+        let before = warmup_cache_key(&binding, &[]);
+        let after = warmup_cache_key(&binding, &[model_pool("gpt-5-mini")]);
         assert_ne!(before, after);
     }
 
@@ -962,21 +1730,35 @@ mod tests {
     /// a perfectly good entry and buy a `/models` round trip per warmup.
     #[test]
     fn cache_key_ignores_pool_order() {
+        let binding = cache_binding("account-a", "a@example.com");
         let one = warmup_cache_key(
-            "alice",
+            &binding,
             &[model_pool("gpt-5-mini"), model_pool("gpt-5-spark")],
         );
         let other = warmup_cache_key(
-            "alice",
+            &binding,
             &[model_pool("gpt-5-spark"), model_pool("gpt-5-mini")],
         );
         assert_eq!(one, other);
+    }
+
+    #[test]
+    fn cache_key_treats_normalized_pools_as_a_set() {
+        let binding = cache_binding("account-a", "a@example.com");
+        assert_eq!(
+            warmup_cache_key(&binding, &[model_pool("GPT-5 Mini")]),
+            warmup_cache_key(
+                &binding,
+                &[model_pool("gpt_5-mini"), model_pool("GPT-5 Mini")]
+            )
+        );
     }
 
     /// Pools that `select_warmup_models` never acts on must not perturb the key
     /// either, or an unrelated non-model quota would invalidate a good entry.
     #[test]
     fn cache_key_ignores_pools_that_are_not_warmed() {
+        let binding = cache_binding("account-a", "a@example.com");
         let non_model = crate::usage::AdditionalRateLimit {
             metered_feature: Some("code_review".to_string()),
             ..model_pool("Code review")
@@ -986,8 +1768,8 @@ mod tests {
             ..model_pool("gpt-5-spark")
         };
         assert_eq!(
-            warmup_cache_key("alice", &[model_pool("gpt-5-mini")]),
-            warmup_cache_key("alice", &[model_pool("gpt-5-mini"), non_model, exhausted])
+            warmup_cache_key(&binding, &[model_pool("gpt-5-mini")]),
+            warmup_cache_key(&binding, &[model_pool("gpt-5-mini"), non_model, exhausted])
         );
     }
 
@@ -1145,7 +1927,10 @@ mod tests {
 
         assert_eq!(
             select_warmup_models(&models, &limits).unwrap(),
-            vec!["gpt-5.4-mini", "gpt-5.3-codex-spark"]
+            test_selection(
+                "gpt-5.4-mini",
+                &[("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark")]
+            )
         );
     }
 
@@ -1175,7 +1960,7 @@ mod tests {
 
         assert_eq!(
             select_warmup_models(&models, &limits).unwrap(),
-            vec!["gpt-5.4-mini"]
+            test_selection("gpt-5.4-mini", &[])
         );
     }
 
@@ -1205,7 +1990,7 @@ mod tests {
 
         assert_eq!(
             select_warmup_models(&models, &limits).unwrap(),
-            vec!["gpt-5.4-mini"]
+            test_selection("gpt-5.4-mini", &[])
         );
     }
 
@@ -1235,8 +2020,31 @@ mod tests {
 
         assert_eq!(
             select_warmup_models(&models, &limits).unwrap(),
-            vec!["gpt-5.6-codex", "gpt-5.3-codex-spark"]
+            test_selection(
+                "gpt-5.6-codex",
+                &[("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark")]
+            )
         );
+    }
+
+    #[test]
+    fn test_warmup_models_require_a_distinct_main_pool_model() {
+        let models = vec![ModelEntry {
+            slug: "gpt-5.3-codex-spark".to_string(),
+            visibility: Some("List".to_string()),
+            priority: Some(1),
+            supported_in_api: Some(true),
+            ..Default::default()
+        }];
+        let limits = vec![crate::usage::AdditionalRateLimit {
+            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+            metered_feature: Some("codex_bengalfox".to_string()),
+            ..Default::default()
+        }];
+
+        let error = select_warmup_models(&models, &limits).unwrap_err();
+
+        assert!(error.to_string().contains("no main-pool model"));
     }
 
     #[test]
@@ -1282,7 +2090,54 @@ mod tests {
 
         assert_eq!(
             select_warmup_models(&models, &limits).unwrap(),
-            vec!["gpt-5.4-mini", "gpt-5.3-codex-spark", "gpt-6-codex-burst"]
+            test_selection(
+                "gpt-5.4-mini",
+                &[
+                    ("GPT-5.3-Codex-Spark", "gpt-5.3-codex-spark"),
+                    ("GPT-6-Codex-Burst", "gpt-6-codex-burst"),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn test_warmup_models_group_pools_that_share_one_model_request() {
+        let models = vec![
+            ModelEntry {
+                slug: "gpt-main-mini".to_string(),
+                visibility: Some("List".to_string()),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+            ModelEntry {
+                slug: "spark-fast".to_string(),
+                visibility: Some("List".to_string()),
+                supported_in_api: Some(true),
+                ..Default::default()
+            },
+        ];
+        let limits = vec![
+            crate::usage::AdditionalRateLimit {
+                limit_name: Some("Spark".to_string()),
+                metered_feature: Some("codex_spark".to_string()),
+                ..Default::default()
+            },
+            crate::usage::AdditionalRateLimit {
+                limit_name: Some("Spark Fast".to_string()),
+                metered_feature: Some("codex_spark_fast".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            select_warmup_models(&models, &limits).unwrap(),
+            WarmupModelSelection {
+                main: "gpt-main-mini".to_string(),
+                additional: vec![SelectedPoolModel {
+                    pool_keys: vec!["spark".to_string(), "sparkfast".to_string()],
+                    model: "spark-fast".to_string(),
+                }],
+            }
         );
     }
 
@@ -1307,7 +2162,7 @@ mod tests {
 
     #[test]
     fn test_model_fetch_failure_is_not_replaced_with_a_hardcoded_model() {
-        let error = require_official_model::<Vec<String>>(Err(anyhow::anyhow!(
+        let error = require_official_model::<WarmupModelSelection>(Err(anyhow::anyhow!(
             "models endpoint unavailable"
         )))
         .unwrap_err();
@@ -1359,9 +2214,11 @@ mod tests {
         let request = make_request(
             &endpoints,
             &reqwest::Client::new(),
-            "access-token",
-            Some("workspace-123"),
-            true,
+            WarmupRequestAuth {
+                access_token: "access-token",
+                account_id: Some("workspace-123"),
+                is_fedramp: true,
+            },
             &build_body("gpt-test"),
         )
         .unwrap()
@@ -1393,12 +2250,29 @@ mod tests {
     mod refresh_short_circuit {
         use super::*;
         use axum::http::StatusCode;
+        use axum::response::IntoResponse;
         use axum::routing::{get, post};
         use axum::{Json, Router};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         use crate::auth::URL_ENV_LOCK as ENV_LOCK;
+
+        fn run_profile_url_test<F, Fut>(test: F)
+        where
+            F: FnOnce() -> Fut,
+            Fut: std::future::Future<Output = ()>,
+        {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _url_env_lock = runtime.block_on(ENV_LOCK.lock());
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runtime.block_on(test());
+        }
 
         struct EnvVarGuard {
             key: &'static str,
@@ -1454,9 +2328,30 @@ mod tests {
         }
 
         fn write_test_auth(path: &std::path::Path, access_token: &str, refresh_token: &str) {
+            write_test_auth_for_identity(
+                path,
+                access_token,
+                refresh_token,
+                "acct-warmup-test",
+                "warmup-test@example.com",
+            );
+        }
+
+        fn write_test_auth_for_identity(
+            path: &std::path::Path,
+            access_token: &str,
+            refresh_token: &str,
+            account_id: &str,
+            email: &str,
+        ) {
             let val = serde_json::json!({
                 "tokens": {
-                    "id_token": test_id_token(),
+                    "id_token": make_jwt(&serde_json::json!({
+                        "email": email,
+                        "https://api.openai.com/auth": {
+                            "chatgpt_account_id": account_id
+                        }
+                    })),
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                 }
@@ -1464,6 +2359,106 @@ mod tests {
             crate::auth::write_auth(path, &val)
                 .unwrap()
                 .assert_durably_published();
+        }
+
+        fn strict_binding_for_profile(
+            profile_path: &std::path::Path,
+        ) -> crate::jwt::StrictAccountBinding {
+            crate::auth::account_info_from_auth_value(
+                &crate::auth::read_auth(profile_path).unwrap(),
+            )
+            .strict_binding()
+            .expect("the staged test profile has a strict account identity")
+        }
+
+        fn cache_usage_for_profile(
+            alias: &str,
+            profile_path: &std::path::Path,
+            usage: &crate::usage::UsageInfo,
+        ) {
+            let auth = crate::auth::read_auth(profile_path).unwrap();
+            let binding = crate::auth::account_info_from_auth_value(&auth)
+                .strict_binding()
+                .expect("the staged test profile has a strict account identity");
+            crate::cache::put_bound_versioned(alias, &binding, usage).unwrap();
+        }
+
+        #[test]
+        fn post_revalidation_rejects_a_token_that_is_no_longer_fresh() {
+            let auth = serde_json::json!({
+                "tokens": {
+                    "id_token": test_id_token(),
+                    "access_token": expired_access_token(),
+                    "refresh_token": "refresh-token"
+                }
+            });
+            let binding = crate::auth::account_info_from_auth_value(&auth)
+                .strict_binding()
+                .unwrap();
+            let snapshot = WarmupCredentialSnapshot::from_auth(
+                "freshness-test",
+                auth,
+                &binding,
+                "test identity changed",
+            )
+            .unwrap();
+
+            let error = snapshot
+                .ensure_fresh_for_post("freshness-test")
+                .expect_err("an expiring token must not authorize a warmup POST");
+            assert!(
+                error.to_string().contains("too close to expiry"),
+                "freshness failure should identify the post-discovery boundary: {error:#}"
+            );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn post_revalidation_rejects_same_identity_credential_rotation() {
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+            let alias = "warmup-snapshot-rotation";
+            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
+            let first_access = make_jwt(&serde_json::json!({
+                "exp": crate::auth::now_unix_secs().unwrap() + 3_600
+            }));
+            write_test_auth(&profile_path, &first_access, "refresh-token-before");
+            let auth = crate::auth::read_auth(&profile_path).unwrap();
+            let binding = crate::auth::account_info_from_auth_value(&auth)
+                .strict_binding()
+                .unwrap();
+            let snapshot =
+                WarmupCredentialSnapshot::from_auth(alias, auth, &binding, "test identity changed")
+                    .unwrap();
+
+            let rotated_access = make_jwt(&serde_json::json!({
+                "exp": crate::auth::now_unix_secs().unwrap() + 7_200
+            }));
+            write_test_auth(&profile_path, &rotated_access, "refresh-token-after");
+            let error = reacquire_warmup_snapshot_after_model_discovery(
+                alias,
+                &profile_path,
+                &binding,
+                &snapshot,
+            )
+            .await
+            .map(|(lease, _)| drop(lease))
+            .expect_err("credential rotation must invalidate the prepared warmup snapshot");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("credentials changed during model discovery"),
+                "same-identity rotation should fail the exact snapshot check: {error:#}"
+            );
+            assert_eq!(
+                crate::auth::extract_tokens(&crate::auth::read_auth(&profile_path).unwrap()).0,
+                Some(rotated_access),
+                "snapshot validation must not overwrite the concurrently rotated credential"
+            );
         }
 
         /// Starts a mock server answering all three warmup-relevant endpoints and
@@ -1572,29 +2567,41 @@ mod tests {
             let client = reqwest::Client::new();
             let first_client = client.clone();
             let first_endpoints = endpoints.clone();
+            let first_cache_key =
+                warmup_cache_key(&cache_binding("workspace-one", "one@example.com"), &[]);
             let first = tokio::spawn(async move {
+                let mut network = NetworkBudget::new(test_first_network_permit());
                 resolve_warmup_models(
                     &first_endpoints,
-                    "concurrent-model-account-one",
+                    &first_cache_key,
                     &first_client,
-                    "token-one",
-                    Some("workspace-one"),
-                    false,
+                    WarmupRequestAuth {
+                        access_token: "token-one",
+                        account_id: Some("workspace-one"),
+                        is_fedramp: false,
+                    },
                     &[],
+                    &mut network,
                 )
                 .await
             });
             assert_eq!(arrival_rx.recv().await.as_deref(), Some("workspace-one"));
 
+            let second_cache_key =
+                warmup_cache_key(&cache_binding("workspace-two", "two@example.com"), &[]);
             let second = tokio::spawn(async move {
+                let mut network = NetworkBudget::new(test_first_network_permit());
                 resolve_warmup_models(
                     &endpoints,
-                    "concurrent-model-account-two",
+                    &second_cache_key,
                     &client,
-                    "token-two",
-                    Some("workspace-two"),
-                    false,
+                    WarmupRequestAuth {
+                        access_token: "token-two",
+                        account_id: Some("workspace-two"),
+                        is_fedramp: false,
+                    },
                     &[],
+                    &mut network,
                 )
                 .await
             });
@@ -1630,14 +2637,13 @@ mod tests {
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "terminal-refresh-test";
+            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
+            write_test_auth(&profile_path, &expired_access_token(), "refresh-token-1");
             // Pre-populate the usage cache so `warmup_account` never calls the
             // (unrelated) usage-fetch path, which has its own independent
             // proactive-refresh call — that would inflate the auth-endpoint
             // call count for a reason this test isn't about.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
-
-            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
-            write_test_auth(&profile_path, &expired_access_token(), "refresh-token-1");
+            cache_usage_for_profile(alias, &profile_path, &crate::usage::UsageInfo::default());
 
             // Every refresh attempt is rejected as reused; the auth server never
             // issues new tokens. The warmup POST is unreachable with a live token,
@@ -1678,13 +2684,13 @@ mod tests {
             let home = crate::fs_ops::create_direct_tempdir().unwrap();
             let _codex_switch_home = use_test_home(home.path());
             let alias = "unknown-refresh-test";
-            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
             let profile_path = home.path().join("profiles").join(alias).join("auth.json");
             write_test_auth(
                 &profile_path,
                 &expired_access_token(),
                 "refresh-token-unknown",
             );
+            cache_usage_for_profile(alias, &profile_path, &crate::usage::UsageInfo::default());
             let (token_calls, _guards) = start_mock_server(
                 StatusCode::OK,
                 serde_json::json!({
@@ -1774,10 +2780,19 @@ mod tests {
 
             let result = {
                 let _tracing_guard = tracing::subscriber::set_default(subscriber);
+                let client = crate::auth::build_http_client().unwrap();
                 let lease = crate::profile::acquire_profile_lease_async(alias)
                     .await
                     .expect("model test acquires its profile lease");
-                fetch_models_for_profile_leased(alias, &profile_path, &lease).await
+                let expected_binding = strict_binding_for_profile(&profile_path);
+                fetch_models_for_profile_leased_with_client(
+                    alias,
+                    &profile_path,
+                    lease,
+                    &expected_binding,
+                    &client,
+                )
+                .await
             };
 
             // Existing degrade-gracefully behavior must be preserved: a failed
@@ -1793,6 +2808,836 @@ mod tests {
                 "the real rejection reason must be traceable in the logs, not silently \
                  dropped — captured log output was: {logs:?}"
             );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn fetch_models_rejects_rebound_alias_before_any_request() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let network_calls = Arc::new(AtomicUsize::new(0));
+            let token_calls = Arc::clone(&network_calls);
+            let model_calls = Arc::clone(&network_calls);
+            let app = Router::new()
+                .route(
+                    "/oauth/token",
+                    post(move || {
+                        let calls = Arc::clone(&token_calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "access_token": "rotated-access",
+                                    "refresh_token": "rotated-refresh"
+                                })),
+                            )
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/models",
+                    get(move || {
+                        let calls = Arc::clone(&model_calls);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "models": [{"slug": "gpt-5-mini"}]
+                            }))
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _token_url =
+                EnvVarGuard::set("CS_TOKEN_URL", &format!("http://{addr}/oauth/token"));
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+
+            let alias = "fetch-models-rebound";
+            let profile_path = home.path().join("profiles").join(alias).join("auth.json");
+            write_test_auth(
+                &profile_path,
+                &expired_access_token(),
+                "refresh-token-rebound",
+            );
+            let mut expected_binding = strict_binding_for_profile(&profile_path);
+            expected_binding.account_id = "previous-owner".to_string();
+            let client = reqwest::Client::new();
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .expect("model test acquires its profile lease");
+
+            let error = fetch_models_for_profile_leased_with_client(
+                alias,
+                &profile_path,
+                lease,
+                &expected_binding,
+                &client,
+            )
+            .await
+            .expect_err("a model request must reject an alias rebound to another account");
+            server.abort();
+
+            assert!(
+                format!("{error:#}").contains("profile identity changed"),
+                "alias rebinding should fail with an identity-specific error: {error:#}"
+            );
+            assert_eq!(
+                network_calls.load(Ordering::SeqCst),
+                0,
+                "identity validation must run before token refresh or model discovery HTTP"
+            );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn model_endpoint_wait_does_not_retain_the_profile_lease() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let (arrival_tx, mut arrival_rx) = tokio::sync::mpsc::unbounded_channel();
+            let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let handler_gate = Arc::clone(&response_gate);
+            let app = Router::new().route(
+                "/codex/models",
+                get(move || {
+                    let arrival_tx = arrival_tx.clone();
+                    let gate = Arc::clone(&handler_gate);
+                    async move {
+                        arrival_tx.send(()).unwrap();
+                        let _permit = gate.acquire_owned().await.unwrap();
+                        Json(serde_json::json!({
+                            "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+
+            let alias = "model-read-releases-profile-lease";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let expected_binding = strict_binding_for_profile(&profile_path);
+            let client = reqwest::Client::new();
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .expect("model test acquires its initial profile lease");
+            let task_path = profile_path.clone();
+            let task_binding = expected_binding.clone();
+            let task = tokio::spawn(async move {
+                fetch_models_for_profile_leased_with_client(
+                    alias,
+                    &task_path,
+                    lease,
+                    &task_binding,
+                    &client,
+                )
+                .await
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), arrival_rx.recv())
+                .await
+                .expect("the model request must reach the deliberately blocked endpoint")
+                .expect("the model endpoint must report request arrival");
+            let replacement_lease = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                crate::profile::acquire_profile_lease_async(alias),
+            )
+            .await
+            .expect("the read-only model response must not retain the profile lease")
+            .expect("the released profile lease must be acquirable");
+            drop(replacement_lease);
+
+            response_gate.add_permits(1);
+            let models = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("model discovery must finish after the endpoint is released")
+                .expect("model discovery task must join")
+                .expect("model discovery must succeed");
+            server.abort();
+
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].slug, "gpt-5-mini");
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn warmup_model_wait_releases_then_reacquires_the_profile_lease() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let (arrival_tx, mut arrival_rx) = tokio::sync::mpsc::unbounded_channel();
+            let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let handler_gate = Arc::clone(&response_gate);
+            let responses_calls = Arc::new(AtomicUsize::new(0));
+            let responses_counter = Arc::clone(&responses_calls);
+            let app = Router::new()
+                .route(
+                    "/codex/models",
+                    get(move || {
+                        let arrival_tx = arrival_tx.clone();
+                        let gate = Arc::clone(&handler_gate);
+                        async move {
+                            arrival_tx.send(()).unwrap();
+                            let _permit = gate.acquire_owned().await.unwrap();
+                            Json(serde_json::json!({
+                                "models": [{
+                                    "slug": "gpt-5-mini",
+                                    "supported_in_api": true
+                                }]
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move || {
+                        let counter = Arc::clone(&responses_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::OK, "")
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+            let _responses_url = EnvVarGuard::set(
+                "CS_RESPONSES_URL",
+                &format!("http://{addr}/codex/responses"),
+            );
+
+            let alias = "warmup-model-read-releases-profile-lease";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let expected_binding = strict_binding_for_profile(&profile_path);
+            let cache_key = warmup_cache_key(&expected_binding, &[]);
+            model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .expect("warmup test acquires its initial profile lease");
+            let task_path = profile_path.clone();
+            let task_binding = expected_binding.clone();
+            let task = tokio::spawn(async move {
+                warmup_account_leased_with_client_after_usage_preflight(
+                    alias,
+                    &task_path,
+                    lease,
+                    &reqwest::Client::new(),
+                    &task_binding,
+                    Some(crate::usage::UsageInfo::default()),
+                    test_first_network_permit(),
+                )
+                .await
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), arrival_rx.recv())
+                .await
+                .expect("the warmup model request must reach the blocked endpoint")
+                .expect("the model endpoint must report request arrival");
+            let concurrent_lease = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                crate::profile::acquire_profile_lease_async(alias),
+            )
+            .await
+            .expect("a blocked read-only /models request must not retain the alias lease")
+            .expect("the released warmup lease must be acquirable");
+            drop(concurrent_lease);
+
+            response_gate.add_permits(1);
+            let returned_lease = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("warmup must finish after model discovery is released")
+                .expect("warmup task must join")
+                .expect("unchanged credentials must pass post-discovery revalidation");
+            drop(returned_lease);
+            server.abort();
+
+            assert_eq!(
+                responses_calls.load(Ordering::SeqCst),
+                1,
+                "the unchanged normal flow must still send exactly one warmup POST"
+            );
+            assert_eq!(
+                model_cache_get(&*MODEL_CACHE.lock().await, &cache_key),
+                Some(test_selection("gpt-5-mini", &[])),
+                "a revalidated model result should be published normally"
+            );
+        }
+
+        #[test]
+        fn cached_models_commit_cancellation_boundary_before_warmup_post() {
+            run_profile_url_test(|| async {
+                let home = crate::fs_ops::create_direct_tempdir().unwrap();
+                let _codex_switch_home = use_test_home(home.path());
+
+                let responses_calls = Arc::new(AtomicUsize::new(0));
+                let responses_counter = Arc::clone(&responses_calls);
+                let app = Router::new().route(
+                    "/codex/responses",
+                    post(move || {
+                        let counter = Arc::clone(&responses_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::OK, "")
+                        }
+                    }),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let _models_url =
+                    EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+                let _responses_url = EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                );
+
+                let alias = "warmup-cache-hit-commit-boundary";
+                let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+                let binding = strict_binding_for_profile(&profile_path);
+                let cache_key = warmup_cache_key(&binding, &[]);
+                model_cache_set(
+                    &mut *MODEL_CACHE.lock().await,
+                    &cache_key,
+                    test_selection("gpt-5-mini", &[]),
+                );
+                let commit_calls = Arc::new(AtomicUsize::new(0));
+                let task_commit_calls = Arc::clone(&commit_calls);
+                let controls = WarmupExecutionControls::cancellable(
+                    test_first_network_permit(),
+                    std::future::pending(),
+                    move || {
+                        task_commit_calls.fetch_add(1, Ordering::SeqCst);
+                        false
+                    },
+                );
+                let lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .unwrap();
+                let error = warmup_account_leased_with_client_after_usage_preflight_with_controls(
+                    alias,
+                    &profile_path,
+                    lease,
+                    &reqwest::Client::new(),
+                    &binding,
+                    Some(crate::usage::UsageInfo::default()),
+                    controls,
+                )
+                .await
+                .map(drop)
+                .expect_err("a cancelled cache-hit boundary must stop before quota mutation");
+                server.abort();
+
+                assert!(warmup_wait_was_cancelled(&error), "{error:#}");
+                assert_eq!(commit_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    responses_calls.load(Ordering::SeqCst),
+                    0,
+                    "a cache hit must atomically commit before its first warmup POST"
+                );
+                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+            });
+        }
+
+        #[test]
+        fn cancelling_blocked_model_discovery_prevents_cache_publish_and_warmup_post() {
+            run_profile_url_test(|| async {
+                let home = crate::fs_ops::create_direct_tempdir().unwrap();
+                let _codex_switch_home = use_test_home(home.path());
+
+                let (arrival_tx, mut arrival_rx) = tokio::sync::mpsc::unbounded_channel();
+                let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let handler_gate = Arc::clone(&response_gate);
+                let responses_calls = Arc::new(AtomicUsize::new(0));
+                let responses_counter = Arc::clone(&responses_calls);
+                let app = Router::new()
+                    .route(
+                        "/codex/models",
+                        get(move || {
+                            let arrival_tx = arrival_tx.clone();
+                            let gate = Arc::clone(&handler_gate);
+                            async move {
+                                arrival_tx.send(()).unwrap();
+                                let _permit = gate.acquire_owned().await.unwrap();
+                                Json(serde_json::json!({
+                                    "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                                }))
+                            }
+                        }),
+                    )
+                    .route(
+                        "/codex/responses",
+                        post(move || {
+                            let counter = Arc::clone(&responses_counter);
+                            async move {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::OK, "")
+                            }
+                        }),
+                    );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let _models_url =
+                    EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+                let _responses_url = EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                );
+
+                let alias = "warmup-cancel-blocked-model-discovery";
+                let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+                let binding = strict_binding_for_profile(&profile_path);
+                let cache_key = warmup_cache_key(&binding, &[]);
+                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let committed = Arc::new(AtomicBool::new(false));
+                let task_committed = Arc::clone(&committed);
+                let controls = WarmupExecutionControls::cancellable(
+                    test_first_network_permit(),
+                    async move {
+                        let _ = cancel_rx.await;
+                    },
+                    move || {
+                        task_committed.store(true, Ordering::SeqCst);
+                        true
+                    },
+                );
+                let lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .unwrap();
+                let task_path = profile_path.clone();
+                let task_binding = binding.clone();
+                let task = tokio::spawn(async move {
+                    warmup_account_leased_with_client_after_usage_preflight_with_controls(
+                        alias,
+                        &task_path,
+                        lease,
+                        &reqwest::Client::new(),
+                        &task_binding,
+                        Some(crate::usage::UsageInfo::default()),
+                        controls,
+                    )
+                    .await
+                });
+
+                tokio::time::timeout(std::time::Duration::from_secs(1), arrival_rx.recv())
+                    .await
+                    .expect("the cancellable model request must reach the blocked endpoint")
+                    .expect("the model endpoint must report request arrival");
+                cancel_tx.send(()).unwrap();
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .expect("cancellation must stop a blocked read-only model request")
+                    .expect("warmup task must join")
+                    .map(drop)
+                    .expect_err("cancelled model discovery must not reach a quota POST");
+                server.abort();
+
+                assert!(warmup_wait_was_cancelled(&error), "{error:#}");
+                assert!(!committed.load(Ordering::SeqCst));
+                assert_eq!(responses_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    model_cache_get(&*MODEL_CACHE.lock().await, &cache_key),
+                    None
+                );
+            });
+        }
+
+        #[test]
+        fn cancelling_post_discovery_lease_reacquisition_prevents_publish_and_post() {
+            run_profile_url_test(|| async {
+                let home = crate::fs_ops::create_direct_tempdir().unwrap();
+                let _codex_switch_home = use_test_home(home.path());
+
+                let (arrival_tx, mut arrival_rx) = tokio::sync::mpsc::unbounded_channel();
+                let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let handler_gate = Arc::clone(&response_gate);
+                let responses_calls = Arc::new(AtomicUsize::new(0));
+                let responses_counter = Arc::clone(&responses_calls);
+                let app = Router::new()
+                    .route(
+                        "/codex/models",
+                        get(move || {
+                            let arrival_tx = arrival_tx.clone();
+                            let gate = Arc::clone(&handler_gate);
+                            async move {
+                                arrival_tx.send(()).unwrap();
+                                let permit = gate.acquire_owned().await.unwrap();
+                                permit.forget();
+                                Json(serde_json::json!({
+                                    "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                                }))
+                            }
+                        }),
+                    )
+                    .route(
+                        "/codex/responses",
+                        post(move || {
+                            let counter = Arc::clone(&responses_counter);
+                            async move {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                (StatusCode::OK, "")
+                            }
+                        }),
+                    );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app).await.unwrap();
+                });
+                let _models_url =
+                    EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+                let _responses_url = EnvVarGuard::set(
+                    "CS_RESPONSES_URL",
+                    &format!("http://{addr}/codex/responses"),
+                );
+
+                let alias = "warmup-cancel-model-lease-reacquire";
+                let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+                let binding = strict_binding_for_profile(&profile_path);
+                let cache_key = warmup_cache_key(&binding, &[]);
+                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let committed = Arc::new(AtomicBool::new(false));
+                let task_committed = Arc::clone(&committed);
+                let controls = WarmupExecutionControls::cancellable(
+                    test_first_network_permit(),
+                    async move {
+                        let _ = cancel_rx.await;
+                    },
+                    move || {
+                        task_committed.store(true, Ordering::SeqCst);
+                        true
+                    },
+                );
+                let lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .unwrap();
+                let task_path = profile_path.clone();
+                let task_binding = binding.clone();
+                let task = tokio::spawn(async move {
+                    warmup_account_leased_with_client_after_usage_preflight_with_controls(
+                        alias,
+                        &task_path,
+                        lease,
+                        &reqwest::Client::new(),
+                        &task_binding,
+                        Some(crate::usage::UsageInfo::default()),
+                        controls,
+                    )
+                    .await
+                });
+
+                tokio::time::timeout(std::time::Duration::from_secs(1), arrival_rx.recv())
+                    .await
+                    .expect("the model request must reach the gated endpoint")
+                    .expect("the model endpoint must report request arrival");
+                let held_lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .expect("model discovery must release the alias lease");
+                let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+                crate::profile::notify_on_test_lock_attempt(
+                    &format!("profile '{alias}'"),
+                    attempt_tx,
+                );
+                response_gate.add_permits(1);
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        if attempt_rx.try_recv().is_ok() {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("warmup must reach the blocked post-discovery lease reacquisition");
+                cancel_tx.send(()).unwrap();
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .expect("cancellation must stop post-discovery lease reacquisition")
+                    .expect("warmup task must join")
+                    .map(drop)
+                    .expect_err("cancelled reacquisition must not publish models or send a POST");
+
+                assert!(warmup_wait_was_cancelled(&error), "{error:#}");
+                assert!(!committed.load(Ordering::SeqCst));
+                assert_eq!(responses_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    model_cache_get(&*MODEL_CACHE.lock().await, &cache_key),
+                    None
+                );
+                drop(held_lease);
+                drop(
+                    crate::profile::acquire_profile_lease_async(alias)
+                        .await
+                        .expect(
+                            "the cancelled reacquisition must eventually release its worker lease",
+                        ),
+                );
+                server.abort();
+            });
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn alias_rebind_or_delete_during_model_discovery_prevents_warmup_mutation() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let (arrival_tx, mut arrival_rx) = tokio::sync::mpsc::unbounded_channel();
+            let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let handler_gate = Arc::clone(&response_gate);
+            let responses_calls = Arc::new(AtomicUsize::new(0));
+            let responses_counter = Arc::clone(&responses_calls);
+            let app = Router::new()
+                .route(
+                    "/codex/models",
+                    get(move || {
+                        let arrival_tx = arrival_tx.clone();
+                        let gate = Arc::clone(&handler_gate);
+                        async move {
+                            arrival_tx.send(()).unwrap();
+                            let permit = gate.acquire_owned().await.unwrap();
+                            permit.forget();
+                            Json(serde_json::json!({
+                                "models": [{
+                                    "slug": "gpt-5-mini",
+                                    "supported_in_api": true
+                                }]
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move || {
+                        let counter = Arc::clone(&responses_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::OK, "")
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+            let _responses_url = EnvVarGuard::set(
+                "CS_RESPONSES_URL",
+                &format!("http://{addr}/codex/responses"),
+            );
+
+            for (alias, delete_profile) in [
+                ("warmup-rebound-during-model-read", false),
+                ("warmup-deleted-during-model-read", true),
+            ] {
+                let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+                let expected_binding = strict_binding_for_profile(&profile_path);
+                let cache_key = warmup_cache_key(&expected_binding, &[]);
+                model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+                let lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .expect("warmup test acquires its initial profile lease");
+                let task_path = profile_path.clone();
+                let task_binding = expected_binding.clone();
+                let task = tokio::spawn(async move {
+                    warmup_account_leased_with_client_after_usage_preflight(
+                        alias,
+                        &task_path,
+                        lease,
+                        &reqwest::Client::new(),
+                        &task_binding,
+                        Some(crate::usage::UsageInfo::default()),
+                        test_first_network_permit(),
+                    )
+                    .await
+                });
+
+                tokio::time::timeout(std::time::Duration::from_secs(1), arrival_rx.recv())
+                    .await
+                    .expect("the warmup model request must reach the blocked endpoint")
+                    .expect("the model endpoint must report request arrival");
+                let mutation_lease = crate::profile::acquire_profile_lease_async(alias)
+                    .await
+                    .expect("the concurrent alias mutation must acquire the released lease");
+                if delete_profile {
+                    std::fs::remove_file(&profile_path).unwrap();
+                } else {
+                    write_test_auth_for_identity(
+                        &profile_path,
+                        &live_access_token(),
+                        "replacement-refresh-token",
+                        "acct-rebound-owner",
+                        "rebound-owner@example.com",
+                    );
+                }
+                drop(mutation_lease);
+                response_gate.add_permits(1);
+
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .expect("warmup must stop after the profile mutation is visible")
+                    .expect("warmup task must join")
+                    .map(drop)
+                    .expect_err("a rebound or deleted alias must fail before warmup POST");
+                if delete_profile {
+                    assert!(
+                        format!("{error:#}").contains("cannot revalidate auth"),
+                        "deletion should fail at auth revalidation: {error:#}"
+                    );
+                    assert!(
+                        !profile_path.exists(),
+                        "warmup must not recreate the deleted profile"
+                    );
+                } else {
+                    assert!(
+                        format!("{error:#}").contains("identity changed during model discovery"),
+                        "rebind should fail at strict identity revalidation: {error:#}"
+                    );
+                    assert_eq!(
+                        strict_binding_for_profile(&profile_path).account_id,
+                        "acct-rebound-owner",
+                        "warmup must not overwrite the replacement owner's credentials"
+                    );
+                }
+                assert_eq!(
+                    model_cache_get(&*MODEL_CACHE.lock().await, &cache_key),
+                    None,
+                    "an unvalidated discovery result must not mutate the model cache"
+                );
+            }
+            server.abort();
+
+            assert_eq!(
+                responses_calls.load(Ordering::SeqCst),
+                0,
+                "neither profile mutation may be followed by a warmup POST"
+            );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn model_retry_backoff_releases_network_capacity() {
+            let _lock = ENV_LOCK.lock().await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let server_calls = Arc::clone(&calls);
+            let first_response = Arc::new(tokio::sync::Semaphore::new(0));
+            let server_first_response = Arc::clone(&first_response);
+            let app = Router::new().route(
+                "/codex/models",
+                get(move || {
+                    let calls = Arc::clone(&server_calls);
+                    let first_response = Arc::clone(&server_first_response);
+                    async move {
+                        let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            first_response.add_permits(1);
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({"error": "retry"})),
+                            )
+                        } else {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "models": [{
+                                        "slug": "gpt-5-mini",
+                                        "supported_in_api": true
+                                    }]
+                                })),
+                            )
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+            let endpoints = crate::auth::service_endpoints().unwrap();
+            let limiter = Arc::new(Semaphore::new(1));
+            let task_limiter = Arc::clone(&limiter);
+            let task = tokio::spawn(async move {
+                let mut network = NetworkBudget::new(first_network_permit(task_limiter));
+                fetch_models(
+                    &endpoints,
+                    &reqwest::Client::new(),
+                    WarmupRequestAuth {
+                        access_token: "access-token",
+                        account_id: None,
+                        is_fedramp: false,
+                    },
+                    &mut network,
+                )
+                .await
+            });
+
+            let observed = first_response.acquire_owned().await.unwrap();
+            observed.forget();
+            let spare = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                limiter.clone().acquire_owned(),
+            )
+            .await
+            .expect("the retry delay must not retain network capacity")
+            .expect("the model limiter must remain open");
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the retry must reserve fresh capacity before its second request"
+            );
+            drop(spare);
+
+            let models = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("the retried model request must finish")
+                .expect("the model task must join")
+                .expect("the second model attempt must succeed");
+            server.abort();
+            assert_eq!(models.len(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
 
         // ── rotated tokens that never reach disk must abort the account ──
@@ -1828,7 +3673,15 @@ mod tests {
             access_token: &str,
         ) -> std::path::PathBuf {
             let readable = home.join("staged").join(alias).join("auth.json");
-            write_test_auth(&readable, access_token, "refresh-token-live");
+            let account_id = format!("acct-{alias}");
+            let email = format!("{alias}@example.com");
+            write_test_auth_for_identity(
+                &readable,
+                access_token,
+                "refresh-token-live",
+                &account_id,
+                &email,
+            );
             std::fs::create_dir_all(home.join("profiles").join(alias).join("auth.json")).unwrap();
             readable
         }
@@ -1840,8 +3693,319 @@ mod tests {
             access_token: &str,
         ) -> std::path::PathBuf {
             let path = home.join("profiles").join(alias).join("auth.json");
-            write_test_auth(&path, access_token, "refresh-token-live");
+            let account_id = format!("acct-{alias}");
+            let email = format!("{alias}@example.com");
+            write_test_auth_for_identity(
+                &path,
+                access_token,
+                "refresh-token-live",
+                &account_id,
+                &email,
+            );
             path
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn cache_miss_warmup_does_not_wait_for_reset_credit_metadata() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let reset_credit_calls = Arc::new(AtomicUsize::new(0));
+            let reset_credit_server_calls = Arc::clone(&reset_credit_calls);
+            let reset_credit_gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let handler_gate = Arc::clone(&reset_credit_gate);
+            let usage_response = Arc::new(tokio::sync::Semaphore::new(0));
+            let handler_usage_response = Arc::clone(&usage_response);
+            let app = Router::new()
+                .route(
+                    "/usage",
+                    get(move || {
+                        let usage_response = Arc::clone(&handler_usage_response);
+                        async move {
+                            usage_response.add_permits(1);
+                            Json(serde_json::json!({
+                                "plan_type": "pro",
+                                "rate_limit": null,
+                                "credits": null,
+                                "spend_control": null,
+                                "additional_rate_limits": null,
+                                "rate_limit_reached_type": null
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/credits",
+                    get(move || {
+                        let calls = Arc::clone(&reset_credit_server_calls);
+                        let gate = Arc::clone(&handler_gate);
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let permit = gate.acquire_owned().await.unwrap();
+                            permit.forget();
+                            Json(serde_json::json!({
+                                "available_count": 0,
+                                "credits": []
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/models",
+                    get(|| async {
+                        Json(serde_json::json!({
+                            "models": [{
+                                "slug": "gpt-5-mini",
+                                "supported_in_api": true
+                            }]
+                        }))
+                    }),
+                )
+                .route("/codex/responses", post(|| async { (StatusCode::OK, "") }));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _usage_url = EnvVarGuard::set("CS_USAGE_URL", &format!("http://{addr}/usage"));
+            let _credits_url =
+                EnvVarGuard::set("CS_RESET_CREDITS_URL", &format!("http://{addr}/credits"));
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+            let _responses_url = EnvVarGuard::set(
+                "CS_RESPONSES_URL",
+                &format!("http://{addr}/codex/responses"),
+            );
+
+            let alias = "warmup-quota-only-cache-miss";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let binding = crate::auth::account_info_from_auth_value(
+                &crate::auth::read_auth(&profile_path).unwrap(),
+            )
+            .strict_binding()
+            .unwrap();
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .unwrap();
+            let client = crate::auth::build_http_client().unwrap();
+            let cache_key = warmup_cache_key(&binding, &[]);
+            model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+            let fetch_lock = {
+                let mut locks = MODEL_FETCH_LOCKS.lock().await;
+                locks
+                    .entry(cache_key)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            };
+            let fetch_guard = fetch_lock.lock_owned().await;
+            let limiter = Arc::new(Semaphore::new(1));
+            let task_limiter = Arc::clone(&limiter);
+            let task = tokio::spawn(async move {
+                let lease = warmup_account_leased_with_client_after_usage_preflight(
+                    alias,
+                    &profile_path,
+                    lease,
+                    &client,
+                    &binding,
+                    None,
+                    first_network_permit(task_limiter),
+                )
+                .await?;
+                drop(lease);
+                Ok::<(), anyhow::Error>(())
+            });
+
+            let observed = usage_response.acquire_owned().await.unwrap();
+            observed.forget();
+            let spare =
+                tokio::time::timeout(std::time::Duration::from_secs(1), limiter.acquire_owned())
+                    .await
+                    .expect("warmup cache preparation must not retain the usage request permit")
+                    .expect("the warmup limiter must remain open");
+            drop(spare);
+            drop(fetch_guard);
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+            server.abort();
+
+            let warmup_result = result
+                .expect("warmup waited for the deliberately blocked reset-credit endpoint")
+                .expect("warmup task must join");
+            assert!(
+                warmup_result.is_ok(),
+                "quota-only discovery should leave the warmup healthy: {warmup_result:?}"
+            );
+            assert_eq!(
+                reset_credit_calls.load(Ordering::SeqCst),
+                0,
+                "warmup only needs quota pools and must not contact the reset-credit endpoint"
+            );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn supplied_usage_preflight_skips_cache_and_usage_probe() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let usage_calls = Arc::new(AtomicUsize::new(0));
+            let usage_counter = Arc::clone(&usage_calls);
+            let responses_calls = Arc::new(AtomicUsize::new(0));
+            let responses_counter = Arc::clone(&responses_calls);
+            let app = Router::new()
+                .route(
+                    "/usage",
+                    get(move || {
+                        let counter = Arc::clone(&usage_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "plan_type": "pro",
+                                "rate_limit": null,
+                                "credits": null,
+                                "spend_control": null,
+                                "additional_rate_limits": null,
+                                "rate_limit_reached_type": null
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/models",
+                    get(|| async {
+                        Json(serde_json::json!({
+                            "models": [
+                                {"slug": "gpt-5-mini", "supported_in_api": true},
+                                {"slug": "gpt-5-spark", "supported_in_api": true}
+                            ]
+                        }))
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move || {
+                        let counter = Arc::clone(&responses_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::OK, "")
+                        }
+                    }),
+                );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _usage_url = EnvVarGuard::set("CS_USAGE_URL", &format!("http://{addr}/usage"));
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+            let _responses_url = EnvVarGuard::set(
+                "CS_RESPONSES_URL",
+                &format!("http://{addr}/codex/responses"),
+            );
+
+            let alias = "warmup-supplied-cache-hit";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let binding = crate::auth::account_info_from_auth_value(
+                &crate::auth::read_auth(&profile_path).unwrap(),
+            )
+            .strict_binding()
+            .unwrap();
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .unwrap();
+            let client = crate::auth::build_http_client().unwrap();
+            let cached_usage = crate::usage::UsageInfo {
+                additional_limits: vec![crate::usage::AdditionalRateLimit {
+                    limit_name: Some("gpt-5-spark".to_string()),
+                    metered_feature: Some("codex_spark".to_string()),
+                    allowed: Some(true),
+                    limit_reached: Some(false),
+                    primary: None,
+                    secondary: None,
+                }],
+                ..Default::default()
+            };
+
+            let result = warmup_account_leased_with_client_after_usage_preflight(
+                alias,
+                &profile_path,
+                lease,
+                &client,
+                &binding,
+                Some(cached_usage),
+                test_first_network_permit(),
+            )
+            .await
+            .map(drop);
+            server.abort();
+
+            assert!(
+                result.is_ok(),
+                "supplied cache hit should warm normally: {result:?}"
+            );
+            assert_eq!(
+                usage_calls.load(Ordering::SeqCst),
+                0,
+                "a proven cache hit must not be replaced by another cache lookup and quota probe"
+            );
+            assert_eq!(
+                responses_calls.load(Ordering::SeqCst),
+                2,
+                "the supplied additional pool must be warmed together with the main pool"
+            );
+        }
+
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn supplied_usage_preflight_is_rejected_after_alias_rebinding() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let alias = "warmup-preflight-rebound";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let mut stale_binding = crate::auth::account_info_from_auth_value(
+                &crate::auth::read_auth(&profile_path).unwrap(),
+            )
+            .strict_binding()
+            .unwrap();
+            stale_binding.account_id = "previous-owner".to_string();
+            let lease = crate::profile::acquire_profile_lease_async(alias)
+                .await
+                .unwrap();
+
+            let error = warmup_account_leased_with_client_after_usage_preflight(
+                alias,
+                &profile_path,
+                lease,
+                &reqwest::Client::new(),
+                &stale_binding,
+                Some(crate::usage::UsageInfo::default()),
+                test_first_network_permit(),
+            )
+            .await
+            .map(drop)
+            .expect_err("usage preflight from a previous alias owner must be rejected");
+
+            assert!(
+                format!("{error:#}").contains("identity changed after warmup cache preflight"),
+                "rebound alias should fail with an identity-specific error: {error:#}"
+            );
         }
 
         /// Mock server whose `/oauth/token` always rotates successfully, so the
@@ -1873,7 +4037,6 @@ mod tests {
                             (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
-                                    "id_token": test_id_token(),
                                     "access_token": live_access_token(),
                                     "refresh_token": format!("rotated-refresh-{n}"),
                                 })),
@@ -1958,9 +4121,9 @@ mod tests {
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-pre-warmup";
-            // Keep the (independent) usage-fetch refresh path out of this test.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
             let profile_path = stage_writable_profile(home.path(), alias, &expired_access_token());
+            // Keep the (independent) usage-fetch refresh path out of this test.
+            cache_usage_for_profile(alias, &profile_path, &crate::usage::UsageInfo::default());
 
             let (_token_calls, _guards) =
                 start_rotating_mock_server(vec![StatusCode::OK], Some(profile_path.clone())).await;
@@ -1985,9 +4148,9 @@ mod tests {
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "persist-fail-401-retry";
-            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
             // Not expiring, so only the 401 handler triggers a refresh.
             let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            cache_usage_for_profile(alias, &profile_path, &crate::usage::UsageInfo::default());
 
             // First warmup POST is unauthorized (drives the refresh), the retry
             // would have succeeded — which is precisely how the failure used to
@@ -2023,10 +4186,19 @@ mod tests {
             let (_token_calls, _guards) =
                 start_rotating_mock_server(vec![StatusCode::OK], Some(profile_path.clone())).await;
 
+            let client = crate::auth::build_http_client().unwrap();
             let lease = crate::profile::acquire_profile_lease_async(alias)
                 .await
                 .expect("model test acquires its profile lease");
-            let result = fetch_models_for_profile_leased(alias, &profile_path, &lease).await;
+            let expected_binding = strict_binding_for_profile(&profile_path);
+            let result = fetch_models_for_profile_leased_with_client(
+                alias,
+                &profile_path,
+                lease,
+                &expected_binding,
+                &client,
+            )
+            .await;
 
             let error = result.map(|models| format!("{models:?}")).expect_err(
                 "degrading to the old token is only correct when the refresh was refused; a \
@@ -2051,12 +4223,13 @@ mod tests {
 
             let broken = "batch-persist-broken";
             let healthy = "batch-persist-healthy";
-            crate::cache::put(broken, &crate::usage::UsageInfo::default()).unwrap();
-            crate::cache::put(healthy, &crate::usage::UsageInfo::default()).unwrap();
             let broken_path =
                 stage_unwritable_profile(home.path(), broken, &expired_access_token());
             let healthy_path =
                 stage_writable_profile(home.path(), healthy, &expired_access_token());
+            let healthy_binding = strict_binding_for_profile(&healthy_path);
+            cache_usage_for_profile(broken, &broken_path, &crate::usage::UsageInfo::default());
+            cache_usage_for_profile(healthy, &healthy_path, &crate::usage::UsageInfo::default());
 
             let (_token_calls, _guards) =
                 start_rotating_mock_server(vec![StatusCode::OK], None).await;
@@ -2064,7 +4237,7 @@ mod tests {
             // Mirrors the batch driver in `commands::misc`: one task per alias,
             // outcomes collected independently.
             let mut tasks = tokio::task::JoinSet::new();
-            for (alias, path) in [(broken, broken_path), (healthy, healthy_path)] {
+            for (alias, path) in [(broken, broken_path), (healthy, healthy_path.clone())] {
                 let alias = alias.to_string();
                 tasks.spawn(async move {
                     let result = warmup_account(&alias, &path).await;
@@ -2091,6 +4264,11 @@ mod tests {
                 "one account's persist failure must not take down the others in the batch: \
                  {healthy_result:?}"
             );
+            assert_eq!(
+                strict_binding_for_profile(&healthy_path),
+                healthy_binding,
+                "refreshing one batch member must preserve that profile's account binding"
+            );
         }
 
         // ── /models is resolved once per warmup ──────────────────
@@ -2116,7 +4294,10 @@ mod tests {
                             (
                                 StatusCode::OK,
                                 Json(serde_json::json!({
-                                    "models": [{"slug": "gpt-5-mini", "supported_in_api": true}]
+                                    "models": [
+                                        {"slug": "gpt-5-mini", "supported_in_api": true},
+                                        {"slug": "gpt-5-spark", "supported_in_api": true}
+                                    ]
                                 })),
                             )
                         }
@@ -2155,10 +4336,10 @@ mod tests {
 
             // Unique alias: MODEL_CACHE is process-global and outlives one test.
             let alias = "models-fetch-count-no-pools";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
             // Cached usage with no `additional_limits`, so the usage-fetch path
             // stays out of this and there is no additional pool to warm.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
-            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            cache_usage_for_profile(alias, &profile_path, &crate::usage::UsageInfo::default());
 
             let (models_calls, _guards) = start_models_counting_mock_server().await;
 
@@ -2188,12 +4369,14 @@ mod tests {
             let _codex_switch_home = use_test_home(home.path());
 
             let alias = "models-fetch-count-with-pool";
-            crate::cache::put(
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            cache_usage_for_profile(
                 alias,
+                &profile_path,
                 &crate::usage::UsageInfo {
                     additional_limits: vec![crate::usage::AdditionalRateLimit {
-                        limit_name: Some("gpt-5-mini".to_string()),
-                        metered_feature: Some("codex_mini".to_string()),
+                        limit_name: Some("gpt-5-spark".to_string()),
+                        metered_feature: Some("codex_spark".to_string()),
                         allowed: Some(true),
                         limit_reached: Some(false),
                         primary: None,
@@ -2201,9 +4384,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            )
-            .unwrap();
-            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            );
 
             let (models_calls, _guards) = start_models_counting_mock_server().await;
 
@@ -2278,6 +4459,141 @@ mod tests {
             (models_calls, responses_calls, guards)
         }
 
+        #[allow(clippy::await_holding_lock)]
+        #[tokio::test]
+        async fn stale_additional_model_refreshes_once_without_reposting_successful_targets() {
+            let _lock = ENV_LOCK.lock().await;
+            let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let home = crate::fs_ops::create_direct_tempdir().unwrap();
+            let _codex_switch_home = use_test_home(home.path());
+
+            let models_calls = Arc::new(AtomicUsize::new(0));
+            let model_counter = Arc::clone(&models_calls);
+            let response_calls = Arc::new(std::sync::Mutex::new(HashMap::<String, usize>::new()));
+            let response_counter = Arc::clone(&response_calls);
+            let app = Router::new()
+                .route(
+                    "/codex/models",
+                    get(move || {
+                        let counter = Arc::clone(&model_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "models": [
+                                    {
+                                        "slug": "main-new-mini",
+                                        "supported_in_api": true
+                                    },
+                                    {
+                                        "slug": "addon-good",
+                                        "display_name": "Pool B",
+                                        "supported_in_api": true
+                                    },
+                                    {
+                                        "slug": "addon-new",
+                                        "display_name": "Pool A",
+                                        "supported_in_api": true
+                                    }
+                                ]
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/codex/responses",
+                    post(move |Json(body): Json<serde_json::Value>| {
+                        let calls = Arc::clone(&response_counter);
+                        async move {
+                            let model = body["model"].as_str().unwrap_or_default().to_string();
+                            *calls
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .entry(model.clone())
+                                .or_default() += 1;
+                            if model == "addon-old" {
+                                (StatusCode::BAD_REQUEST, "model not supported").into_response()
+                            } else {
+                                (StatusCode::OK, "").into_response()
+                            }
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let _models_url =
+                EnvVarGuard::set("CS_MODELS_URL", &format!("http://{addr}/codex/models"));
+            let _responses_url = EnvVarGuard::set(
+                "CS_RESPONSES_URL",
+                &format!("http://{addr}/codex/responses"),
+            );
+
+            let alias = "stale-additional-model-refresh";
+            let profile_path = stage_writable_profile(home.path(), alias, &live_access_token());
+            let additional_limits = vec![
+                crate::usage::AdditionalRateLimit {
+                    limit_name: Some("Pool A".to_string()),
+                    metered_feature: Some("codex_pool_a".to_string()),
+                    allowed: Some(true),
+                    limit_reached: Some(false),
+                    ..Default::default()
+                },
+                crate::usage::AdditionalRateLimit {
+                    limit_name: Some("Pool B".to_string()),
+                    metered_feature: Some("codex_pool_b".to_string()),
+                    allowed: Some(true),
+                    limit_reached: Some(false),
+                    ..Default::default()
+                },
+            ];
+            cache_usage_for_profile(
+                alias,
+                &profile_path,
+                &crate::usage::UsageInfo {
+                    additional_limits: additional_limits.clone(),
+                    ..Default::default()
+                },
+            );
+            let binding = strict_binding_for_profile(&profile_path);
+            let cache_key = warmup_cache_key(&binding, &additional_limits);
+            model_cache_set(
+                &mut *MODEL_CACHE.lock().await,
+                &cache_key,
+                test_selection(
+                    "main-old",
+                    &[("Pool A", "addon-good"), ("Pool B", "addon-old")],
+                ),
+            );
+
+            warmup_account(alias, &profile_path)
+                .await
+                .expect("an unsupported additional model should recover from official metadata");
+            server.abort();
+
+            assert_eq!(models_calls.load(Ordering::SeqCst), 1);
+            let calls = response_calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(calls.get("main-old"), Some(&1));
+            assert_eq!(calls.get("main-new-mini"), None);
+            assert_eq!(calls.get("addon-good"), Some(&1));
+            assert_eq!(calls.get("addon-old"), Some(&1));
+            assert_eq!(calls.get("addon-new"), Some(&1));
+            drop(calls);
+            assert_eq!(
+                model_cache_get(&*MODEL_CACHE.lock().await, &cache_key),
+                Some(test_selection(
+                    "main-new-mini",
+                    &[("Pool A", "addon-new"), ("Pool B", "addon-good")],
+                ))
+            );
+            model_cache_invalidate(&mut *MODEL_CACHE.lock().await, &cache_key);
+        }
+
         /// The resolved set bakes in the additional pools that existed when it
         /// was cached, so keying the cache on the alias alone freezes it for the
         /// life of the process. The CLI exits between warmups and never notices;
@@ -2299,7 +4615,7 @@ mod tests {
             let (models_calls, responses_calls, _guards) = start_counting_mock_server().await;
 
             // First warmup: the account has no additional quota pool.
-            crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
+            cache_usage_for_profile(alias, &profile_path, &crate::usage::UsageInfo::default());
             warmup_account(alias, &profile_path)
                 .await
                 .expect("the first warmup against a healthy mock server must succeed");
@@ -2310,8 +4626,9 @@ mod tests {
             );
 
             // The account gains a model quota pool while the process keeps running.
-            crate::cache::put(
+            cache_usage_for_profile(
                 alias,
+                &profile_path,
                 &crate::usage::UsageInfo {
                     additional_limits: vec![crate::usage::AdditionalRateLimit {
                         limit_name: Some("gpt-5-spark".to_string()),
@@ -2323,8 +4640,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
-            )
-            .unwrap();
+            );
             warmup_account(alias, &profile_path)
                 .await
                 .expect("the second warmup against a healthy mock server must succeed");

@@ -847,12 +847,16 @@ fn publish_installer_daemon_boundary_state(
         .context("flushing installer daemon-boundary marker")
 }
 
-pub async fn dispatch(cmd: DaemonCommand, json: bool) -> Result<()> {
+pub async fn dispatch(
+    cmd: DaemonCommand,
+    json: bool,
+    file_log_writer: crate::logging::FileLogWriter,
+) -> Result<()> {
     match cmd {
         DaemonCommand::Start {
             foreground,
             expected_executable,
-        } => start(foreground, expected_executable).await,
+        } => start(foreground, expected_executable, file_log_writer).await,
         DaemonCommand::Stop {
             expected_service_executable,
         } => stop(expected_service_executable),
@@ -952,7 +956,11 @@ pub(crate) fn check_uninstall_owner(expected_executable: Option<std::path::PathB
     validated_uninstall_owner(expected_executable).map(|_| ())
 }
 
-async fn start(foreground: bool, expected_executable: Option<std::path::PathBuf>) -> Result<()> {
+async fn start(
+    foreground: bool,
+    expected_executable: Option<std::path::PathBuf>,
+    file_log_writer: crate::logging::FileLogWriter,
+) -> Result<()> {
     if expected_executable.is_some() && foreground {
         anyhow::bail!("--expected-executable cannot be combined with --foreground");
     }
@@ -962,11 +970,11 @@ async fn start(foreground: bool, expected_executable: Option<std::path::PathBuf>
     }
     #[cfg(target_os = "windows")]
     if let Some(expected_executable) = expected_executable.as_deref() {
-        return start_windows_installer_owned(expected_executable);
+        return start_windows_installer_owned(expected_executable, &file_log_writer);
     }
     #[cfg(not(any(unix, target_os = "windows")))]
     {
-        let _ = foreground;
+        let _ = (foreground, file_log_writer);
         anyhow::bail!("The background daemon is not supported on this platform.");
     }
     #[cfg(any(unix, target_os = "windows"))]
@@ -975,6 +983,7 @@ async fn start(foreground: bool, expected_executable: Option<std::path::PathBuf>
             if let Some(pid) = pidfile::running_pid_checked()? {
                 anyhow::bail!("Daemon is already running (PID {pid})");
             }
+            ensure_startup_file_logging(&file_log_writer)?;
             pidfile::cleanup_pidfile()?;
             return run_foreground().await;
         }
@@ -986,24 +995,32 @@ async fn start(foreground: bool, expected_executable: Option<std::path::PathBuf>
         if let Some(pid) = pidfile::running_pid_checked()? {
             anyhow::bail!("Daemon is already running (PID {pid})");
         }
-        pidfile::cleanup_pidfile()?;
         let executable = std::env::current_exe()?;
-        if service::is_installed_checked()? {
+        let service_installed = service::is_installed_checked()?;
+        ensure_startup_file_logging(&file_log_writer)?;
+        pidfile::cleanup_pidfile()?;
+        if service_installed {
             return service::start_installed_locked(&executable, &service_lease);
         }
         start_detached_executable_locked(&executable, &service_lease)
     }
 }
 
+fn ensure_startup_file_logging(file_log_writer: &crate::logging::FileLogWriter) -> Result<()> {
+    file_log_writer
+        .ensure_initialized()
+        .context("initializing secure file logging before daemon readiness")
+}
+
 async fn run_foreground() -> Result<()> {
-    pidfile::write_pidfile_exclusive()?;
+    let shutdown_request = pidfile::write_pidfile_exclusive()?;
     // RAII guard ensures PID file is cleaned up even on panic
     let guard = pidfile::PidGuard::new();
     tracing::info!(
         "codex-switch-global-pace daemon started (PID {})",
         std::process::id()
     );
-    let run_result = loop_runner::run_daemon_loop().await;
+    let run_result = loop_runner::run_daemon_loop(shutdown_request).await;
     let cleanup_result = guard.cleanup();
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -1034,14 +1051,19 @@ fn start_detached_executable_locked(
 }
 
 #[cfg(target_os = "windows")]
-fn start_windows_installer_owned(expected_executable: &std::path::Path) -> Result<()> {
+fn start_windows_installer_owned(
+    expected_executable: &std::path::Path,
+    file_log_writer: &crate::logging::FileLogWriter,
+) -> Result<()> {
     service::validate_expected_executable(expected_executable)?;
     let service_lease = service::acquire_service_operation_lease()?;
     if pidfile::running_pid_checked()?.is_some() {
         anyhow::bail!("Daemon is already running");
     }
+    let service_installed = service::is_installed_checked()?;
+    ensure_startup_file_logging(file_log_writer)?;
     pidfile::cleanup_pidfile()?;
-    if service::is_installed_checked()? {
+    if service_installed {
         service::start_installed_locked(expected_executable, &service_lease)
     } else {
         start_detached_executable_locked(expected_executable, &service_lease)
@@ -3158,6 +3180,28 @@ fn service_manager_name() -> &'static str {
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "unsupported"
+    }
+}
+
+#[cfg(test)]
+mod startup_file_log_tests {
+    use super::ensure_startup_file_logging;
+
+    #[test]
+    fn readiness_preserves_the_file_log_cause_and_stores_it_for_one_observer() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let occupied = root.path().join("occupied");
+        std::fs::write(&occupied, b"not a directory").unwrap();
+        let writer = crate::logging::FileLogWriter::lazy_for_directory(occupied);
+
+        let error = ensure_startup_file_logging(&writer)
+            .expect_err("daemon readiness must reject an unusable log directory");
+
+        let detail = format!("{error:#}");
+        assert!(detail.contains("initializing secure file logging before daemon readiness"));
+        assert!(detail.contains("creating log directory"));
+        assert!(writer.take_initialization_error().unwrap().is_some());
+        assert_eq!(writer.take_initialization_error().unwrap(), None);
     }
 }
 

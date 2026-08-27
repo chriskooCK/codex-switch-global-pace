@@ -1,2 +1,5 @@
+[build.env]
+passthrough = ["CS_RELEASE_SOURCE_COMMIT"]
+
 [target.aarch64-unknown-linux-musl]
 image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:f604e399cbb2154ddeb013db99eb4f123d24f09a579c7e8d6ed631d15ffa8b12"
