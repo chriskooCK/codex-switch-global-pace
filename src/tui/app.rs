@@ -341,8 +341,13 @@ enum StartupAuthPoll {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CredentialOperationBlocker {
-    StartupReconciliation,
     StartupFailure,
+    Transition(CredentialTransitionBlocker),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialTransitionBlocker {
+    StartupReconciliation,
     ProfileSwitch,
 }
 
@@ -498,18 +503,23 @@ impl App {
         self.confirm.is_some() || self.rename.is_some() || self.profile_switch_in_flight()
     }
 
-    fn credential_operation_blocker(&self) -> Option<CredentialOperationBlocker> {
+    fn credential_transition_blocker(&self) -> Option<CredentialTransitionBlocker> {
         match self.startup_auth_state {
             StartupAuthState::Reconciling => {
-                return Some(CredentialOperationBlocker::StartupReconciliation);
+                return Some(CredentialTransitionBlocker::StartupReconciliation);
             }
-            StartupAuthState::Blocked => {
-                return Some(CredentialOperationBlocker::StartupFailure);
-            }
-            StartupAuthState::Ready => {}
+            StartupAuthState::Ready | StartupAuthState::Blocked => {}
         }
         self.profile_switch_in_flight()
-            .then_some(CredentialOperationBlocker::ProfileSwitch)
+            .then_some(CredentialTransitionBlocker::ProfileSwitch)
+    }
+
+    fn credential_operation_blocker(&self) -> Option<CredentialOperationBlocker> {
+        if self.startup_auth_state == StartupAuthState::Blocked {
+            return Some(CredentialOperationBlocker::StartupFailure);
+        }
+        self.credential_transition_blocker()
+            .map(CredentialOperationBlocker::Transition)
     }
 
     fn credential_operations_ready(&self) -> bool {
@@ -520,15 +530,40 @@ impl App {
         let Some(blocker) = self.credential_operation_blocker() else {
             return false;
         };
+        let (message, is_error) = match blocker {
+            CredentialOperationBlocker::StartupFailure => (
+                "Account operations are blocked because live credential synchronization failed",
+                true,
+            ),
+            CredentialOperationBlocker::Transition(
+                CredentialTransitionBlocker::StartupReconciliation,
+            ) => (
+                "Finishing live credential synchronization before starting an account operation",
+                false,
+            ),
+            CredentialOperationBlocker::Transition(CredentialTransitionBlocker::ProfileSwitch) => (
+                "Finish the active profile switch before starting another account operation",
+                false,
+            ),
+        };
+        if is_error {
+            self.set_status_error(message.to_string(), 5);
+        } else {
+            self.set_status(message.to_string(), 5);
+        }
+        true
+    }
+
+    fn reject_credential_recovery_during_transition(&mut self) -> bool {
+        let Some(blocker) = self.credential_transition_blocker() else {
+            return false;
+        };
         let message = match blocker {
-            CredentialOperationBlocker::StartupReconciliation => {
-                "Finishing live credential synchronization before starting an account operation"
+            CredentialTransitionBlocker::StartupReconciliation => {
+                "Finishing live credential synchronization before changing accounts"
             }
-            CredentialOperationBlocker::StartupFailure => {
-                "Account operations are blocked because live credential synchronization failed"
-            }
-            CredentialOperationBlocker::ProfileSwitch => {
-                "Finish the active profile switch before starting another account operation"
+            CredentialTransitionBlocker::ProfileSwitch => {
+                "Finish the active profile switch before changing accounts again"
             }
         };
         self.set_status(message.to_string(), 5);
@@ -1239,6 +1274,9 @@ impl App {
             );
             return;
         }
+        if self.reject_new_credential_operation() {
+            return;
+        }
         if self.account_operation_in_flight(alias) {
             self.set_status(
                 format!("{alias}: wait for the account operation to finish before deleting"),
@@ -1264,6 +1302,9 @@ impl App {
                     .to_string(),
                 5,
             );
+            return;
+        }
+        if self.reject_new_credential_operation() {
             return;
         }
         if self.account_operation_in_flight(alias) {
@@ -1377,19 +1418,67 @@ impl App {
         Ok(())
     }
 
-    pub fn load_profiles_preserving_selection(&mut self) {
+    fn try_load_profiles_preserving_selection(&mut self) -> Result<()> {
         let selected_alias = self
             .selected_account_idx()
             .and_then(|idx| self.accounts.get(idx))
             .map(|entry| entry.alias.clone());
 
-        self.load_profiles();
+        self.try_load_profiles()?;
 
         if let Some(alias) = selected_alias
             && let Some(account_idx) = self.accounts.iter().position(|a| a.alias == alias)
             && let Some(view_idx) = self.view_indices.iter().position(|&idx| idx == account_idx)
         {
             self.selected = view_idx;
+        }
+        Ok(())
+    }
+
+    fn complete_credential_recovery_reload(&mut self) -> Result<()> {
+        self.try_load_profiles_preserving_selection()?;
+        self.startup_auth_state = StartupAuthState::Ready;
+        Ok(())
+    }
+
+    fn finish_oauth_attempt(&mut self, result: Result<String>) {
+        // An OAuth round can persist replacement credentials before a later
+        // live-auth update reports an error. Always discard pre-login model
+        // generations and reconcile the displayed profiles before deciding
+        // whether ordinary credential work is safe again.
+        self.invalidate_models_after_credential_reload();
+        let reload_result = self.complete_credential_recovery_reload();
+        let reload_succeeded = match (result, reload_result) {
+            (Ok(message), Ok(())) => {
+                self.set_status(message, 5);
+                true
+            }
+            (Err(error), Ok(())) => {
+                self.set_status_error(format!("OAuth failed: {error}"), 7);
+                true
+            }
+            (Ok(message), Err(reload_error)) => {
+                self.startup_auth_state = StartupAuthState::Blocked;
+                self.set_status_error(
+                    format!("{message}; profile reload failed: {reload_error:#}"),
+                    8,
+                );
+                false
+            }
+            (Err(error), Err(reload_error)) => {
+                self.startup_auth_state = StartupAuthState::Blocked;
+                self.set_status_error(
+                    format!("OAuth failed: {error}; profile reload failed: {reload_error:#}"),
+                    8,
+                );
+                false
+            }
+        };
+        if reload_succeeded {
+            self.refresh(Refresh::Forced);
+            if self.auto_refresh_enabled {
+                self.next_auto_refresh = Some(Instant::now() + self.auto_refresh_interval);
+            }
         }
     }
 
@@ -2339,7 +2428,7 @@ impl App {
             );
             return;
         }
-        if self.reject_new_credential_operation() {
+        if self.reject_credential_recovery_during_transition() {
             return;
         }
         if self.reset_card_in_flight(&alias) {
@@ -2499,6 +2588,7 @@ impl App {
     ) {
         match result {
             Ok(outcome) => {
+                self.startup_auth_state = StartupAuthState::Ready;
                 for account in &mut self.accounts {
                     account.is_current = account.alias == alias;
                 }
@@ -2853,6 +2943,9 @@ impl App {
             );
             return;
         }
+        if self.reject_new_credential_operation() {
+            return;
+        }
         if let Some(alias) = self
             .marked
             .iter()
@@ -3111,7 +3204,11 @@ impl App {
             return;
         }
 
-        self.load_profiles_preserving_selection();
+        if let Err(error) = self.try_load_profiles_preserving_selection() {
+            self.set_status_error(format!("Auto refresh profile reload failed: {error:#}"), 6);
+            self.next_auto_refresh = Some(now + Duration::from_secs(5));
+            return;
+        }
         let account_count = self.accounts.len();
         if self.auto_warmup_enabled {
             self.warmup_all(account_count);
@@ -3467,7 +3564,7 @@ async fn perform_oauth(
     mode: OAuthMode,
     device: bool,
 ) {
-    if app.reject_new_credential_operation() {
+    if app.reject_credential_recovery_during_transition() {
         app.close_menu();
         return;
     }
@@ -3511,25 +3608,7 @@ async fn perform_oauth(
     crate::output::set_message_mode(crate::output::MessageMode::Silent);
     resume_tui_after_plain_output(terminal);
 
-    // Replacement writes preserve the profile copy even when a later live-auth
-    // update reports an error. Invalidate generations for every completed OAuth
-    // attempt so a result fetched with pre-login credentials can never repopulate
-    // the cache after such a partial commit.
-    app.invalidate_models_after_credential_reload();
-    match result {
-        Ok(msg) => {
-            app.set_status(msg, 5);
-            app.load_profiles_preserving_selection();
-            app.refresh(Refresh::Forced);
-            // Reset auto-refresh timer so it doesn't fire immediately.
-            if app.auto_refresh_enabled {
-                app.next_auto_refresh = Some(Instant::now() + app.auto_refresh_interval);
-            }
-        }
-        Err(e) => {
-            app.set_status_error(format!("OAuth failed: {e}"), 7);
-        }
-    }
+    app.finish_oauth_attempt(result);
 }
 
 /// Sequentially re-login every marked alias. The TUI is suspended for the
@@ -3578,7 +3657,7 @@ where
 }
 
 async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, device: bool) {
-    if app.reject_new_credential_operation() {
+    if app.reject_credential_recovery_during_transition() {
         app.close_menu();
         return;
     }
@@ -3691,18 +3770,25 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     } else {
         format!("Batch re-login: {ok} ok, {} failed", failed.len())
     };
-    if failed.is_empty() && !stopped {
-        app.set_status(summary, 8);
-    } else {
-        app.set_status_error(summary, 8);
-    }
     // See `perform_oauth`: a failed round may still have preserved new profile
     // credentials before a live-auth update failed.
     app.invalidate_models_after_credential_reload();
-    app.load_profiles_preserving_selection();
-    app.refresh(Refresh::Forced);
-    if app.auto_refresh_enabled {
-        app.next_auto_refresh = Some(Instant::now() + app.auto_refresh_interval);
+    match app.complete_credential_recovery_reload() {
+        Ok(()) => {
+            if failed.is_empty() && !stopped {
+                app.set_status(summary, 8);
+            } else {
+                app.set_status_error(summary, 8);
+            }
+            app.refresh(Refresh::Forced);
+            if app.auto_refresh_enabled {
+                app.next_auto_refresh = Some(Instant::now() + app.auto_refresh_interval);
+            }
+        }
+        Err(error) => {
+            app.startup_auth_state = StartupAuthState::Blocked;
+            app.set_status_error(format!("{summary}; profile reload failed: {error:#}"), 8);
+        }
     }
 }
 
@@ -4043,6 +4129,7 @@ mod tests {
         assert!(app.is_warmup_in_flight("target"));
         assert!(app.is_warmup_in_flight("unrelated"));
 
+        app.startup_auth_state = super::StartupAuthState::Blocked;
         app.open_account_menu();
         let action = app
             .menu
@@ -4078,6 +4165,7 @@ mod tests {
         assert!(app.confirm.is_none());
         assert!(!app.accounts[0].is_current);
         assert!(app.accounts[1].is_current);
+        assert_eq!(app.startup_auth_state, super::StartupAuthState::Ready);
         assert!(matches!(app.accounts[0].usage, UsageStatus::Idle));
         assert!(matches!(app.accounts[1].usage, UsageStatus::Idle));
         assert!(!app.model_cache.contains_key("current"));
@@ -4162,7 +4250,7 @@ mod tests {
             alias: "account".into(),
             info: AccountInfo::default(),
             usage: UsageStatus::Idle,
-            is_current: true,
+            is_current: false,
         });
         app.view_indices.push(0);
         app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
@@ -4171,10 +4259,16 @@ mod tests {
         app.ensure_models_loaded("account");
         app.refresh_all(Refresh::Forced);
         app.warmup_one("account");
+        app.request_delete_alias("account");
+        app.start_rename_alias("account");
+        app.marked.insert("account".into());
+        app.request_batch_delete();
         assert!(app.model_requests.is_empty());
         assert!(app.refreshing_requests.is_empty());
         assert!(app.warmup_preflight.is_none());
         assert!(app.warmup_tasks.is_empty());
+        assert!(app.confirm.is_none());
+        assert!(app.rename.is_none());
 
         app.auto_refresh_enabled = true;
         app.next_auto_refresh = Some(Instant::now());
@@ -4214,11 +4308,87 @@ mod tests {
             super::StartupAuthPoll::Blocked
         );
         assert_eq!(app.startup_auth_state, super::StartupAuthState::Blocked);
+        assert_eq!(app.credential_transition_blocker(), None);
         app.refresh_all(Refresh::Forced);
         app.ensure_models_loaded("account");
+        assert!(app.status_is_error);
         assert!(app.account_tasks.is_empty());
         assert!(app.refreshing_requests.is_empty());
         assert!(app.model_requests.is_empty());
+    }
+
+    #[test]
+    fn auto_refresh_stops_when_profile_reload_fails() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::write(profile_path, b"not-json").unwrap();
+
+        let mut app = App::new();
+        app.auto_refresh_enabled = true;
+        app.next_auto_refresh = Some(Instant::now());
+        let deferred_after = Instant::now();
+
+        app.run_due_auto_refresh();
+
+        assert!(app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.starts_with("Auto refresh profile reload failed:"))
+        );
+        assert!(app.account_tasks.is_empty());
+        assert!(app.refreshing_requests.is_empty());
+        assert!(app.warmup_tasks.is_empty());
+        assert!(
+            app.next_auto_refresh
+                .is_some_and(|next| next > deferred_after)
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_oauth_attempt_reloads_a_partially_committed_profile() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let auth = managed_auth(
+            "account@example.com",
+            "acct_account",
+            "replacement-access",
+            "replacement-refresh",
+        );
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_auth_durable(&profile_path, &auth);
+        write_auth_durable(&codex_home.join("auth.json"), &auth);
+
+        let mut app = App::new();
+        app.startup_auth_state = super::StartupAuthState::Blocked;
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+
+        app.finish_oauth_attempt(Err(anyhow::anyhow!(
+            "live-auth update failed after profile commit"
+        )));
+
+        assert_eq!(app.startup_auth_state, super::StartupAuthState::Ready);
+        assert!(app.status_is_error);
+        assert_eq!(app.accounts.len(), 1);
+        assert!(app.accounts[0].is_current);
+        assert!(app.refreshing_requests.contains_key("account"));
+        app.drain_credential_tasks().await;
     }
 
     #[allow(clippy::await_holding_lock)]
