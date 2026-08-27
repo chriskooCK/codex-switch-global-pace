@@ -302,6 +302,7 @@ pub struct App {
     /// frame. It is tracked to completion because it may write a newer live
     /// credential into its strictly matched saved profile.
     startup_auth_reconciliation: Option<tokio::task::JoinHandle<Result<TuiAuthReconciliation>>>,
+    startup_auth_state: StartupAuthState,
     shutting_down: bool,
     pub confirm: Option<ConfirmAction>,
     pub rename: Option<RenameState>,
@@ -322,6 +323,27 @@ pub struct App {
     pub model_sender: tokio::sync::mpsc::Sender<(String, u64, Result<Vec<ModelEntry>, String>)>,
     pub model_requests: HashMap<String, u64>,
     pub model_next_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAuthState {
+    Ready,
+    Reconciling,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupAuthPoll {
+    Pending,
+    Ready,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialOperationBlocker {
+    StartupReconciliation,
+    StartupFailure,
+    ProfileSwitch,
 }
 
 impl App {
@@ -364,6 +386,7 @@ impl App {
             account_tasks: HashMap::new(),
             account_task_next_id: 0,
             startup_auth_reconciliation: None,
+            startup_auth_state: StartupAuthState::Ready,
             shutting_down: false,
             confirm: None,
             rename: None,
@@ -471,31 +494,44 @@ impl App {
         })
     }
 
-    fn startup_auth_reconciliation_in_flight(&self) -> bool {
-        self.startup_auth_reconciliation.is_some()
-    }
-
     fn interactive_operation_in_flight(&self) -> bool {
         self.confirm.is_some() || self.rename.is_some() || self.profile_switch_in_flight()
     }
 
-    fn reject_new_credential_operation_during_switch(&mut self) -> bool {
-        if self.startup_auth_reconciliation_in_flight() {
-            self.set_status(
-                "Finishing live credential synchronization before starting an account operation"
-                    .to_string(),
-                5,
-            );
-            return true;
+    fn credential_operation_blocker(&self) -> Option<CredentialOperationBlocker> {
+        match self.startup_auth_state {
+            StartupAuthState::Reconciling => {
+                return Some(CredentialOperationBlocker::StartupReconciliation);
+            }
+            StartupAuthState::Blocked => {
+                return Some(CredentialOperationBlocker::StartupFailure);
+            }
+            StartupAuthState::Ready => {}
         }
-        if !self.profile_switch_in_flight() {
+        self.profile_switch_in_flight()
+            .then_some(CredentialOperationBlocker::ProfileSwitch)
+    }
+
+    fn credential_operations_ready(&self) -> bool {
+        self.credential_operation_blocker().is_none()
+    }
+
+    fn reject_new_credential_operation(&mut self) -> bool {
+        let Some(blocker) = self.credential_operation_blocker() else {
             return false;
-        }
-        self.set_status(
-            "Finish the active profile switch before starting another account operation"
-                .to_string(),
-            5,
-        );
+        };
+        let message = match blocker {
+            CredentialOperationBlocker::StartupReconciliation => {
+                "Finishing live credential synchronization before starting an account operation"
+            }
+            CredentialOperationBlocker::StartupFailure => {
+                "Account operations are blocked because live credential synchronization failed"
+            }
+            CredentialOperationBlocker::ProfileSwitch => {
+                "Finish the active profile switch before starting another account operation"
+            }
+        };
+        self.set_status(message.to_string(), 5);
         true
     }
 
@@ -509,61 +545,72 @@ impl App {
         if self.startup_auth_reconciliation.is_some() {
             return;
         }
+        self.startup_auth_state = StartupAuthState::Reconciling;
         self.set_status("Synchronizing live Codex credentials...".to_string(), 60);
         self.startup_auth_reconciliation = Some(tokio::task::spawn_blocking(
             profile::reconcile_live_auth_for_tui,
         ));
     }
 
-    /// Returns true once the one-shot startup reconciliation has completed.
-    async fn poll_startup_auth_reconciliation(&mut self) -> bool {
+    async fn poll_startup_auth_reconciliation(&mut self) -> StartupAuthPoll {
         let Some(task) = self.startup_auth_reconciliation.as_ref() else {
-            return true;
+            return match self.startup_auth_state {
+                StartupAuthState::Ready => StartupAuthPoll::Ready,
+                StartupAuthState::Reconciling => StartupAuthPoll::Pending,
+                StartupAuthState::Blocked => StartupAuthPoll::Blocked,
+            };
         };
         if !task.is_finished() {
-            return false;
+            return StartupAuthPoll::Pending;
         }
         let task = self
             .startup_auth_reconciliation
             .take()
             .expect("finished startup reconciliation must remain tracked");
-        match task.await {
-            Ok(Ok(TuiAuthReconciliation::NoChange)) => {
-                self.load_profiles_from_marker_preserving_selection();
-                self.set_status("Accounts ready".to_string(), 3);
-            }
+        let result = match task.await {
+            Ok(Ok(TuiAuthReconciliation::NoChange)) => self
+                .try_load_profiles_from_marker_preserving_selection()
+                .map(|()| "Accounts ready".to_string()),
             Ok(Ok(TuiAuthReconciliation::ProfileUpdated { alias })) => {
                 self.invalidate_models_after_credential_reload();
-                self.load_profiles_from_marker_preserving_selection();
-                self.set_status(format!("Updated live credentials for {alias}"), 5);
+                self.try_load_profiles_from_marker_preserving_selection()
+                    .map(|()| format!("Updated live credentials for {alias}"))
             }
-            Ok(Ok(TuiAuthReconciliation::UntrackedAccount)) => {
-                if let Err(error) = self.try_load_profiles_with_current(None) {
-                    self.set_status_error(format!("Profile reload failed: {error:#}"), 6);
-                } else {
-                    self.set_status(
-                        "The live Codex account is not saved; press a to add it".to_string(),
-                        8,
-                    );
-                }
+            Ok(Ok(TuiAuthReconciliation::NoLiveAuth)) => self
+                .try_load_profiles_with_current(None)
+                .map(|()| "No live Codex account is signed in".to_string()),
+            Ok(Ok(TuiAuthReconciliation::UntrackedAccount)) => self
+                .try_load_profiles_with_current(None)
+                .map(|()| "The live Codex account is not saved; press a to add it".to_string()),
+            Ok(Ok(TuiAuthReconciliation::UnresolvedIdentity { aliases })) => {
+                self.try_load_profiles_with_current(None).map(|()| {
+                    format!(
+                        "Live Codex account identity is incomplete; matching profiles: {}",
+                        aliases.join(", ")
+                    )
+                })
             }
-            Ok(Err(error)) => {
+            Ok(Err(error)) => Err(error.context("synchronizing live credentials")),
+            Err(error) => Err(anyhow::anyhow!(
+                "live credential synchronization task failed: {}",
+                crate::task_batch::join_failure_detail(&error)
+            )),
+        };
+        match result {
+            Ok(message) => {
+                self.startup_auth_state = StartupAuthState::Ready;
+                self.set_status(message, 8);
+                StartupAuthPoll::Ready
+            }
+            Err(error) => {
+                self.startup_auth_state = StartupAuthState::Blocked;
                 self.set_status_error(
                     format!("Live credential synchronization failed: {error:#}"),
                     8,
                 );
-            }
-            Err(error) => {
-                self.set_status_error(
-                    format!(
-                        "Live credential synchronization task failed: {}",
-                        crate::task_batch::join_failure_detail(&error)
-                    ),
-                    8,
-                );
+                StartupAuthPoll::Blocked
             }
         }
-        true
     }
 
     /// Observe completed account tasks so panics cannot leave their state
@@ -764,7 +811,7 @@ impl App {
     /// and it isn't already loaded or in flight. Idempotent — safe to call
     /// every frame.
     pub fn ensure_models_loaded(&mut self, alias: &str) {
-        if self.profile_switch_in_flight() {
+        if !self.credential_operations_ready() {
             return;
         }
         // Errors are stable session state too. Retrying every render tick can
@@ -1111,7 +1158,7 @@ impl App {
 
     /// Warmup just one alias.
     pub fn warmup_one(&mut self, alias: &str) {
-        if self.reject_new_credential_operation_during_switch() {
+        if self.reject_new_credential_operation() {
             return;
         }
         let target_indices: Vec<usize> = self
@@ -1130,6 +1177,9 @@ impl App {
     }
 
     pub fn request_consume_reset_card(&mut self, alias: &str) {
+        if self.reject_new_credential_operation() {
+            return;
+        }
         if self.interactive_operation_in_flight() {
             self.set_status(
                 "Finish the active confirmation or profile switch before using a reset card"
@@ -1310,13 +1360,13 @@ impl App {
         Ok(())
     }
 
-    fn load_profiles_from_marker_preserving_selection(&mut self) {
+    fn try_load_profiles_from_marker_preserving_selection(&mut self) -> Result<()> {
         let selected_alias = self
             .selected_account_idx()
             .and_then(|idx| self.accounts.get(idx))
             .map(|entry| entry.alias.clone());
 
-        self.load_profiles_from_marker();
+        self.try_load_profiles_from_marker()?;
 
         if let Some(alias) = selected_alias
             && let Some(account_idx) = self.accounts.iter().position(|a| a.alias == alias)
@@ -1324,6 +1374,7 @@ impl App {
         {
             self.selected = view_idx;
         }
+        Ok(())
     }
 
     pub fn load_profiles_preserving_selection(&mut self) {
@@ -1495,7 +1546,7 @@ impl App {
         target_indices: Vec<usize>,
         origin: WarmupPreflightOrigin,
     ) {
-        if self.shutting_down || self.profile_switch_in_flight() {
+        if self.shutting_down || !self.credential_operations_ready() {
             return;
         }
         if self.warmup_preflight.is_some() {
@@ -1711,7 +1762,7 @@ impl App {
     }
 
     pub fn refresh_one(&mut self, alias: &str) {
-        if self.reject_new_credential_operation_during_switch() {
+        if self.reject_new_credential_operation() {
             return;
         }
         let Some(idx) = self
@@ -1730,7 +1781,7 @@ impl App {
     }
 
     fn spawn_warmup(&mut self, alias: String) {
-        if self.profile_switch_in_flight() {
+        if !self.credential_operations_ready() {
             return;
         }
         // Skip if this alias already has an in-flight warmup task.
@@ -2008,7 +2059,7 @@ impl App {
     }
 
     fn fetch_usage_for(&mut self, idx: usize, refresh: Refresh) {
-        if self.profile_switch_in_flight() {
+        if !self.credential_operations_ready() {
             return;
         }
         let entry = match self.accounts.get(idx) {
@@ -2193,7 +2244,7 @@ impl App {
     /// via the Enter > Batch menu so the implicit "marks change scope"
     /// behavior is gone.
     pub fn refresh(&mut self, refresh: Refresh) {
-        if self.reject_new_credential_operation_during_switch() {
+        if self.reject_new_credential_operation() {
             return;
         }
         let target_indices: Vec<usize> = self.view_indices.clone();
@@ -2201,6 +2252,9 @@ impl App {
     }
 
     pub fn refresh_all(&mut self, refresh: Refresh) {
+        if self.reject_new_credential_operation() {
+            return;
+        }
         let target_indices: Vec<usize> = (0..self.accounts.len()).collect();
         self.refresh_indices(&target_indices, refresh);
     }
@@ -2283,6 +2337,9 @@ impl App {
                     .to_string(),
                 5,
             );
+            return;
+        }
+        if self.reject_new_credential_operation() {
             return;
         }
         if self.reset_card_in_flight(&alias) {
@@ -2690,6 +2747,9 @@ impl App {
     }
 
     fn consume_reset_card(&mut self, alias: &str, credit: ResetCredit) {
+        if self.reject_new_credential_operation() {
+            return;
+        }
         if !self.reset_cards_in_flight.insert(alias.to_string()) {
             self.set_status(format!("{alias}: reset card use is already in progress"), 4);
             return;
@@ -2814,7 +2874,7 @@ impl App {
         if self.marked.is_empty() {
             return;
         }
-        if self.reject_new_credential_operation_during_switch() {
+        if self.reject_new_credential_operation() {
             return;
         }
         let target_indices: Vec<usize> = self
@@ -2834,7 +2894,7 @@ impl App {
         if self.marked.is_empty() {
             return;
         }
-        if self.reject_new_credential_operation_during_switch() {
+        if self.reject_new_credential_operation() {
             return;
         }
         let target_indices: Vec<usize> = self
@@ -3042,7 +3102,7 @@ impl App {
             return;
         }
 
-        if self.profile_switch_in_flight()
+        if !self.credential_operations_ready()
             || self.loading_count() > 0
             || !self.warmup_tasks.is_empty()
             || self.warmup_preflight.is_some()
@@ -3117,13 +3177,19 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
 
     app.start_startup_auth_reconciliation();
     app.start_update_check();
-    let mut startup_ready = false;
+    let mut startup_settled = false;
 
     loop {
-        if !startup_ready && app.poll_startup_auth_reconciliation().await {
-            startup_ready = true;
-            if !app.accounts.is_empty() {
-                app.refresh(Refresh::Cached);
+        if !startup_settled {
+            match app.poll_startup_auth_reconciliation().await {
+                StartupAuthPoll::Pending => {}
+                StartupAuthPoll::Ready => {
+                    startup_settled = true;
+                    if !app.accounts.is_empty() {
+                        app.refresh(Refresh::Cached);
+                    }
+                }
+                StartupAuthPoll::Blocked => startup_settled = true,
             }
         }
         app.poll_results();
@@ -3135,8 +3201,8 @@ async fn run_app(terminal: &mut DefaultTerminal) -> Result<()> {
         app.poll_profile_switch_results();
         app.poll_update();
         app.tick();
-        app.run_due_auto_refresh();
-        if startup_ready {
+        if app.startup_auth_state == StartupAuthState::Ready {
+            app.run_due_auto_refresh();
             app.ensure_models_loaded_for_selected();
         }
 
@@ -3401,7 +3467,7 @@ async fn perform_oauth(
     mode: OAuthMode,
     device: bool,
 ) {
-    if app.reject_new_credential_operation_during_switch() {
+    if app.reject_new_credential_operation() {
         app.close_menu();
         return;
     }
@@ -3512,7 +3578,7 @@ where
 }
 
 async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, device: bool) {
-    if app.reject_new_credential_operation_during_switch() {
+    if app.reject_new_credential_operation() {
         app.close_menu();
         return;
     }
@@ -4087,6 +4153,108 @@ mod tests {
         .await
         .expect("mock profile switch task must settle");
         assert!(!app.profile_switch_in_flight());
+    }
+
+    #[test]
+    fn startup_reconciliation_defers_every_account_request_path() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: true,
+        });
+        app.view_indices.push(0);
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        app.startup_auth_state = super::StartupAuthState::Reconciling;
+
+        app.ensure_models_loaded("account");
+        app.refresh_all(Refresh::Forced);
+        app.warmup_one("account");
+        assert!(app.model_requests.is_empty());
+        assert!(app.refreshing_requests.is_empty());
+        assert!(app.warmup_preflight.is_none());
+        assert!(app.warmup_tasks.is_empty());
+
+        app.auto_refresh_enabled = true;
+        app.next_auto_refresh = Some(Instant::now());
+        let deferred_after = Instant::now();
+        app.run_due_auto_refresh();
+        assert!(
+            app.next_auto_refresh
+                .is_some_and(|next| next > deferred_after)
+        );
+        assert!(app.account_tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_failure_blocks_account_requests() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Idle,
+            is_current: true,
+        });
+        app.view_indices.push(0);
+        app.startup_auth_state = super::StartupAuthState::Reconciling;
+        app.startup_auth_reconciliation = Some(tokio::spawn(async {
+            anyhow::bail!("deliberate reconciliation failure")
+        }));
+        while !app
+            .startup_auth_reconciliation
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            app.poll_startup_auth_reconciliation().await,
+            super::StartupAuthPoll::Blocked
+        );
+        assert_eq!(app.startup_auth_state, super::StartupAuthState::Blocked);
+        app.refresh_all(Refresh::Forced);
+        app.ensure_models_loaded("account");
+        assert!(app.account_tasks.is_empty());
+        assert!(app.refreshing_requests.is_empty());
+        assert!(app.model_requests.is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_live_auth_clears_the_marker_only_startup_selection() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth("account@example.com", "acct_account", "access", "refresh"),
+        );
+        std::fs::write(home.path().join("current"), "account").unwrap();
+
+        let mut app = App::new();
+        app.load_profiles_from_marker();
+        assert!(app.accounts[0].is_current);
+        app.start_startup_auth_reconciliation();
+        let outcome = loop {
+            let outcome = app.poll_startup_auth_reconciliation().await;
+            if outcome != super::StartupAuthPoll::Pending {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(outcome, super::StartupAuthPoll::Ready);
+        assert!(!app.accounts[0].is_current);
+        assert_eq!(app.startup_auth_state, super::StartupAuthState::Ready);
     }
 
     #[allow(clippy::await_holding_lock)]
