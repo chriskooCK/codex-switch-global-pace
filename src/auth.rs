@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rand::Rng as _;
@@ -419,6 +419,18 @@ fn validate_cli_auth_credentials_config(config_path: &Path, config: &toml::Value
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthDurabilityArtifact {
+    Candidate,
+    Backup,
+    Record,
+}
+
+#[cfg(test)]
+type AuthDurabilityHook =
+    std::sync::Arc<dyn Fn(AuthDurabilityArtifact) -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
 thread_local! {
     static TEST_CODEX_CONFIG_LOAD_COUNT: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
@@ -717,6 +729,16 @@ struct StagedPrivateFile {
 }
 
 fn stage_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile> {
+    let staged = prepare_private_file(path, contents)?;
+    staged
+        .file
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing temporary file for {}", path.display()))?;
+    Ok(staged)
+}
+
+fn prepare_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile> {
     let parent = private_write_parent(path)?;
     let directory_guard = acquire_private_directory(parent)?;
 
@@ -732,9 +754,6 @@ fn stage_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile>
     }
     tmp.write_all(contents)
         .with_context(|| format!("writing temporary file for {}", path.display()))?;
-    tmp.as_file()
-        .sync_all()
-        .with_context(|| format!("syncing temporary file for {}", path.display()))?;
     Ok(StagedPrivateFile {
         file: tmp,
         _directory_guard: directory_guard,
@@ -1221,23 +1240,67 @@ enum ExpectedInodeObservation {
     Unreadable(String),
 }
 
-fn stage_exact_private_file(path: &Path, contents: &[u8]) -> Result<ExactPrivateFile> {
-    let staged = stage_private_file(path, contents)?;
+struct PreparedExactPrivateFile {
+    // Keep the handle before the exact owner so an error closes the handle
+    // before token-bound cleanup runs on Windows.
+    file: std::fs::File,
+    exact: ExactPrivateFile,
+}
+
+impl PreparedExactPrivateFile {
+    fn token(&self) -> &crate::fs_ops::FileToken {
+        self.exact.token()
+    }
+
+    fn make_durable(mut self) -> Result<ExactPrivateFile> {
+        self.file.sync_all().with_context(|| {
+            format!(
+                "syncing private transaction file {}",
+                self.exact.path().display()
+            )
+        })?;
+        let handle_token = crate::fs_ops::token_for_file(&mut self.file)?;
+        if &handle_token != self.exact.token() {
+            anyhow::bail!(
+                "private transaction file changed while it was made durable: {}",
+                self.exact.path().display()
+            );
+        }
+        let path_token = crate::fs_ops::token_for_path(self.exact.path())?;
+        if &path_token != self.exact.token() {
+            anyhow::bail!(
+                "private transaction path changed while it was made durable: {}",
+                self.exact.path().display()
+            );
+        }
+        Ok(self.exact)
+    }
+}
+
+fn prepare_exact_private_file(path: &Path, contents: &[u8]) -> Result<PreparedExactPrivateFile> {
+    let staged = prepare_private_file(path, contents)?;
     let StagedPrivateFile {
         mut file,
         _directory_guard,
     } = staged;
     let token = crate::fs_ops::token_for_file(file.as_file_mut())?;
-    let (_file, staged_path) = file
+    let (file, staged_path) = file
         .keep()
         .map_err(|error| error.error)
         .with_context(|| format!("retaining private transaction file for {}", path.display()))?;
-    Ok(ExactPrivateFile {
-        path: staged_path,
-        token,
-        cleanup_on_drop: true,
-        _directory_guard,
+    Ok(PreparedExactPrivateFile {
+        file,
+        exact: ExactPrivateFile {
+            path: staged_path,
+            token,
+            cleanup_on_drop: true,
+            _directory_guard,
+        },
     })
+}
+
+fn stage_exact_private_file(path: &Path, contents: &[u8]) -> Result<ExactPrivateFile> {
+    prepare_exact_private_file(path, contents)?.make_durable()
 }
 
 pub(crate) fn remove_bound_path(path: &Path, expected: &crate::fs_ops::FileToken) -> Result<()> {
@@ -1432,12 +1495,18 @@ fn move_owned_noreplace(file: &mut ExactPrivateFile, destination: &Path) -> Resu
     }))
 }
 
-fn publish_record_exclusive(
+fn prepare_publication_record(
     record_path: &Path,
     record: &AuthPublicationRecord,
-) -> Result<RecordPublication> {
+) -> Result<PreparedExactPrivateFile> {
     let encoded = serde_json::to_vec(record)?;
-    let mut staged = stage_exact_private_file(record_path, &encoded)?;
+    prepare_exact_private_file(record_path, &encoded)
+}
+
+fn publish_record_exclusive(
+    record_path: &Path,
+    mut staged: ExactPrivateFile,
+) -> Result<RecordPublication> {
     let boundary = crate::fs_ops::rename_noreplace(staged.path(), record_path);
     let source_after = crate::fs_ops::token_if_present(staged.path())?;
     let destination_after = crate::fs_ops::token_if_present(record_path)?;
@@ -1962,6 +2031,8 @@ thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static TEST_BEFORE_BACKUP_RETENTION_DELETE:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_AUTH_DURABILITY_HOOK:
+        std::cell::RefCell<Option<AuthDurabilityHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -2006,6 +2077,21 @@ fn run_before_backup_retention_delete_test_hook() {
     });
 }
 
+#[cfg(test)]
+fn before_next_auth_durability(
+    action: impl Fn(AuthDurabilityArtifact) -> Result<()> + Send + Sync + 'static,
+) {
+    TEST_AUTH_DURABILITY_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(std::sync::Arc::new(action));
+    });
+}
+
+#[cfg(test)]
+fn take_auth_durability_hook() -> Option<AuthDurabilityHook> {
+    TEST_AUTH_DURABILITY_HOOK.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
 fn create_independent_backup_stage(
     source: &Path,
     destination: &Path,
@@ -2084,8 +2170,14 @@ fn create_independent_backup_stage(
 fn prepare_existing_auth_publication(
     path: &Path,
     expected_token: &crate::fs_ops::FileToken,
+    expected_bytes: &[u8],
     contents: &[u8],
-) -> Result<(String, String, ExactPrivateFile, ExactPrivateFile)> {
+) -> Result<(
+    AuthPublicationRecord,
+    ExactPrivateFile,
+    ExactPrivateFile,
+    ExactPrivateFile,
+)> {
     const UNIQUE_NAME_ATTEMPTS: usize = 16;
 
     for _ in 0..UNIQUE_NAME_ATTEMPTS {
@@ -2097,7 +2189,9 @@ fn prepare_existing_auth_publication(
         #[cfg(windows)]
         let displaced_path = transaction_role_path(path, "displaced", &nonce)?;
 
-        if crate::fs_ops::token_if_present(&backup_path)?.is_some()
+        if crate::fs_ops::token_if_present(&candidate_path)?.is_some()
+            || crate::fs_ops::token_if_present(&backup_stage_path)?.is_some()
+            || crate::fs_ops::token_if_present(&backup_path)?.is_some()
             || cfg!(windows) && {
                 #[cfg(windows)]
                 {
@@ -2112,7 +2206,38 @@ fn prepare_existing_auth_publication(
             continue;
         }
 
-        let mut candidate = stage_exact_private_file(path, contents)?;
+        let candidate = prepare_exact_private_file(path, contents)?;
+        // `expected_bytes` was bound to `expected_token` above. Staging that
+        // immutable snapshot produces the same independent original backup
+        // without serializing its FlushFileBuffers ahead of the other two
+        // durability prerequisites. The live token is checked again after all
+        // three flushes and immediately before the eventual exchange.
+        let backup_stage = prepare_exact_private_file(path, expected_bytes)?;
+        let record = AuthPublicationRecord {
+            version: AUTH_PUBLICATION_RECORD_VERSION,
+            nonce,
+            backup_stamp: stamp,
+            expected_token: expected_token.to_string(),
+            candidate_token: candidate.token().to_string(),
+            backup_token: backup_stage.token().to_string(),
+        };
+        let record_path = auth_publication_record_path(path)?;
+        let record_stage = prepare_publication_record(&record_path, &record)?;
+        let (mut candidate, mut backup_stage, record_stage) =
+            make_auth_publication_prerequisites_durable(
+                path,
+                candidate,
+                backup_stage,
+                record_stage,
+            )?;
+
+        if crate::fs_ops::token_if_present(path)?.as_ref() != Some(expected_token) {
+            anyhow::bail!(
+                "auth source changed while its durable publication prerequisites were prepared: {}",
+                path.display()
+            );
+        }
+
         if let Err(error) = move_owned_noreplace(&mut candidate, &candidate_path) {
             if io_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) {
                 continue;
@@ -2125,18 +2250,94 @@ fn prepare_existing_auth_publication(
             });
         }
 
-        match create_independent_backup_stage(path, &backup_stage_path, expected_token) {
-            Ok(backup_stage) => return Ok((nonce, stamp, candidate, backup_stage)),
-            Err(error) if io_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+        if let Err(error) = move_owned_noreplace(&mut backup_stage, &backup_stage_path) {
+            if io_error_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) {
                 continue;
             }
-            Err(error) => return Err(error),
+            return Err(error).with_context(|| {
+                format!(
+                    "preparing independent auth recovery copy {}",
+                    backup_stage_path.display()
+                )
+            });
         }
+
+        return Ok((record, candidate, backup_stage, record_stage));
     }
     anyhow::bail!(
         "could not reserve collision-free auth publication paths for {}",
         path.display()
     )
+}
+
+fn join_auth_durability_worker(
+    artifact: &str,
+    result: std::thread::Result<Result<ExactPrivateFile>>,
+) -> Result<ExactPrivateFile> {
+    match result {
+        Ok(result) => result.with_context(|| format!("making auth {artifact} durable")),
+        Err(_) => anyhow::bail!("auth {artifact} durability worker panicked"),
+    }
+}
+
+fn make_auth_publication_prerequisites_durable(
+    path: &Path,
+    candidate: PreparedExactPrivateFile,
+    backup: PreparedExactPrivateFile,
+    record: PreparedExactPrivateFile,
+) -> Result<(ExactPrivateFile, ExactPrivateFile, ExactPrivateFile)> {
+    #[cfg(test)]
+    let hook = take_auth_durability_hook();
+    #[cfg(test)]
+    let candidate_hook = hook.clone();
+    #[cfg(test)]
+    let backup_hook = hook.clone();
+    #[cfg(test)]
+    let record_hook = hook;
+
+    let started = Instant::now();
+    let (candidate_result, backup_result, record_result) = std::thread::scope(|scope| {
+        let candidate_worker = scope.spawn(move || {
+            #[cfg(test)]
+            if let Some(hook) = candidate_hook {
+                hook(AuthDurabilityArtifact::Candidate)?;
+            }
+            candidate.make_durable()
+        });
+        let backup_worker = scope.spawn(move || {
+            #[cfg(test)]
+            if let Some(hook) = backup_hook {
+                hook(AuthDurabilityArtifact::Backup)?;
+            }
+            backup.make_durable()
+        });
+        let record_worker = scope.spawn(move || {
+            #[cfg(test)]
+            if let Some(hook) = record_hook {
+                hook(AuthDurabilityArtifact::Record)?;
+            }
+            record.make_durable()
+        });
+        (
+            candidate_worker.join(),
+            backup_worker.join(),
+            record_worker.join(),
+        )
+    });
+    let succeeded = candidate_result.as_ref().is_ok_and(|result| result.is_ok())
+        && backup_result.as_ref().is_ok_and(|result| result.is_ok())
+        && record_result.as_ref().is_ok_and(|result| result.is_ok());
+    tracing::debug!(
+        auth_path = %path.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        succeeded,
+        "prepared auth publication durability prerequisites"
+    );
+
+    let candidate = join_auth_durability_worker("candidate", candidate_result)?;
+    let backup = join_auth_durability_worker("backup", backup_result)?;
+    let record = join_auth_durability_worker("record", record_result)?;
+    Ok((candidate, backup, record))
 }
 
 fn conditional_write_from_settlement(
@@ -2229,18 +2430,10 @@ pub(crate) fn atomic_write_private_if_unchanged(
         return Ok(ConditionalWrite::Changed);
     }
 
-    let (nonce, stamp, mut candidate, mut backup_stage) =
-        prepare_existing_auth_publication(path, &expected_token, contents)?;
-    let record = AuthPublicationRecord {
-        version: AUTH_PUBLICATION_RECORD_VERSION,
-        nonce,
-        backup_stamp: stamp,
-        expected_token: expected_token.to_string(),
-        candidate_token: candidate.token().to_string(),
-        backup_token: backup_stage.token().to_string(),
-    };
+    let (record, mut candidate, mut backup_stage, record_stage) =
+        prepare_existing_auth_publication(path, &expected_token, expected_bytes, contents)?;
     let record_path = auth_publication_record_path(path)?;
-    let record_token = match publish_record_exclusive(&record_path, &record)? {
+    let record_token = match publish_record_exclusive(&record_path, record_stage)? {
         RecordPublication::Durable(token) => token,
         RecordPublication::VisibleNotDurable { token, error } => {
             candidate.disarm();
@@ -3896,6 +4089,105 @@ mod tests {
             super::ConditionalWrite::Changed
         );
         assert_eq!(std::fs::read(&missing).unwrap(), b"created");
+    }
+
+    #[test]
+    fn auth_publication_flushes_all_prerequisites_before_record_visibility() {
+        struct DurabilityGate {
+            entered: std::sync::Mutex<Vec<super::AuthDurabilityArtifact>>,
+            ready: std::sync::Condvar,
+        }
+
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
+        let live = dir.path().join("auth.json");
+        std::fs::write(&live, b"original").unwrap();
+        let record_path = super::auth_publication_record_path(&live).unwrap();
+        let gate = std::sync::Arc::new(DurabilityGate {
+            entered: std::sync::Mutex::new(Vec::new()),
+            ready: std::sync::Condvar::new(),
+        });
+        let hook_gate = gate.clone();
+        let hook_live = live.clone();
+        let hook_record = record_path.clone();
+        super::before_next_auth_durability(move |artifact| {
+            if hook_record.exists() {
+                anyhow::bail!("publication record became visible before durable preparation");
+            }
+            if std::fs::read(&hook_live)? != b"original" {
+                anyhow::bail!("live auth changed before durable preparation completed");
+            }
+
+            let mut entered = hook_gate
+                .entered
+                .lock()
+                .map_err(|_| anyhow::anyhow!("durability gate was poisoned"))?;
+            entered.push(artifact);
+            hook_gate.ready.notify_all();
+            while entered.len() < 3 {
+                let (next, timeout) = hook_gate
+                    .ready
+                    .wait_timeout(entered, std::time::Duration::from_secs(5))
+                    .map_err(|_| anyhow::anyhow!("durability gate was poisoned"))?;
+                entered = next;
+                if timeout.timed_out() && entered.len() < 3 {
+                    anyhow::bail!("durability prerequisites did not enter in parallel");
+                }
+            }
+            Ok(())
+        });
+
+        assert_eq!(
+            super::atomic_write_private_if_unchanged(&live, Some(b"original"), b"replacement")
+                .unwrap(),
+            super::ConditionalWrite::Written
+        );
+        let entered = gate.entered.lock().unwrap();
+        assert_eq!(entered.len(), 3);
+        assert!(entered.contains(&super::AuthDurabilityArtifact::Candidate));
+        assert!(entered.contains(&super::AuthDurabilityArtifact::Backup));
+        assert!(entered.contains(&super::AuthDurabilityArtifact::Record));
+        assert_eq!(std::fs::read(&live).unwrap(), b"replacement");
+        assert!(super::read_publication_record(&live).unwrap().is_none());
+    }
+
+    #[test]
+    fn failed_parallel_durability_never_publishes_or_leaves_transaction_roles() {
+        for failed in [
+            super::AuthDurabilityArtifact::Candidate,
+            super::AuthDurabilityArtifact::Backup,
+            super::AuthDurabilityArtifact::Record,
+        ] {
+            let dir = crate::fs_ops::create_direct_tempdir().unwrap();
+            let live = dir.path().join("auth.json");
+            std::fs::write(&live, b"original").unwrap();
+            super::before_next_auth_durability(move |artifact| {
+                if artifact == failed {
+                    anyhow::bail!("injected {artifact:?} durability failure");
+                }
+                Ok(())
+            });
+
+            let error =
+                super::atomic_write_private_if_unchanged(&live, Some(b"original"), b"replacement")
+                    .unwrap_err();
+
+            assert!(
+                format!("{error:#}").contains("durability failure"),
+                "unexpected error for {failed:?}: {error:#}"
+            );
+            assert_eq!(std::fs::read(&live).unwrap(), b"original");
+            assert!(super::read_publication_record(&live).unwrap().is_none());
+            assert!(
+                std::fs::read_dir(dir.path())
+                    .unwrap()
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+                    .all(|name| !name.contains(".codex-switch-candidate-")
+                        && !name.contains(".codex-switch-backup-")
+                        && !name.contains(".codex-switch-displaced-")),
+                "failed durable preparation must clean exact transaction roles"
+            );
+        }
     }
 
     #[test]

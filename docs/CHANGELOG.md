@@ -1,5 +1,29 @@
 # Changelog
 
+## v20260828.1.0 — 2026-08-28
+
+- **Switch-priority startup refresh** — An interactive profile switch can now
+  stop an in-flight, read-only usage GET (including permit waits, response-body
+  reads, and retry backoff) and release that profile lease immediately. Token
+  refresh retains an explicit irreversible boundary: once a refresh begins,
+  its response and replacement credential are still drained and persisted.
+  Cancelled target and formerly-active account refreshes are merged and resumed
+  exactly once after the switch.
+- **Parallel durable auth preparation** — Existing-auth replacement prepares
+  the candidate, independent original backup, and recovery record privately,
+  then flushes the three independent files concurrently. All three must be
+  durable and the live file must still match before any recovery record or new
+  live credential is published. This removes three sequential Windows disk
+  flush waits from the measured switch bottleneck without weakening rollback,
+  external-writer detection, or crash recovery.
+- **Task-backed switch progress** — The TUI status bar now derives preparing,
+  live-synchronization, and commit progress from the tracked switch task. The
+  message therefore remains visible for the full operation instead of expiring
+  after 60 seconds or being hidden by an unrelated transient notice.
+- **Portable release gate** — The startup cleanup lease helper and its lock
+  error type are compiled only on Windows, so non-Windows Clippy no longer
+  rejects an otherwise valid development candidate as dead code.
+
 ## v20260827.1.0 — 2026-08-27
 
 - **Immediate TUI startup** — The account screen renders from the saved active
