@@ -26,8 +26,9 @@ pub(crate) type FirstNetworkPermit = Pin<
     Box<dyn Future<Output = Result<Option<tokio::sync::OwnedSemaphorePermit>>> + Send + 'static>,
 >;
 
-/// Build the ordinary, non-cancellable admission wait used by CLI and daemon
-/// callers. TUI callers wrap the same wait in their safe cancellation race.
+/// Build the deferred first admission used by every caller. TUI usage reads
+/// make the enclosing `NetworkPermitBudget::acquire` phase cancellable; model
+/// and warmup callers retain their separate first-wait boundary.
 pub(crate) fn first_network_permit(limiter: Arc<tokio::sync::Semaphore>) -> FirstNetworkPermit {
     Box::pin(async move {
         limiter
@@ -48,6 +49,167 @@ pub(crate) fn network_wait_was_cancelled(error: &anyhow::Error) -> bool {
 
 pub(crate) fn network_wait_cancelled_error() -> anyhow::Error {
     NetworkWaitCancelled.into()
+}
+
+const USAGE_READ_CANCELLABLE: u8 = 0;
+const USAGE_READ_CANCELLED: u8 = 1;
+const USAGE_CREDENTIAL_WORK: u8 = 2;
+const USAGE_READ_FINISHED: u8 = 3;
+
+#[derive(Debug)]
+struct UsageTaskCancellationState {
+    phase: std::sync::atomic::AtomicU8,
+    cancellation_completed: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+/// Cancellation boundary for a TUI usage read.
+///
+/// Waiting for a usage GET permit, sending that GET, reading its response, and
+/// retry backoff are reconstructable and may be stopped to release a profile
+/// lease for an interactive switch. Refreshing a token is different: once the
+/// credential-work transition wins, cancellation is permanently refused so
+/// the refresh response and its durable persistence are always drained.
+#[derive(Clone, Debug)]
+pub(crate) struct UsageTaskCancellation {
+    state: Arc<UsageTaskCancellationState>,
+}
+
+impl UsageTaskCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(UsageTaskCancellationState {
+                phase: std::sync::atomic::AtomicU8::new(USAGE_READ_CANCELLABLE),
+                cancellation_completed: std::sync::atomic::AtomicBool::new(false),
+                wake: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+
+    /// Request cancellation only while the task contains read-only work.
+    pub(crate) fn request(&self) -> bool {
+        let cancelled = self
+            .state
+            .phase
+            .compare_exchange(
+                USAGE_READ_CANCELLABLE,
+                USAGE_READ_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.state.wake.notify_waiters();
+        }
+        cancelled
+    }
+
+    /// Cross the irreversible refresh boundary. A cancellation that won the
+    /// race prevents the refresh; after this succeeds, `request` stays false.
+    fn begin_credential_work(&self) -> bool {
+        match self.state.phase.compare_exchange(
+            USAGE_READ_CANCELLABLE,
+            USAGE_CREDENTIAL_WORK,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) | Err(USAGE_CREDENTIAL_WORK) => true,
+            Err(USAGE_READ_CANCELLED | USAGE_READ_FINISHED) => false,
+            Err(unexpected) => unreachable!("unexpected usage cancellation phase {unexpected}"),
+        }
+    }
+
+    /// Claim a completed read before publishing it. If cancellation won at
+    /// the same boundary, the caller must discard the reconstructable result.
+    pub(crate) fn finish(&self) -> bool {
+        loop {
+            let current = self.state.phase.load(std::sync::atomic::Ordering::Acquire);
+            match current {
+                USAGE_READ_CANCELLED => return false,
+                USAGE_READ_FINISHED => return true,
+                USAGE_READ_CANCELLABLE | USAGE_CREDENTIAL_WORK => {
+                    if self
+                        .state
+                        .phase
+                        .compare_exchange(
+                            current,
+                            USAGE_READ_FINISHED,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return true;
+                    }
+                }
+                unexpected => unreachable!("unexpected usage cancellation phase {unexpected}"),
+            }
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.phase.load(std::sync::atomic::Ordering::Acquire) == USAGE_READ_CANCELLED
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            // Register before checking the phase so a notification between the
+            // check and await cannot be lost.
+            let notified = self.state.wake.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn mark_cancellation_completed(&self) {
+        debug_assert!(self.is_cancelled());
+        self.state
+            .cancellation_completed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn cancellation_completed(&self) -> bool {
+        self.state
+            .cancellation_completed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for UsageTaskCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("usage read cancelled before credential work")]
+struct UsageReadCancelled;
+
+fn usage_cancellation_error(alias: &str, error: &anyhow::Error) -> UsageError {
+    UsageError {
+        summary: "usage read cancelled".to_string(),
+        detail: format!("[{alias}] {error:#}"),
+    }
+}
+
+async fn await_cancellable_usage_read<T, F>(
+    cancellation: Option<&UsageTaskCancellation>,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let Some(cancellation) = cancellation else {
+        return future.await;
+    };
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(UsageReadCancelled.into()),
+        result = &mut future => result,
+    }
 }
 
 /// Consume one caller-defined admission wait at the first actual HTTP
@@ -655,6 +817,34 @@ pub(crate) async fn execute_prepared_core_usage_with_existing_lease_and_client(
         ResetCreditEnrichment::Deferred,
         UsageCacheWrite::Skip,
         network,
+        None,
+    )
+    .await
+    .map(|observation| observation.usage)
+}
+
+/// Execute a TUI core usage request with cancellation limited to read-only
+/// network phases. If token refresh becomes necessary, the control crosses an
+/// irreversible boundary before the POST and refuses every later request.
+pub(crate) async fn execute_prepared_core_usage_cancellable_with_existing_lease_and_client(
+    prepared: PreparedCoreUsageRequest,
+    lease: &crate::profile::ProfileLease,
+    client: &reqwest::Client,
+    network: &mut NetworkPermitBudget,
+    cancellation: &UsageTaskCancellation,
+) -> std::result::Result<UsageInfo, UsageError> {
+    let inner = match prepared.state {
+        PreparedCoreUsageState::Cached(usage) => return Ok(usage),
+        PreparedCoreUsageState::Network(inner) => inner,
+    };
+    execute_prepared_usage_request(
+        inner,
+        lease,
+        client,
+        ResetCreditEnrichment::Deferred,
+        UsageCacheWrite::Skip,
+        network,
+        Some(cancellation),
     )
     .await
     .map(|observation| observation.usage)
@@ -691,6 +881,7 @@ pub(crate) async fn execute_prepared_full_usage_with_existing_lease_and_client(
         ResetCreditEnrichment::Inline,
         UsageCacheWrite::Store,
         network,
+        None,
     )
     .await
 }
@@ -1061,6 +1252,7 @@ async fn fetch_usage_observation_with_lease_and_client(
         policy.reset_credit_enrichment,
         policy.cache_write,
         &mut network,
+        None,
     )
     .await
 }
@@ -1152,6 +1344,7 @@ async fn execute_prepared_usage_request(
     reset_credit_enrichment: ResetCreditEnrichment,
     cache_write: UsageCacheWrite,
     network: &mut NetworkPermitBudget,
+    cancellation: Option<&UsageTaskCancellation>,
 ) -> std::result::Result<UsageObservation, UsageError> {
     let PreparedUsageRequest {
         alias,
@@ -1192,7 +1385,14 @@ async fn execute_prepared_usage_request(
     while attempt < max_attempts {
         if attempt > 0 {
             debug!("[{alias}] retry attempt {}/{max_attempts}", attempt + 1);
-            tokio::time::sleep(RETRY_DELAY).await;
+            if let Err(error) = await_cancellable_usage_read(cancellation, async {
+                tokio::time::sleep(RETRY_DELAY).await;
+                Ok(())
+            })
+            .await
+            {
+                return Err(usage_cancellation_error(alias, &error));
+            }
         }
 
         // Deliberately *after* the delay. The winner writes the rotated token
@@ -1250,7 +1450,7 @@ async fn execute_prepared_usage_request(
                         }
                     }
                 };
-            fetch_usage_with_refresh_transactional(
+            fetch_usage_with_refresh_transactional_cancellable(
                 &endpoints,
                 client,
                 alias,
@@ -1263,6 +1463,7 @@ async fn execute_prepared_usage_request(
                 &mut persist_before_follow_up,
                 reset_credit_enrichment,
                 network,
+                cancellation,
             )
             .await
         };
@@ -1316,6 +1517,9 @@ async fn execute_prepared_usage_request(
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                if e.downcast_ref::<UsageReadCancelled>().is_some() {
+                    return Err(usage_cancellation_error(alias, &e));
+                }
                 if e.downcast_ref::<InvalidUsageResponse>().is_some() {
                     warn!("[{alias}] Usage API response rejected without retry: {msg}");
                     return Err(UsageError {
@@ -1497,6 +1701,7 @@ async fn send_usage_request(
     request_context: &'static str,
     body_context: &'static str,
     network: &mut NetworkPermitBudget,
+    cancellation: Option<&UsageTaskCancellation>,
 ) -> Result<BufferedUsageResponse> {
     let request = apply_account_routing_headers(
         client
@@ -1506,16 +1711,28 @@ async fn send_usage_request(
         is_fedramp,
     );
     let (status, body) = {
-        let _permit = network.acquire().await?;
-        let response = request
-            .send()
-            .await
-            .map_err(|error| UsageRequestFailure::request(request_context, &error))?;
+        let _permit =
+            await_cancellable_usage_read(cancellation, async { network.acquire().await }).await?;
+        let response = await_cancellable_usage_read(cancellation, async move {
+            request
+                .send()
+                .await
+                .map_err(|error| UsageRequestFailure::request(request_context, &error))
+        })
+        .await?;
         let status = response.status();
         let body = if status.is_success() {
-            Some(response.json().await.map_err(|error| {
-                usage_response_json_error(&format!("{body_context} (HTTP {status})"), &error)
-            })?)
+            Some(
+                await_cancellable_usage_read(cancellation, async move {
+                    response.json().await.map_err(|error| {
+                        usage_response_json_error(
+                            &format!("{body_context} (HTTP {status})"),
+                            &error,
+                        )
+                    })
+                })
+                .await?,
+            )
         } else {
             None
         };
@@ -1549,6 +1766,44 @@ where
     A: FnMut() -> Result<T>,
     F: FnMut(T, &str, RefreshTokenResolution) -> Result<RefreshedTokens>,
 {
+    fetch_usage_with_refresh_transactional_cancellable(
+        endpoints,
+        client,
+        alias,
+        access_token,
+        id_token,
+        refresh_token,
+        account_id,
+        is_fedramp,
+        authorize_rotation,
+        persist_rotation,
+        reset_credit_enrichment,
+        network,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_usage_with_refresh_transactional_cancellable<A, F, T>(
+    endpoints: &auth::ServiceEndpoints,
+    client: &reqwest::Client,
+    alias: &str,
+    access_token: &str,
+    id_token: Option<&str>,
+    refresh_token: Option<&str>,
+    account_id: Option<&str>,
+    is_fedramp: bool,
+    authorize_rotation: &mut A,
+    persist_rotation: &mut F,
+    reset_credit_enrichment: ResetCreditEnrichment,
+    network: &mut NetworkPermitBudget,
+    cancellation: Option<&UsageTaskCancellation>,
+) -> Result<UsageInfo>
+where
+    A: FnMut() -> Result<T>,
+    F: FnMut(T, &str, RefreshTokenResolution) -> Result<RefreshedTokens>,
+{
     let usage_url = endpoints.usage()?;
     let mut rejected_refresh: Option<anyhow::Error> = None;
     let mut retryable_proactive_refresh: Option<anyhow::Error> = None;
@@ -1562,7 +1817,17 @@ where
         info!("[{alias}] token expiring soon, proactively refreshing");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token_with_network(endpoints, alias, client, id_token, rt, network).await {
+        match do_refresh_token_for_usage(
+            endpoints,
+            alias,
+            client,
+            id_token,
+            rt,
+            network,
+            cancellation,
+        )
+        .await
+        {
             Ok(resolution) => {
                 let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
@@ -1576,6 +1841,7 @@ where
                     "Usage API request failed",
                     "failed to parse usage response",
                     network,
+                    cancellation,
                 )
                 .await?;
 
@@ -1609,6 +1875,9 @@ where
                 ));
             }
             Err(e) => {
+                if e.downcast_ref::<UsageReadCancelled>().is_some() {
+                    return Err(e);
+                }
                 if e.downcast_ref::<RefreshOutcomeUnknown>().is_some() {
                     return Err(e);
                 }
@@ -1641,6 +1910,7 @@ where
         "Usage API request failed",
         "failed to parse usage response",
         network,
+        cancellation,
     )
     .await?;
 
@@ -1695,7 +1965,17 @@ where
         info!("[{alias}] got HTTP {status}, attempting token refresh");
 
         let authorization = authorize_rotation()?;
-        match do_refresh_token_with_network(endpoints, alias, client, id_token, rt, network).await {
+        match do_refresh_token_for_usage(
+            endpoints,
+            alias,
+            client,
+            id_token,
+            rt,
+            network,
+            cancellation,
+        )
+        .await
+        {
             Ok(resolution) => {
                 let new_tokens = persist_rotation(authorization, rt, resolution)?;
                 let bearer = new_tokens.access_token.clone();
@@ -1709,6 +1989,7 @@ where
                     "Usage API retry request failed",
                     "failed to parse usage response after refresh",
                     network,
+                    cancellation,
                 )
                 .await?;
 
@@ -1973,26 +2254,73 @@ pub(crate) async fn do_refresh_token_with_network(
     debug!("[{alias}] sending token refresh request to {token_url}");
 
     let request = build_refresh_request(client, token_url, refresh_token);
-    let (status, body_text) = {
-        let _permit = network.acquire().await?;
-        let resp = request.send().await.map_err(|error| {
-            let detail = format_reqwest_error("token refresh request failed", &error).to_string();
-            refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
-                "token refresh request transport failed after submission began: {detail}"
-            )))
-        })?;
+    let permit = network.acquire().await?;
+    execute_refresh_request_with_permit(alias, request, current_id_token, refresh_token, permit)
+        .await
+}
 
-        let status = resp.status();
-
-        // Read raw body before returning the permit: a truncated response can
-        // leave a single-use refresh-token outcome unknowable.
-        let body_text = resp.text().await.map_err(|error| {
-            refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
-                "failed to read token refresh response body (HTTP {status})"
-            )))
-        })?;
-        (status, body_text)
+/// Usage-only refresh entry point. Waiting for network capacity does not
+/// contact the auth server and remains cancellable. Once capacity is owned,
+/// the credential-work CAS is the final operation before `request.send`; a
+/// winning CAS makes the response body and caller-owned persistence drain.
+#[allow(clippy::too_many_arguments)]
+async fn do_refresh_token_for_usage(
+    endpoints: &auth::ServiceEndpoints,
+    alias: &str,
+    client: &reqwest::Client,
+    current_id_token: Option<&str>,
+    refresh_token: &str,
+    network: &mut NetworkPermitBudget,
+    cancellation: Option<&UsageTaskCancellation>,
+) -> Result<RefreshTokenResolution> {
+    let Some(cancellation) = cancellation else {
+        return do_refresh_token_with_network(
+            endpoints,
+            alias,
+            client,
+            current_id_token,
+            refresh_token,
+            network,
+        )
+        .await;
     };
+
+    let token_url = endpoints.token()?;
+    debug!("[{alias}] waiting to send token refresh request to {token_url}");
+    let request = build_refresh_request(client, token_url, refresh_token);
+    let permit =
+        await_cancellable_usage_read(Some(cancellation), async { network.acquire().await }).await?;
+    if !cancellation.begin_credential_work() {
+        return Err(UsageReadCancelled.into());
+    }
+    execute_refresh_request_with_permit(alias, request, current_id_token, refresh_token, permit)
+        .await
+}
+
+async fn execute_refresh_request_with_permit(
+    alias: &str,
+    request: reqwest::RequestBuilder,
+    current_id_token: Option<&str>,
+    refresh_token: &str,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> Result<RefreshTokenResolution> {
+    let resp = request.send().await.map_err(|error| {
+        let detail = format_reqwest_error("token refresh request failed", &error).to_string();
+        refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
+            "token refresh request transport failed after submission began: {detail}"
+        )))
+    })?;
+
+    let status = resp.status();
+
+    // Read raw body before returning the permit: a truncated response can
+    // leave a single-use refresh-token outcome unknowable.
+    let body_text = resp.text().await.map_err(|error| {
+        refresh_outcome_unknown(anyhow::Error::new(error).context(format!(
+            "failed to read token refresh response body (HTTP {status})"
+        )))
+    })?;
+    drop(permit);
     debug!("[{alias}] token refresh response: HTTP {status}");
 
     let r: RefreshResponse = serde_json::from_str(&body_text).map_err(|error| {
@@ -2784,6 +3112,489 @@ mod tests {
             .expect_err("a cancelled first admission must not be polled again");
         assert!(network_wait_was_cancelled(&second_error));
         assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellable_healthy_get_releases_its_network_permit() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let (request_started_tx, mut request_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_response_gate = Arc::clone(&response_gate);
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let server_token_calls = Arc::clone(&token_calls);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let request_started_tx = request_started_tx.clone();
+                    let response_gate = Arc::clone(&server_response_gate);
+                    async move {
+                        request_started_tx.send(()).unwrap();
+                        response_gate.acquire().await.unwrap().forget();
+                        axum::Json(valid_usage_body())
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&server_token_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let endpoints = auth::service_endpoints().unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let task_limiter = Arc::clone(&limiter);
+        let cancellation = UsageTaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let request = tokio::spawn(async move {
+            let mut network = NetworkPermitBudget::new(first_network_permit(task_limiter));
+            let mut authorize_rotation = || Ok(());
+            let mut persist_rotation =
+                |(): (), _: &str, _: RefreshTokenResolution| -> Result<RefreshedTokens> {
+                    panic!("a healthy usage GET must not refresh credentials")
+                };
+            fetch_usage_with_refresh_transactional_cancellable(
+                &endpoints,
+                &reqwest::Client::new(),
+                "blocked-healthy-get",
+                "healthy-access",
+                None,
+                None,
+                None,
+                false,
+                &mut authorize_rotation,
+                &mut persist_rotation,
+                ResetCreditEnrichment::Deferred,
+                &mut network,
+                Some(&task_cancellation),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), request_started_rx.recv())
+            .await
+            .expect("usage GET did not reach the server")
+            .expect("usage request channel closed");
+        assert_eq!(limiter.available_permits(), 0);
+        assert!(cancellation.request());
+
+        let error = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+            .await
+            .expect("cancelled usage GET kept waiting for the response")
+            .unwrap()
+            .expect_err("cancelled usage GET unexpectedly succeeded");
+        assert!(error.downcast_ref::<UsageReadCancelled>().is_some());
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            limiter.acquire_owned(),
+        )
+        .await
+        .expect("cancelled usage GET retained its network permit")
+        .unwrap();
+        drop(permit);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_before_reactive_refresh_boundary_skips_token_post() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let server_token_calls = Arc::clone(&token_calls);
+        let app = Router::new()
+            .route("/usage", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&server_token_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let (authorization_started_tx, authorization_started_rx) = tokio::sync::oneshot::channel();
+        let (authorization_release_tx, authorization_release_rx) = std::sync::mpsc::channel();
+        let cancellation = UsageTaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let endpoints = auth::service_endpoints().unwrap();
+        let request = tokio::spawn(async move {
+            let mut authorization_started_tx = Some(authorization_started_tx);
+            let mut authorize_rotation = move || {
+                authorization_started_tx
+                    .take()
+                    .expect("authorization runs once")
+                    .send(())
+                    .unwrap();
+                authorization_release_rx.recv().unwrap();
+                Ok(())
+            };
+            let mut persist_rotation =
+                |(): (), _: &str, _: RefreshTokenResolution| -> Result<RefreshedTokens> {
+                    panic!("a cancelled refresh must not reach persistence")
+                };
+            let mut network = NetworkPermitBudget::unlimited();
+            fetch_usage_with_refresh_transactional_cancellable(
+                &endpoints,
+                &reqwest::Client::new(),
+                "cancel-before-refresh",
+                "old-access",
+                Some("old-id"),
+                Some("old-refresh"),
+                None,
+                false,
+                &mut authorize_rotation,
+                &mut persist_rotation,
+                ResetCreditEnrichment::Deferred,
+                &mut network,
+                Some(&task_cancellation),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), authorization_started_rx)
+            .await
+            .expect("reactive refresh authorization did not start")
+            .unwrap();
+        assert!(cancellation.request());
+        authorization_release_tx.send(()).unwrap();
+
+        let error = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+            .await
+            .expect("cancellation did not stop before the refresh POST")
+            .unwrap()
+            .expect_err("cancelled reactive refresh unexpectedly succeeded");
+        assert!(error.downcast_ref::<UsageReadCancelled>().is_some());
+        assert_eq!(token_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_while_refresh_waits_for_capacity_skips_token_post() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let server_usage_calls = Arc::clone(&usage_calls);
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let server_token_calls = Arc::clone(&token_calls);
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let calls = Arc::clone(&server_usage_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(valid_usage_body())
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&server_token_calls);
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let saturated = Arc::new(tokio::sync::Semaphore::new(0));
+        let first_limiter = Arc::clone(&saturated);
+        let (permit_wait_started_tx, permit_wait_started_rx) = tokio::sync::oneshot::channel();
+        let first_permit: FirstNetworkPermit = Box::pin(async move {
+            permit_wait_started_tx.send(()).unwrap();
+            first_limiter
+                .acquire_owned()
+                .await
+                .map(Some)
+                .map_err(|_| NetworkLimiterClosed.into())
+        });
+        let cancellation = UsageTaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let endpoints = auth::service_endpoints().unwrap();
+        let now = auth::now_unix_secs().unwrap();
+        let expired_access = jwt_with_exp(now - 1);
+        let id_token = jwt_with_exp_and_identity(now + 86_400);
+        let request = tokio::spawn(async move {
+            let mut authorize_rotation = || Ok(());
+            let mut persist_rotation =
+                |(): (), _: &str, _: RefreshTokenResolution| -> Result<RefreshedTokens> {
+                    panic!("a refresh cancelled during admission must not reach persistence")
+                };
+            let mut network = NetworkPermitBudget::new(first_permit);
+            fetch_usage_with_refresh_transactional_cancellable(
+                &endpoints,
+                &reqwest::Client::new(),
+                "saturated-refresh-admission",
+                &expired_access,
+                Some(&id_token),
+                Some("old-refresh"),
+                None,
+                false,
+                &mut authorize_rotation,
+                &mut persist_rotation,
+                ResetCreditEnrichment::Deferred,
+                &mut network,
+                Some(&task_cancellation),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), permit_wait_started_rx)
+            .await
+            .expect("token refresh did not begin waiting for saturated capacity")
+            .unwrap();
+        assert!(
+            cancellation.request(),
+            "refresh admission must remain cancellable before a permit is acquired"
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+            .await
+            .expect("cancelled refresh admission retained the profile task")
+            .unwrap()
+            .expect_err("cancelled refresh admission unexpectedly succeeded");
+        assert!(error.downcast_ref::<UsageReadCancelled>().is_some());
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(saturated.available_permits(), 0);
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_after_refresh_boundary_is_refused_and_persistence_drains() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        crate::config::init_defaults_for_tests();
+
+        let now = auth::now_unix_secs().unwrap();
+        let refreshed_id = jwt_with_exp_and_identity(now + 86_400);
+        let refreshed_access = jwt_with_exp(now + 86_400);
+        let token_response_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_token_response_gate = Arc::clone(&token_response_gate);
+        let (token_started_tx, mut token_started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let token_calls = Arc::new(AtomicUsize::new(0));
+        let server_token_calls = Arc::clone(&token_calls);
+        let usage_calls = Arc::new(AtomicUsize::new(0));
+        let server_usage_calls = Arc::clone(&usage_calls);
+        let token_id = refreshed_id.clone();
+        let token_access = refreshed_access.clone();
+        let app = Router::new()
+            .route(
+                "/usage",
+                get(move || {
+                    let calls = Arc::clone(&server_usage_calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::UNAUTHORIZED.into_response()
+                        } else {
+                            axum::Json(valid_usage_body()).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move || {
+                    let calls = Arc::clone(&server_token_calls);
+                    let token_started_tx = token_started_tx.clone();
+                    let response_gate = Arc::clone(&server_token_response_gate);
+                    let id_token = token_id.clone();
+                    let access_token = token_access.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        token_started_tx.send(()).unwrap();
+                        response_gate.acquire().await.unwrap().forget();
+                        axum::Json(json!({
+                            "id_token": id_token,
+                            "access_token": access_token,
+                            "refresh_token": "new-refresh"
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+        let _token_url = EnvVarGuard::set("CS_TOKEN_URL", format!("http://{address}/token"));
+
+        let persisted = Arc::new(AtomicUsize::new(0));
+        let task_persisted = Arc::clone(&persisted);
+        let cancellation = UsageTaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let endpoints = auth::service_endpoints().unwrap();
+        let request = tokio::spawn(async move {
+            let mut authorize_rotation = || Ok(());
+            let mut persist_rotation =
+                move |(): (), _: &str, resolution: RefreshTokenResolution| {
+                    task_persisted.fetch_add(1, Ordering::SeqCst);
+                    match resolution {
+                        RefreshTokenResolution::Validated(tokens) => Ok(tokens),
+                        RefreshTokenResolution::RotatedButInvalid { .. } => {
+                            panic!("the fixture must return valid refreshed credentials")
+                        }
+                    }
+                };
+            let mut network = NetworkPermitBudget::unlimited();
+            fetch_usage_with_refresh_transactional_cancellable(
+                &endpoints,
+                &reqwest::Client::new(),
+                "drain-refresh",
+                "old-access",
+                Some("old-id"),
+                Some("old-refresh"),
+                None,
+                false,
+                &mut authorize_rotation,
+                &mut persist_rotation,
+                ResetCreditEnrichment::Deferred,
+                &mut network,
+                Some(&task_cancellation),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), token_started_rx.recv())
+            .await
+            .expect("refresh POST did not reach the server")
+            .expect("token request channel closed");
+        assert!(
+            !cancellation.request(),
+            "credential work must be irreversible once the refresh POST starts"
+        );
+        token_response_gate.add_permits(1);
+
+        let usage = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("refresh response and persistence were not drained")
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage.plan_type.as_deref(), Some("pro"));
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(token_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(persisted.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_backoff_is_cancellable_before_credential_work() {
+        let _url_lock = crate::auth::URL_ENV_LOCK.lock().await;
+        let _profile_env_lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::config::init_defaults_for_tests();
+
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _switch_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path().display().to_string());
+        let (first_attempt_tx, mut first_attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/usage",
+            get(move || {
+                let calls = Arc::clone(&server_calls);
+                let first_attempt_tx = first_attempt_tx.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    first_attempt_tx.send(()).unwrap();
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let _usage_url = EnvVarGuard::set("CS_USAGE_URL", format!("http://{address}/usage"));
+
+        let alias = "cancel-retry-backoff";
+        let lease = crate::profile::acquire_profile_lease_async(alias.to_string())
+            .await
+            .unwrap();
+        let prepared = PreparedCoreUsageRequest {
+            state: PreparedCoreUsageState::Network(PreparedUsageRequest {
+                alias: alias.to_string(),
+                profile_path: home.path().join("unused-auth.json"),
+                cache_binding: crate::jwt::StrictAccountBinding {
+                    account_id: "acct-retry-cancel".to_string(),
+                    email: "retry-cancel@example.com".to_string(),
+                },
+                account_id: None,
+                is_fedramp: false,
+                id_token: None,
+                access_token: "healthy-access".to_string(),
+                refresh_token: None,
+                endpoints: auth::service_endpoints().unwrap(),
+            }),
+        };
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let client = reqwest::Client::new();
+        let cancellation = UsageTaskCancellation::new();
+        let task_cancellation = cancellation.clone();
+        let mut network = NetworkPermitBudget::new(first_network_permit(Arc::clone(&limiter)));
+        let request = tokio::spawn(async move {
+            execute_prepared_core_usage_cancellable_with_existing_lease_and_client(
+                prepared,
+                &lease,
+                &client,
+                &mut network,
+                &task_cancellation,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_attempt_rx.recv())
+            .await
+            .expect("first usage attempt did not reach the server")
+            .expect("first-attempt channel closed");
+        let permit = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            limiter.acquire_owned(),
+        )
+        .await
+        .expect("first attempt did not release its network permit before backoff")
+        .unwrap();
+        assert!(cancellation.request());
+
+        let error = tokio::time::timeout(std::time::Duration::from_millis(500), request)
+            .await
+            .expect("retry backoff ignored usage cancellation")
+            .unwrap()
+            .expect_err("cancelled retry unexpectedly succeeded");
+        drop(permit);
+        assert_eq!(error.summary, "usage read cancelled");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[allow(clippy::await_holding_lock)]

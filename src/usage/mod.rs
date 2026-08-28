@@ -13,8 +13,10 @@ mod scoring;
 #[allow(unused_imports)]
 pub(crate) use api::{
     FirstNetworkPermit, NetworkPermitBudget, PreparedCoreUsageRequest, PreparedFullUsageRequest,
-    UsageObservation, apply_account_routing_headers, do_refresh_token,
-    do_refresh_token_with_network, execute_prepared_core_usage_with_existing_lease_and_client,
+    UsageObservation, UsageTaskCancellation, apply_account_routing_headers, do_refresh_token,
+    do_refresh_token_with_network,
+    execute_prepared_core_usage_cancellable_with_existing_lease_and_client,
+    execute_prepared_core_usage_with_existing_lease_and_client,
     execute_prepared_full_usage_with_existing_lease_and_client,
     fetch_usage_observation_force_with_existing_lease_and_client,
     fetch_usage_retried_with_existing_lease_and_client, first_network_permit,

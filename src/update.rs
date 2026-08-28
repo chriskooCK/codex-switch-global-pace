@@ -3,7 +3,9 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use fs4::{FileExt, TryLockError};
+use fs4::FileExt;
+#[cfg(windows)]
+use fs4::TryLockError;
 #[cfg(windows)]
 use rand::Rng as _;
 use semver::Version;
@@ -1530,6 +1532,7 @@ fn acquire_update_lease(executable: &Path) -> Result<UpdateLease> {
     })
 }
 
+#[cfg(windows)]
 fn try_acquire_startup_cleanup_lease(executable: &Path) -> Result<Option<UpdateLease>> {
     let (file, lock_path) = open_update_lock_file(executable)?;
     match FileExt::try_lock(&file) {

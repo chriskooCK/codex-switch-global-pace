@@ -1118,6 +1118,15 @@ fn status_bar_content(app: &App, width: u16) -> StatusBarContent {
             show_version: false,
         };
     }
+    if let Some(progress) = app.profile_switch_progress() {
+        return StatusBarContent {
+            lines: wrapped_status_line(
+                Line::from(Span::styled(progress, base().fg(C_CYAN))),
+                width,
+            ),
+            show_version: false,
+        };
+    }
     if let Some(status) = &app.status_msg {
         return StatusBarContent {
             lines: wrapped_status_line(
@@ -1450,10 +1459,13 @@ mod tests {
         PACE_LABEL, editable_input_line, fitted_segments, global_weekly_panel_height, plan_color,
         quota_pace_color, quota_table_value, render, render_detail_panel,
         render_global_weekly_pace, render_usage_gauge, render_usage_gauges, reset_timestamp_color,
-        status_bar_height, status_message_color, table_text_widths, usage_gauges_height,
+        status_bar_content, status_bar_height, status_message_color, table_text_widths,
+        usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
-    use crate::tui::app::{AccountEntry, App, ConfirmAction, UsageStatus};
+    use crate::tui::app::{
+        AccountEntry, App, ConfirmAction, RenameState, SearchState, UsageStatus,
+    };
     use crate::tui::meter::percent_marker_offset;
     use crate::usage::{
         AdditionalRateLimit, GlobalPaceWeighting, GlobalWeeklySummary, UsageAvailability,
@@ -1552,10 +1564,90 @@ mod tests {
         }
     }
 
+    fn status_content_text(app: &App) -> String {
+        status_bar_content(app, 80)
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn status_message_color_distinguishes_errors_from_information() {
         assert_eq!(status_message_color(false), C_CYAN);
         assert_eq!(status_message_color(true), C_RED);
+    }
+
+    #[tokio::test]
+    async fn tracked_profile_switch_progress_survives_transient_status_expiry_in_render() {
+        let mut app = App::new();
+        app.track_pending_profile_switch_for_render_test("slow-account");
+        app.status_msg = Some("temporary background notice".to_string());
+        app.status_is_error = true;
+        app.status_expiry = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.tick();
+        assert!(app.status_msg.is_none());
+
+        let width = 80;
+        let height = 18;
+        let status_height = status_bar_height(&app, width);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, TEST_NOW))
+            .unwrap();
+
+        let rendered = ((height - status_height as u16)..height)
+            .map(|y| row_text(terminal.backend(), y).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("Preparing switch to slow-account..."),
+            "{rendered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_statuses_precede_switch_progress_which_precedes_transient_status() {
+        let mut app = App::new();
+        app.track_pending_profile_switch_for_render_test("account");
+        app.status_msg = Some("temporary background notice".to_string());
+
+        let progress = status_content_text(&app);
+        assert!(progress.contains("Preparing switch to account..."));
+        assert!(!progress.contains("temporary background notice"));
+
+        app.search_active = true;
+        app.search = Some(SearchState {
+            query: "needle".to_string(),
+            cursor: 6,
+        });
+        app.confirm = Some(ConfirmAction::Delete("delete-me".to_string()));
+        app.rename = Some(RenameState {
+            old_alias: "old".to_string(),
+            input: "renamed".to_string(),
+            cursor: 7,
+        });
+        let rename = status_content_text(&app);
+        assert!(rename.contains("Rename:"));
+        assert!(rename.contains("renamed"));
+        assert!(!rename.contains("Preparing switch"));
+
+        app.rename = None;
+        let confirm = status_content_text(&app);
+        assert!(confirm.contains("Delete profile 'delete-me'?"));
+        assert!(!confirm.contains("Preparing switch"));
+
+        app.confirm = None;
+        let search = status_content_text(&app);
+        assert!(search.contains("needle"));
+        assert!(!search.contains("Preparing switch"));
     }
 
     #[test]

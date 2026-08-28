@@ -442,6 +442,26 @@ enum AccountTaskKind {
     SwitchCommit,
 }
 
+impl AccountTaskKind {
+    fn is_profile_switch(self) -> bool {
+        matches!(
+            self,
+            Self::SwitchPrepare | Self::SwitchSync | Self::SwitchCommit
+        )
+    }
+
+    fn profile_switch_progress(self, alias: &str) -> Option<String> {
+        match self {
+            Self::SwitchPrepare => Some(format!("Preparing switch to {alias}...")),
+            Self::SwitchSync => Some(format!(
+                "Synchronizing the current Codex login before switching to {alias}..."
+            )),
+            Self::SwitchCommit => Some(format!("Switching to {alias}...")),
+            Self::Usage { .. } | Self::Model { .. } | Self::ResetCard => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SafeTaskCancellationState {
     state: std::sync::atomic::AtomicU8,
@@ -549,6 +569,21 @@ fn cancellable_first_network_permit(
     })
 }
 
+#[derive(Clone, Debug)]
+pub(super) enum CredentialTaskCancellation {
+    Safe(SafeTaskCancellation),
+    Usage(crate::usage::UsageTaskCancellation),
+}
+
+impl CredentialTaskCancellation {
+    pub(super) fn request(&self) -> bool {
+        match self {
+            Self::Safe(control) => control.request(),
+            Self::Usage(control) => control.request(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AccountTask {
     alias: String,
@@ -557,6 +592,7 @@ struct AccountTask {
     followup_controls: Vec<cache::CacheLockAcquireControl>,
     network_wait: Option<SafeTaskCancellation>,
     read_only_work: Option<SafeTaskCancellation>,
+    usage_work: Option<crate::usage::UsageTaskCancellation>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -565,6 +601,7 @@ struct AccountTaskControls {
     followup_controls: Vec<cache::CacheLockAcquireControl>,
     network_wait: Option<SafeTaskCancellation>,
     read_only_work: Option<SafeTaskCancellation>,
+    usage_work: Option<crate::usage::UsageTaskCancellation>,
 }
 
 #[derive(Debug)]
@@ -835,8 +872,9 @@ pub struct App {
     auth_expiry_latest: HashMap<String, u64>,
     auth_expiry_next_id: u64,
     /// Monotonic generation of state that can change the rendered frame.
-    /// Background-task presence is intentionally excluded: there is no spinner,
-    /// so pending work alone must not force a 10 Hz redraw loop.
+    /// Ordinary background-task presence is intentionally excluded because it
+    /// has no spinner. Profile-switch phases are user-visible status content and
+    /// explicitly advance this revision when their tracked task changes.
     render_revision: u64,
 }
 
@@ -1015,9 +1053,13 @@ impl App {
                 followup_controls: controls.followup_controls,
                 network_wait: controls.network_wait,
                 read_only_work: controls.read_only_work,
+                usage_work: controls.usage_work,
                 handle,
             },
         );
+        if kind.is_profile_switch() {
+            self.mark_render_changed();
+        }
     }
 
     fn account_operation_in_flight(&self, alias: &str) -> bool {
@@ -1049,13 +1091,19 @@ impl App {
                 .network_wait
                 .as_ref()
                 .is_some_and(SafeTaskCancellation::request);
+            let cancelled_during_usage_read = task
+                .usage_work
+                .as_ref()
+                .is_some_and(crate::usage::UsageTaskCancellation::request);
             for control in &task.followup_controls {
                 control.cancel_waiting();
             }
             if let Some(control) = &task.read_only_work {
                 let _ = control.request();
             }
-            if (cancelled_before_lease || cancelled_during_network_wait)
+            if (cancelled_before_lease
+                || cancelled_during_network_wait
+                || cancelled_during_usage_read)
                 && let AccountTaskKind::Usage { request_id } = task.kind
                 && active_usage.is_some_and(|(active_id, _)| active_id == request_id)
             {
@@ -1098,7 +1146,7 @@ impl App {
     ) -> Vec<(
         String,
         profile::ProfileLeaseAcquireControl,
-        Vec<SafeTaskCancellation>,
+        Vec<CredentialTaskCancellation>,
     )> {
         let mut controls: Vec<_> = self
             .account_tasks
@@ -1110,34 +1158,69 @@ impl App {
                 )
             })
             .map(|task| {
-                let safe = task
+                let mut cancellations: Vec<CredentialTaskCancellation> = task
                     .network_wait
                     .iter()
                     .chain(task.read_only_work.iter())
                     .cloned()
+                    .map(CredentialTaskCancellation::Safe)
                     .collect();
-                (task.alias.clone(), task.lease_control.clone(), safe)
+                cancellations.extend(
+                    task.usage_work
+                        .iter()
+                        .cloned()
+                        .map(CredentialTaskCancellation::Usage),
+                );
+                (
+                    task.alias.clone(),
+                    task.lease_control.clone(),
+                    cancellations,
+                )
             })
             .collect();
         controls.extend(self.warmup_tasks.values().map(|task| {
             (
                 task.alias.clone(),
                 task.lease_control.clone(),
-                vec![task.network_wait.clone(), task.model_discovery.clone()],
+                vec![
+                    CredentialTaskCancellation::Safe(task.network_wait.clone()),
+                    CredentialTaskCancellation::Safe(task.model_discovery.clone()),
+                ],
             )
         }));
         controls
     }
 
     fn profile_switch_in_flight(&self) -> bool {
-        self.account_tasks.values().any(|task| {
-            matches!(
-                task.kind,
-                AccountTaskKind::SwitchPrepare
-                    | AccountTaskKind::SwitchSync
-                    | AccountTaskKind::SwitchCommit
-            )
-        })
+        self.account_tasks
+            .values()
+            .any(|task| task.kind.is_profile_switch())
+    }
+
+    /// Return the newest tracked profile-switch phase for the status bar.
+    ///
+    /// A completed phase can coexist briefly with the next phase between its
+    /// result-channel send and JoinHandle cleanup. The task id is monotonic, so
+    /// the newest id is the authoritative phase without duplicating switch
+    /// state in a separate UI flag.
+    pub(super) fn profile_switch_progress(&self) -> Option<String> {
+        let (_, task) = self
+            .account_tasks
+            .iter()
+            .filter_map(|(&task_id, task)| task.kind.is_profile_switch().then_some((task_id, task)))
+            .max_by_key(|(task_id, _)| *task_id)?;
+        task.kind.profile_switch_progress(&task.alias)
+    }
+
+    #[cfg(test)]
+    pub(super) fn track_pending_profile_switch_for_render_test(&mut self, alias: &str) {
+        let handle = tokio::spawn(std::future::pending());
+        self.track_account_task(
+            alias.to_string(),
+            AccountTaskKind::SwitchPrepare,
+            profile::ProfileLeaseAcquireControl::new(),
+            handle,
+        );
     }
 
     fn profile_mutation_in_flight(&self) -> bool {
@@ -1669,6 +1752,9 @@ impl App {
             };
             let alias = task.alias;
             let kind = task.kind;
+            if kind.is_profile_switch() {
+                self.mark_render_changed();
+            }
             let cancelled_before_lease = task.lease_control.is_cancelled();
             let cancelled_at_safe_boundary = task
                 .network_wait
@@ -1677,7 +1763,11 @@ impl App {
                 || task
                     .read_only_work
                     .as_ref()
-                    .is_some_and(SafeTaskCancellation::completed);
+                    .is_some_and(SafeTaskCancellation::completed)
+                || task
+                    .usage_work
+                    .as_ref()
+                    .is_some_and(crate::usage::UsageTaskCancellation::cancellation_completed);
             let joined = task.handle.await;
             if (cancelled_before_lease || cancelled_at_safe_boundary) && joined.is_ok() {
                 match kind {
@@ -1694,7 +1784,11 @@ impl App {
                             // A successfully joined cancellation at either safe
                             // boundary has no required worker result. Task
                             // completion proves that no profile lease remains.
-                            self.refreshing_requests.remove(&alias);
+                            let resume_after_switch = self.profile_switch_in_flight();
+                            let cancelled_refresh = self
+                                .refreshing_requests
+                                .remove(&alias)
+                                .map(|(_, refresh)| refresh);
                             self.mark_render_changed();
                             if self
                                 .usage_metadata_requests
@@ -1704,6 +1798,12 @@ impl App {
                                 self.usage_metadata_requests.remove(&alias);
                             }
                             self.pending_usage_refreshes.remove(&alias);
+                            if resume_after_switch && let Some(refresh) = cancelled_refresh {
+                                self.defer_post_switch_usage_refresh(
+                                    alias.clone(),
+                                    AccountRefreshPlan::resume_cancelled_usage(refresh),
+                                );
+                            }
                             if let Some(entry) =
                                 self.accounts.iter_mut().find(|entry| entry.alias == alias)
                                 && matches!(entry.usage, UsageStatus::Loading)
@@ -1871,11 +1971,10 @@ impl App {
     /// request after the server received it can lose its single-use token.
     pub async fn drain_credential_tasks(&mut self) {
         self.shutting_down = true;
-        // Pre-lease work and a lease holder still waiting for network capacity
-        // can stop before a request is sent. Once network work wins that exact
-        // boundary, token refresh and durable persistence still drain normally;
-        // model discovery has one additional boundary around its later
-        // read-only GET.
+        // Pre-lease work and read-only usage network phases can stop. A usage
+        // task that crossed its token-refresh boundary refuses cancellation so
+        // the response and durable persistence still drain normally; model
+        // discovery retains its separate first-request and later-GET bounds.
         for task in self.account_tasks.values() {
             task.lease_control.cancel_waiting();
             for control in &task.followup_controls {
@@ -1885,6 +1984,9 @@ impl App {
                 let _ = control.request();
             }
             if let Some(control) = &task.read_only_work {
+                let _ = control.request();
+            }
+            if let Some(control) = &task.usage_work {
                 let _ = control.request();
             }
         }
@@ -4170,8 +4272,8 @@ impl App {
         let tracked_alias = alias.clone();
         let lease_control = profile::ProfileLeaseAcquireControl::new();
         let task_lease_control = lease_control.clone();
-        let network_wait = SafeTaskCancellation::new();
-        let task_network_wait = network_wait.clone();
+        let usage_work = crate::usage::UsageTaskCancellation::new();
+        let task_usage_work = usage_work.clone();
         let base_cache_control = cache::CacheLockAcquireControl::new();
         let task_base_cache_control = base_cache_control.clone();
         let enrichment_control = cache::CacheLockAcquireControl::new();
@@ -4185,8 +4287,17 @@ impl App {
             .await
             {
                 Ok(Some(lease)) => lease,
-                Ok(None) => return,
+                Ok(None) => {
+                    if task_usage_work.is_cancelled() {
+                        task_usage_work.mark_cancellation_completed();
+                    }
+                    return;
+                }
                 Err(error) => {
+                    if !task_usage_work.finish() {
+                        task_usage_work.mark_cancellation_completed();
+                        return;
+                    }
                     let result = Err(UsageError {
                         summary: "profile lock failed".to_string(),
                         detail: format!(
@@ -4213,52 +4324,28 @@ impl App {
             .await;
             let result = match prepared {
                 Ok(prepared) => match prepared.cached_usage().cloned() {
-                    Some(usage) if task_network_wait.begin_work() => Ok(usage),
-                    Some(_) => {
-                        task_network_wait.mark_completed();
-                        drop(lease);
-                        publish_usage_lease_release(&usage_lease_release_tx, &alias, request_id)
-                            .await;
-                        return;
-                    }
+                    Some(usage) => Ok(usage),
                     None => {
-                        let first_permit = cancellable_first_network_permit(
-                            limiter.clone(),
-                            task_network_wait.clone(),
-                        );
+                        let first_permit = crate::usage::first_network_permit(limiter.clone());
                         let mut network = crate::usage::NetworkPermitBudget::new(first_permit);
-                        let result =
-                            crate::usage::execute_prepared_core_usage_with_existing_lease_and_client(
-                                prepared,
-                                &lease,
-                                &http_client,
-                                &mut network,
-                            )
-                            .await;
-                        if network.first_wait_was_cancelled() {
-                            if !task_network_wait.completed() {
-                                task_network_wait.mark_completed();
-                            }
-                            drop(lease);
-                            publish_usage_lease_release(
-                                &usage_lease_release_tx,
-                                &alias,
-                                request_id,
-                            )
-                            .await;
-                            return;
-                        }
-                        result
+                        crate::usage::execute_prepared_core_usage_cancellable_with_existing_lease_and_client(
+                            prepared,
+                            &lease,
+                            &http_client,
+                            &mut network,
+                            &task_usage_work,
+                        )
+                        .await
                     }
                 },
-                Err(error) if task_network_wait.begin_work() => Err(error),
-                Err(_) => {
-                    task_network_wait.mark_completed();
-                    drop(lease);
-                    publish_usage_lease_release(&usage_lease_release_tx, &alias, request_id).await;
-                    return;
-                }
+                Err(error) => Err(error),
             };
+            if !task_usage_work.finish() {
+                task_usage_work.mark_cancellation_completed();
+                drop(lease);
+                publish_usage_lease_release(&usage_lease_release_tx, &alias, request_id).await;
+                return;
+            }
             let core_usage = result.as_ref().ok().cloned();
             // The core helper does not return until any rotated credential has
             // crossed its persistence boundary, so the quota result and the
@@ -4373,8 +4460,9 @@ impl App {
             lease_control,
             AccountTaskControls {
                 followup_controls: vec![base_cache_control, enrichment_control],
-                network_wait: Some(network_wait),
+                network_wait: None,
                 read_only_work: None,
+                usage_work: Some(usage_work),
             },
             handle,
         );
@@ -4798,7 +4886,6 @@ impl App {
             lease_control,
             handle,
         );
-        self.set_status(format!("Preparing switch to {tracked_alias}..."), 60);
     }
 
     fn start_live_auth_sync_before_switch(&mut self, target_alias: String) {
@@ -4825,10 +4912,6 @@ impl App {
             lease_control,
             handle,
         );
-        self.set_status(
-            format!("Synchronizing the current Codex login before switching to {tracked_alias}..."),
-            60,
-        );
     }
 
     fn start_profile_switch_commit(&mut self, confirmed: profile::ConfirmedProfileSwitch) {
@@ -4851,7 +4934,6 @@ impl App {
             lease_control,
             handle,
         );
-        self.set_status(format!("Switching to {tracked_alias}..."), 60);
     }
 
     pub fn poll_profile_switch_results(&mut self) {
@@ -6880,6 +6962,45 @@ mod tests {
         assert_eq!(app.status_msg.as_deref(), Some("Already using current"));
     }
 
+    #[tokio::test]
+    async fn profile_switch_progress_uses_the_newest_tracked_switch_phase() {
+        let mut app = App::new();
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::SwitchPrepare,
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(std::future::pending()),
+        );
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::SwitchSync,
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(std::future::pending()),
+        );
+        app.track_account_task(
+            "other".into(),
+            AccountTaskKind::Usage { request_id: 7 },
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(std::future::pending()),
+        );
+
+        assert_eq!(
+            app.profile_switch_progress().as_deref(),
+            Some("Synchronizing the current Codex login before switching to account...")
+        );
+
+        app.track_account_task(
+            "account".into(),
+            AccountTaskKind::SwitchCommit,
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(std::future::pending()),
+        );
+        assert_eq!(
+            app.profile_switch_progress().as_deref(),
+            Some("Switching to account...")
+        );
+    }
+
     #[test]
     fn safe_task_cancellation_and_work_start_share_one_exact_boundary() {
         let cancelled = SafeTaskCancellation::new();
@@ -7712,6 +7833,116 @@ mod tests {
         assert!(app.deferred_post_switch_usage_refreshes.is_empty());
         assert!(app.refreshing_requests.contains_key("unrelated"));
         assert!(app.workspace_requests.is_empty());
+        app.drain_credential_tasks().await;
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn switch_cancellations_resume_target_and_active_usage_once() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        for alias in ["target", "current"] {
+            let path = home.path().join(format!("profiles/{alias}/auth.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_auth_durable(
+                &path,
+                &managed_auth(
+                    "test@example.com",
+                    "acct_test",
+                    &format!("{alias}-access"),
+                    &format!("{alias}-refresh"),
+                ),
+            );
+        }
+
+        let mut app = App::new();
+        add_test_account(&mut app, "target");
+        add_test_account(&mut app, "current");
+        app.view_indices.extend([0, 1]);
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+
+        for (request_id, alias, refresh) in [
+            (7, "target", Refresh::Forced),
+            (8, "current", Refresh::Unattended),
+        ] {
+            app.refreshing_requests
+                .insert(alias.to_string(), (request_id, refresh));
+            app.usage_generations.insert(alias.to_string(), request_id);
+            app.accounts
+                .iter_mut()
+                .find(|account| account.alias == alias)
+                .unwrap()
+                .usage = UsageStatus::Loading;
+
+            let usage_work = crate::usage::UsageTaskCancellation::new();
+            assert!(usage_work.request());
+            usage_work.mark_cancellation_completed();
+            app.track_account_task_with_controls(
+                alias.to_string(),
+                AccountTaskKind::Usage { request_id },
+                profile::ProfileLeaseAcquireControl::new(),
+                AccountTaskControls {
+                    usage_work: Some(usage_work),
+                    ..AccountTaskControls::default()
+                },
+                tokio::spawn(async {}),
+            );
+        }
+
+        // The target was already queued by `switch_selected`. Observing its
+        // worker cancellation must merge with that intent, not schedule a
+        // second post-switch generation.
+        app.defer_post_switch_usage_refresh(
+            "target".into(),
+            AccountRefreshPlan::resume_cancelled_usage(Refresh::Forced),
+        );
+        let (release_switch, wait_for_release) = tokio::sync::oneshot::channel();
+        app.track_account_task(
+            "target".into(),
+            AccountTaskKind::SwitchSync,
+            profile::ProfileLeaseAcquireControl::new(),
+            tokio::spawn(async move {
+                let _ = wait_for_release.await;
+            }),
+        );
+
+        while app
+            .account_tasks
+            .values()
+            .filter(|task| matches!(task.kind, AccountTaskKind::Usage { .. }))
+            .any(|task| !task.handle.is_finished())
+        {
+            tokio::task::yield_now().await;
+        }
+        app.poll_account_tasks().await;
+
+        assert!(app.refreshing_requests.is_empty());
+        assert_eq!(app.deferred_post_switch_usage_refreshes.len(), 2);
+        assert_eq!(
+            app.deferred_post_switch_usage_refreshes.get("target"),
+            Some(&AccountRefreshPlan::usage_only(Refresh::Forced))
+        );
+        assert_eq!(
+            app.deferred_post_switch_usage_refreshes.get("current"),
+            Some(&AccountRefreshPlan::usage_only(Refresh::Unattended))
+        );
+
+        let generation_before_resume = app.usage_next_id;
+        release_switch.send(()).unwrap();
+        while app.profile_switch_in_flight() {
+            tokio::task::yield_now().await;
+            app.poll_account_tasks().await;
+        }
+        app.poll_profile_switch_results();
+
+        assert!(app.deferred_post_switch_usage_refreshes.is_empty());
+        assert_eq!(app.usage_next_id, generation_before_resume.wrapping_add(2));
+        assert_eq!(app.refreshing_requests.len(), 2);
+        assert!(app.refreshing_requests.contains_key("target"));
+        assert!(app.refreshing_requests.contains_key("current"));
         app.drain_credential_tasks().await;
     }
 
