@@ -1,6 +1,6 @@
 [package]
 name = "codex-switch-global-pace"
-version = "20260828.1.0"
+version = "20260828.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Codex multi-profile manager with a global weekly pace dashboard"
@@ -89,6 +89,7 @@ windows-sys = { version = "=0.61.2", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
     "Win32_System_SystemInformation",
     "Win32_System_Registry",
     "Win32_System_Threading",

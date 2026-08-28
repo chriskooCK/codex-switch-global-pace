@@ -927,7 +927,7 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL,
     };
 
     let mut walked = PathBuf::new();
@@ -962,10 +962,10 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
     let mut private_tree_started = false;
     let mut handles = Vec::with_capacity(prefixes.len());
     for (index, component_path) in prefixes.into_iter().enumerate() {
-        let open = || {
+        let open = |inspect_acl: bool| {
             let mut options = std::fs::OpenOptions::new();
             options
-                .access_mode(FILE_READ_ATTRIBUTES)
+                .access_mode(FILE_READ_ATTRIBUTES | if inspect_acl { READ_CONTROL } else { 0 })
                 // Delete sharing is deliberately absent: every already-opened
                 // ancestor remains a stable namespace component while the next
                 // child is opened or securely created.
@@ -973,7 +973,8 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
             options.open(&component_path)
         };
-        let directory = match open() {
+        let inspect_acl = private_tree_started || index == final_index;
+        let directory = match open(inspect_acl) {
             Ok(directory) => directory,
             Err(error)
                 if index != 0
@@ -996,7 +997,7 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
                         });
                     }
                 }
-                open().with_context(|| {
+                open(true).with_context(|| {
                     format!(
                         "opening securely-created private directory {}",
                         component_path.display()
@@ -1026,8 +1027,6 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
                 component_path.display()
             );
         }
-        handles.push(directory);
-
         // Existing ancestors may be shared, but their pinned handles make them
         // immutable for this operation. The final private directory and every
         // component created for it must itself belong to this user before its
@@ -1035,8 +1034,21 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
         // closed instead of being adopted.
         if private_tree_started || index == final_index {
             require_windows_path_owner(&component_path, "private directory")?;
-            harden_windows_acl(&component_path, true)?;
+            if !windows_private_directory_acl_is_exact(&directory, &component_path)? {
+                // Retain recursive repair for a genuinely drifted directory:
+                // inherited permissions may already have reached existing
+                // descendants. The exact common case above must not invoke
+                // SetNamedSecurityInfoW because Windows would walk that whole
+                // descendant tree even when the DACL is unchanged.
+                harden_windows_acl(&component_path, true)?;
+                anyhow::ensure!(
+                    windows_private_directory_acl_is_exact(&directory, &component_path)?,
+                    "private Windows directory ACL did not match the required policy after repair: {}",
+                    component_path.display()
+                );
+            }
         }
+        handles.push(directory);
     }
 
     Ok(PrivateDirectoryGuard { _handles: handles })
@@ -2008,8 +2020,17 @@ fn settle_auth_publication(
 /// live-auth transaction. Exact known states are completed or rolled back;
 /// unknown namespace occupants are never overwritten or deleted.
 pub(crate) fn recover_interrupted_auth_publication(live_path: &Path) -> Result<()> {
+    let started = Instant::now();
     let _directory_guard = acquire_private_directory(private_write_parent(live_path)?)?;
+    let directory_guard_ms = started.elapsed().as_millis();
+    let record_started = Instant::now();
     let Some((record, record_token)) = read_publication_record(live_path)? else {
+        tracing::debug!(
+            directory_guard_ms,
+            record_read_ms = record_started.elapsed().as_millis(),
+            total_ms = started.elapsed().as_millis(),
+            "no interrupted auth publication to recover"
+        );
         return Ok(());
     };
     let parsed = parse_publication_record(live_path, record, record_token)?;
@@ -2724,13 +2745,192 @@ fn windows_owner_sid_matches_token(
 }
 
 #[cfg(any(windows, test))]
+const WINDOWS_LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+#[cfg(any(windows, test))]
+const WINDOWS_BUILTIN_ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+#[cfg(any(windows, test))]
+fn mark_expected_windows_private_sid(
+    expected_sids: &[&str; 3],
+    seen: &mut [bool; 3],
+    actual_sid: &str,
+) -> bool {
+    let Some(position) = expected_sids
+        .iter()
+        .enumerate()
+        .find_map(|(position, expected)| {
+            (*expected == actual_sid && !seen[position]).then_some(position)
+        })
+    else {
+        return false;
+    };
+    seen[position] = true;
+    true
+}
+
+#[cfg(any(windows, test))]
 fn windows_private_acl_sddl(current_user_sid: &str, directory: bool) -> String {
     let inheritance = if directory { "OICI" } else { "" };
     format!(
         "D:P(A;{inheritance};FA;;;{current_user_sid})\
-         (A;{inheritance};FA;;;S-1-5-18)\
-         (A;{inheritance};FA;;;S-1-5-32-544)"
+         (A;{inheritance};FA;;;{WINDOWS_LOCAL_SYSTEM_SID})\
+         (A;{inheritance};FA;;;{WINDOWS_BUILTIN_ADMINISTRATORS_SID})"
     )
+}
+
+#[cfg(windows)]
+fn windows_private_directory_acl_is_exact(file: &std::fs::File, path: &Path) -> Result<bool> {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAce,
+        GetLengthSid, GetSecurityDescriptorControl, IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE,
+        PSECURITY_DESCRIPTOR, SE_DACL_PRESENT, SE_DACL_PROTECTED, SID,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    struct LocalAllocation(PSECURITY_DESCRIPTOR);
+    impl Drop for LocalAllocation {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    fn sid_string(sid: windows_sys::Win32::Security::PSID) -> Option<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        struct LocalSid(*mut u16);
+        impl Drop for LocalSid {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0.cast()) };
+            }
+        }
+
+        if sid.is_null() || unsafe { IsValidSid(sid) } == 0 {
+            return None;
+        }
+        let mut value = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut value) } == 0 {
+            return None;
+        }
+        let _value = LocalSid(value);
+        let mut len = 0;
+        while unsafe { *value.add(len) } != 0 {
+            len += 1;
+        }
+        String::from_utf16(unsafe { std::slice::from_raw_parts(value, len) }).ok()
+    }
+
+    let mut dacl = null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!(
+            "reading private directory DACL for {} failed: {}",
+            path.display(),
+            std::io::Error::from_raw_os_error(status as i32)
+        );
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    if descriptor.is_null() || dacl.is_null() {
+        return Ok(false);
+    }
+
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "reading private directory security control for {}",
+                path.display()
+            )
+        });
+    }
+    if control & SE_DACL_PRESENT == 0
+        || control & SE_DACL_PROTECTED == 0
+        || unsafe { IsValidAcl(dacl) } == 0
+        || unsafe { (*dacl).AceCount } != 3
+    {
+        return Ok(false);
+    }
+
+    let user_sid = windows_current_user_sid_string(path)?;
+    let expected_sids = [
+        user_sid.as_str(),
+        WINDOWS_LOCAL_SYSTEM_SID,
+        WINDOWS_BUILTIN_ADMINISTRATORS_SID,
+    ];
+    let mut seen = [false; 3];
+    let expected_flags = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+    for index in 0..3 {
+        let mut raw_ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
+            return Ok(false);
+        }
+        let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8 || header.AceFlags != expected_flags {
+            return Ok(false);
+        }
+        let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        if usize::from(header.AceSize) < sid_offset + std::mem::size_of::<SID>() {
+            return Ok(false);
+        }
+        let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
+        if unsafe { (*ace).Mask } != FILE_ALL_ACCESS {
+            return Ok(false);
+        }
+        let sid = unsafe {
+            std::ptr::addr_of!((*ace).SidStart)
+                .cast_mut()
+                .cast::<core::ffi::c_void>()
+        };
+        if unsafe { IsValidSid(sid) } == 0 {
+            return Ok(false);
+        }
+        let sid_bytes = unsafe { GetLengthSid(sid) } as usize;
+        if sid_bytes == 0 || sid_offset + sid_bytes > usize::from(header.AceSize) {
+            return Ok(false);
+        }
+        let Some(sid) = sid_string(sid) else {
+            return Ok(false);
+        };
+        if !mark_expected_windows_private_sid(&expected_sids, &mut seen, &sid) {
+            return Ok(false);
+        }
+    }
+    Ok(seen.into_iter().all(|entry| entry))
+}
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static TEST_WINDOWS_DIRECTORY_ACL_REPAIR_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(all(test, windows))]
+fn reset_windows_directory_acl_repair_count() {
+    TEST_WINDOWS_DIRECTORY_ACL_REPAIR_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(all(test, windows))]
+fn windows_directory_acl_repair_count() -> usize {
+    TEST_WINDOWS_DIRECTORY_ACL_REPAIR_COUNT.with(std::cell::Cell::get)
 }
 
 #[cfg(windows)]
@@ -2822,6 +3022,10 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    #[cfg(test)]
+    if directory {
+        TEST_WINDOWS_DIRECTORY_ACL_REPAIR_COUNT.with(|count| count.set(count.get() + 1));
+    }
     // SAFETY: the path is NUL-terminated, `dacl` points inside the live
     // security descriptor, and null owner/group/SACL pointers are required
     // because only the exact protected DACL is being replaced.
@@ -3929,6 +4133,41 @@ mod tests {
         assert!(moved.join("private").is_dir());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn exact_windows_private_directory_acl_is_validated_without_tree_repair() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let private = root.path().join("private");
+
+        drop(acquire_private_directory(&private).expect("create exact private directory"));
+        reset_windows_directory_acl_repair_count();
+        drop(acquire_private_directory(&private).expect("revalidate exact private directory"));
+        assert_eq!(
+            windows_directory_acl_repair_count(),
+            0,
+            "an exact protected DACL must remain a read-only validation"
+        );
+
+        let seeded = std::process::Command::new("icacls")
+            .arg(&private)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+            .output()
+            .expect("seed an unexpected directory ACE");
+        assert!(
+            seeded.status.success(),
+            "failed to seed an unexpected directory ACE: {}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+
+        reset_windows_directory_acl_repair_count();
+        drop(acquire_private_directory(&private).expect("repair drifted private directory"));
+        assert_eq!(windows_directory_acl_repair_count(), 1);
+
+        reset_windows_directory_acl_repair_count();
+        drop(acquire_private_directory(&private).expect("revalidate repaired private directory"));
+        assert_eq!(windows_directory_acl_repair_count(), 0);
+    }
+
     #[test]
     fn test_managed_auth_rejects_api_only_policy() {
         let config: toml::Value = toml::from_str("forced_login_method = \"api\"\n").unwrap();
@@ -3982,6 +4221,33 @@ mod tests {
             user,
             default_owner
         ));
+    }
+
+    #[test]
+    fn windows_private_acl_sid_matching_accepts_a_system_token_user() {
+        let expected = [
+            WINDOWS_LOCAL_SYSTEM_SID,
+            WINDOWS_LOCAL_SYSTEM_SID,
+            WINDOWS_BUILTIN_ADMINISTRATORS_SID,
+        ];
+        let mut seen = [false; 3];
+
+        assert!(mark_expected_windows_private_sid(
+            &expected,
+            &mut seen,
+            WINDOWS_LOCAL_SYSTEM_SID
+        ));
+        assert!(mark_expected_windows_private_sid(
+            &expected,
+            &mut seen,
+            WINDOWS_BUILTIN_ADMINISTRATORS_SID
+        ));
+        assert!(mark_expected_windows_private_sid(
+            &expected,
+            &mut seen,
+            WINDOWS_LOCAL_SYSTEM_SID
+        ));
+        assert!(seen.into_iter().all(|entry| entry));
     }
 
     #[test]

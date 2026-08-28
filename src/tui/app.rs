@@ -3865,10 +3865,8 @@ impl App {
                     self.set_status_error(message.clone(), 7);
                     if e.invalidate_cache {
                         self.start_usage_cache_invalidation(alias, binding, None, Some(message));
-                    } else {
-                        if self.reset_cards_in_flight.remove(&alias) {
-                            self.mark_render_changed();
-                        }
+                    } else if self.reset_cards_in_flight.remove(&alias) {
+                        self.mark_render_changed();
                     }
                 }
             }

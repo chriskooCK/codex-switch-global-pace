@@ -41,6 +41,13 @@ a command that emits no enabled log record does no log-path or ACL work.
 
 [`src/auth.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/auth.rs) resolves `CODEX_HOME`, validates the Codex credential-store contract, reads and atomically writes authentication JSON, rotates live-auth backups, and builds network clients. For an existing live credential, the replacement candidate, independent original backup, and recovery record are prepared privately and flushed concurrently; all three must become durable and the live token must still match before the recovery record or replacement is published. It does not own profile selection.
 
+On Windows, private-directory validation holds non-delete-shared handles for the
+complete path and compares the protected DACL by meaning rather than ACE order.
+An already exact current-user/System/Administrators policy is read-only; actual
+permission drift retains recursive repair so permissions inherited by existing
+children are corrected, and the repaired DACL is checked again on the same
+pinned directory object.
+
 [`src/profile.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/profile.rs) owns aliases, identity deduplication, imports, recoverable deletion, current-profile tracking, and switching. `auth.lock` serializes replacement or synchronization of the live `auth.json`. A compatibility-only `launch.lock` is acquired first so an older `codex-switch` process sharing the same state directory cannot restore staged credentials over a newer switch; this binary does not implement the `launch` command.
 
 Credential replacement requires an exact `account_id` and email match; an
