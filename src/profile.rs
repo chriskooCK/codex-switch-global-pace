@@ -483,19 +483,31 @@ struct AuthTransaction {
 fn lock_auth_transaction() -> Result<AuthTransaction> {
     // Preserve the historical lock order so this binary cannot deadlock with
     // an older shared-state process: launch.lock, then auth.lock.
+    let started = Instant::now();
     let legacy_launch = lock_legacy_launch_compatibility()?;
+    let legacy_lock_ms = started.elapsed().as_millis();
+    let auth_started = Instant::now();
     let auth = lock_live_auth()?;
+    let auth_lock_ms = auth_started.elapsed().as_millis();
     let transaction = AuthTransaction {
         _legacy_launch: legacy_launch,
         _auth: auth,
     };
     let live_path = codex_auth_path()?;
+    let recovery_started = Instant::now();
     crate::auth::recover_interrupted_auth_publication(&live_path).with_context(|| {
         format!(
             "recovering an interrupted live-auth publication at {}",
             live_path.display()
         )
     })?;
+    tracing::debug!(
+        legacy_lock_ms,
+        auth_lock_ms,
+        recovery_ms = recovery_started.elapsed().as_millis(),
+        total_ms = started.elapsed().as_millis(),
+        "live-auth transaction lock acquired"
+    );
     Ok(transaction)
 }
 

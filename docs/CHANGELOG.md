@@ -1,5 +1,22 @@
 # Changelog
 
+## v20260828.2.0 — 2026-08-28
+
+- **Constant-work Windows ACL validation** — Existing private state directories
+  are now checked through their pinned handles and an exact semantic DACL
+  comparison. An already protected directory with only the current user,
+  LocalSystem, and Administrators full-control entries no longer calls
+  `SetNamedSecurityInfoW`; that Windows API otherwise propagates inheritable
+  entries through the complete descendant tree even when the DACL is unchanged.
+  A safe untracked-login switch decision measured 22,550 ms before the change
+  and a 22.0 ms median over ten runs afterward on a Codex home containing about
+  277,000 descendants. Real ACL drift still uses the established recursive
+  self-repair path and is revalidated against the same pinned directory handle.
+- **Credential-lock phase diagnostics** — Debug logging now records legacy-lock,
+  auth-lock, and interrupted-publication recovery timing without logging account
+  names or credential contents, so future switch stalls can be separated from
+  filesystem security work without adding normal-mode output.
+
 ## v20260828.1.0 — 2026-08-28
 
 - **Switch-priority startup refresh** — An interactive profile switch can now
