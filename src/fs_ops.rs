@@ -46,6 +46,7 @@ pub(crate) enum DirectoryRenameOutcome {
     },
 }
 
+#[cfg(any(test, windows))]
 impl CreateExactOutcome {
     pub(crate) fn token(&self) -> &FileToken {
         match self {
