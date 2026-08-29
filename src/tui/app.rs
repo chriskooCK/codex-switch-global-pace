@@ -5906,6 +5906,55 @@ enum StartupUsagePhase {
     Settled,
 }
 
+/// Let authoritative account refresh win startup when the optional cache
+/// snapshot is still waiting for its lock. The cache control and lock worker
+/// share one atomic acquisition boundary: a successful cancellation proves no
+/// snapshot can later be produced or attached, while a failed cancellation
+/// means acquisition already won and the existing identity-bound result must
+/// finish normally.
+fn cancel_superseded_startup_cache_wait(
+    app: &App,
+    phase: &StartupUsagePhase,
+    startup_auth_settled: bool,
+) -> bool {
+    if !startup_auth_settled || !matches!(phase, StartupUsagePhase::ReadingCache { .. }) {
+        return false;
+    }
+    let authoritative_refresh_ready =
+        app.startup_auth_state == StartupAuthState::Blocked || app.credential_operations_ready();
+    authoritative_refresh_ready
+        && app
+            .startup_cache_task
+            .as_ref()
+            .is_some_and(|task| task.control.cancel_contended())
+}
+
+fn apply_startup_cache_result(
+    app: &mut App,
+    phase: &mut StartupUsagePhase,
+    result: Result<Option<cache::CacheSnapshot>>,
+) {
+    let StartupUsagePhase::ReadingCache { identities } =
+        std::mem::replace(phase, StartupUsagePhase::WaitingForProfiles)
+    else {
+        unreachable!("startup cache result requires the reading phase")
+    };
+    let cache_error = match result {
+        Ok(Some(snapshot)) => {
+            if !app.accounts.is_empty() {
+                app.apply_startup_cache_snapshot(snapshot, &identities);
+            }
+            None
+        }
+        // A waiting snapshot is deliberately cancelled only after either the
+        // authoritative path is ready or auth reconciliation has blocked it.
+        // It is therefore an intentional cache miss, not a startup failure.
+        Ok(None) => None,
+        Err(error) => Some(format!("Could not read usage cache: {error:#}")),
+    };
+    *phase = StartupUsagePhase::Ready { cache_error };
+}
+
 fn advance_startup_ready_phase(app: &mut App, phase: &mut StartupUsagePhase) -> bool {
     let cache_error = match std::mem::replace(phase, StartupUsagePhase::Settled) {
         StartupUsagePhase::Ready { cache_error } => cache_error,
@@ -6032,25 +6081,7 @@ async fn run_app(
         if matches!(startup_usage_phase, StartupUsagePhase::ReadingCache { .. })
             && let Some(result) = app.poll_startup_cache_result().await
         {
-            let StartupUsagePhase::ReadingCache { identities } = std::mem::replace(
-                &mut startup_usage_phase,
-                StartupUsagePhase::WaitingForProfiles,
-            ) else {
-                unreachable!("startup cache result requires the reading phase")
-            };
-            let cache_error = match result {
-                Ok(Some(snapshot)) => {
-                    if !app.accounts.is_empty() {
-                        app.apply_startup_cache_snapshot(snapshot, &identities);
-                    }
-                    None
-                }
-                Ok(None) => Some(
-                    "Startup usage cache read was cancelled before acquiring its lock".to_string(),
-                ),
-                Err(error) => Some(format!("Could not read usage cache: {error:#}")),
-            };
-            startup_usage_phase = StartupUsagePhase::Ready { cache_error };
+            apply_startup_cache_result(&mut app, &mut startup_usage_phase, result);
         }
 
         if !startup_auth_settled && app.startup_auth_reconciliation.is_some() {
@@ -6062,6 +6093,7 @@ async fn run_app(
                 StartupAuthPoll::Blocked => startup_auth_settled = true,
             }
         }
+        cancel_superseded_startup_cache_wait(&app, &startup_usage_phase, startup_auth_settled);
         if startup_auth_settled && matches!(startup_usage_phase, StartupUsagePhase::Ready { .. }) {
             if app.startup_auth_state == StartupAuthState::Blocked {
                 startup_usage_phase = StartupUsagePhase::Settled;
@@ -6784,11 +6816,12 @@ mod tests {
     use super::{
         AccountEntry, AccountRefreshPlan, AccountTaskControls, AccountTaskKind, App,
         BatchDeleteReport, CachedUsageApplication, ConfirmAction, ModelStatus,
-        STATUS_MESSAGE_MAX_CHARS, SafeTaskCancellation, SearchState, SortMode,
+        STATUS_MESSAGE_MAX_CHARS, SafeTaskCancellation, SearchState, SortMode, StartupAuthState,
         StartupFileLogInitTask, StartupSelfUpdateCleanupTask, StartupUsagePhase, UsageStatus,
         WarmupOrigin, WarmupReadyCandidate, WarmupTask, WorkspaceRefresh,
-        advance_startup_ready_phase, advance_startup_usage_phase, batch_relogin_not_attempted,
-        dispatch_menu_use, drain_credential_tasks_on_error, finish_login_or_stop_after_round,
+        advance_startup_ready_phase, advance_startup_usage_phase, apply_startup_cache_result,
+        batch_relogin_not_attempted, cancel_superseded_startup_cache_wait, dispatch_menu_use,
+        drain_credential_tasks_on_error, finish_login_or_stop_after_round,
         prepare_workspace_lookup_auth, redraw_after_poll, refresh_fetches_loaded_usage,
         reset_card_failure_from_outcome, retained_usage_by_identity, strict_account_identity,
     };
@@ -9327,7 +9360,7 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn profile_switch_commit_keeps_event_loop_responsive_during_cache_lock_contention() {
+    async fn profile_switch_completion_does_not_wait_for_cache_lock_contention() {
         let _lock = crate::profile::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -9373,10 +9406,6 @@ mod tests {
             .open(home.path().join("cache.lock"))
             .unwrap();
         fs4::FileExt::lock(&cache_lock).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            drop(cache_lock);
-        });
 
         app.switch_selected();
         let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
@@ -9389,10 +9418,16 @@ mod tests {
             "cache-lock contention must stay on the blocking pool"
         );
 
-        release.join().unwrap();
         settle_profile_switch(&mut app).await;
         assert!(app.accounts[0].is_current);
         assert!(!app.status_is_error);
+        assert!(
+            app.status_msg
+                .as_deref()
+                .is_some_and(|message| message.contains("selection history was not updated")),
+            "the completed switch must surface its non-fatal history warning"
+        );
+        drop(cache_lock);
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -12095,6 +12130,123 @@ mod tests {
             StartupUsagePhase::RefreshingCore { ref ordered_aliases }
                 if ordered_aliases == &["account".to_string()]
         ));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn authoritative_startup_ready_preserves_an_uncontended_cache_snapshot() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let binding = test_binding();
+        crate::cache::put_bound_versioned(
+            "account",
+            &binding,
+            &UsageInfo {
+                fetched_at: Some(crate::auth::now_unix_secs().unwrap()),
+                ..UsageInfo::default()
+            },
+        )
+        .unwrap();
+
+        let mut app = App::new();
+        add_test_account(&mut app, "account");
+        app.startup_auth_state = StartupAuthState::Blocked;
+        let identities = [("account".to_string(), binding.clone())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        app.start_startup_cache_read(identities.clone(), vec![binding.account_id]);
+        let mut phase = StartupUsagePhase::ReadingCache { identities };
+
+        // A current-thread spawned worker has not run yet. Readiness alone must
+        // not cancel it until the worker has proved real OS-lock contention.
+        assert!(!cancel_superseded_startup_cache_wait(&app, &phase, true));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = app.poll_startup_cache_result().await {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("uncontended startup cache snapshot did not finish");
+        assert!(matches!(&result, Ok(Some(snapshot)) if snapshot.usage.contains_key("account")));
+        apply_startup_cache_result(&mut app, &mut phase, result);
+        assert!(matches!(app.accounts[0].usage, UsageStatus::Loaded(_)));
+        assert!(!app.status_is_error);
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn authoritative_startup_refresh_cancels_a_contended_cache_snapshot() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let profile_path = home.path().join("profiles/account/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        write_auth_durable(
+            &profile_path,
+            &managed_auth(
+                "test@example.com",
+                "acct_test",
+                "access-token",
+                "refresh-token",
+            ),
+        );
+
+        let cache_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(home.path().join("cache.lock"))
+            .unwrap();
+        fs4::FileExt::lock(&cache_lock).unwrap();
+
+        let mut app = App::new();
+        add_test_account(&mut app, "account");
+        app.view_indices.push(0);
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let binding = strict_account_identity(&app.accounts[0].info).unwrap();
+        let identities = [("account".to_string(), binding.clone())]
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        app.start_startup_cache_read(identities.clone(), vec![binding.account_id]);
+        let mut phase = StartupUsagePhase::ReadingCache { identities };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if cancel_superseded_startup_cache_wait(&app, &phase, true) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup cache reader never observed the held cache lock");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(result) = app.poll_startup_cache_result().await {
+                    break result;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled startup cache reader waited for the still-held cache lock");
+        assert!(matches!(&result, Ok(None)));
+        apply_startup_cache_result(&mut app, &mut phase, result);
+
+        assert!(advance_startup_ready_phase(&mut app, &mut phase));
+        assert!(app.refreshing_requests.contains_key("account"));
+        assert!(!app.status_is_error);
+        drop(cache_lock);
+        app.drain_credential_tasks().await;
     }
 
     #[allow(clippy::await_holding_lock)]

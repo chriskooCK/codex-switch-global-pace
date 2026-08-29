@@ -444,47 +444,42 @@ fn optional_task_definition(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-fn task_listing_contains_name(listing: &[u8], expected_name: &str) -> Result<bool> {
-    let mut found = false;
-    for (index, raw_line) in listing.split(|byte| *byte == b'\n').enumerate() {
-        let mut line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-        if index == 0 {
-            line = line.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(line);
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix(b"\"") else {
-            anyhow::bail!("Task Scheduler CSV listing contained a non-CSV row");
-        };
-        let Some(end) = rest.windows(2).position(|window| window == b"\",") else {
-            anyhow::bail!("Task Scheduler CSV listing contained an unterminated task name");
-        };
-        let name = &rest[..end];
-        if name.eq_ignore_ascii_case(expected_name.as_bytes()) {
-            if found {
-                anyhow::bail!(
-                    "Task Scheduler CSV listing contained the service task more than once"
-                );
-            }
-            found = true;
-        }
-    }
-    Ok(found)
+fn task_query_exit_code_is_not_found(code: Option<i32>) -> bool {
+    // `schtasks /HRESULT` returns HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+    // through the process exit-code bits. Unlike stderr, this classification is
+    // stable across Windows display languages. Every other failure remains an
+    // error so scheduler access and service failures cannot look like absence.
+    const TASK_NOT_FOUND_HRESULT: u32 = 0x8007_0002;
+    code.is_some_and(|code| code as u32 == TASK_NOT_FOUND_HRESULT)
 }
 
 #[cfg(target_os = "windows")]
 fn optional_scheduled_task_xml(action: &str) -> Result<Option<Vec<u8>>> {
-    let listing = schtasks(
-        &["/Query", "/FO", "CSV", "/NH"],
-        "list scheduled tasks for exact service-state inspection",
-    )?;
-    if !task_listing_contains_name(&listing.stdout, WINDOWS_TASK_NAME)? {
+    let output = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", WINDOWS_TASK_NAME, "/XML", "/HRESULT"])
+        .output()
+        .with_context(|| format!("running Task Scheduler query to {action}"))?;
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+    if task_query_exit_code_is_not_found(output.status.code()) {
         return Ok(None);
     }
-    Ok(Some(
-        schtasks(&["/Query", "/TN", WINDOWS_TASK_NAME, "/XML"], action)?.stdout,
-    ))
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    let status = output
+        .status
+        .code()
+        .map(|code| format!("0x{:08X}", code as u32))
+        .unwrap_or_else(|| "unavailable".to_string());
+    let detail = if message.is_empty() {
+        format!("Task Scheduler query exited with status {status}")
+    } else {
+        format!("{message} (status {status})")
+    };
+    anyhow::bail!(task_scheduler_failure_message(action, &detail));
 }
 
 #[cfg(target_os = "windows")]
@@ -4463,7 +4458,7 @@ mod tests {
         classify_exact_uninstall_transition, definition_snapshot_matches, launchd_job_pid,
         launchd_list_contains_label, launchd_plist, parse_task_scheduler_manager_proof_output,
         require_manager_runtime_consistency, stop_exact_scheduled_daemon_generation_with,
-        systemd_exec_quote, systemd_quote, systemd_unit, task_listing_contains_name,
+        systemd_exec_quote, systemd_quote, systemd_unit, task_query_exit_code_is_not_found,
         task_scheduler_command, task_scheduler_failure_message, transaction_error_with_restoration,
         uninstall_locked_exact_with, validate_expected_executable,
         validate_install_migration_authority, validate_launchd_definition_value,
@@ -5083,22 +5078,18 @@ mod tests {
     }
 
     #[test]
-    fn task_scheduler_listing_uses_one_exact_task_name_field() {
-        let listing = b"\"\\other\",\"N/A\",\"Ready\"\r\n\
-\"\\CODEX-SWITCH-GLOBAL-PACE-DAEMON\",\"N/A\",\"Ready\"\r\n";
-        assert!(task_listing_contains_name(listing, WINDOWS_TASK_NAME).unwrap());
-        assert!(
-            !task_listing_contains_name(
-                b"\"\\codex-switch-global-pace-daemon-other\",\"N/A\",\"Ready\"\r\n",
-                WINDOWS_TASK_NAME
-            )
-            .unwrap()
-        );
-        assert!(task_listing_contains_name(b"localized error\r\n", WINDOWS_TASK_NAME).is_err());
-        let duplicate = format!(
-            "\"{WINDOWS_TASK_NAME}\",\"N/A\",\"Ready\"\r\n\"{WINDOWS_TASK_NAME}\",\"N/A\",\"Ready\"\r\n"
-        );
-        assert!(task_listing_contains_name(duplicate.as_bytes(), WINDOWS_TASK_NAME).is_err());
+    fn task_scheduler_exact_query_only_classifies_file_not_found_as_absent() {
+        assert!(task_query_exit_code_is_not_found(Some(
+            0x8007_0002_u32 as i32
+        )));
+        assert!(!task_query_exit_code_is_not_found(Some(1)));
+        assert!(!task_query_exit_code_is_not_found(Some(
+            0x8007_0005_u32 as i32
+        )));
+        assert!(!task_query_exit_code_is_not_found(Some(
+            0x8004_130F_u32 as i32
+        )));
+        assert!(!task_query_exit_code_is_not_found(None));
     }
 
     #[cfg(windows)]

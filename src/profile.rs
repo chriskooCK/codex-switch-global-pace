@@ -1196,7 +1196,7 @@ pub(crate) struct ProfileSwitchOutcome {
 impl ProfileSwitchOutcome {
     fn record(alias: &str) -> Self {
         Self {
-            selection_history_warning: crate::cache::set_last_used(alias).err(),
+            selection_history_warning: crate::cache::try_set_last_used(alias).err(),
         }
     }
 
@@ -5389,7 +5389,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_switch_releases_auth_transaction_but_keeps_profile_lease_during_history_write() {
+    fn successful_switch_does_not_wait_for_contended_selection_history() {
         let _env = TestEnv::new();
         let target = realistic_auth_json("target@example.com", "acct_target", "t-old", "t-ref");
         seed_profile("target", &target);
@@ -5412,41 +5412,69 @@ mod tests {
             .open(cache_lock_path)
             .unwrap();
         FileExt::lock(&cache_lock).unwrap();
-        let mut cleanup = ThreadCleanup::new(cache_lock);
 
         let (switch_tx, switch_rx) = std::sync::mpsc::channel();
-        cleanup.push(std::thread::spawn(move || {
+        let switch_worker = std::thread::spawn(move || {
             let _ = switch_tx.send(super::commit_confirmed_profile_switch(confirmed));
-        }));
+        });
+        let switch = switch_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("committed switch waited for the contended selection-history cache")
+            .unwrap();
+        let warning = switch
+            .selection_history_warning()
+            .expect("cache contention must remain visible as a non-fatal history warning");
+        assert!(format!("{warning:#}").contains("cache lock"));
+        switch_worker.join().unwrap();
+        assert_eq!(current_alias(), "target");
 
-        let marker_path = super::current_file().unwrap();
-        let marker_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let activated =
-                std::fs::read_to_string(&marker_path).is_ok_and(|marker| marker.trim() == "target");
-            if activated {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < marker_deadline,
-                "switch never reached the selection-history write"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The auth transaction and target lease end with the committed switch,
+        // even though its derived history could not be recorded. Releasing the
+        // unrelated cache owner then permits a normal rename without a stale
+        // last-used key being recreated under either alias.
+        super::lock_auth_transaction()
+            .map(drop)
+            .expect("committed switch retained the auth transaction");
+        drop(cache_lock);
+        let _ = super::rename_profile("target", "renamed").unwrap();
 
-        let (auth_started_tx, auth_started_rx) = std::sync::mpsc::channel();
+        let cache: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(app_home.join("cache.json")).unwrap()).unwrap();
+        assert!(cache.pointer("/last_used/target").is_none());
+        assert!(cache.pointer("/last_used/renamed").is_none());
+    }
+
+    #[test]
+    fn successful_selection_history_write_releases_auth_but_keeps_target_lease() {
+        let _env = TestEnv::new();
+        let target = realistic_auth_json("target@example.com", "acct_target", "t-old", "t-ref");
+        seed_profile("target", &target);
+        let prepared = super::prepare_profile_switch("target").unwrap();
+        let confirmed = super::confirm_prepared_profile_switch_without_overwrite(prepared).unwrap();
+
+        let (history_started_tx, history_started_rx) = std::sync::mpsc::channel();
+        let (history_continue_tx, history_continue_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (switch_tx, switch_rx) = std::sync::mpsc::channel();
+        let switch_worker = std::thread::spawn(move || {
+            crate::cache::before_next_last_used_write(move || {
+                history_started_tx.send(()).unwrap();
+                let _ = history_continue_rx.recv();
+            });
+            let _ = switch_tx.send(super::commit_confirmed_profile_switch(confirmed));
+        });
+        let mut cleanup = ThreadCleanup::new(history_continue_tx);
+        cleanup.push(switch_worker);
+        history_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("switch did not reach the successful selection-history write");
+
         let (auth_done_tx, auth_done_rx) = std::sync::mpsc::channel();
         cleanup.push(std::thread::spawn(move || {
-            let _ = auth_started_tx.send(());
-            let result = super::lock_auth_transaction().map(drop);
-            let _ = auth_done_tx.send(result);
+            let _ = auth_done_tx.send(super::lock_auth_transaction().map(drop));
         }));
-        auth_started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("concurrent auth transaction did not start");
         auth_done_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("selection-history write kept the auth transaction locked")
+            .expect("selection-history write retained the auth transaction")
             .expect("concurrent auth transaction failed");
 
         let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
@@ -5457,7 +5485,7 @@ mod tests {
         }));
         attempt_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("rename did not contend on the switch-owned profile lease");
+            .expect("rename did not contend on the switch-owned target lease");
         assert!(matches!(
             rename_rx.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -5466,15 +5494,17 @@ mod tests {
         cleanup.release_blocker();
         let switch = switch_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("switch did not finish after cache-lock release")
+            .expect("switch did not finish after selection-history continuation")
             .unwrap();
         assert!(switch.selection_history_warning().is_none());
-        let _ = rename_rx
+        let rename = rename_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("rename did not finish after the switch released its lease")
+            .expect("rename did not finish after the switch released its target lease")
             .unwrap();
+        assert!(rename.durability_warning().is_none());
         cleanup.join_all();
 
+        let app_home = crate::auth::app_home().unwrap();
         let cache: serde_json::Value =
             serde_json::from_slice(&std::fs::read(app_home.join("cache.json")).unwrap()).unwrap();
         assert!(cache.pointer("/last_used/target").is_none());
@@ -8569,7 +8599,7 @@ mod tests {
             &realistic_auth_json("old@example.com", "acct_old", "old_access", "old_refresh"),
         );
         crate::cache::put(alias, &crate::usage::UsageInfo::default()).unwrap();
-        crate::cache::set_last_used(alias).unwrap();
+        crate::cache::try_set_last_used(alias).unwrap();
         crate::cache::put_auth_failure(
             alias,
             "old_refresh",

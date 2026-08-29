@@ -5248,13 +5248,23 @@ fn daemon_service_installations_stage_validate_and_rollback() {
         "acquire_service_operation_lease",
         "definition_snapshot_matches",
         "Global\\\\codex-switch-global-pace-daemon-service-operation-v1",
-        "task_listing_contains_name",
-        "&[\"/Query\", \"/FO\", \"CSV\", \"/NH\"]",
+        "task_query_exit_code_is_not_found",
+        "0x8007_0002",
+        ".args([\"/Query\", \"/TN\", WINDOWS_TASK_NAME, \"/XML\", \"/HRESULT\"])",
         "optional_scheduled_task_xml",
     ] {
         assert!(
             service.contains(required),
             "missing service transaction contract `{required}`"
+        );
+    }
+    for forbidden in [
+        "task_listing_contains_name",
+        "&[\"/Query\", \"/FO\", \"CSV\", \"/NH\"]",
+    ] {
+        assert!(
+            !service.contains(forbidden),
+            "scheduled-task inspection must not enumerate every task through `{forbidden}`"
         );
     }
     let lease = service

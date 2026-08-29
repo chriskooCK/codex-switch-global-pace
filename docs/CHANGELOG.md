@@ -1,5 +1,31 @@
 # Changelog
 
+## v20260829.1.0 — 2026-08-29
+
+- **Authoritative startup refresh no longer waits behind the cache** — Once
+  credential reconciliation has settled and the authoritative refresh path is
+  ready, a startup cache snapshot that is still waiting for `cache.lock` is
+  cancelled at the existing atomic acquisition boundary. If acquisition already
+  won, the identity-bound snapshot still finishes normally. A held-lock
+  regression now reaches authoritative refresh in about 0.13 seconds instead of
+  inheriting the cache lock's wait timeout.
+- **Committed switches do not wait for selection history** — Live auth and the
+  current-profile marker are durable before derived last-used metadata is
+  attempted. That metadata now tries the path-specific cache lock once and
+  reports a non-fatal warning if another process owns it, so the TUI no longer
+  remains in `Switching` after the account has changed. Cache mutations also
+  acquire their cross-process lock before process-wide serialization, preventing
+  an external wait on one state directory from blocking unrelated in-process
+  cache paths. Across ten controlled 500 ms contention runs, median switch time
+  fell from 553.6 ms to 62.8 ms.
+- **Exact Windows service-state lookup** — Windows daemon inspection now asks
+  Task Scheduler for the one configured task with `/HRESULT` instead of
+  enumerating every scheduled task first. Only the locale-independent
+  file-not-found HRESULT means absence; access, scheduler, and process failures
+  remain errors. In 50 interleaved local release runs, `--json daemon status`
+  fell from a 648.7 ms median to 39.1 ms (p95 707.9 ms to 62.3 ms), while its
+  output and the installer-state output remained byte-identical.
+
 ## v20260828.2.0 — 2026-08-28
 
 - **Constant-work Windows ACL validation** — Existing private state directories

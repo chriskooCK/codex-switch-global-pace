@@ -22,9 +22,31 @@ const WORKSPACE_RESOLUTION_TTL: u64 = 24 * 60 * 60;
 static CACHE_LOCK: Mutex<()> = Mutex::new(());
 const CACHE_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const CACHE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const CACHE_LOCK_WAITING: u8 = 0;
-const CACHE_LOCK_ACQUIRED: u8 = 1;
-const CACHE_LOCK_CANCELLED: u8 = 2;
+const CACHE_LOCK_PENDING: u8 = 0;
+const CACHE_LOCK_CONTENDED: u8 = 1;
+const CACHE_LOCK_ACQUIRED: u8 = 2;
+const CACHE_LOCK_CANCELLED: u8 = 3;
+const CACHE_LOCK_TIMED_OUT: u8 = 4;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BEFORE_LAST_USED_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_next_last_used_write(action: impl FnOnce() + 'static) {
+    TEST_BEFORE_LAST_USED_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+}
+
+#[cfg(test)]
+fn run_before_last_used_write_test_hook() {
+    TEST_BEFORE_LAST_USED_WRITE.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action();
+        }
+    });
+}
 
 /// Cancellation boundary for derived-cache work that is still waiting for the
 /// cache lock. Once acquisition wins, cancellation is a no-op and the small
@@ -38,7 +60,7 @@ pub(crate) struct CacheLockAcquireControl {
 impl CacheLockAcquireControl {
     pub(crate) fn new() -> Self {
         Self {
-            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CACHE_LOCK_WAITING)),
+            state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(CACHE_LOCK_PENDING)),
             wake: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -46,8 +68,30 @@ impl CacheLockAcquireControl {
     pub(crate) fn cancel_waiting(&self) -> bool {
         let cancelled = self
             .state
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |state| match state {
+                    CACHE_LOCK_PENDING | CACHE_LOCK_CONTENDED => Some(CACHE_LOCK_CANCELLED),
+                    _ => None,
+                },
+            )
+            .is_ok();
+        if cancelled {
+            self.wake.notify_one();
+        }
+        cancelled
+    }
+
+    /// Cancel only after the worker has observed actual OS-lock contention.
+    /// This narrower boundary lets opportunistic startup cache reads keep an
+    /// uncontended hit even when another authoritative startup prerequisite
+    /// happens to win the scheduler race.
+    pub(crate) fn cancel_contended(&self) -> bool {
+        let cancelled = self
+            .state
             .compare_exchange(
-                CACHE_LOCK_WAITING,
+                CACHE_LOCK_CONTENDED,
                 CACHE_LOCK_CANCELLED,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
@@ -74,9 +118,35 @@ impl CacheLockAcquireControl {
 
     fn mark_acquired(&self) -> bool {
         self.state
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |state| match state {
+                    CACHE_LOCK_PENDING | CACHE_LOCK_CONTENDED => Some(CACHE_LOCK_ACQUIRED),
+                    _ => None,
+                },
+            )
+            .is_ok()
+    }
+
+    fn mark_contended(&self) -> bool {
+        match self.state.compare_exchange(
+            CACHE_LOCK_PENDING,
+            CACHE_LOCK_CONTENDED,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) | Err(CACHE_LOCK_CONTENDED) => true,
+            Err(CACHE_LOCK_ACQUIRED | CACHE_LOCK_CANCELLED | CACHE_LOCK_TIMED_OUT) => false,
+            Err(state) => unreachable!("unknown cache-lock acquisition state {state}"),
+        }
+    }
+
+    fn mark_timed_out(&self) -> bool {
+        self.state
             .compare_exchange(
-                CACHE_LOCK_WAITING,
-                CACHE_LOCK_ACQUIRED,
+                CACHE_LOCK_CONTENDED,
+                CACHE_LOCK_TIMED_OUT,
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
             )
@@ -368,11 +438,17 @@ fn open_cache_lock_file(path: &std::path::Path) -> Result<std::fs::File> {
         .with_context(|| format!("opening cache lock {}", path.display()))
 }
 
+#[cfg(test)]
 fn with_cache_file_lock_at<T>(
     path: &std::path::Path,
     timeout: Duration,
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    let _file = acquire_cache_file_lock_at(path, timeout)?;
+    operation()
+}
+
+fn acquire_cache_file_lock_at(path: &std::path::Path, timeout: Duration) -> Result<std::fs::File> {
     let file = open_cache_lock_file(path)?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -394,14 +470,53 @@ fn with_cache_file_lock_at<T>(
             }
         }
     }
-    operation()
+    Ok(file)
 }
 
 fn with_cache_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_cache_lock_at(&cache_lock_path()?, CACHE_LOCK_WAIT_TIMEOUT, operation)
+}
+
+fn with_cache_lock_at<T>(
+    lock_path: &std::path::Path,
+    timeout: Duration,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    // Take the path-specific OS lock before the process-wide serialization
+    // guard. No thread can then hold the process guard while waiting on an
+    // external cache owner, which keeps unrelated in-process cache paths and
+    // latency-sensitive best-effort writes from inheriting that wait.
+    let _file_lock = acquire_cache_file_lock_at(lock_path, timeout)?;
     let _process_lock = CACHE_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("cache process lock poisoned"))?;
-    with_cache_file_lock_at(&cache_lock_path()?, CACHE_LOCK_WAIT_TIMEOUT, operation)
+    operation()
+}
+
+/// Run a best-effort derived-cache mutation without extending a completed
+/// user-visible operation behind unrelated cache work.
+///
+/// The path-specific OS lock is attempted exactly once. Once it is owned, the
+/// process guard cannot be held by another operation on this cache path because
+/// every production cache flow uses the same OS-first lock order. Callers must
+/// surface failure as a warning; this is only appropriate for metadata whose
+/// publication is explicitly non-authoritative.
+fn try_with_cache_lock<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let path = cache_lock_path()?;
+    let file = open_cache_lock_file(&path)?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _process_lock = CACHE_LOCK
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cache process lock poisoned"))?;
+            operation()
+        }
+        Err(TryLockError::WouldBlock) => {
+            anyhow::bail!("cache lock {} is busy", path.display())
+        }
+        Err(TryLockError::Error(error)) => Err(anyhow::Error::from(error))
+            .with_context(|| format!("locking cache file {}", path.display())),
+    }
 }
 
 fn with_cache_lock_cancellable_at<T>(
@@ -411,30 +526,6 @@ fn with_cache_lock_cancellable_at<T>(
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<Option<T>> {
     let deadline = Instant::now() + timeout;
-    let _process_lock = loop {
-        if control.is_cancelled() {
-            return Ok(None);
-        }
-        match CACHE_LOCK.try_lock() {
-            Ok(guard) => break guard,
-            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(CACHE_LOCK_POLL_INTERVAL);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                anyhow::bail!(
-                    "cache process lock remained held for {:.3}s",
-                    timeout.as_secs_f64()
-                );
-            }
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                anyhow::bail!("cache process lock poisoned");
-            }
-        }
-    };
-
-    if control.is_cancelled() {
-        return Ok(None);
-    }
     let file = open_cache_lock_file(lock_path)?;
     loop {
         if control.is_cancelled() {
@@ -445,12 +536,21 @@ fn with_cache_lock_cancellable_at<T>(
                 if !control.mark_acquired() {
                     return Ok(None);
                 }
+                let _process_lock = CACHE_LOCK
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("cache process lock poisoned"))?;
                 return operation().map(Some);
             }
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                if !control.mark_contended() {
+                    return Ok(None);
+                }
                 std::thread::sleep(CACHE_LOCK_POLL_INTERVAL);
             }
             Err(TryLockError::WouldBlock) => {
+                if !control.mark_contended() || !control.mark_timed_out() {
+                    return Ok(None);
+                }
                 anyhow::bail!(
                     "cache lock {} remained held for {:.3}s; refusing to replace the live lock file",
                     lock_path.display(),
@@ -1767,13 +1867,14 @@ pub(crate) fn ranking_snapshot_checked(account_ids: &[String]) -> Result<Ranking
     })
 }
 
-/// Record a successful profile selection for scoring.
-///
-/// Callers retain the selected profile lease until this write finishes so a
-/// concurrent rename cannot move the old key and then let this function
-/// recreate it under a stale alias.
-pub fn set_last_used(alias: &str) -> Result<()> {
-    with_cache_lock(|| {
+/// Record successful-selection metadata only when both cache locks are
+/// immediately available. The profile switch itself is already durable before
+/// this derived history is attempted, so contention is returned to the caller
+/// as a warning instead of keeping the switch visibly in progress.
+pub(crate) fn try_set_last_used(alias: &str) -> Result<()> {
+    try_with_cache_lock(|| {
+        #[cfg(test)]
+        run_before_last_used_write_test_hook();
         let mut cache = load_cache_checked()?;
         let now = crate::auth::now_unix_secs()?;
         cache.last_used.insert(alias.to_string(), now);
@@ -2946,6 +3047,45 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[test]
+    fn external_cache_wait_does_not_hold_process_serialization() {
+        let dir = crate::fs_ops::create_direct_tempdir().unwrap();
+        let blocked_path = dir.path().join("blocked.lock");
+        let unrelated_path = dir.path().join("unrelated.lock");
+        let holder = open_cache_lock_file(&blocked_path).unwrap();
+        FileExt::lock(&holder).unwrap();
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let blocked_worker = std::thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            with_cache_lock_at(&blocked_path, Duration::from_secs(5), || Ok(()))
+        });
+        waiting_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (unrelated_tx, unrelated_rx) = std::sync::mpsc::channel();
+        let unrelated_worker = std::thread::spawn(move || {
+            unrelated_tx
+                .send(with_cache_lock_at(
+                    &unrelated_path,
+                    Duration::from_secs(1),
+                    || Ok(7),
+                ))
+                .unwrap();
+        });
+        let unrelated = unrelated_rx.recv_timeout(Duration::from_secs(1));
+
+        drop(holder);
+        blocked_worker.join().unwrap().unwrap();
+        unrelated_worker.join().unwrap();
+        assert_eq!(
+            unrelated
+                .expect("an external lock wait blocked an unrelated in-process cache path")
+                .unwrap(),
+            7
+        );
+    }
+
     #[tokio::test]
     async fn cancellable_snapshot_does_not_wait_for_a_held_cache_lock() {
         let dir = crate::fs_ops::create_direct_tempdir().unwrap();
@@ -2977,6 +3117,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn contended_cache_cancellation_and_timeout_have_one_winner() {
+        let cancelled = CacheLockAcquireControl::new();
+        assert!(cancelled.mark_contended());
+        assert!(cancelled.cancel_contended());
+        assert!(!cancelled.mark_timed_out());
+
+        let timed_out = CacheLockAcquireControl::new();
+        assert!(timed_out.mark_contended());
+        assert!(timed_out.mark_timed_out());
+        assert!(!timed_out.cancel_contended());
+        assert!(!timed_out.cancel_waiting());
     }
 
     #[tokio::test]
