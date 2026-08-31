@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v20260901.1.0 — 2026-09-01
 
 - **Write-ahead recovery for every refresh-token rotation** — A replacement for
   a consumed single-use refresh token is now durably staged under the private
