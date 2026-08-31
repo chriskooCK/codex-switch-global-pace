@@ -888,10 +888,10 @@ pub(crate) async fn execute_prepared_full_usage_with_existing_lease_and_client(
 
 /// Write credentials the auth server just rotated back to the profile.
 ///
-/// The previous `refresh_token` is dead the moment these were issued, so a
-/// failed write leaves only an in-memory copy of the sole credential the server
-/// still accepts. Losing it bricks the account, which makes this a reportable
-/// failure rather than something to warn about and walk past.
+/// The previous `refresh_token` is dead the moment these were issued. The
+/// write-ahead recovery stage is committed before profile I/O, then removed
+/// exactly only after the profile itself is durable. Any incomplete path remains
+/// reportable so callers never retry a consumed single-use credential.
 fn persist_refreshed_tokens(
     lease: &crate::profile::ProfileLease,
     authorization: crate::profile::FreshCredentialsActivationAuthorization,
@@ -910,12 +910,28 @@ fn persist_refreshed_tokens(
     .map_err(|err| UsageError::token_persist_failed(alias, &err))?;
     match update {
         crate::profile::RefreshTokenUpdate::Saved => Ok(()),
-        crate::profile::RefreshTokenUpdate::Superseded => {
-            Err(UsageError::token_update_superseded(alias))
+        crate::profile::RefreshTokenUpdate::Superseded { recovery_path } => {
+            Err(UsageError::token_update_superseded(alias, &recovery_path))
         }
-        crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } => {
-            Err(UsageError::live_activation_incomplete(alias, &cause))
-        }
+        crate::profile::RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path,
+            cause,
+        } => Err(UsageError::credential_commit_incomplete(
+            alias,
+            recovery_path.as_deref(),
+            &cause,
+        )),
+        crate::profile::RefreshTokenUpdate::SavedWithCleanupIncomplete {
+            recovery_path,
+            cause,
+        } => Err(UsageError::recovery_cleanup_incomplete(
+            alias,
+            recovery_path.as_deref(),
+            &cause,
+        )),
+        crate::profile::RefreshTokenUpdate::RecoveryPreserved { path, cause } => Err(
+            UsageError::rotated_credentials_recovery_preserved(alias, &path, &cause),
+        ),
         crate::profile::RefreshTokenUpdate::Quarantined { path, cause } => Err(
             UsageError::refreshed_credentials_quarantined(alias, &path, &cause),
         ),
@@ -951,8 +967,10 @@ pub(crate) fn persist_refresh_resolution(
                     UsageError::refreshed_credentials_quarantined(alias, &path, &cause),
                 ),
                 crate::profile::RefreshTokenUpdate::Saved
-                | crate::profile::RefreshTokenUpdate::Superseded
-                | crate::profile::RefreshTokenUpdate::SavedWithActivationIncomplete { .. } => {
+                | crate::profile::RefreshTokenUpdate::Superseded { .. }
+                | crate::profile::RefreshTokenUpdate::SavedWithCommitIncomplete { .. }
+                | crate::profile::RefreshTokenUpdate::SavedWithCleanupIncomplete { .. }
+                | crate::profile::RefreshTokenUpdate::RecoveryPreserved { .. } => {
                     Err(UsageError::invalid_refresh_recovery_failed(
                         alias,
                         &anyhow::anyhow!(

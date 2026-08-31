@@ -6034,6 +6034,26 @@ fn readmes_describe_current_cli_and_codex_requirements() {
 }
 
 #[test]
+fn multilingual_entry_points_describe_incomplete_identity_recovery() {
+    for path in [
+        "README.md",
+        "README_CN.md",
+        "docs/wiki/Getting-Started.md",
+        "docs/wiki/Feature-Guide.md",
+        "docs/wiki/Korean-Guide.md",
+        "docs/wiki/Chinese-Guide.md",
+    ] {
+        let guide = repo_file(path);
+        for required in ["account_id", "--yes", "deleted-profiles/", "recovery/"] {
+            assert!(
+                guide.contains(required),
+                "{path} must document the recovery contract `{required}`"
+            );
+        }
+    }
+}
+
+#[test]
 fn readme_leads_with_the_safe_windows_account_switch_workflow() {
     let readme = repo_file("README.md");
     let workflow = readme
@@ -6057,6 +6077,27 @@ fn readme_leads_with_the_safe_windows_account_switch_workflow() {
         );
     }
     assert!(readme.contains("[한국어 안내](docs/wiki/Korean-Guide.md)"));
+
+    let readme_cn = repo_file("README_CN.md");
+    let workflow_cn = readme_cn
+        .split("## 最常用：切换 Codex Windows 应用的当前账号")
+        .nth(1)
+        .and_then(|section| section.split("## 快速开始").next())
+        .expect("Chinese README must put the everyday Windows switch workflow before quick start");
+    for required in [
+        "隐藏图标",
+        "Quit",
+        "Exit",
+        "codex-switch-global-pace list -f",
+        "codex-switch-global-pace use work",
+        "codex-switch-global-pace use",
+        "重新打开 Codex Windows 应用",
+    ] {
+        assert!(
+            workflow_cn.contains(required),
+            "Chinese Windows switch workflow must document `{required}`"
+        );
+    }
 }
 
 #[test]

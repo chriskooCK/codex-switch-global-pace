@@ -63,7 +63,20 @@ codex-switch-global-pace          # 打开交互界面
 ```
 
 无浏览器服务器使用 `codex-switch-global-pace login --device`。
-Alias 长度为 1–64 个 ASCII 字节，只能包含字母、数字、`_`、`-` 和 `.`；`.` 与 `..` 不可使用。重复使用 alias 只能重新授权同一实际账号，不能用另一账号覆盖；如果它原本不是当前账号，请在重新授权后运行 `use <alias>` 才会切换过去。
+Alias 长度为 1–64 个 ASCII 字节，只能包含字母、数字、`_`、`-` 和 `.`；`.` 与 `..` 不可使用。身份字段完整的既有 alias 只能重新授权同一实际账号，不能用另一账号覆盖；如果它原本不是当前账号，请在重新授权后运行 `use <alias>` 才会切换过去。
+
+每次 OAuth 登录都必须同时提供非空的 `account_id` 和邮箱。旧版本创建的
+profile 如果缺少其中一项，交互式 `login <alias>` 会显示默认 **No** 的确认；
+JSON 或其他非交互运行必须显式使用 `login <alias> --yes`。确认后，程序先把
+原认证文件完整归档到 `deleted-profiles/`，并且只有新账号与所有已知身份字段
+一致时，才会替换同一个 alias。
+
+服务轮换一次性 refresh token 后，返回的轮换材料会先持久化到私有
+`recovery/` 目录，再尝试写入 profile。profile 持久化之前发生冲突或失败时，
+程序会保留并报告该材料。profile 已持久化后，即使随后的实时认证激活失败，
+也可以精确清理原暂存文件，因此这种部分提交不一定有恢复路径。精确清理失败
+时，只有仍能确认原文件 identity 才会报告该路径，否则不会把无关文件标成
+恢复凭据，也不会自行重试已经消耗的 token。
 
 本程序复用已有的 profile：Windows 原生环境通常位于
 `%USERPROFILE%\.codex-switch`，macOS/Linux 通常位于 `~/.codex-switch`。

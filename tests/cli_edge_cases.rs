@@ -175,7 +175,9 @@ fn run_with_env(home: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
 }
 
 fn run_with_timeout(home: &Path, args: &[&str], timeout: Duration) -> Output {
-    let mut child = command(home, args).spawn().unwrap();
+    let mut cmd = command(home, args);
+    cmd.stdin(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
     let start = std::time::Instant::now();
 
     loop {
@@ -198,6 +200,50 @@ fn parse_stdout_json(output: &Output) -> Value {
 }
 
 #[test]
+fn incomplete_reauth_stops_before_oauth_in_json_and_non_tty_modes_without_yes() {
+    for (args, json) in [
+        (
+            (&["--json", "login", "legacy", "--device"] as &[&str]),
+            true,
+        ),
+        ((&["login", "legacy", "--device"] as &[&str]), false),
+    ] {
+        let home = temp_home();
+        let app_home = home.path().join(".codex-switch");
+        let profile_path = app_home.join("profiles/legacy/auth.json");
+        let incomplete = auth_json_with_access("legacy@example.com", "");
+        write_json(&profile_path, &incomplete);
+        let original = fs::read(&profile_path).unwrap();
+
+        let output = run_with_timeout(home.path(), args, Duration::from_secs(5));
+
+        assert!(!output.status.success());
+        let detail = if json {
+            parse_stdout_json(&output)["error"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        } else {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        };
+        assert!(
+            detail.contains("incomplete legacy account identity"),
+            "{detail}"
+        );
+        assert!(detail.contains("--yes"), "{detail}");
+        assert_eq!(fs::read(&profile_path).unwrap(), original);
+        assert!(
+            !app_home.join("deleted-profiles").exists(),
+            "confirmation failure must happen before archive creation"
+        );
+    }
+}
+
+#[test]
 fn json_warmup_with_no_profiles_reports_a_complete_success_object() {
     let home = temp_home();
 
@@ -211,19 +257,19 @@ fn json_warmup_with_no_profiles_reports_a_complete_success_object() {
 }
 
 #[cfg(feature = "test-endpoints")]
-fn quarantined_path_from_error(error: &str) -> PathBuf {
+fn preserved_recovery_path_from_error(error: &str) -> PathBuf {
     let (_, after_path) = error
-        .split_once("credential copy was quarantined at ")
+        .split_once("The exact usable recovery stage remains at ")
         .expect("rotation rescue error must name its recovery path");
     let (path, _) = after_path
-        .split_once(" and was not made into an activatable profile")
+        .split_once(". No activatable profile")
         .expect("rotation rescue error must end its recovery path before the profile warning");
     PathBuf::from(path)
 }
 
 #[cfg(feature = "test-endpoints")]
 fn assert_error_names_recovered_file(error: &str, recovered: &Path) {
-    let reported = quarantined_path_from_error(error);
+    let reported = preserved_recovery_path_from_error(error);
     assert_eq!(
         fs::canonicalize(&reported).unwrap(),
         fs::canonicalize(recovered).unwrap(),
@@ -1451,7 +1497,7 @@ mod rotated_credential_import_tests {
     }
 
     #[test]
-    fn import_quarantines_rotated_credentials_when_refresh_loses_account_identity() {
+    fn import_preserves_rotated_credentials_when_refresh_loses_account_identity() {
         let home = temp_home();
         let mut sample = auth_json("rotate@example.com", "acct_rotate");
         sample["tokens"]
@@ -1487,7 +1533,7 @@ mod rotated_credential_import_tests {
         );
         let recovery_dir = home.join(".codex-switch/recovery");
         let recovered: Vec<_> = fs::read_dir(&recovery_dir)
-            .expect("rotated credentials must be quarantined even without an account id")
+            .expect("rotated credentials must be preserved even without an account id")
             .map(|entry| entry.unwrap().path())
             .collect();
         assert_eq!(recovered.len(), 1);
@@ -1635,9 +1681,9 @@ mod rotated_credential_import_tests {
 
     /// The same single-use credential is at stake when validation *succeeds* and
     /// the profile write is what fails. A separate recovery store is still
-    /// available, so the rotated token must be quarantined instead of discarded.
+    /// available, so the rotated token must be preserved instead of discarded.
     #[test]
-    fn import_quarantines_the_rotation_when_the_profile_write_fails_after_validation() {
+    fn import_preserves_the_rotation_when_the_profile_write_fails_after_validation() {
         let home = temp_home();
         let sample = auth_json_needing_refresh("savefail@example.com", "acct_savefail");
         let rotated_id_token = sample["tokens"]["id_token"].as_str().unwrap().to_string();
@@ -1664,7 +1710,7 @@ mod rotated_credential_import_tests {
         let error = report["error"].as_str().unwrap_or_default();
         assert!(
             error.contains("token_rotated"),
-            "a recoverable profile write failure must be reported as quarantined: {error}"
+            "a recoverable profile write failure must report preserved rotation material: {error}"
         );
         let recovered: Vec<_> = fs::read_dir(home.join(".codex-switch/recovery"))
             .expect("the rotated credential must fall back to the recovery store")

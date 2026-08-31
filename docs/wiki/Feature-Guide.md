@@ -60,8 +60,8 @@ codex-switch-global-pace login --device server
 Authenticating a new identity under a new alias saves and immediately activates
 that profile. If the authenticated identity already belongs to a saved profile,
 the matching profile is updated and activated instead, and the requested new
-alias is not created. Reusing an existing alias re-authorizes only that same
-identity; if it was inactive, run `use <alias>` afterwards to activate it.
+alias is not created. Reusing a complete existing alias re-authorizes only that
+same identity; if it was inactive, run `use <alias>` afterwards to activate it.
 Aliases are 1–64 ASCII bytes and may contain only letters, numbers, `_`, `-`,
 and `.`; `.` and `..` are not valid aliases. If the browser is still signed in
 to the first account, change accounts before approving the second login and
@@ -73,17 +73,36 @@ Existing `auth.json` files can be imported individually or from a directory. Imp
 codex-switch-global-pace import ~/auth-backups
 ```
 
-Interactive login updates an existing profile only when both `account_id` and
-email match exactly. An email-only or otherwise incomplete identity cannot
-authorize a credential overwrite. Re-login releases the target profile while
-you complete browser or device-code authorization, so quota reads and other
-account maintenance can continue; commit reacquires the profile and verifies
-that its strict identity did not change in the meantime. Import is deliberately
-create-only and never updates an existing profile: Usage API validation proves
-that the bearer can access a workspace, but a Team workspace ID can be shared by
-several users and cannot authorize overwriting another saved credential.
+Every new OAuth save requires both a non-empty `account_id` and email. For a
+complete existing profile, interactive login updates it only when both fields
+match exactly. Re-login releases the target profile while you complete browser
+or device-code authorization, so quota reads and other account maintenance can
+continue; commit reacquires the profile and verifies that its strict identity
+did not change in the meantime.
 
-An existing alias cannot be reauthorized as a different account. If the wrong
+An older profile that lacks either identity field follows a separate,
+recoverable migration. `login <alias>` asks for explicit confirmation with a
+default of **No**; JSON and other non-interactive runs require `--yes` before
+OAuth starts. The completed login must include both identity fields and match
+every identity field already known by the legacy profile. The app then archives
+the exact previous credentials under `deleted-profiles/` before replacing that
+same alias. If the profile changed during OAuth or the authenticated identity is
+already owned by another profile, neither archival nor replacement proceeds.
+
+Import is deliberately create-only and never updates an existing profile:
+Usage API validation proves that the bearer can access a workspace, but a Team
+workspace ID can be shared by several users and cannot authorize overwriting
+another saved credential.
+
+If a rotated import profile is durably created but its recovery stage cannot be
+cleaned exactly, the import remains successful and reports a cleanup warning.
+It reports `recovery_path` only when the original stage still owns that name. A
+profile publication that is visible but not durably or securely confirmed is a
+partial commit, not a false "profile absent" result.
+
+A complete existing alias cannot be reauthorized as a different account. The
+incomplete-legacy migration above can prove only the identity fields it already
+knows and therefore requires confirmation plus an exact archive. If the wrong
 browser identity was saved, follow
 [Correct a wrong browser account](Troubleshooting.md#correct-a-wrong-browser-account)
 rather than trying to overwrite the alias.
@@ -129,6 +148,19 @@ metadata is keyed by account ID, so aliases for the same verified account share
 the same cached organization result.
 
 Normal reads refresh only stale entries. Use `list -f` or the TUI refresh action when a fresh network read is required.
+
+When the service issues a replacement for a single-use refresh token, the app
+must first durably stage the returned rotation material under the private
+`recovery/` directory. Only then can it attempt the identity-bound profile
+commit. Conflicts and failures before that profile is durable preserve and
+report the staged material. Once the profile is durable, cleanup removes the
+exact staged file by its original file identity; it never unlinks an unrelated
+replacement at the same path. A later live-auth activation can still fail after
+that cleanup, so the resulting partial commit may report no recovery path.
+Failed exact cleanup reports a path only when the original staged file is still
+proven there; a replaced or unverifiable name is reported as partial cleanup
+without being mislabeled as the rotated credential. No failure path
+automatically retries a token the service already consumed.
 
 The Global Weekly Pace box visualizes every account with a valid weekly window
 as one equal-weight pool. This is only an aggregate display: quota remains

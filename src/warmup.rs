@@ -3640,19 +3640,18 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 2);
         }
 
-        // ── rotated tokens that never reach disk must abort the account ──
+        // ── rotated tokens that cannot reach the profile must abort the account ──
         //
         // OpenAI's refresh_token is single-use: the moment the auth server hands
         // back a rotated one, the previous token is dead. If the write back to
-        // the profile then fails, the only credential the server still accepts
-        // lives in this process's memory. Finishing the request with it and
-        // exiting zero leaves a bricked profile and no signal, so every one of
+        // the profile then fails, the write-ahead recovery file is the only
+        // durable successor. Continuing network work or exiting without the
+        // reported path would conceal the incomplete commit, so every one of
         // these paths has to report instead.
 
         /// Substring every persist-failure report must carry, so the message
         /// can never be mistaken for the auth server rejecting the refresh.
-        const PERSIST_FAILURE_MARKER: &str =
-            "token refresh succeeded but the rotated credentials could not be saved";
+        const PERSIST_FAILURE_MARKER: &str = "rotated credentials were preserved privately";
 
         /// An access_token JWT far from expiry, so the pre-warmup proactive
         /// refresh stays out of the way and the 401 retry path can be exercised

@@ -6665,6 +6665,19 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 }
 
+fn require_individual_incomplete_reauth(
+    alias: &str,
+    recover_incomplete: bool,
+    batch: bool,
+) -> Result<()> {
+    if recover_incomplete && batch {
+        anyhow::bail!(
+            "profile '{alias}' has incomplete legacy account identity; recover it with an individual re-login so its previous credentials can be confirmed and archived"
+        );
+    }
+    Ok(())
+}
+
 async fn run_oauth_inner(
     mode: OAuthMode,
     device: bool,
@@ -6714,6 +6727,20 @@ async fn run_oauth_inner(
                 };
                 profile::prepare_profile_reauth_with_lease(&lease)?
             };
+            let recover_incomplete = prepared.requires_recoverable_replacement();
+            require_individual_incomplete_reauth(
+                &alias,
+                recover_incomplete,
+                lease_control.is_some(),
+            )?;
+            if recover_incomplete {
+                let prompt = format!(
+                    "Profile '{alias}' has incomplete legacy account identity. Archive its current credentials recoverably, then replace it with this re-login? [y/N] "
+                );
+                if !crate::commands::confirm_default_no(&prompt) {
+                    return Err(crate::error::CsError::Aborted.into());
+                }
+            }
             let tokens = if device {
                 login::run_device_code_auth().await?
             } else {
@@ -6721,7 +6748,12 @@ async fn run_oauth_inner(
             };
             let (auth_val, info) = login::build_auth_from_tokens(&tokens)?;
             let lease = profile::acquire_profile_lease_async(alias.clone()).await?;
-            profile::commit_prepared_profile_reauth_with_lease(prepared, &lease, &auth_val)?;
+            let outcome = profile::commit_prepared_profile_reauth_with_lease(
+                prepared,
+                &lease,
+                &auth_val,
+                recover_incomplete,
+            )?;
             drop(lease);
             let email_disp = info.email.as_deref().unwrap_or("unknown");
             println!(
@@ -6729,6 +6761,12 @@ async fn run_oauth_inner(
                 safe_text::terminal_text(&alias),
                 safe_text::terminal_text(email_disp)
             );
+            if let Some(path) = outcome.archive_path() {
+                println!(
+                    "Previous incomplete credentials archived for recovery at {}",
+                    safe_text::terminal_text(&path.display().to_string())
+                );
+            }
             Ok(OAuthSave {
                 message: format!("Re-logged in: {alias}"),
                 alias,
@@ -6815,7 +6853,7 @@ fn edit_grapheme_input(input: &mut String, cursor: &mut usize, code: KeyCode) {
 mod tests {
     use super::{
         AccountEntry, AccountRefreshPlan, AccountTaskControls, AccountTaskKind, App,
-        BatchDeleteReport, CachedUsageApplication, ConfirmAction, ModelStatus,
+        BatchDeleteReport, CachedUsageApplication, ConfirmAction, ModelStatus, OAuthMode,
         STATUS_MESSAGE_MAX_CHARS, SafeTaskCancellation, SearchState, SortMode, StartupAuthState,
         StartupFileLogInitTask, StartupSelfUpdateCleanupTask, StartupUsagePhase, UsageStatus,
         WarmupOrigin, WarmupReadyCandidate, WarmupTask, WorkspaceRefresh,
@@ -6823,7 +6861,8 @@ mod tests {
         batch_relogin_not_attempted, cancel_superseded_startup_cache_wait, dispatch_menu_use,
         drain_credential_tasks_on_error, finish_login_or_stop_after_round,
         prepare_workspace_lookup_auth, redraw_after_poll, refresh_fetches_loaded_usage,
-        reset_card_failure_from_outcome, retained_usage_by_identity, strict_account_identity,
+        require_individual_incomplete_reauth, reset_card_failure_from_outcome,
+        retained_usage_by_identity, run_oauth_inner, strict_account_identity,
     };
     use crate::{
         jwt::{AccountInfo, OrgInfo, StrictAccountBinding},
@@ -13356,6 +13395,52 @@ mod tests {
         // the accurate error rather than the unknown-outcome safe message.
         assert!(!failure.invalidate_cache);
         assert_eq!(failure.message, "Reset card failed (account): HTTP 400");
+    }
+
+    #[test]
+    fn batch_relogin_requires_incomplete_profiles_to_be_recovered_individually() {
+        let error = require_individual_incomplete_reauth("legacy", true, true)
+            .expect_err("batch mode must not bypass the individual archive confirmation");
+        assert!(error.to_string().contains("individual re-login"));
+
+        require_individual_incomplete_reauth("legacy", true, false).unwrap();
+        require_individual_incomplete_reauth("complete", false, true).unwrap();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_relogin_rejects_an_actual_incomplete_profile_before_oauth() {
+        let _lock = crate::profile::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = crate::fs_ops::create_direct_tempdir().unwrap();
+        let codex_home = home.path().join("codex");
+        let _app_home = EnvVarGuard::set("CODEX_SWITCH_HOME", home.path());
+        let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let profile_path = home.path().join("profiles/legacy/auth.json");
+        std::fs::create_dir_all(profile_path.parent().unwrap()).unwrap();
+        let incomplete = managed_auth("legacy@example.com", "", "legacy-access", "legacy-refresh");
+        write_auth_durable(&profile_path, &incomplete);
+        let original = std::fs::read(&profile_path).unwrap();
+        let control = profile::ProfileLeaseAcquireControl::new();
+
+        let error = match run_oauth_inner(
+            OAuthMode::Relogin("legacy".to_string()),
+            true,
+            Some(&control),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("batch re-login must stop before selecting an OAuth implementation"),
+        };
+
+        assert!(
+            error.to_string().contains("individual re-login"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&profile_path).unwrap(), original);
+        assert!(!home.path().join("deleted-profiles").exists());
     }
 
     #[test]
