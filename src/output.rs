@@ -127,6 +127,15 @@ pub struct JsonOk {
 }
 
 #[derive(Serialize)]
+pub struct JsonReauth {
+    pub ok: bool,
+    pub alias: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct JsonError {
     pub ok: bool,
     pub error: String,
@@ -139,6 +148,21 @@ pub struct JsonImportEntry {
     pub action: String,
     pub account: JsonAccount,
     pub usage: JsonUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_warning: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct JsonImportResult {
+    pub ok: bool,
+    pub alias: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_warning: Option<String>,
 }
 
 #[derive(Serialize)]

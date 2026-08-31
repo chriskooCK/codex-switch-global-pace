@@ -966,8 +966,12 @@ pub fn build_auth_from_tokens(
         }
     });
     let info = crate::jwt::parse_account_info(&temp);
-    let account_id = info.account_id.as_deref().unwrap_or("").to_string();
-    Ok((build_auth_json(tokens, &account_id)?, info))
+    let binding = info.strict_binding().ok_or_else(|| {
+        anyhow::anyhow!(
+            "login credentials must contain both a non-empty account_id and email before they can be saved"
+        )
+    })?;
+    Ok((build_auth_json(tokens, &binding.account_id)?, info))
 }
 
 pub fn build_auth_json(tokens: &LoginTokens, account_id: &str) -> Result<serde_json::Value> {
@@ -1072,6 +1076,28 @@ mod tests {
     use super::*;
     use chrono::DateTime;
 
+    fn login_id_token(email: Option<&str>, account_id: Option<&str>) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id
+            }
+        });
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        format!("header.{payload}.signature")
+    }
+
+    fn login_tokens_with_identity(email: Option<&str>, account_id: Option<&str>) -> LoginTokens {
+        LoginTokens {
+            id_token: login_id_token(email, account_id),
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            api_key: None,
+        }
+    }
+
     async fn send_callback_request(addr: std::net::SocketAddr, path: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
@@ -1160,6 +1186,42 @@ mod tests {
             auth.get("auth_mode").and_then(|v| v.as_str()),
             Some("chatgpt")
         );
+    }
+
+    #[test]
+    fn build_auth_from_tokens_persists_a_complete_identity() {
+        let tokens = login_tokens_with_identity(Some("alice@example.com"), Some("acct-123"));
+
+        let (auth, info) = build_auth_from_tokens(&tokens).unwrap();
+
+        assert_eq!(info.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(info.account_id.as_deref(), Some("acct-123"));
+        assert_eq!(
+            auth.pointer("/tokens/account_id")
+                .and_then(serde_json::Value::as_str),
+            Some("acct-123")
+        );
+    }
+
+    #[test]
+    fn build_auth_from_tokens_rejects_every_incomplete_identity() {
+        for (email, account_id) in [
+            (None, Some("acct-123")),
+            (Some("alice@example.com"), None),
+            (Some("  "), Some("acct-123")),
+            (Some("alice@example.com"), Some("  ")),
+        ] {
+            let tokens = login_tokens_with_identity(email, account_id);
+            let error = build_auth_from_tokens(&tokens)
+                .expect_err("an incomplete login identity must not reach profile persistence");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("both a non-empty account_id and email"),
+                "{error:#}"
+            );
+        }
     }
 
     fn successful_token_response() -> TokenResponse {

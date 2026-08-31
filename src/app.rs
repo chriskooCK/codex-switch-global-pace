@@ -677,8 +677,8 @@ async fn dispatch(
         }
         Some(Commands::Rename { old, new }) => commands::rename_cmd(&old, &new, json),
         Some(Commands::Delete { alias, yes }) => commands::delete_cmd(&alias, yes, json),
-        Some(Commands::Login { alias, device }) => {
-            commands::login_cmd(alias.as_deref(), device, json).await
+        Some(Commands::Login { alias, device, yes }) => {
+            commands::login_cmd(alias.as_deref(), device, yes, json).await
         }
         Some(Commands::Import { path, alias }) => {
             commands::import_cmd(&path, alias.as_deref(), json).await

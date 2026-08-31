@@ -11,6 +11,26 @@ Weekly quota；quota 始终分别属于各账号，不会被转移、合并或�
 
 > 本程序会管理本机认证文件。请勿公开 profile、`auth.json`、Token、代理凭据或未脱敏的 debug 输出。
 
+## 最常用：切换 Codex Windows 应用的当前账号
+
+1. 保存当前工作并关闭所有 Codex 窗口。
+2. 打开 Windows 通知区域（包括 `^` 后的隐藏图标），找到 Codex 桌面应用的
+   **ChatGPT** tray 图标（某些版本可能显示 **Codex**），右键选择 **Quit** 或
+   **Exit**，并确认图标已经消失。
+3. 图标完全消失后，在 PowerShell 或命令提示符中切换：
+
+   ```powershell
+   codex-switch-global-pace list -f
+   codex-switch-global-pace use work
+   # 或自动选择：codex-switch-global-pace use
+   ```
+
+4. 重新打开 Codex Windows 应用；新进程会从 `$CODEX_HOME/auth.json` 读取已切换的账号。
+
+只关闭窗口并不够；tray 图标仍存在时，后台进程可能还在运行。使用 Codex CLI
+时也应先退出所有正在运行的 Codex session/process（`codex`、`codex resume`
+或 `codex exec`），切换成功后再启动新进程。
+
 ## 快速开始
 
 Codex 必须使用文件型凭据存储。在原生 Windows PowerShell 中，该文件通常为
@@ -36,7 +56,7 @@ gh auth status
 
 GitHub 登录只用于下载并验证 Release，不会成为 Codex 账号。
 
-## 最常用：切换 Codex Windows 应用的当前账号
+## 添加并验证个人与工作账号
 
 先用不同 alias 保存账号。新身份会保存并立即成为当前账号；如果浏览器身份已
 存在于其他 profile，则会更新并激活匹配的 profile，而不会创建请求的新 alias：
@@ -51,24 +71,20 @@ codex-switch-global-pace login work
 codex-switch-global-pace list -f
 ```
 
-日常切换时：
+Alias 长度为 1–64 个 ASCII 字节，只能包含字母、数字、`_`、`-` 和 `.`；`.` 与 `..` 不可使用。身份字段完整的既有 alias 只能重新授权同一实际账号，不能用另一账号覆盖；如果它原本不是当前账号，请在重新授权后运行 `use <alias>` 才会切换过去。
 
-1. 保存当前工作并关闭 Codex 窗口。
-2. 打开 Windows 通知区域的隐藏图标，找到 Codex 桌面应用的 **ChatGPT**
-   tray 图标（某些版本可能显示 **Codex**），右键后选择 **Quit** 或 **Exit**。
-3. 等到 tray 图标完全消失后再切换：
+每次 OAuth 登录都必须同时提供非空的 `account_id` 和邮箱。旧版本创建的
+profile 如果缺少其中一项，交互式 `login <alias>` 会显示默认 **No** 的确认；
+JSON 或其他非交互运行必须显式使用 `login <alias> --yes`。确认后，程序先把
+原认证文件完整归档到 `deleted-profiles/`，并且只有新账号与所有已知身份字段
+一致时，才会替换同一个 alias。
 
-   ```powershell
-   codex-switch-global-pace list -f
-   codex-switch-global-pace use work
-   # 或自动选择：codex-switch-global-pace use
-   ```
-
-4. 重新打开 Codex Windows 应用。新进程会读取已切换的 `$CODEX_HOME/auth.json`。
-
-只关闭窗口并不够；tray 图标仍存在时，后台进程可能还在运行。使用 Codex CLI 时也应先退出所有正在运行的 Codex session/process（`codex`、`codex resume` 或 `codex exec`），切换成功后再启动新进程。
-
-Alias 长度为 1–64 个 ASCII 字节，只能包含字母、数字、`_`、`-` 和 `.`；`.` 与 `..` 不可使用。重复使用 alias 只能重新授权同一实际账号，不能用另一账号覆盖；如果它原本不是当前账号，请在重新授权后运行 `use <alias>` 才会切换过去。
+服务轮换一次性 refresh token 后，返回的轮换材料会先持久化到私有
+`recovery/` 目录，再尝试写入 profile。profile 持久化之前发生冲突或失败时，
+程序会保留并报告该材料。profile 已持久化后，即使随后的实时认证激活失败，
+也可以精确清理原暂存文件，因此这种部分提交不一定有恢复路径。精确清理失败
+时，只有仍能确认原暂存文件身份才会报告该路径，否则不会把无关文件说成恢复
+文件，也不会自行重试已经消耗的 token。
 
 常用命令：
 

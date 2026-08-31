@@ -684,14 +684,51 @@ impl UsageError {
     /// The refreshed profile bytes are visible, but their full local commit
     /// (directory durability and, when active, live-auth synchronization) did
     /// not complete. Retrying the refresh would spend another single-use token.
-    pub fn live_activation_incomplete(alias: &str, cause: &anyhow::Error) -> Self {
+    pub fn credential_commit_incomplete(
+        alias: &str,
+        recovery_path: Option<&std::path::Path>,
+        cause: &anyhow::Error,
+    ) -> Self {
+        let recovery = recovery_path.map_or_else(String::new, |path| {
+            format!(
+                " The exact rotated credentials remain privately preserved at {}.",
+                path.display()
+            )
+        });
         Self {
             summary: "credential commit incomplete".to_string(),
             detail: format!(
                 "[{alias}] refreshed credentials are visible in the profile, but their durable \
                  commit or live Codex auth synchronization could not be confirmed safely: \
-                 {cause:#}. The refresh was stopped without spending another token. Fix the \
+                 {cause:#}.{recovery} The refresh was stopped without spending another token. Fix the \
                  reported local path problem, then inspect the profile before retrying."
+            ),
+        }
+    }
+
+    /// The rotated credential commit is complete; only deletion of its
+    /// redundant write-ahead recovery stage could not be proven exact.
+    pub fn recovery_cleanup_incomplete(
+        alias: &str,
+        recovery_path: Option<&std::path::Path>,
+        cause: &anyhow::Error,
+    ) -> Self {
+        let recovery = recovery_path.map_or_else(
+            || {
+                " The original recovery file could not be rebound to its exact file identity, so no path is claimed for it."
+                    .to_string()
+            },
+            |path| {
+                format!(
+                    " The exact redundant recovery file is still present at {}.",
+                    path.display()
+                )
+            },
+        );
+        Self {
+            summary: "recovery cleanup incomplete".to_string(),
+            detail: format!(
+                "[{alias}] refreshed credentials were durably committed to the profile and any required live Codex auth update completed, but exact cleanup of the write-ahead recovery stage failed: {cause:#}.{recovery} No additional token was spent. Resolve the reported local path problem before deleting any recovery file manually."
             ),
         }
     }
@@ -712,6 +749,22 @@ impl UsageError {
                  {cause:#}. The exact rotated credentials were preserved privately at {}. \
                  The existing profile and live Codex auth were left unchanged; inspect the \
                  account mismatch before recovering or retrying.",
+                path.display()
+            ),
+        }
+    }
+
+    /// A validated rotation is durable in the private recovery area, but a
+    /// local operational failure prevented any profile replacement.
+    pub fn rotated_credentials_recovery_preserved(
+        alias: &str,
+        path: &std::path::Path,
+        cause: &anyhow::Error,
+    ) -> Self {
+        Self {
+            summary: "rotated credentials preserved for recovery".to_string(),
+            detail: format!(
+                "[{alias}] token refresh succeeded and the exact rotated credentials were preserved privately at {}, but the profile commit was stopped before replacement: {cause:#}. The existing profile and live Codex auth were left unchanged; fix the reported local problem and inspect the named recovery file before retrying.",
                 path.display()
             ),
         }
@@ -741,13 +794,15 @@ impl UsageError {
 
     /// A different writer replaced the profile credential while this refresh
     /// was in flight, so the compare-and-swap deliberately preserved it.
-    pub fn token_update_superseded(alias: &str) -> Self {
+    pub fn token_update_superseded(alias: &str, recovery_path: &std::path::Path) -> Self {
         Self {
             summary: "refreshed token superseded".to_string(),
             detail: format!(
                 "[{alias}] the saved credential changed while token refresh was in progress. \
                  The refreshed response was not installed because overwriting the newer \
-                 credential would be unsafe; this request was stopped."
+                 credential would be unsafe. The exact rotated response was preserved privately \
+                 at {}; this request was stopped.",
+                recovery_path.display()
             ),
         }
     }
@@ -768,6 +823,37 @@ pub struct TokenPersistFailure {
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.detail)
+    }
+}
+
+#[cfg(test)]
+mod usage_error_tests {
+    use super::UsageError;
+
+    #[test]
+    fn cleanup_only_failure_reports_committed_credentials_and_only_an_exact_path() {
+        let path = std::path::Path::new("recovery/owned.json");
+        let error = UsageError::recovery_cleanup_incomplete(
+            "alice",
+            Some(path),
+            &anyhow::anyhow!("exact removal refused"),
+        );
+        assert_eq!(error.summary, "recovery cleanup incomplete");
+        assert!(error.detail.contains("durably committed"));
+        assert!(error.detail.contains("recovery/owned.json"));
+        assert!(
+            !error
+                .detail
+                .contains("commit or live Codex auth synchronization could not")
+        );
+
+        let unbound = UsageError::recovery_cleanup_incomplete(
+            "alice",
+            None,
+            &anyhow::anyhow!("path identity changed"),
+        );
+        assert!(unbound.detail.contains("no path is claimed"));
+        assert!(!unbound.detail.contains("recovery/owned.json"));
     }
 }
 

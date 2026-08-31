@@ -1648,12 +1648,26 @@ pub(crate) enum RefreshTokenUpdate {
     Saved,
     /// Another credential replaced the token presented to the auth server.
     /// Refusing to overwrite it preserves the newer writer.
-    Superseded,
+    Superseded { recovery_path: PathBuf },
     /// The refreshed credential is already visible in the profile, but either
     /// its directory durability or the subsequent live-auth activation could
     /// not be confirmed. The caller must stop without spending another
     /// single-use refresh token and surface `cause` as a partial commit.
-    SavedWithActivationIncomplete { cause: anyhow::Error },
+    SavedWithCommitIncomplete {
+        recovery_path: Option<PathBuf>,
+        cause: anyhow::Error,
+    },
+    /// The refreshed credential is durably committed to the profile and, when
+    /// applicable, live Codex auth. Only exact cleanup of its now-redundant
+    /// recovery stage is incomplete.
+    SavedWithCleanupIncomplete {
+        recovery_path: Option<PathBuf>,
+        cause: anyhow::Error,
+    },
+    /// The rotated credential passed response validation and remains durably
+    /// staged, but a local operational failure stopped profile commit before
+    /// the saved credential was replaced.
+    RecoveryPreserved { path: PathBuf, cause: anyhow::Error },
     /// The auth server rotated the single-use token, but the returned
     /// credentials failed a local account/policy invariant. They were not
     /// installed into the profile or live auth; the exact response was instead
@@ -1667,9 +1681,78 @@ pub(crate) enum RefreshTokenUpdate {
 pub(crate) struct FreshCredentialsActivationAuthorization {
     alias: String,
     expected_live: Option<Vec<u8>>,
+    expected_current_marker: Option<String>,
     activate_live: bool,
     expected_identity: AccountIdentity,
     expected_profile: serde_json::Value,
+}
+
+enum FreshLiveActivationPlan {
+    Skip,
+    Activate { expected_live: Option<Vec<u8>> },
+    Incomplete(anyhow::Error),
+}
+
+fn plan_fresh_live_activation(
+    alias: &str,
+    authorization: &FreshCredentialsActivationAuthorization,
+    pre_refresh_profile: &serde_json::Value,
+) -> FreshLiveActivationPlan {
+    let current = match read_current_checked() {
+        Ok(current) => current,
+        Err(cause) => {
+            return FreshLiveActivationPlan::Incomplete(cause.context(format!(
+                "refreshed profile '{alias}' can be made durable, but its active marker could not be revalidated before live-auth activation"
+            )));
+        }
+    };
+
+    if authorization.activate_live && current == authorization.expected_current_marker {
+        return FreshLiveActivationPlan::Activate {
+            expected_live: authorization.expected_live.clone(),
+        };
+    }
+
+    if current.as_deref() != Some(alias) {
+        return FreshLiveActivationPlan::Skip;
+    }
+
+    let live_path = match codex_auth_path() {
+        Ok(path) => path,
+        Err(cause) => return FreshLiveActivationPlan::Incomplete(cause),
+    };
+    let current_live = match snapshot_optional_file(&live_path) {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return FreshLiveActivationPlan::Incomplete(anyhow::anyhow!(
+                "profile '{alias}' became active while its refresh was in flight, but live auth is absent; the refreshed profile will be saved without recreating live auth"
+            ));
+        }
+        Err(cause) => {
+            return FreshLiveActivationPlan::Incomplete(cause.context(format!(
+                "profile '{alias}' became active while its refresh was in flight, but its exact live-auth snapshot could not be read"
+            )));
+        }
+    };
+    let live: serde_json::Value = match serde_json::from_slice(&current_live) {
+        Ok(live) => live,
+        Err(cause) => {
+            return FreshLiveActivationPlan::Incomplete(anyhow::Error::new(cause).context(
+                format!(
+                    "profile '{alias}' became active while its refresh was in flight, but live auth is not valid JSON"
+                ),
+            ));
+        }
+    };
+    if &live != pre_refresh_profile {
+        return FreshLiveActivationPlan::Incomplete(anyhow::anyhow!(
+            "profile '{alias}' became active while its refresh was in flight, but live auth is not the exact pre-refresh credential; the foreign or newer live credential was not overwritten"
+        ));
+    }
+
+    FreshLiveActivationPlan::Activate {
+        expected_live: Some(current_live),
+    }
 }
 
 pub(crate) fn authorize_fresh_credentials_activation(
@@ -1684,6 +1767,7 @@ pub(crate) fn authorize_fresh_credentials_activation(
         format!("profile '{alias}' cannot safely authorize a single-use token refresh")
     })?;
     let expected_live = snapshot_optional_file(&codex_auth_path()?)?;
+    let expected_current_marker = read_current_checked()?;
     let activate_live = match expected_live.as_deref() {
         Some(snapshot) => live_snapshot_belongs_to_auth_value_locked(alias, &profile, snapshot)?,
         None => false,
@@ -1691,6 +1775,7 @@ pub(crate) fn authorize_fresh_credentials_activation(
     Ok(FreshCredentialsActivationAuthorization {
         alias: alias.to_string(),
         expected_live,
+        expected_current_marker,
         activate_live,
         expected_identity,
         expected_profile: profile,
@@ -1707,10 +1792,87 @@ fn quarantine_refreshed_credentials(
             "refreshed credentials for profile '{alias}' were rejected, but their recovery copy could not be preserved"
         )
     })?;
-    Ok(RefreshTokenUpdate::Quarantined {
+    Ok(quarantine_staged_refresh(stage, cause))
+}
+
+fn quarantine_staged_refresh(
+    stage: RotationRecoveryStage,
+    cause: anyhow::Error,
+) -> RefreshTokenUpdate {
+    RefreshTokenUpdate::Quarantined {
         path: stage.path,
         cause,
+    }
+}
+
+fn preserve_staged_refresh(
+    stage: RotationRecoveryStage,
+    cause: anyhow::Error,
+) -> RefreshTokenUpdate {
+    RefreshTokenUpdate::RecoveryPreserved {
+        path: stage.path,
+        cause,
+    }
+}
+
+/// Infallible, timestamp-free copy of the successor material returned by a
+/// successful refresh response. This is the first write-ahead value: it must be
+/// durable before `apply_tokens` performs clock-dependent local transformation.
+fn raw_refresh_rotation_material(
+    alias: &str,
+    id_token: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "recovery_kind": "validated_token_refresh_response",
+        "profile_alias": alias,
+        "id_token": id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
     })
+}
+
+fn exact_recovery_path_after_cleanup_failure(
+    path: &Path,
+    expected: &crate::fs_ops::FileToken,
+    cleanup: anyhow::Error,
+) -> (Option<PathBuf>, anyhow::Error) {
+    match crate::fs_ops::token_if_present(path) {
+        Ok(Some(observed)) if &observed == expected => (Some(path.to_path_buf()), cleanup),
+        Ok(_) => (None, cleanup),
+        Err(observation) => (
+            None,
+            anyhow::anyhow!(
+                "exact recovery-stage cleanup failed ({cleanup:#}) and the path could not be rebound to its original file identity ({observation:#})"
+            ),
+        ),
+    }
+}
+
+fn displaced_stage_cleanup_incomplete(
+    path: &Path,
+    expected: &crate::fs_ops::FileToken,
+    cleanup: anyhow::Error,
+) -> anyhow::Error {
+    match crate::fs_ops::token_if_present(path) {
+        Ok(Some(observed)) if &observed == expected => anyhow::anyhow!(
+            "cleanup of the exact previous recovery stage is incomplete ({cleanup:#}); that exact stage remains at {}",
+            path.display()
+        ),
+        Ok(Some(_)) => anyhow::anyhow!(
+            "cleanup of the exact previous recovery stage is incomplete ({cleanup:#}); {} now belongs to a different file, so no previous-stage ownership is claimed there",
+            path.display()
+        ),
+        Ok(None) => anyhow::anyhow!(
+            "cleanup of the exact previous recovery stage is incomplete ({cleanup:#}); {} is no longer present, but removal durability was not confirmed",
+            path.display()
+        ),
+        Err(observation) => anyhow::anyhow!(
+            "cleanup of the exact previous recovery stage is incomplete ({cleanup:#}); {} could not be revalidated, so no previous-stage ownership is claimed there ({observation:#})",
+            path.display()
+        ),
+    }
 }
 
 /// Preserve an invalid refresh response after the server returned a non-empty
@@ -1741,15 +1903,24 @@ pub(crate) fn quarantine_invalid_refresh_response_leased(
     quarantine_refreshed_credentials(alias, recovery, cause)
 }
 
-fn update_profile_tokens_if_refresh_matches_after_lock(
+struct RefreshCommitHooks<AfterLock, BeforeCleanup> {
+    after_lock: AfterLock,
+    before_cleanup: BeforeCleanup,
+}
+
+fn update_profile_tokens_if_refresh_matches_after_lock<AfterLock, BeforeCleanup>(
     lease: &ProfileLease,
     authorization: FreshCredentialsActivationAuthorization,
     presented_refresh_token: &str,
     id_token: &str,
     access_token: &str,
     new_refresh_token: &str,
-    after_lock: impl FnOnce(),
-) -> Result<RefreshTokenUpdate> {
+    hooks: RefreshCommitHooks<AfterLock, BeforeCleanup>,
+) -> Result<RefreshTokenUpdate>
+where
+    AfterLock: FnOnce(),
+    BeforeCleanup: FnOnce(),
+{
     let alias = lease.alias();
     validate_alias(alias)?;
     if authorization.alias != alias {
@@ -1759,10 +1930,84 @@ fn update_profile_tokens_if_refresh_matches_after_lock(
         );
     }
     crate::auth::validate_complete_oauth_tokens(id_token, access_token, new_refresh_token)?;
-    let profile_path = profile_auth_path(alias)?;
-    let profile = read_auth(&profile_path)?;
+
+    let raw_rotation =
+        raw_refresh_rotation_material(alias, id_token, access_token, new_refresh_token);
+    let mut stage = stage_refresh_rotation(alias, &raw_rotation).with_context(|| {
+        format!(
+            "refreshed credentials for profile '{alias}' could not be preserved before local credential transformation"
+        )
+    })?;
+    let mut staged_value = authorization.expected_profile.clone();
+    if let Err(cause) =
+        crate::auth::apply_tokens(&mut staged_value, id_token, access_token, new_refresh_token)
+    {
+        return Ok(preserve_staged_refresh(
+            stage,
+            cause.context(format!(
+                "refreshed credentials for profile '{alias}' were preserved, but local credential transformation failed"
+            )),
+        ));
+    }
+    if let Err(cause) = stage.persist(&staged_value) {
+        return Ok(preserve_staged_refresh(
+            stage,
+            cause.context(format!(
+                "refreshed credentials for profile '{alias}' were preserved, but the complete local credential could not replace their raw recovery material"
+            )),
+        ));
+    }
+
+    let _transaction = match lock_auth_transaction() {
+        Ok(transaction) => transaction,
+        Err(cause) => {
+            return Ok(preserve_staged_refresh(
+                stage,
+                cause.context(format!(
+                    "refreshed credentials for profile '{alias}' were preserved, but the legacy-compatible auth transaction could not be acquired before profile commit"
+                )),
+            ));
+        }
+    };
+    (hooks.after_lock)();
+
+    if refresh_token(&authorization.expected_profile) != Some(presented_refresh_token) {
+        return Ok(quarantine_staged_refresh(
+            stage,
+            anyhow::anyhow!(
+                "the pre-request authorization did not contain the refresh token presented to the server"
+            ),
+        ));
+    }
+    if let Err(cause) = ensure_account_identity_matches(
+        alias,
+        &authorization.expected_identity,
+        &extract_identity(&staged_value),
+    ) {
+        return Ok(quarantine_staged_refresh(
+            stage,
+            cause.context("the refresh endpoint returned credentials for another account"),
+        ));
+    }
+    if let Err(cause) = crate::auth::validate_managed_auth_value(&staged_value) {
+        return Ok(quarantine_staged_refresh(
+            stage,
+            cause.context("the refreshed credentials violate the managed account policy"),
+        ));
+    }
+
+    let profile_path = match profile_auth_path(alias) {
+        Ok(path) => path,
+        Err(cause) => return Ok(preserve_staged_refresh(stage, cause)),
+    };
+    let profile = match read_auth(&profile_path) {
+        Ok(profile) => profile,
+        Err(cause) => return Ok(preserve_staged_refresh(stage, cause)),
+    };
     if refresh_token(&profile) != Some(presented_refresh_token) {
-        return Ok(RefreshTokenUpdate::Superseded);
+        return Ok(RefreshTokenUpdate::Superseded {
+            recovery_path: stage.path,
+        });
     }
 
     if let Err(cause) = ensure_account_identity_matches(
@@ -1770,65 +2015,95 @@ fn update_profile_tokens_if_refresh_matches_after_lock(
         &authorization.expected_identity,
         &extract_identity(&profile),
     ) {
-        let mut recovered = authorization.expected_profile.clone();
-        crate::auth::apply_tokens(&mut recovered, id_token, access_token, new_refresh_token)?;
-        return quarantine_refreshed_credentials(
-            alias,
-            &recovered,
+        return Ok(quarantine_staged_refresh(
+            stage,
             cause.context(
                 "the profile changed account identity while its token refresh was in flight",
             ),
-        );
+        ));
     }
 
     let mut updated = profile.clone();
-    crate::auth::apply_tokens(&mut updated, id_token, access_token, new_refresh_token)?;
+    if let Err(cause) =
+        crate::auth::apply_tokens(&mut updated, id_token, access_token, new_refresh_token)
+    {
+        return Ok(preserve_staged_refresh(stage, cause));
+    }
     if let Err(cause) = ensure_account_identity_matches(
         alias,
         &authorization.expected_identity,
         &extract_identity(&updated),
     ) {
-        return quarantine_refreshed_credentials(
-            alias,
-            &updated,
+        return Ok(quarantine_staged_refresh(
+            stage,
             cause.context("the refresh endpoint returned credentials for another account"),
-        );
+        ));
     }
     if let Err(cause) = crate::auth::validate_managed_auth_value(&updated) {
-        return quarantine_refreshed_credentials(
-            alias,
-            &updated,
+        return Ok(quarantine_staged_refresh(
+            stage,
             cause.context("the refreshed credentials violate the managed account policy"),
-        );
+        ));
     }
-    let profile_write = write_auth(&profile_path, &updated)?;
+    let live_activation = plan_fresh_live_activation(alias, &authorization, &profile);
+    if updated != staged_value
+        && let Err(cause) = stage.persist(&updated)
+    {
+        return Ok(preserve_staged_refresh(
+            stage,
+            cause.context("updating the recovery stage with the final profile credential"),
+        ));
+    }
+    let profile_write = match write_auth(&profile_path, &updated) {
+        Ok(outcome) => outcome,
+        Err(cause) => return Ok(preserve_staged_refresh(stage, cause)),
+    };
     if let Err(cause) = require_durable_private_write(
         &profile_path,
         "refreshed profile credentials",
         profile_write,
     ) {
-        return Ok(RefreshTokenUpdate::SavedWithActivationIncomplete { cause });
+        return Ok(RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path: Some(stage.path),
+            cause,
+        });
     }
-    if !authorization.activate_live {
-        return Ok(RefreshTokenUpdate::Saved);
-    }
-    let _transaction = match lock_auth_transaction() {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            return Ok(RefreshTokenUpdate::SavedWithActivationIncomplete {
-                cause: error.context(format!(
-                    "new credentials are preserved in profile '{alias}', but the live-auth transaction could not be acquired"
-                )),
-            });
+
+    let activation_error = match live_activation {
+        FreshLiveActivationPlan::Skip => None,
+        FreshLiveActivationPlan::Activate { expected_live } => {
+            commit_fresh_credentials_activation(alias, &updated, expected_live.as_deref()).err()
         }
+        FreshLiveActivationPlan::Incomplete(cause) => Some(cause),
     };
-    after_lock();
-    if let Err(error) =
-        commit_fresh_credentials_activation(alias, &updated, authorization.expected_live.as_deref())
-    {
-        return Ok(RefreshTokenUpdate::SavedWithActivationIncomplete { cause: error });
+
+    (hooks.before_cleanup)();
+    let cleanup_error = crate::auth::remove_bound_path(&stage.path, &stage.token)
+        .err()
+        .map(|cause| exact_recovery_path_after_cleanup_failure(&stage.path, &stage.token, cause));
+    match (activation_error, cleanup_error) {
+        (None, None) => Ok(RefreshTokenUpdate::Saved),
+        (Some(cause), None) => Ok(RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path: None,
+            cause,
+        }),
+        (None, Some((recovery_path, cause))) => {
+            Ok(RefreshTokenUpdate::SavedWithCleanupIncomplete {
+                recovery_path,
+                cause: cause.context(
+                    "the refreshed credential commit completed, but its exact recovery stage could not be removed",
+                ),
+            })
+        }
+        (Some(activation), Some((recovery_path, cleanup))) => {
+            Ok(RefreshTokenUpdate::SavedWithCommitIncomplete {
+                recovery_path,
+                cause: anyhow::anyhow!(
+                    "live-auth activation failed ({activation:#}) and exact recovery-stage cleanup also failed ({cleanup:#})"
+                ),
+            })
+        }
     }
-    Ok(RefreshTokenUpdate::Saved)
 }
 
 pub(crate) fn update_profile_tokens_if_refresh_matches_leased(
@@ -1846,24 +2121,58 @@ pub(crate) fn update_profile_tokens_if_refresh_matches_leased(
         id_token,
         access_token,
         new_refresh_token,
-        || {},
+        RefreshCommitHooks {
+            after_lock: || {},
+            before_cleanup: || {},
+        },
     )
 }
 
-/// Stable account ownership captured before an interactive re-login begins.
-///
-/// It intentionally retains no credentials. The caller may release the profile
-/// lease while waiting for OAuth, then must consume this value under a newly
-/// acquired lease before replacing anything.
+/// Stable ownership proof captured before an interactive re-login begins.
+/// Complete identities keep the existing strict binding behavior. A legacy
+/// incomplete profile instead retains only its exact file token and known
+/// identity components; replacing it requires explicit caller confirmation and
+/// a durable archive of the old credential.
+#[derive(Debug)]
+enum ProfileReauthProof {
+    Strict(StrictAccountBinding),
+    Incomplete {
+        identity: AccountIdentity,
+        file_token: crate::fs_ops::FileToken,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct PreparedProfileReauth {
     alias: String,
-    binding: StrictAccountBinding,
+    proof: ProfileReauthProof,
 }
 
 impl PreparedProfileReauth {
-    pub(crate) fn email(&self) -> &str {
-        &self.binding.email
+    pub(crate) fn email(&self) -> Option<&str> {
+        match &self.proof {
+            ProfileReauthProof::Strict(binding) => Some(&binding.email),
+            ProfileReauthProof::Incomplete { identity, .. } => identity.email.as_deref(),
+        }
+    }
+
+    pub(crate) fn requires_recoverable_replacement(&self) -> bool {
+        matches!(self.proof, ProfileReauthProof::Incomplete { .. })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ProfileReauthOutcome {
+    Reauthorized,
+    RecoveredIncomplete { archive_path: PathBuf },
+}
+
+impl ProfileReauthOutcome {
+    pub(crate) fn archive_path(&self) -> Option<&Path> {
+        match self {
+            Self::Reauthorized => None,
+            Self::RecoveredIncomplete { archive_path } => Some(archive_path),
+        }
     }
 }
 
@@ -1874,44 +2183,139 @@ pub(crate) fn prepare_profile_reauth_with_lease(
     let profile_path = profile_auth_path(alias)?;
     let existing = read_existing_auth(&profile_path)?
         .ok_or_else(|| anyhow::Error::from(CsError::NotFound(alias.to_string())))?;
-    let binding = crate::auth::account_info_from_auth_value(&existing)
-        .strict_binding()
-        .with_context(|| {
-            format!(
-                "profile '{alias}' must contain both account_id and email before re-login can begin"
-            )
-        })?;
+    let identity = extract_identity(&existing);
+    let proof = match crate::auth::account_info_from_auth_value(&existing).strict_binding() {
+        Some(binding) => ProfileReauthProof::Strict(binding),
+        None => ProfileReauthProof::Incomplete {
+            identity,
+            file_token: crate::fs_ops::token_for_path(&profile_path)
+                .with_context(|| format!("binding incomplete profile '{alias}' before re-login"))?,
+        },
+    };
     Ok(PreparedProfileReauth {
         alias: alias.to_string(),
-        binding,
+        proof,
     })
 }
 
-fn replace_profile_auth_and_live_from_existing(
+fn ensure_known_identity_components_match(
+    alias: &str,
+    known: &AccountIdentity,
+    incoming: &AccountIdentity,
+) -> Result<()> {
+    require_complete_account_identity(alias, incoming)?;
+    if known
+        .account_id
+        .as_deref()
+        .is_some_and(|account_id| incoming.account_id.as_deref() != Some(account_id))
+        || known
+            .email
+            .as_deref()
+            .is_some_and(|email| incoming.email.as_deref() != Some(email))
+    {
+        anyhow::bail!(
+            "authenticated account does not match the known identity fields of legacy profile '{alias}'"
+        );
+    }
+    Ok(())
+}
+
+fn deleted_profile_archive_path(alias: &str) -> Result<PathBuf> {
+    validate_alias(alias)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    Ok(deleted_profiles_dir()?.join(format!("{alias}.backup-{timestamp}")))
+}
+
+fn archive_profile_credentials_exact(
+    alias: &str,
+    profile_path: &Path,
+    expected: &crate::fs_ops::FileToken,
+) -> Result<PathBuf> {
+    let deleted_dir = deleted_profiles_dir()?;
+    ensure_private_dir(&deleted_dir)?;
+    let archive_dir = deleted_profile_archive_path(alias)?;
+    std::fs::create_dir(&archive_dir).with_context(|| {
+        format!(
+            "reserving a recoverable archive for profile '{alias}' at {}",
+            archive_dir.display()
+        )
+    })?;
+    ensure_private_dir(&archive_dir)?;
+    #[cfg(unix)]
+    crate::auth::confirm_namespace_durability(&archive_dir)?;
+
+    let archive_auth = archive_dir.join("auth.json");
+    let creation = crate::fs_ops::create_exclusive_copy(profile_path, &archive_auth, expected)
+        .with_context(|| {
+            format!(
+                "archiving the exact previous credentials for profile '{alias}' at {}",
+                archive_auth.display()
+            )
+        })?;
+    if matches!(
+        creation,
+        crate::fs_ops::CreateExactOutcome::CreatedNamespaceDurabilityUnconfirmed(_)
+    ) {
+        #[cfg(unix)]
+        crate::auth::confirm_namespace_durability(&archive_auth).with_context(|| {
+            format!(
+                "confirming the previous credential archive for profile '{alias}' at {}",
+                archive_auth.display()
+            )
+        })?;
+        #[cfg(windows)]
+        anyhow::bail!(
+            "Windows exact archive creation at {} returned an unsupported Unix-only durability outcome",
+            archive_auth.display()
+        );
+    }
+    #[cfg(windows)]
+    crate::auth::harden_windows_private_file(&archive_auth)?;
+    Ok(archive_dir)
+}
+
+fn replace_strict_profile_auth_and_live(
     lease: &ProfileLease,
-    existing: &serde_json::Value,
+    expected_binding: &StrictAccountBinding,
     val: &serde_json::Value,
 ) -> Result<()> {
     let alias = lease.alias();
-    let profile_path = profile_auth_path(alias)?;
     crate::auth::validate_managed_auth_value(val)?;
-    ensure_same_account_identity(alias, existing, val)?;
-    write_profile_auth_durably(alias, &profile_path, val)?;
     let _transaction = lock_auth_transaction().with_context(|| {
         format!(
-            "new credentials are preserved in profile '{alias}', but the live-auth transaction could not be acquired"
+            "the live-auth transaction could not be acquired before replacing profile '{alias}'"
         )
     })?;
+    let profile_path = profile_auth_path(alias)?;
+    let existing = read_existing_auth(&profile_path)?
+        .ok_or_else(|| anyhow::Error::from(CsError::NotFound(alias.to_string())))?;
+    let current_binding = crate::auth::account_info_from_auth_value(&existing)
+        .strict_binding()
+        .with_context(|| {
+            format!(
+                "profile '{alias}' no longer contains the complete account identity authorized before re-login"
+            )
+        })?;
+    anyhow::ensure!(
+        &current_binding == expected_binding,
+        "profile '{alias}' changed account identity while re-login was in progress"
+    );
+    ensure_same_account_identity(alias, &existing, val)?;
     let live_snapshot = snapshot_optional_file(&codex_auth_path()?)?;
-    let active = match live_snapshot.as_deref() {
-        Some(snapshot) => live_snapshot_belongs_to_auth_value_locked(alias, existing, snapshot),
+    let was_active = match live_snapshot.as_deref() {
+        Some(snapshot) => live_snapshot_belongs_to_auth_value_locked(alias, &existing, snapshot),
         None => Ok(false),
-    };
-    if active.with_context(|| {
+    }
+    .with_context(|| {
         format!(
-            "new credentials are preserved in profile '{alias}', but determining whether live auth also needed replacement failed"
+            "determining whether live auth also needs replacement failed before profile '{alias}' was changed"
         )
-    })? {
+    })?;
+    write_profile_auth_durably(alias, &profile_path, val)?;
+    if was_active {
         commit_fresh_credentials_activation(alias, val, live_snapshot.as_deref())?;
     } else if read_current_checked()
         .with_context(|| {
@@ -1932,13 +2336,15 @@ fn replace_profile_auth_and_live_from_existing(
 }
 
 /// Commit a re-login after the interactive OAuth wait no longer owns the
-/// profile lease. Both the current saved owner and the incoming account must
-/// still match the exact identity captured before that wait.
+/// profile lease. A complete profile must retain its strict identity. An
+/// incomplete legacy profile must retain its exact file identity, match every
+/// known identity component, and be archived before explicit replacement.
 pub(crate) fn commit_prepared_profile_reauth_with_lease(
     prepared: PreparedProfileReauth,
     lease: &ProfileLease,
     val: &serde_json::Value,
-) -> Result<()> {
+    allow_recoverable_replacement: bool,
+) -> Result<ProfileReauthOutcome> {
     anyhow::ensure!(
         lease.alias() == prepared.alias,
         "re-login for '{}' received profile lease for '{}'",
@@ -1946,21 +2352,93 @@ pub(crate) fn commit_prepared_profile_reauth_with_lease(
         lease.alias()
     );
     let alias = lease.alias();
-    let profile_path = profile_auth_path(alias)?;
-    let existing = read_existing_auth(&profile_path)?
-        .ok_or_else(|| anyhow::Error::from(CsError::NotFound(alias.to_string())))?;
-    let current_binding = crate::auth::account_info_from_auth_value(&existing)
-        .strict_binding()
-        .with_context(|| {
-            format!(
-                "profile '{alias}' no longer contains the complete account identity authorized before re-login"
-            )
-        })?;
-    anyhow::ensure!(
-        current_binding == prepared.binding,
-        "profile '{alias}' changed account identity while re-login was in progress"
-    );
-    replace_profile_auth_and_live_from_existing(lease, &existing, val)
+    match prepared.proof {
+        ProfileReauthProof::Strict(binding) => {
+            replace_strict_profile_auth_and_live(lease, &binding, val)?;
+            Ok(ProfileReauthOutcome::Reauthorized)
+        }
+        ProfileReauthProof::Incomplete {
+            identity,
+            file_token,
+        } => {
+            anyhow::ensure!(
+                allow_recoverable_replacement,
+                "profile '{alias}' has incomplete account identity; explicit confirmation is required before its previous credentials can be archived and replaced"
+            );
+            crate::auth::validate_managed_auth_value(val)?;
+            let incoming_identity = extract_identity(val);
+            ensure_known_identity_components_match(alias, &identity, &incoming_identity)?;
+
+            let _transaction = lock_auth_transaction()?;
+            let profile_path = profile_auth_path(alias)?;
+            let current_token =
+                crate::fs_ops::token_for_path(&profile_path).with_context(|| {
+                    format!("revalidating incomplete profile '{alias}' after OAuth")
+                })?;
+            anyhow::ensure!(
+                current_token == file_token,
+                "profile '{alias}' changed while re-login was in progress; its previous credentials were not archived or replaced"
+            );
+            let existing = read_auth(&profile_path)?;
+            anyhow::ensure!(
+                extract_identity(&existing) == identity,
+                "profile '{alias}' changed identity while re-login was in progress; its previous credentials were not archived or replaced"
+            );
+
+            let duplicates = scan_profiles_by_identity(&incoming_identity)?
+                .exact
+                .into_iter()
+                .filter(|existing_alias| existing_alias != alias)
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                duplicates.is_empty(),
+                "authenticated account already belongs to profile(s) {}; legacy profile '{alias}' was not replaced",
+                duplicates.join(", ")
+            );
+
+            let live_snapshot = snapshot_optional_file(&codex_auth_path()?)?;
+            let was_active = match live_snapshot.as_deref() {
+                Some(snapshot) => {
+                    live_snapshot_belongs_to_auth_value_locked(alias, &existing, snapshot)?
+                }
+                None => false,
+            };
+            let archive_path =
+                archive_profile_credentials_exact(alias, &profile_path, &file_token)?;
+            write_profile_auth_durably(alias, &profile_path, val).with_context(|| {
+                format!(
+                    "the previous credentials remain recoverable at {}; profile '{alias}' replacement did not complete",
+                    archive_path.display()
+                )
+            })?;
+            if was_active {
+                commit_fresh_credentials_activation(alias, val, live_snapshot.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "profile '{alias}' was replaced and its previous credentials remain at {}, but live activation did not fully complete",
+                            archive_path.display()
+                        )
+                    })?;
+            } else if read_current_checked()
+                .with_context(|| {
+                    format!(
+                        "profile '{alias}' was replaced and its previous credentials remain at {}, but reading the current marker failed",
+                        archive_path.display()
+                    )
+                })?
+                .as_deref()
+                == Some(alias)
+            {
+                repair_stale_current_marker_locked(alias).with_context(|| {
+                    format!(
+                        "profile '{alias}' was replaced and its previous credentials remain at {}, but repairing its stale current marker failed",
+                        archive_path.display()
+                    )
+                })?;
+            }
+            Ok(ProfileReauthOutcome::RecoveredIncomplete { archive_path })
+        }
+    }
 }
 
 fn find_matching_profiles_for_bytes_checked(target: &[u8]) -> Result<Vec<String>> {
@@ -2431,25 +2909,63 @@ impl SaveAction {
 }
 
 #[derive(Debug)]
-pub(crate) enum RecoveredImportAction {
-    Profile(SaveAction),
-    Quarantined { path: PathBuf, reason: String },
+pub(crate) struct ImportRecoveryCleanupIncomplete {
+    pub(crate) recovery_path: Option<PathBuf>,
+    pub(crate) cause: anyhow::Error,
 }
 
-/// Durable copy of an imported credential after the auth server has consumed
-/// its previous single-use refresh token.
-///
-/// The file lives under the app-owned recovery directory. A successful import
-/// moves this exact file into the chosen profile, while a failed or interrupted
-/// import deliberately leaves it in recovery.
 #[derive(Debug)]
-pub(crate) struct ImportRotationStage {
+pub(crate) struct ImportProfileCommitIncomplete {
+    pub(crate) recovery_path: Option<PathBuf>,
+    pub(crate) cause: anyhow::Error,
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportSaveOutcome {
+    pub(crate) action: SaveAction,
+    pub(crate) profile_commit: Option<ImportProfileCommitIncomplete>,
+    pub(crate) recovery_cleanup: Option<ImportRecoveryCleanupIncomplete>,
+}
+
+enum ImportPromotionOutcome {
+    Durable {
+        recovery_cleanup: Option<ImportRecoveryCleanupIncomplete>,
+    },
+    ProfileCommitIncomplete(ImportProfileCommitIncomplete),
+}
+
+#[derive(Debug)]
+pub(crate) enum ValidatedImportCommit {
+    Profile(ImportSaveOutcome),
+    RecoveryPreserved {
+        recovery_path: Option<PathBuf>,
+        cause: anyhow::Error,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) enum RecoveredImportAction {
+    Profile(ImportSaveOutcome),
+    RecoveryPreserved {
+        recovery_path: Option<PathBuf>,
+        reason: String,
+    },
+}
+
+/// Durable copy of a credential after the auth server has consumed its
+/// previous single-use refresh token.
+///
+/// The file lives under the app-owned recovery directory. A successful
+/// credential commit removes or promotes this exact file, while a failed or
+/// interrupted commit deliberately leaves it in recovery.
+#[derive(Debug)]
+pub(crate) struct RotationRecoveryStage {
     path: PathBuf,
     token: crate::fs_ops::FileToken,
     _directory_guard: crate::auth::PrivateDirectoryGuard,
 }
 
-impl ImportRotationStage {
+impl RotationRecoveryStage {
     pub(crate) fn persist(&mut self, val: &serde_json::Value) -> Result<()> {
         let contents = serde_json::to_vec_pretty(val)
             .context("serializing rotated credentials for recovery")?;
@@ -2500,11 +3016,15 @@ impl ImportRotationStage {
                 );
             }
             if let Err(cleanup) = crate::auth::remove_bound_path(&displaced, &previous_token) {
-                anyhow::bail!(
-                    "latest rotated credentials were committed at {}, but the exact previous stage at {} could not be removed ({cleanup:#}); both were preserved",
-                    previous_path.display(),
-                    displaced.display()
-                );
+                return Err(displaced_stage_cleanup_incomplete(
+                    &displaced,
+                    &previous_token,
+                    cleanup,
+                )
+                .context(format!(
+                    "latest rotated credentials were committed at {}",
+                    previous_path.display()
+                )));
             }
             return Ok(());
         }
@@ -2612,10 +3132,15 @@ fn stage_rotation_candidate(stage_path: &Path, contents: &[u8]) -> Result<ExactR
     })?;
     ensure_private_dir(parent)?;
     let mut candidate = tempfile::Builder::new()
-        .prefix(".rotated-import-candidate-")
+        .prefix(".rotated-credential-candidate-")
         .suffix(".json")
         .tempfile_in(parent)
-        .with_context(|| format!("creating rotated import candidate in {}", parent.display()))?;
+        .with_context(|| {
+            format!(
+                "creating rotated credential candidate in {}",
+                parent.display()
+            )
+        })?;
     #[cfg(windows)]
     crate::auth::harden_windows_private_file(candidate.path())?;
     #[cfg(unix)]
@@ -2654,6 +3179,8 @@ fn stage_rotation_candidate(stage_path: &Path, contents: &[u8]) -> Result<ExactR
 thread_local! {
     static TEST_BEFORE_IMPORT_PROMOTION:
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_BEFORE_IMPORT_RECOVERY_CLEANUP:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -2664,6 +3191,20 @@ fn before_next_import_promotion(action: impl FnOnce() + 'static) {
 #[cfg(test)]
 fn run_before_import_promotion_test_hook() {
     TEST_BEFORE_IMPORT_PROMOTION.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action();
+        }
+    });
+}
+
+#[cfg(test)]
+fn before_next_import_recovery_cleanup(action: impl FnOnce() + 'static) {
+    TEST_BEFORE_IMPORT_RECOVERY_CLEANUP.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+}
+
+#[cfg(test)]
+fn run_before_import_recovery_cleanup_test_hook() {
+    TEST_BEFORE_IMPORT_RECOVERY_CLEANUP.with(|slot| {
         if let Some(action) = slot.borrow_mut().take() {
             action();
         }
@@ -2684,7 +3225,10 @@ fn rotation_displaced_path(stage_path: &Path) -> Result<PathBuf> {
     for _ in 0..UNIQUE_DISPLACED_PATH_ATTEMPTS {
         let mut nonce = [0_u8; 16];
         rand::rng().fill_bytes(&mut nonce);
-        let candidate = parent.join(format!(".rotated-import-displaced-{}", hex::encode(nonce)));
+        let candidate = parent.join(format!(
+            ".rotated-credential-displaced-{}",
+            hex::encode(nonce)
+        ));
         if crate::fs_ops::token_if_present(&candidate)?.is_none() {
             return Ok(candidate);
         }
@@ -2702,6 +3246,8 @@ pub struct ImportSuccess {
     pub action: &'static str,
     pub account: crate::jwt::AccountInfo,
     pub usage: crate::usage::UsageInfo,
+    pub recovery_path: Option<PathBuf>,
+    pub cleanup_warning: Option<String>,
 }
 
 #[derive(Debug)]
@@ -3638,11 +4184,7 @@ pub fn cmd_delete(alias: &str) -> Result<ProfileMutationOutcome> {
     let stale_marker = read_current_checked()?.as_deref() == Some(alias);
     let deleted_dir = deleted_profiles_dir()?;
     ensure_private_dir(&deleted_dir)?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_nanos();
-    let archived = deleted_dir.join(format!("{alias}.backup-{timestamp}"));
+    let archived = deleted_profile_archive_path(alias)?;
     // Cache state is reconstructable; clear it before moving the recoverable
     // profile so a cache write failure cannot leave the command half-deleted.
     crate::cache::purge_profile(alias)?;
@@ -3742,13 +4284,19 @@ pub fn save_imported_auth_value(
     validated_account_id: &str,
     suggested_alias: Option<&str>,
 ) -> Result<SaveAction> {
-    save_imported_auth_value_with_stage(
+    let committed = save_imported_auth_value_with_stage(
         val,
         hint_alias,
         validated_account_id,
         suggested_alias,
         None,
-    )
+    )?;
+    let ValidatedImportCommit::Profile(outcome) = committed else {
+        unreachable!("an import without rotation material cannot preserve a recovery stage")
+    };
+    debug_assert!(outcome.profile_commit.is_none());
+    debug_assert!(outcome.recovery_cleanup.is_none());
+    Ok(outcome.action)
 }
 
 pub(crate) fn save_imported_auth_value_with_stage(
@@ -3756,17 +4304,20 @@ pub(crate) fn save_imported_auth_value_with_stage(
     hint_alias: Option<&str>,
     validated_account_id: &str,
     suggested_alias: Option<&str>,
-    stage: Option<ImportRotationStage>,
-) -> Result<SaveAction> {
-    let _transaction = lock_auth_transaction()?;
-    save_imported_auth_value_with_stage_locked(
-        val,
-        hint_alias,
-        validated_account_id,
-        suggested_alias,
-        stage,
-        None,
-    )
+    stage: Option<RotationRecoveryStage>,
+) -> Result<ValidatedImportCommit> {
+    let result = (|| {
+        let _transaction = lock_auth_transaction()?;
+        save_imported_auth_value_with_stage_locked(
+            val,
+            hint_alias,
+            validated_account_id,
+            suggested_alias,
+            stage.as_ref(),
+            None,
+        )
+    })();
+    classify_validated_import_commit(stage.as_ref(), result)
 }
 
 pub(crate) fn save_reserved_imported_auth_value_with_stage(
@@ -3774,21 +4325,21 @@ pub(crate) fn save_reserved_imported_auth_value_with_stage(
     hint_alias: Option<&str>,
     validated_account_id: &str,
     suggested_alias: Option<&str>,
-    stage: Option<ImportRotationStage>,
+    stage: Option<RotationRecoveryStage>,
     reservation: ImportCredentialReservation,
-) -> Result<SaveAction> {
+) -> Result<ValidatedImportCommit> {
     let result = save_imported_auth_value_with_stage_locked(
         val,
         hint_alias,
         validated_account_id,
         suggested_alias,
-        stage,
+        stage.as_ref(),
         Some(&reservation.profiles),
     );
     // Keep every reserved profile lease and the auth transaction alive through
     // the create-only commit that consumes the retained registry snapshot.
     drop(reservation);
-    result
+    classify_validated_import_commit(stage.as_ref(), result)
 }
 
 fn save_imported_auth_value_with_stage_locked(
@@ -3796,9 +4347,9 @@ fn save_imported_auth_value_with_stage_locked(
     hint_alias: Option<&str>,
     validated_account_id: &str,
     suggested_alias: Option<&str>,
-    stage: Option<ImportRotationStage>,
+    stage: Option<&RotationRecoveryStage>,
     reserved_profiles: Option<&ParsedProfileRegistrySnapshot>,
-) -> Result<SaveAction> {
+) -> Result<ImportSaveOutcome> {
     let identity = extract_identity(val);
     let account_id = identity
         .account_id
@@ -3824,7 +4375,24 @@ fn save_imported_auth_value_with_stage_locked(
         Some(profiles) => refuse_duplicate_import_identity_in_snapshot(&identity, profiles)?,
         None => refuse_duplicate_import_identity(&identity)?,
     }
-    create_import_profile(val, hint_alias, suggested_alias, stage.as_ref())
+    create_import_profile(val, hint_alias, suggested_alias, stage)
+}
+
+fn classify_validated_import_commit(
+    stage: Option<&RotationRecoveryStage>,
+    result: Result<ImportSaveOutcome>,
+) -> Result<ValidatedImportCommit> {
+    match (stage, result) {
+        (_, Ok(outcome)) => Ok(ValidatedImportCommit::Profile(outcome)),
+        (None, Err(cause)) => Err(cause),
+        (Some(stage), Err(cause)) => {
+            let (recovery_path, cause) = classify_import_recovery_after_failure(stage, cause);
+            Ok(ValidatedImportCommit::RecoveryPreserved {
+                recovery_path,
+                cause,
+            })
+        }
+    }
 }
 
 fn refuse_duplicate_import_identity(identity: &AccountIdentity) -> Result<()> {
@@ -3862,7 +4430,7 @@ pub(crate) fn save_recovered_import_auth_value_with_stage(
     val: serde_json::Value,
     hint_alias: Option<&str>,
     suggested_alias: Option<&str>,
-    stage: Option<ImportRotationStage>,
+    stage: Option<RotationRecoveryStage>,
 ) -> Result<RecoveredImportAction> {
     let (current_stage, stale_stage) = match stage {
         Some(stage) => match stage.contains(&val) {
@@ -3904,10 +4472,13 @@ pub(crate) fn save_recovered_import_auth_value_with_stage(
     let _transaction = match lock_auth_transaction() {
         Ok(transaction) => transaction,
         Err(error) => {
-            return Ok(RecoveredImportAction::Quarantined {
-                path: current_stage.path,
+            let (recovery_path, cause) =
+                classify_import_recovery_after_failure(&current_stage, error);
+            return Ok(RecoveredImportAction::RecoveryPreserved {
+                recovery_path,
                 reason: format!(
-                    "the latest rotated credentials are safe, but profile recovery could not acquire the profile-registry transaction: {error:#}"
+                    "profile recovery could not acquire the profile-registry transaction: {:#}",
+                    cause
                 ),
             });
         }
@@ -3927,10 +4498,14 @@ pub(crate) fn save_recovered_import_auth_value_with_stage(
     });
     match profile_result {
         Ok(action) => Ok(action),
-        Err(error) => Ok(RecoveredImportAction::Quarantined {
-            path: current_stage.path,
-            reason: error.to_string(),
-        }),
+        Err(error) => {
+            let (recovery_path, cause) =
+                classify_import_recovery_after_failure(&current_stage, error);
+            Ok(RecoveredImportAction::RecoveryPreserved {
+                recovery_path,
+                reason: format!("{cause:#}"),
+            })
+        }
     }
 }
 
@@ -3946,11 +4521,11 @@ fn remove_stale_import_stage(stale_stage: Option<&(PathBuf, crate::fs_ops::FileT
     }
 }
 
-pub(crate) fn stage_import_rotation(val: &serde_json::Value) -> Result<ImportRotationStage> {
+pub(crate) fn stage_import_rotation(val: &serde_json::Value) -> Result<RotationRecoveryStage> {
     stage_rotation_recovery(val, "rotated-import-")
 }
 
-fn stage_refresh_rotation(alias: &str, val: &serde_json::Value) -> Result<ImportRotationStage> {
+fn stage_refresh_rotation(alias: &str, val: &serde_json::Value) -> Result<RotationRecoveryStage> {
     validate_alias(alias)?;
     stage_rotation_recovery(val, &format!("rotated-refresh-{alias}-"))
 }
@@ -3958,26 +4533,20 @@ fn stage_refresh_rotation(alias: &str, val: &serde_json::Value) -> Result<Import
 fn stage_rotation_recovery(
     val: &serde_json::Value,
     file_prefix: &str,
-) -> Result<ImportRotationStage> {
-    let (path, token, directory_guard) = allocate_rotation_recovery_path(file_prefix)?;
-    let mut stage = ImportRotationStage {
+) -> Result<RotationRecoveryStage> {
+    let contents =
+        serde_json::to_vec_pretty(val).context("serializing rotated credentials for recovery")?;
+    let (path, token, directory_guard) = create_rotation_recovery_file(file_prefix, &contents)?;
+    Ok(RotationRecoveryStage {
         path,
         token,
         _directory_guard: directory_guard,
-    };
-    if let Err(error) = stage.persist(val) {
-        return Err(error).with_context(|| {
-            format!(
-                "the latest rotated credentials require recovery at {}",
-                stage.path().display()
-            )
-        });
-    }
-    Ok(stage)
+    })
 }
 
-fn allocate_rotation_recovery_path(
+fn create_rotation_recovery_file(
     file_prefix: &str,
+    contents: &[u8],
 ) -> Result<(
     PathBuf,
     crate::fs_ops::FileToken,
@@ -4004,26 +4573,38 @@ fn allocate_rotation_recovery_path(
             .as_file()
             .set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    reserved.as_file().sync_all()?;
+    reserved
+        .write_all(contents)
+        .context("writing rotated credentials to their initial recovery file")?;
+    reserved
+        .as_file()
+        .sync_all()
+        .context("synchronizing the initial rotated-credential recovery file")?;
     let token = crate::fs_ops::token_for_file(reserved.as_file_mut())?;
     let (_file, path) = reserved
         .keep()
         .map_err(|error| error.error)
-        .context("preserving the reserved rotated-credential recovery file")?;
+        .context("preserving the written rotated-credential recovery file")?;
     #[cfg(unix)]
     if let Err(durability) = crate::auth::confirm_namespace_durability(&path) {
-        return match crate::auth::remove_bound_path(&path, &token) {
-            Ok(()) => Err(durability).with_context(|| {
-                format!(
-                    "reserved rotated-credential stage {} was not durably created",
-                    path.display()
-                )
-            }),
-            Err(cleanup) => anyhow::bail!(
-                "reserved rotated-credential stage {} was not durably created ({durability:#}) and could not be exactly removed ({cleanup:#}); it was preserved",
+        match crate::fs_ops::token_if_present(&path) {
+            Ok(Some(observed)) if observed == token => anyhow::bail!(
+                "the exact rotated credentials are visible and file-synchronized at {}, but creation of that recovery name is not durably confirmed ({durability:#}); the exact file was left in place and the profile commit was not started",
                 path.display()
             ),
-        };
+            Ok(Some(_)) => anyhow::bail!(
+                "rotated-credential recovery-name durability is unconfirmed ({durability:#}), and {} was replaced before its original file identity could be reported; the profile commit was not started",
+                path.display()
+            ),
+            Ok(None) => anyhow::bail!(
+                "rotated-credential recovery-name durability is unconfirmed ({durability:#}), and the written file at {} is no longer present; the profile commit was not started",
+                path.display()
+            ),
+            Err(observation) => anyhow::bail!(
+                "rotated-credential recovery-name durability is unconfirmed ({durability:#}), and the file identity at {} could not be revalidated ({observation:#}); the profile commit was not started",
+                path.display()
+            ),
+        }
     }
     Ok((path, token, directory_guard))
 }
@@ -4032,8 +4613,8 @@ fn create_import_profile(
     val: &serde_json::Value,
     hint_alias: Option<&str>,
     suggested_alias: Option<&str>,
-    stage: Option<&ImportRotationStage>,
-) -> Result<SaveAction> {
+    stage: Option<&RotationRecoveryStage>,
+) -> Result<ImportSaveOutcome> {
     let registry = ProfileRegistry::open()?;
     let identity = extract_identity(val);
     let alias = hint_alias
@@ -4049,18 +4630,56 @@ fn create_import_profile(
     };
     validate_alias(&alias)?;
 
-    match stage {
-        Some(stage) => promote_import_stage(&alias, val, stage)?,
-        None => write_profile_credentials(&alias, val)?,
+    let (profile_commit, recovery_cleanup) = match stage {
+        Some(stage) => match promote_import_stage(&alias, val, stage)? {
+            ImportPromotionOutcome::Durable { recovery_cleanup } => (None, recovery_cleanup),
+            ImportPromotionOutcome::ProfileCommitIncomplete(incomplete) => (Some(incomplete), None),
+        },
+        None => {
+            write_profile_credentials(&alias, val)?;
+            (None, None)
+        }
+    };
+    Ok(ImportSaveOutcome {
+        action: SaveAction::Created(alias),
+        profile_commit,
+        recovery_cleanup,
+    })
+}
+
+fn classify_import_recovery_after_failure(
+    stage: &RotationRecoveryStage,
+    cause: anyhow::Error,
+) -> (Option<PathBuf>, anyhow::Error) {
+    match crate::fs_ops::token_if_present(stage.path()) {
+        Ok(Some(observed)) if observed == stage.token => (Some(stage.path().to_path_buf()), cause),
+        Ok(_) => (None, cause),
+        Err(observation) => (
+            None,
+            cause.context(format!(
+                "the original recovery stage at {} could not be revalidated ({observation:#})",
+                stage.path().display()
+            )),
+        ),
     }
-    Ok(SaveAction::Created(alias))
+}
+
+fn import_profile_commit_incomplete(
+    stage: &RotationRecoveryStage,
+    cause: anyhow::Error,
+) -> ImportProfileCommitIncomplete {
+    let (recovery_path, cause) = classify_import_recovery_after_failure(stage, cause);
+    ImportProfileCommitIncomplete {
+        recovery_path,
+        cause,
+    }
 }
 
 fn promote_import_stage(
     alias: &str,
     val: &serde_json::Value,
-    stage: &ImportRotationStage,
-) -> Result<()> {
+    stage: &RotationRecoveryStage,
+) -> Result<ImportPromotionOutcome> {
     validate_alias(alias)?;
     crate::auth::validate_managed_auth_value(val)?;
     let staged: serde_json::Value = serde_json::from_slice(&stage.read_exact_bytes()?)
@@ -4097,38 +4716,57 @@ fn promote_import_stage(
     ) {
         #[cfg(unix)]
         if let Err(durability) = crate::auth::confirm_namespace_durability(&destination) {
-            anyhow::bail!(
-                "profile '{}' is visible at {}, but its no-clobber publication is not durably confirmed ({durability:#}); the exact recovery stage was preserved at {}",
-                alias,
-                destination.display(),
-                stage.path().display()
-            );
+            return Ok(ImportPromotionOutcome::ProfileCommitIncomplete(
+                import_profile_commit_incomplete(
+                    stage,
+                    anyhow::anyhow!(
+                        "profile '{alias}' is visible at {}, but its no-clobber publication is not durably confirmed ({durability:#})",
+                        destination.display()
+                    ),
+                ),
+            ));
         }
         #[cfg(windows)]
-        anyhow::bail!(
-            "Windows no-clobber profile publication at {} returned an unsupported Unix-only durability outcome; the exact recovery stage was preserved at {}",
-            destination.display(),
-            stage.path().display()
-        );
+        return Ok(ImportPromotionOutcome::ProfileCommitIncomplete(
+            import_profile_commit_incomplete(
+                stage,
+                anyhow::anyhow!(
+                    "Windows no-clobber profile publication at {} returned an unsupported Unix-only durability outcome",
+                    destination.display()
+                ),
+            ),
+        ));
     }
     #[cfg(windows)]
     if let Err(hardening) = crate::auth::harden_windows_private_file(&destination) {
         return match crate::auth::remove_bound_path(&destination, &destination_token) {
             Ok(()) => Err(hardening)
                 .with_context(|| format!("securing newly-published import profile '{alias}'")),
-            Err(cleanup) => anyhow::bail!(
-                "new import profile '{alias}' could not be secured ({hardening:#}) or exactly removed ({cleanup:#}); it and the recovery stage were preserved"
-            ),
+            Err(cleanup) => Ok(ImportPromotionOutcome::ProfileCommitIncomplete(
+                import_profile_commit_incomplete(
+                    stage,
+                    anyhow::anyhow!(
+                        "new import profile '{alias}' could not be secured ({hardening:#}) or exactly removed ({cleanup:#}); its visible state is incomplete"
+                    ),
+                ),
+            )),
         };
     }
-    if let Err(cleanup) = crate::auth::remove_bound_path(stage.path(), &stage.token) {
-        anyhow::bail!(
-            "profile '{}' was published without replacement, but the exact recovery stage {} could not be removed ({cleanup:#}); both copies were preserved",
-            alias,
-            stage.path().display()
-        );
-    }
-    Ok(())
+    #[cfg(test)]
+    run_before_import_recovery_cleanup_test_hook();
+    let recovery_cleanup = crate::auth::remove_bound_path(stage.path(), &stage.token)
+        .err()
+        .map(|cleanup| {
+            let (recovery_path, cause) =
+                exact_recovery_path_after_cleanup_failure(stage.path(), &stage.token, cleanup);
+            ImportRecoveryCleanupIncomplete {
+                recovery_path,
+                cause: cause.context(format!(
+                    "profile '{alias}' was durably published, but exact cleanup of its recovery stage is incomplete"
+                )),
+            }
+        });
+    Ok(ImportPromotionOutcome::Durable { recovery_cleanup })
 }
 
 pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<ProfileMutationOutcome> {
@@ -4255,8 +4893,13 @@ pub fn rename_profile(old_alias: &str, new_alias: &str) -> Result<ProfileMutatio
 }
 
 pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Result<SaveAction> {
-    crate::auth::validate_managed_auth_value(&val)?;
     let identity = extract_identity(&val);
+    if identity.account_id.is_none() || identity.email.is_none() {
+        anyhow::bail!(
+            "login credentials must contain both a non-empty account_id and email before a profile can be saved"
+        );
+    }
+    crate::auth::validate_managed_auth_value(&val)?;
     let mut plan = plan_profile_write(&identity, hint_alias)?;
     for _ in 0..PROFILE_CONCURRENCY_RETRY_LIMIT {
         let lease = acquire_profile_lease(&plan.alias)?;
@@ -4292,7 +4935,7 @@ pub fn save_auth_value(val: serde_json::Value, hint_alias: Option<&str>) -> Resu
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::MutexGuard;
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -4312,6 +4955,17 @@ mod tests {
         super::read_current_checked()
             .expect("read current profile marker")
             .expect("current profile marker exists")
+    }
+
+    fn recovery_files() -> Vec<PathBuf> {
+        let recovery = crate::auth::app_home().unwrap().join("recovery");
+        match std::fs::read_dir(recovery) {
+            Ok(entries) => entries
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("reading recovery directory failed: {error}"),
+        }
     }
 
     struct TestEnv {
@@ -5002,9 +5656,17 @@ mod tests {
             "a-ref-new",
         )
         .expect("the profile write itself succeeds");
-        let super::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } = update else {
+        let super::RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path,
+            cause,
+        } = update
+        else {
             panic!("the injected marker failure must be reported as a partial activation")
         };
+        assert!(
+            recovery_path.is_none(),
+            "a durable profile no longer needs a duplicate recovery stage"
+        );
         let detail = format!("{cause:#}");
         assert!(detail.contains("was published to live auth"), "{detail}");
         assert!(detail.contains("activation marker failed"), "{detail}");
@@ -5024,6 +5686,7 @@ mod tests {
             );
         }
         assert_eq!(current_alias(), "alice");
+        assert!(recovery_files().is_empty());
     }
 
     #[test]
@@ -5045,7 +5708,11 @@ mod tests {
             "a-ref-new",
         )
         .expect("publication itself is visible and must use a partial outcome");
-        let super::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } = update else {
+        let super::RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path,
+            cause,
+        } = update
+        else {
             panic!("unconfirmed directory durability must never be reported as Saved")
         };
         let detail = format!("{cause:#}");
@@ -5055,6 +5722,106 @@ mod tests {
             profile_refresh_token("alice"),
             "a-ref-new",
             "the visible rotated credential must not be mistaken for an unwritten value"
+        );
+        let recovery_path = recovery_path
+            .expect("unconfirmed profile durability must retain the exact recovery stage");
+        assert_eq!(
+            crate::auth::read_auth(&recovery_path).unwrap()["tokens"]["refresh_token"],
+            "a-ref-new"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_never_reports_a_replacement_as_the_recovery_stage() {
+        let _env = TestEnv::new();
+        let recovery_dir = crate::auth::app_home().unwrap().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        let stage_path = recovery_dir.join("owned-stage.json");
+        std::fs::write(&stage_path, b"owned-stage").unwrap();
+        let stage_token = crate::fs_ops::token_for_path(&stage_path).unwrap();
+
+        std::fs::remove_file(&stage_path).unwrap();
+        std::fs::write(&stage_path, b"foreign-replacement").unwrap();
+        let cleanup = crate::auth::remove_bound_path(&stage_path, &stage_token)
+            .expect_err("exact cleanup must refuse a different file identity");
+        let (reported_path, _) =
+            super::exact_recovery_path_after_cleanup_failure(&stage_path, &stage_token, cleanup);
+
+        assert!(reported_path.is_none());
+        assert_eq!(
+            std::fs::read(&stage_path).unwrap(),
+            b"foreign-replacement",
+            "the replacement must not be removed or described as the rotated credential"
+        );
+    }
+
+    #[test]
+    fn displaced_cleanup_does_not_claim_an_unlinked_stage_was_preserved() {
+        let _env = TestEnv::new();
+        let recovery_dir = crate::auth::app_home().unwrap().join("recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        let displaced = recovery_dir.join("displaced-stage.json");
+        std::fs::write(&displaced, b"previous-stage").unwrap();
+        let displaced_token = crate::fs_ops::token_for_path(&displaced).unwrap();
+        std::fs::remove_file(&displaced).unwrap();
+
+        let error = super::displaced_stage_cleanup_incomplete(
+            &displaced,
+            &displaced_token,
+            anyhow::anyhow!("parent-directory sync failed"),
+        );
+        let detail = format!("{error:#}");
+        assert!(detail.contains("is no longer present"), "{detail}");
+        assert!(
+            detail.contains("removal durability was not confirmed"),
+            "{detail}"
+        );
+        assert!(!detail.contains("both were preserved"), "{detail}");
+    }
+
+    #[test]
+    fn committed_refresh_reports_cleanup_only_failure_without_claiming_a_foreign_path() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        let mut foreign_path = None;
+
+        let update = super::update_profile_tokens_if_refresh_matches_after_lock(
+            &lease,
+            authorization,
+            "a-ref",
+            &make_jwt("alice@example.com", "acct_a"),
+            "a-new",
+            "a-ref-new",
+            super::RefreshCommitHooks {
+                after_lock: || {},
+                before_cleanup: || {
+                    let files = recovery_files();
+                    assert_eq!(files.len(), 1);
+                    std::fs::remove_file(&files[0]).unwrap();
+                    std::fs::write(&files[0], b"foreign-replacement").unwrap();
+                    foreign_path = Some(files[0].clone());
+                },
+            },
+        )
+        .unwrap();
+
+        let super::RefreshTokenUpdate::SavedWithCleanupIncomplete {
+            recovery_path,
+            cause,
+        } = update
+        else {
+            panic!("only exact recovery cleanup should be incomplete")
+        };
+        assert!(recovery_path.is_none());
+        assert!(format!("{cause:#}").contains("credential commit completed"));
+        assert_eq!(profile_refresh_token("alice"), "a-ref-new");
+        let foreign_path = foreign_path.unwrap();
+        assert_eq!(
+            std::fs::read(&foreign_path).unwrap(),
+            b"foreign-replacement"
         );
     }
 
@@ -5084,7 +5851,7 @@ mod tests {
             "a-ref-new",
         )
         .expect("the rotated credential must remain durable in the profile");
-        let super::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } = update else {
+        let super::RefreshTokenUpdate::SavedWithCommitIncomplete { cause, .. } = update else {
             panic!("the changed live snapshot must prevent activation")
         };
         assert!(format!("{cause:#}").contains("live auth changed"));
@@ -5127,6 +5894,172 @@ mod tests {
             Some("active")
         );
         assert_eq!(profile_refresh_token("inactive"), "inactive-ref-new");
+        assert!(recovery_files().is_empty());
+    }
+
+    #[test]
+    fn refresh_updates_live_when_a_legacy_switch_activates_the_profile_in_flight() {
+        let _env = TestEnv::new();
+        let active =
+            realistic_auth_json("active@example.com", "acct_active", "active", "active-ref");
+        let inactive = realistic_auth_json(
+            "inactive@example.com",
+            "acct_inactive",
+            "inactive",
+            "inactive-ref",
+        );
+        seed_profile("active", &active);
+        seed_profile("inactive", &inactive);
+        super::switch_profile("active").unwrap();
+
+        let lease = super::acquire_profile_lease("inactive").unwrap();
+        let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        write_live(&inactive);
+        std::fs::write(super::current_file().unwrap(), b"inactive\n").unwrap();
+
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            authorization,
+            "inactive-ref",
+            &make_jwt("inactive@example.com", "acct_inactive"),
+            "inactive-new",
+            "inactive-ref-new",
+        )
+        .unwrap();
+
+        assert!(matches!(update, super::RefreshTokenUpdate::Saved));
+        assert_eq!(profile_refresh_token("inactive"), "inactive-ref-new");
+        assert_eq!(current_alias(), "inactive");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap()["tokens"]["refresh_token"],
+            "inactive-ref-new"
+        );
+        assert!(recovery_files().is_empty());
+    }
+
+    #[test]
+    fn refresh_updates_live_when_its_missing_active_marker_is_repaired_in_flight() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        super::switch_profile("alice").unwrap();
+        std::fs::remove_file(super::current_file().unwrap()).unwrap();
+
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        super::write_current("alice").unwrap();
+
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            authorization,
+            "a-ref",
+            &make_jwt("alice@example.com", "acct_a"),
+            "a-new",
+            "a-ref-new",
+        )
+        .unwrap();
+
+        assert!(matches!(update, super::RefreshTokenUpdate::Saved));
+        assert_eq!(current_alias(), "alice");
+        assert_eq!(profile_refresh_token("alice"), "a-ref-new");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap()["tokens"]["refresh_token"],
+            "a-ref-new"
+        );
+        assert!(recovery_files().is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_overwrite_nonexact_live_when_profile_becomes_active_in_flight() {
+        let _env = TestEnv::new();
+        let active =
+            realistic_auth_json("active@example.com", "acct_active", "active", "active-ref");
+        let inactive = realistic_auth_json(
+            "inactive@example.com",
+            "acct_inactive",
+            "inactive",
+            "inactive-ref",
+        );
+        let foreign = realistic_auth_json(
+            "foreign@example.com",
+            "acct_foreign",
+            "foreign",
+            "foreign-ref",
+        );
+        seed_profile("active", &active);
+        seed_profile("inactive", &inactive);
+        super::switch_profile("active").unwrap();
+
+        let lease = super::acquire_profile_lease("inactive").unwrap();
+        let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        write_live(&foreign);
+        std::fs::write(super::current_file().unwrap(), b"inactive\n").unwrap();
+
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            authorization,
+            "inactive-ref",
+            &make_jwt("inactive@example.com", "acct_inactive"),
+            "inactive-new",
+            "inactive-ref-new",
+        )
+        .unwrap();
+
+        let super::RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path,
+            cause,
+        } = update
+        else {
+            panic!("a foreign live credential must be preserved and reported")
+        };
+        assert!(recovery_path.is_none());
+        assert!(format!("{cause:#}").contains("not the exact pre-refresh credential"));
+        assert_eq!(profile_refresh_token("inactive"), "inactive-ref-new");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            foreign
+        );
+        assert!(recovery_files().is_empty());
+    }
+
+    #[test]
+    fn refresh_reports_marker_read_failure_after_saving_the_rotated_profile() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        super::switch_profile("alice").unwrap();
+
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        let marker = super::current_file().unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            authorization,
+            "a-ref",
+            &make_jwt("alice@example.com", "acct_a"),
+            "a-new",
+            "a-ref-new",
+        )
+        .unwrap();
+
+        let super::RefreshTokenUpdate::SavedWithCommitIncomplete {
+            recovery_path,
+            cause,
+        } = update
+        else {
+            panic!("marker read failure must be reported as a partial live activation")
+        };
+        assert!(recovery_path.is_none());
+        assert!(format!("{cause:#}").contains("active marker could not be revalidated"));
+        assert_eq!(profile_refresh_token("alice"), "a-ref-new");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            alice
+        );
+        assert!(recovery_files().is_empty());
     }
 
     #[test]
@@ -5158,6 +6091,42 @@ mod tests {
         );
         assert_eq!(current_alias(), "active");
         assert_eq!(profile_refresh_token("duplicate"), "old-ref");
+        assert!(recovery_files().is_empty());
+    }
+
+    #[test]
+    fn refresh_does_not_undo_a_later_switch_between_exact_duplicate_aliases() {
+        let _env = TestEnv::new();
+        let old = realistic_auth_json("same@example.com", "acct_same", "old", "old-ref");
+        seed_profile("refreshing", &old);
+        seed_profile("selected", &old);
+        super::switch_profile("refreshing").unwrap();
+
+        let lease = super::acquire_profile_lease("refreshing").unwrap();
+        let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        super::switch_profile("selected").unwrap();
+        assert_eq!(current_alias(), "selected");
+
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            authorization,
+            "old-ref",
+            &make_jwt("same@example.com", "acct_same"),
+            "new",
+            "new-ref",
+        )
+        .unwrap();
+
+        assert!(matches!(update, super::RefreshTokenUpdate::Saved));
+        assert_eq!(current_alias(), "selected");
+        assert_eq!(profile_refresh_token("refreshing"), "new-ref");
+        assert_eq!(profile_refresh_token("selected"), "old-ref");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            old,
+            "the later explicit selection owns live auth even when both old credential files were byte-identical"
+        );
+        assert!(recovery_files().is_empty());
     }
 
     #[test]
@@ -5250,7 +6219,52 @@ mod tests {
     }
 
     #[test]
-    fn rotated_credentials_are_saved_before_live_auth_lock_acquisition() {
+    fn valid_refresh_material_is_staged_before_local_credential_transformation() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        super::switch_profile("alice").unwrap();
+        let profile_path = super::profile_auth_path("alice").unwrap();
+        let live_path = crate::auth::codex_auth_path().unwrap();
+        let profile_before = std::fs::read(&profile_path).unwrap();
+        let live_before = std::fs::read(&live_path).unwrap();
+
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        let mut authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        authorization.expected_profile["tokens"] = serde_json::json!("invalid-local-shape");
+        let id_token = make_jwt("alice@example.com", "acct_a");
+        let update = super::update_profile_tokens_if_refresh_matches_leased(
+            &lease,
+            authorization,
+            "a-ref",
+            &id_token,
+            "a-new",
+            "a-ref-new",
+        )
+        .expect("the returned successor must survive a local transformation failure");
+
+        let super::RefreshTokenUpdate::RecoveryPreserved { path, cause } = update else {
+            panic!("local transformation failure must preserve raw rotation material")
+        };
+        assert!(
+            format!("{cause:#}").contains("local credential transformation failed"),
+            "{cause:#}"
+        );
+        let recovery = crate::auth::read_auth(&path).unwrap();
+        assert_eq!(
+            recovery["recovery_kind"],
+            "validated_token_refresh_response"
+        );
+        assert_eq!(recovery["profile_alias"], "alice");
+        assert_eq!(recovery["id_token"], id_token);
+        assert_eq!(recovery["access_token"], "a-new");
+        assert_eq!(recovery["refresh_token"], "a-ref-new");
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_before);
+        assert_eq!(std::fs::read(&live_path).unwrap(), live_before);
+    }
+
+    #[test]
+    fn rotated_credentials_are_preserved_when_the_auth_transaction_is_unavailable() {
         let _env = TestEnv::new();
         let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
         seed_profile("alice", &alice);
@@ -5271,12 +6285,12 @@ mod tests {
             "a-new",
             "a-ref-new",
         )
-        .expect("profile persistence must not depend on the live-auth lock");
-        let super::RefreshTokenUpdate::SavedWithActivationIncomplete { cause } = update else {
-            panic!("an unavailable live-auth lock must be a partial activation")
+        .expect("the issued credential must be preserved as a typed recovery outcome");
+        let super::RefreshTokenUpdate::RecoveryPreserved { path, cause } = update else {
+            panic!("an unavailable auth transaction must preserve the staged credential")
         };
         assert!(
-            format!("{cause:#}").contains("live-auth transaction could not be acquired"),
+            format!("{cause:#}").contains("auth transaction could not be acquired"),
             "{cause:#}"
         );
 
@@ -5285,7 +6299,16 @@ mod tests {
             saved
                 .pointer("/tokens/refresh_token")
                 .and_then(serde_json::Value::as_str),
-            Some("a-ref-new")
+            Some("a-ref"),
+            "the profile must not be overwritten outside the compatibility transaction"
+        );
+        let recovered = crate::auth::read_auth(&path).unwrap();
+        assert_eq!(
+            recovered
+                .pointer("/tokens/refresh_token")
+                .and_then(serde_json::Value::as_str),
+            Some("a-ref-new"),
+            "the exact issued credential must remain available for recovery"
         );
         let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
         assert_eq!(
@@ -5294,6 +6317,56 @@ mod tests {
             Some("a-ref"),
             "live auth remains unchanged until its transaction can be acquired"
         );
+    }
+
+    #[test]
+    fn refresh_stages_before_waiting_for_the_auth_transaction_then_commits_exactly() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
+        seed_profile("alice", &alice);
+        super::switch_profile("alice").unwrap();
+        let authorization = {
+            let lease = super::acquire_profile_lease("alice").unwrap();
+            super::authorize_fresh_credentials_activation(&lease).unwrap()
+        };
+        let transaction = super::lock_auth_transaction().unwrap();
+
+        let worker = std::thread::spawn(move || {
+            let lease = super::acquire_profile_lease("alice").unwrap();
+            super::update_profile_tokens_if_refresh_matches_leased(
+                &lease,
+                authorization,
+                "a-ref",
+                &make_jwt("alice@example.com", "acct_a"),
+                "a-new",
+                "a-ref-new",
+            )
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while recovery_files().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "refresh did not stage its consumed response before waiting for the auth transaction"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(profile_refresh_token("alice"), "a-ref");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            alice,
+            "profile and live auth must remain old while the compatibility transaction is held"
+        );
+
+        drop(transaction);
+        let update = worker.join().unwrap().unwrap();
+        assert!(matches!(update, super::RefreshTokenUpdate::Saved));
+        assert_eq!(profile_refresh_token("alice"), "a-ref-new");
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap()["tokens"]["refresh_token"],
+            "a-ref-new"
+        );
+        assert!(recovery_files().is_empty());
     }
 
     #[test]
@@ -5803,7 +6876,7 @@ mod tests {
 
         let reservation = super::reserve_import_credential_for_validation(&incoming).unwrap();
         assert_eq!(super::profile_registry_snapshot_count(), 1);
-        let action = super::save_reserved_imported_auth_value_with_stage(
+        let committed = super::save_reserved_imported_auth_value_with_stage(
             &incoming,
             Some("imported"),
             "acct_import",
@@ -5812,8 +6885,15 @@ mod tests {
             reservation,
         )
         .unwrap();
+        let super::ValidatedImportCommit::Profile(action) = committed else {
+            panic!("an import without rotation material cannot require recovery")
+        };
 
-        assert!(matches!(action, super::SaveAction::Created(ref alias) if alias == "imported"));
+        assert!(
+            matches!(action.action, super::SaveAction::Created(ref alias) if alias == "imported")
+        );
+        assert!(action.profile_commit.is_none());
+        assert!(action.recovery_cleanup.is_none());
         assert_eq!(
             super::profile_registry_snapshot_count(),
             1,
@@ -5924,9 +7004,12 @@ mod tests {
                 &make_jwt("alice@example.com", "acct_a"),
                 "a-new",
                 "a-ref-new",
-                || {
-                    let _ = started_tx.send(());
-                    let _ = continue_rx.recv();
+                super::RefreshCommitHooks {
+                    after_lock: || {
+                        let _ = started_tx.send(());
+                        let _ = continue_rx.recv();
+                    },
+                    before_cleanup: || {},
                 },
             );
             let _ = done_tx.send(result);
@@ -7059,7 +8142,8 @@ mod tests {
         let bob = realistic_auth_json("bob@example.com", "acct_b", "acc_b1", "ref_b1");
         let lease = super::acquire_profile_lease("alice").unwrap();
         let prepared = super::prepare_profile_reauth_with_lease(&lease).unwrap();
-        let result = super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &bob);
+        let result =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &bob, false);
         assert!(result.is_err());
         let saved = crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap();
         assert_eq!(saved["tokens"]["access_token"], "acc_a1");
@@ -7083,7 +8167,7 @@ mod tests {
         .expect("interactive re-login preparation must release the alias lease")
         .unwrap();
 
-        assert_eq!(prepared.email(), "alice@example.com");
+        assert_eq!(prepared.email(), Some("alice@example.com"));
         drop(replacement);
     }
 
@@ -7111,10 +8195,92 @@ mod tests {
         );
 
         let lease = super::acquire_profile_lease("alice").unwrap();
-        super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth).unwrap();
+        super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, false).unwrap();
 
         assert_eq!(profile_access_token("alice"), "oauth-access");
         assert_eq!(profile_refresh_token("alice"), "oauth-refresh");
+    }
+
+    #[test]
+    fn complete_relogin_updates_exact_live_auth_despite_a_stale_marker() {
+        let _env = TestEnv::new();
+        let old = realistic_auth_json("alice@example.com", "acct_a", "old-access", "old-refresh");
+        let bob = realistic_auth_json("bob@example.com", "acct_b", "bob-access", "bob-refresh");
+        seed_profile("alice", &old);
+        seed_profile("bob", &bob);
+        write_live(&old);
+        super::write_current("bob").unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("alice").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("alice").unwrap();
+        super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, false).unwrap();
+
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap(),
+            oauth
+        );
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            oauth
+        );
+        assert_eq!(current_alias(), "alice");
+    }
+
+    #[test]
+    fn strict_relogin_revalidates_the_profile_inside_the_legacy_auth_transaction() {
+        let _env = TestEnv::new();
+        let alice = realistic_auth_json("alice@example.com", "acct_a", "old-access", "old-refresh");
+        seed_profile("alice", &alice);
+        let prepared = {
+            let lease = super::acquire_profile_lease("alice").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+        let transaction = super::lock_auth_transaction().unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            super::notify_on_test_lock_attempt("legacy launch compatibility", attempt_tx);
+            let lease = super::acquire_profile_lease("alice").unwrap();
+            let result =
+                super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, false);
+            let _ = done_tx.send(result);
+        });
+        let mut cleanup = ThreadCleanup::new(transaction);
+        cleanup.push(worker);
+        attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("re-login did not wait for the legacy-compatible auth transaction");
+
+        let rebound = realistic_auth_json("bob@example.com", "acct_b", "bob-access", "bob-refresh");
+        let profile_path = super::profile_auth_path("alice").unwrap();
+        write_auth_durable(&profile_path, &rebound);
+        cleanup.release_blocker();
+
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("re-login did not finish after the auth transaction was released")
+            .expect_err("a legacy identity replacement must win over stale re-login proof");
+        assert!(
+            format!("{error:#}").contains("changed account identity"),
+            "{error:#}"
+        );
+        assert_eq!(crate::auth::read_auth(&profile_path).unwrap(), rebound);
+        cleanup.join_all();
     }
 
     #[test]
@@ -7131,8 +8297,9 @@ mod tests {
         write_auth_durable(&target_path, &rebound);
 
         let lease = super::acquire_profile_lease("target").unwrap();
-        let error = super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &rebound)
-            .expect_err("a rebound alias must not adopt the new owner's OAuth credential");
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &rebound, false)
+                .expect_err("a rebound alias must not adopt the new owner's OAuth credential");
 
         assert!(
             format!("{error:#}").contains("changed account identity"),
@@ -7160,24 +8327,444 @@ mod tests {
         );
 
         let lease = super::acquire_profile_lease("alice").unwrap();
-        let error = super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth)
-            .expect_err("a deleted profile must stay deleted after OAuth");
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, false)
+                .expect_err("a deleted profile must stay deleted after OAuth");
 
         assert!(error.downcast_ref::<crate::error::CsError>().is_some());
         assert!(!profile_path.exists());
     }
 
     #[test]
-    fn prepared_relogin_rejects_incomplete_initial_identity_before_oauth() {
+    fn prepared_relogin_archives_and_recovers_an_incomplete_legacy_identity() {
         let _env = TestEnv::new();
         let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
-        seed_profile("alice", &incomplete);
-        let lease = super::acquire_profile_lease("alice").unwrap();
+        seed_profile("legacy", &incomplete);
+        let original_bytes = std::fs::read(super::profile_auth_path("legacy").unwrap()).unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            let prepared = super::prepare_profile_reauth_with_lease(&lease).unwrap();
+            assert!(prepared.requires_recoverable_replacement());
+            prepared
+        };
+        let oauth = realistic_auth_json(
+            "Alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
 
-        let error = super::prepare_profile_reauth_with_lease(&lease)
-            .expect_err("OAuth must not start without a complete initial binding");
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let outcome =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .unwrap();
+        let archive_path = outcome
+            .archive_path()
+            .expect("legacy recovery must report its exact archive");
 
-        assert!(error.to_string().contains("account_id"), "{error:#}");
+        assert_eq!(
+            crate::auth::read_auth(&archive_path.join("auth.json")).unwrap(),
+            incomplete
+        );
+        assert_eq!(
+            std::fs::read(archive_path.join("auth.json")).unwrap(),
+            original_bytes,
+            "the archive must preserve the exact previous credential bytes"
+        );
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            oauth
+        );
+    }
+
+    #[test]
+    fn incomplete_relogin_requires_explicit_recoverable_replacement_confirmation() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, false)
+                .expect_err("an incomplete profile must not be replaced without confirmation");
+
+        assert!(format!("{error:#}").contains("explicit confirmation"));
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            incomplete
+        );
+        assert!(!super::deleted_profiles_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn incomplete_relogin_updates_exact_active_live_auth_after_archiving() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        write_live(&incomplete);
+        super::write_current("legacy").unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let outcome =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .unwrap();
+
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            oauth
+        );
+        assert_eq!(current_alias(), "legacy");
+        assert_eq!(
+            crate::auth::read_auth(&outcome.archive_path().unwrap().join("auth.json")).unwrap(),
+            incomplete
+        );
+    }
+
+    #[test]
+    fn incomplete_relogin_reports_visible_profile_with_unconfirmed_durability_exactly() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        write_live(&incomplete);
+        super::write_current("legacy").unwrap();
+        let profile_path = super::profile_auth_path("legacy").unwrap();
+        let original_bytes = std::fs::read(&profile_path).unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+        crate::auth::fail_next_private_durability_confirmation();
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .expect_err("visible-but-unconfirmed profile publication must be reported");
+        let archives = std::fs::read_dir(super::deleted_profiles_dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            std::fs::read(archives[0].join("auth.json")).unwrap(),
+            original_bytes
+        );
+        assert_eq!(crate::auth::read_auth(&profile_path).unwrap(), oauth);
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            incomplete,
+            "live auth is not attempted until profile durability is confirmed"
+        );
+        let detail = format!("{error:#}");
+        assert!(detail.contains("replacement did not complete"), "{detail}");
+        assert!(
+            detail.contains("now contains the new credentials"),
+            "{detail}"
+        );
+        assert!(detail.contains("durable commit is incomplete"), "{detail}");
+        assert!(
+            detail.contains(&archives[0].display().to_string()),
+            "{detail}"
+        );
+        assert!(!detail.contains("could not be replaced"), "{detail}");
+    }
+
+    #[test]
+    fn incomplete_relogin_reports_live_publish_with_marker_failure_exactly() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        write_live(&incomplete);
+        super::write_current("legacy").unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+        super::fail_next_activation_marker_write();
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .expect_err("a marker failure after live publication must remain visible");
+        let archives = std::fs::read_dir(super::deleted_profiles_dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+
+        assert_eq!(archives.len(), 1);
+        assert_eq!(
+            crate::auth::read_auth(&archives[0].join("auth.json")).unwrap(),
+            incomplete
+        );
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            oauth
+        );
+        assert_eq!(
+            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
+            oauth,
+            "live publication is never rolled back after the marker step fails"
+        );
+        let detail = format!("{error:#}");
+        assert!(
+            detail.contains("live activation did not fully complete"),
+            "{detail}"
+        );
+        assert!(detail.contains("was published to live auth"), "{detail}");
+        assert!(
+            detail.contains(&archives[0].display().to_string()),
+            "{detail}"
+        );
+        assert!(!detail.contains("could not be synchronized"), "{detail}");
+    }
+
+    #[test]
+    fn incomplete_relogin_of_an_inactive_profile_preserves_the_active_account() {
+        let _env = TestEnv::new();
+        let active = realistic_auth_json("bob@example.com", "acct_b", "bob-access", "bob-refresh");
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("active", &active);
+        seed_profile("legacy", &incomplete);
+        super::switch_profile("active").unwrap();
+        let live_before = std::fs::read(crate::auth::codex_auth_path().unwrap()).unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let outcome =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .unwrap();
+
+        assert!(outcome.archive_path().unwrap().join("auth.json").exists());
+        assert_eq!(current_alias(), "active");
+        assert_eq!(
+            std::fs::read(crate::auth::codex_auth_path().unwrap()).unwrap(),
+            live_before,
+            "recovering an inactive legacy profile must not touch live Codex auth"
+        );
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            oauth
+        );
+    }
+
+    #[test]
+    fn incomplete_relogin_archive_failure_leaves_every_credential_unchanged() {
+        let _env = TestEnv::new();
+        let active = realistic_auth_json("bob@example.com", "acct_b", "bob-access", "bob-refresh");
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("active", &active);
+        seed_profile("legacy", &incomplete);
+        super::switch_profile("active").unwrap();
+        let live_before = std::fs::read(crate::auth::codex_auth_path().unwrap()).unwrap();
+        let profile_path = super::profile_auth_path("legacy").unwrap();
+        let profile_before = std::fs::read(&profile_path).unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        std::fs::write(super::deleted_profiles_dir().unwrap(), b"blocked").unwrap();
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .expect_err(
+                    "replacement must not start unless the previous credential is archived",
+                );
+
+        assert!(format!("{error:#}").contains("deleted-profiles"));
+        assert_eq!(std::fs::read(&profile_path).unwrap(), profile_before);
+        assert_eq!(
+            std::fs::read(crate::auth::codex_auth_path().unwrap()).unwrap(),
+            live_before
+        );
+        assert_eq!(current_alias(), "active");
+    }
+
+    #[test]
+    fn incomplete_relogin_marker_failure_reports_the_completed_archive_and_replacement() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        super::write_current("legacy").unwrap();
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let current_path = crate::auth::current_file().unwrap();
+        std::fs::remove_file(&current_path).unwrap();
+        std::fs::create_dir(&current_path).unwrap();
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .expect_err("a post-commit marker read failure must remain visible");
+        let archives = std::fs::read_dir(super::deleted_profiles_dir().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+
+        assert_eq!(archives.len(), 1);
+        let detail = format!("{error:#}");
+        assert!(detail.contains("profile 'legacy' was replaced"), "{detail}");
+        assert!(
+            detail.contains(&archives[0].display().to_string()),
+            "{detail}"
+        );
+        assert_eq!(
+            crate::auth::read_auth(&archives[0].join("auth.json")).unwrap(),
+            incomplete
+        );
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            oauth
+        );
+    }
+
+    #[test]
+    fn incomplete_relogin_rejects_a_known_identity_mismatch_without_archiving() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let wrong =
+            realistic_auth_json("bob@example.com", "acct_b", "oauth-access", "oauth-refresh");
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &wrong, true)
+                .expect_err("known legacy identity fields must still match");
+
+        assert!(format!("{error:#}").contains("known identity fields"));
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            incomplete
+        );
+        assert!(!super::deleted_profiles_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn incomplete_relogin_rejects_same_bytes_recreated_during_oauth() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let profile_path = super::profile_auth_path("legacy").unwrap();
+        std::fs::remove_file(&profile_path).unwrap();
+        write_auth_durable(&profile_path, &incomplete);
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .expect_err("same-byte delete/recreate must not satisfy the prepared file token");
+
+        assert!(format!("{error:#}").contains("changed while re-login"));
+        assert_eq!(crate::auth::read_auth(&profile_path).unwrap(), incomplete);
+        assert!(!super::deleted_profiles_dir().unwrap().exists());
+    }
+
+    #[test]
+    fn incomplete_relogin_does_not_duplicate_an_existing_complete_identity() {
+        let _env = TestEnv::new();
+        let incomplete = realistic_auth_json("alice@example.com", "", "old-access", "old-refresh");
+        seed_profile("legacy", &incomplete);
+        let complete = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "existing-access",
+            "existing-refresh",
+        );
+        seed_profile("existing", &complete);
+        let prepared = {
+            let lease = super::acquire_profile_lease("legacy").unwrap();
+            super::prepare_profile_reauth_with_lease(&lease).unwrap()
+        };
+        let oauth = realistic_auth_json(
+            "alice@example.com",
+            "acct_a",
+            "oauth-access",
+            "oauth-refresh",
+        );
+
+        let lease = super::acquire_profile_lease("legacy").unwrap();
+        let error =
+            super::commit_prepared_profile_reauth_with_lease(prepared, &lease, &oauth, true)
+                .expect_err("legacy recovery must not duplicate an existing strict identity");
+
+        assert!(format!("{error:#}").contains("already belongs to profile(s) existing"));
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("legacy").unwrap()).unwrap(),
+            incomplete
+        );
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("existing").unwrap()).unwrap(),
+            complete
+        );
+        assert!(!super::deleted_profiles_dir().unwrap().exists());
     }
 
     // ── Failure paths ────────────────────────────────────────
@@ -7954,6 +9541,32 @@ mod tests {
     }
 
     #[test]
+    fn initial_rotation_recovery_stage_is_the_written_credential_file() {
+        let _env = TestEnv::new();
+        let rotated = realistic_auth_json(
+            "alice@example.com",
+            "acct_alice",
+            "access_latest",
+            "refresh_latest",
+        );
+
+        let stage = super::stage_import_rotation(&rotated).unwrap();
+        let files = recovery_files();
+
+        assert_eq!(files, vec![stage.path().to_path_buf()]);
+        assert!(stage.contains(&rotated).unwrap());
+        let raw = std::fs::read(stage.path()).unwrap();
+        assert!(
+            !raw.is_empty(),
+            "the owned stage must never be an empty reservation"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+            rotated
+        );
+    }
+
+    #[test]
     fn validated_import_promotes_the_exact_rotation_stage_without_a_duplicate() {
         let _env = TestEnv::new();
         let imported = realistic_auth_json(
@@ -7965,7 +9578,7 @@ mod tests {
         let stage = super::stage_import_rotation(&imported).unwrap();
         let stage_path = stage.path().to_path_buf();
 
-        let action = super::save_imported_auth_value_with_stage(
+        let committed = super::save_imported_auth_value_with_stage(
             &imported,
             Some("alice"),
             "acct_alice",
@@ -7973,8 +9586,13 @@ mod tests {
             Some(stage),
         )
         .unwrap();
+        let super::ValidatedImportCommit::Profile(action) = committed else {
+            panic!("validated stage promotion must create the profile")
+        };
 
-        assert!(matches!(action, super::SaveAction::Created(ref alias) if alias == "alice"));
+        assert!(matches!(action.action, super::SaveAction::Created(ref alias) if alias == "alice"));
+        assert!(action.profile_commit.is_none());
+        assert!(action.recovery_cleanup.is_none());
         assert_eq!(
             crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap(),
             imported
@@ -7988,6 +9606,51 @@ mod tests {
             .collect::<std::io::Result<Vec<_>>>()
             .unwrap();
         assert!(recovery_entries.is_empty());
+    }
+
+    #[test]
+    fn committed_import_reports_cleanup_only_failure_without_claiming_a_foreign_path() {
+        let _env = TestEnv::new();
+        let imported = realistic_auth_json(
+            "alice@example.com",
+            "acct_alice",
+            "access_latest",
+            "refresh_latest",
+        );
+        let stage = super::stage_import_rotation(&imported).unwrap();
+        let stage_path = stage.path().to_path_buf();
+        let replaced_path = stage_path.clone();
+        super::before_next_import_recovery_cleanup(move || {
+            std::fs::remove_file(&replaced_path).unwrap();
+            std::fs::write(&replaced_path, b"foreign-replacement").unwrap();
+        });
+
+        let committed = super::save_imported_auth_value_with_stage(
+            &imported,
+            Some("alice"),
+            "acct_alice",
+            None,
+            Some(stage),
+        )
+        .unwrap();
+        let super::ValidatedImportCommit::Profile(outcome) = committed else {
+            panic!("cleanup failure happens after the durable profile commit")
+        };
+
+        assert!(
+            matches!(outcome.action, super::SaveAction::Created(ref alias) if alias == "alice")
+        );
+        assert!(outcome.profile_commit.is_none());
+        let cleanup = outcome
+            .recovery_cleanup
+            .expect("profile publication succeeded, so only stage cleanup is incomplete");
+        assert!(cleanup.recovery_path.is_none());
+        assert!(format!("{:#}", cleanup.cause).contains("durably published"));
+        assert_eq!(
+            crate::auth::read_auth(&super::profile_auth_path("alice").unwrap()).unwrap(),
+            imported
+        );
+        assert_eq!(std::fs::read(stage_path).unwrap(), b"foreign-replacement");
     }
 
     #[test]
@@ -8007,16 +9670,24 @@ mod tests {
             std::fs::write(&writer_destination, b"foreign-profile").unwrap();
         });
 
-        let error = super::save_imported_auth_value_with_stage(
+        let committed = super::save_imported_auth_value_with_stage(
             &imported,
             Some("alice"),
             "acct_alice",
             None,
             Some(stage),
         )
-        .unwrap_err();
+        .unwrap();
+        let super::ValidatedImportCommit::RecoveryPreserved {
+            recovery_path,
+            cause,
+        } = committed
+        else {
+            panic!("a destination collision must preserve the rotated stage")
+        };
 
-        assert!(format!("{error:#}").contains("without replacement"));
+        assert!(format!("{cause:#}").contains("without replacement"));
+        assert_eq!(recovery_path.as_deref(), Some(stage_path.as_path()));
         assert_eq!(std::fs::read(&destination).unwrap(), b"foreign-profile");
         assert_eq!(crate::auth::read_auth(&stage_path).unwrap(), imported);
     }
@@ -8064,11 +9735,16 @@ mod tests {
             None,
             Some(stale_stage),
         )
-        .expect("a busy registry leaves the latest credentials quarantined");
+        .expect("a busy registry leaves the latest credentials recoverable");
 
-        let super::RecoveredImportAction::Quarantined { path, reason } = action else {
+        let super::RecoveredImportAction::RecoveryPreserved {
+            recovery_path,
+            reason,
+        } = action
+        else {
             panic!("registry-lock failure must retain a recovery stage")
         };
+        let path = recovery_path.expect("the exact latest stage is still present");
         assert_ne!(path, stale_path, "the RT1 stage must not masquerade as RT2");
         assert_eq!(crate::auth::read_auth(&path).unwrap(), latest);
         assert!(!stale_path.exists(), "the superseded RT1 stage is removed");
@@ -8117,24 +9793,31 @@ mod tests {
         let _env = TestEnv::new();
         seed_profile(
             "alice",
-            &realistic_auth_json("alice@example.com", "acct_a", "old_access", "refresh_new"),
+            &realistic_auth_json("alice@example.com", "acct_a", "old_access", "refresh_old"),
         );
         let lease = super::acquire_profile_lease("alice").unwrap();
         let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
+        write_auth_durable(
+            &super::profile_auth_path("alice").unwrap(),
+            &realistic_auth_json("alice@example.com", "acct_a", "login_access", "refresh_new"),
+        );
         let update = super::update_profile_tokens_if_refresh_matches_leased(
             &lease,
             authorization,
             "refresh_old",
-            "stale_id",
+            &make_jwt("alice@example.com", "acct_a"),
             "stale_access",
             "stale_refresh",
         )
         .unwrap();
-        assert!(
-            matches!(update, super::RefreshTokenUpdate::Superseded),
-            "a re-login that replaced the presented token wins"
-        );
+        let super::RefreshTokenUpdate::Superseded { recovery_path } = update else {
+            panic!("a re-login that replaced the presented token must win")
+        };
         assert_eq!(profile_refresh_token("alice"), "refresh_new");
+        assert_eq!(
+            crate::auth::read_auth(&recovery_path).unwrap()["tokens"]["refresh_token"],
+            "stale_refresh"
+        );
 
         let authorization = super::authorize_fresh_credentials_activation(&lease).unwrap();
         let update = super::update_profile_tokens_if_refresh_matches_leased(
@@ -8513,16 +10196,35 @@ mod tests {
     }
 
     #[test]
-    fn login_without_an_alias_refuses_to_pick_between_email_twins() {
+    fn login_sink_rejects_incomplete_identity_before_profile_resolution() {
         let _env = TestEnv::new();
         seed_email_twins();
         let minted = auth_json_without_account_id("oai001@ozi.xyz", "acc_new", "ref_new");
 
         let err = super::save_auth_value(minted, None)
-            .expect_err("an ambiguous email must not resolve to the first candidate");
-        assert!(format!("{err:#}").contains("oai001"), "{err:#}");
+            .expect_err("an incomplete OAuth result must not reach profile resolution");
+        assert!(
+            format!("{err:#}").contains("both a non-empty account_id and email"),
+            "{err:#}"
+        );
         assert_eq!(profile_refresh_token("oai001"), "ref_t");
         assert_eq!(profile_refresh_token("oai001_20x"), "ref_p");
+    }
+
+    #[test]
+    fn login_sink_never_creates_an_incomplete_profile() {
+        let _env = TestEnv::new();
+        let minted = auth_json_without_account_id("alice@example.com", "acc_new", "ref_new");
+
+        let error = super::save_auth_value(minted, Some("alice"))
+            .expect_err("the persistence boundary must reject an incomplete OAuth identity");
+
+        assert!(
+            format!("{error:#}").contains("both a non-empty account_id and email"),
+            "{error:#}"
+        );
+        assert!(!super::profile_auth_path("alice").unwrap().exists());
+        assert!(!crate::auth::codex_auth_path().unwrap().exists());
     }
 
     #[test]

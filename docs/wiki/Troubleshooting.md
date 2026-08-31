@@ -9,7 +9,8 @@ Start with the complete error message, its file path, and the command that produ
 | Headless login cannot open a browser | Run `codex-switch-global-pace login --device`. |
 | Device login says the flow is disabled or unauthorized | Enable device-code login in the ChatGPT personal Security settings. For a managed workspace, ask its administrator to allow device-code authentication. Then start a new `login --device` attempt. |
 | Browser login succeeds in the page but the terminal keeps waiting | Permit loopback connections to `127.0.0.1` on ports 1455 and 1457, close another process using those ports, and retry. If local callbacks remain blocked, use `login --device`. |
-| The wrong browser account was added | Do not reauthorize an existing alias as another identity; that is rejected. Follow [Correct a wrong browser account](#correct-a-wrong-browser-account). |
+| `login <alias>` reports incomplete legacy identity | Run it interactively and approve the default-No prompt only after verifying the alias, or use `login <alias> --yes` for an intentional non-interactive run. The authenticated result must contain `account_id` and email and match every known legacy identity field; approval archives the exact old credentials under `deleted-profiles/` before replacing the same alias. |
+| The wrong browser account was added | Do not reauthorize a complete existing alias as another identity; that is rejected. An incomplete legacy alias uses the explicit confirmation and archive procedure above. Follow [Correct a wrong browser account](#correct-a-wrong-browser-account). |
 | Windows daemon installation is denied | Open PowerShell as Administrator and retry. |
 | Switching or restore fails while the Windows Codex app looks closed | Closing the window can leave Codex in the notification area. Quit it from the system-tray menu and confirm in Task Manager that no Codex process remains, then retry. |
 | Windows daemon stop says credential work is still in flight | Wait briefly and run `codex-switch-global-pace daemon stop` again. The process is intentionally left running instead of force-killed while a refresh token may be rotating. |
@@ -21,7 +22,8 @@ Start with the complete error message, its file path, and the command that produ
 | The daemon says another daemon is running | `codex-switch` and `codex-switch-global-pace` share the daemon PID and state files. Stop and uninstall the other service; do not run both simultaneously. |
 | HTTPS fails with `invalid peer certificate: UnknownIssuer` | An intercepting proxy is re-signing traffic. See [HTTPS fails with an unknown issuer](#https-fails-with-invalid-peer-certificate-unknownissuer). |
 | An account reports `re-login required (refresh_token_reused)` | The stored refresh token was already spent and cannot be recovered. Run `codex-switch-global-pace login <alias>` for that profile. The verdict is remembered, so the account costs no further requests until you sign in again; `codex-switch-global-pace list -f` asks the server anyway. |
-| Import reports a quarantined rotated credential | The server replaced the source file's one-time token before identity or managed-policy validation failed. Keep the named file under `~/.codex-switch/recovery/` private, sign in again, then remove it only after the account works. Recovery files are deliberately not selectable profiles. |
+| Refresh reports a preserved `recovery/` path, superseded credential, incomplete commit, or incomplete cleanup | Do not move a named recovery file into `profiles/` or immediately retry the consumed refresh token. Keep any reported file private, resolve the exact local error, and inspect the named profile state first. Cleanup-only errors may report no path when the app cannot prove that the original stage still owns that name; it will not label a foreign replacement as the recovery credential. |
+| Import reports preserved rotation material, an incomplete profile commit, or incomplete recovery cleanup | The server replaced the source file's one-time token before import fully settled. Do not retry that consumed source. Keep any exactly reported `$CODEX_SWITCH_HOME/recovery/` file private and inspect whether the profile is absent, merely visible with incomplete durability/security, or durably created with cleanup still pending. A path is omitted when the original stage no longer owns it. Recovery files are deliberately not selectable profiles. |
 
 For network or API failures, rerun the smallest failing command with `--debug`:
 
@@ -73,9 +75,11 @@ account that was authenticated.
 If a requested new alias was not created because the browser reused an identity
 that already had a saved profile, correct or sign out that browser session and
 run `login <new-alias>` again. If the wrong identity was actually saved under
-the alias you wanted, an existing-alias login will reject a different account
-rather than overwrite credentials. Preserve the mistaken profile under a
-temporary alias, then create the intended one:
+the alias you wanted, a complete existing-alias login will reject a different
+account rather than overwrite credentials. An incomplete legacy alias instead
+requires the default-No/`--yes` confirmation and exact `deleted-profiles/`
+archive described above. Preserve a complete mistaken profile under a temporary
+alias, then create the intended one:
 
 Before running these commands, finish every active Codex CLI session. On
 Windows, also [fully quit the Codex tray application](#fully-quit-codex-on-windows).
@@ -133,8 +137,10 @@ the certificate explicitly:
 
 ```bash
 # macOS: export the CA, substituting the name shown in Keychain Access
-security find-certificate -c "Proxyman CA" -p > ~/.codex-switch/proxy-ca.pem
-export CODEX_CA_CERTIFICATE=~/.codex-switch/proxy-ca.pem
+codex_switch_home="${CODEX_SWITCH_HOME:-$HOME/.codex-switch}"
+mkdir -p -- "$codex_switch_home"
+security find-certificate -c "Proxyman CA" -p > "$codex_switch_home/proxy-ca.pem"
+export CODEX_CA_CERTIFICATE="$codex_switch_home/proxy-ca.pem"
 ```
 
 Set the variable in the shell profile so the TUI and the daemon inherit it, not
@@ -240,8 +246,11 @@ if ($LASTEXITCODE -ne 0) { throw "Restored profile activation failed." }
 Start a new Codex process and verify the intended account. If `list` rejects the
 restored credential as expired or already used, keep the archive private and run
 `codex-switch-global-pace login <alias>`; do not overwrite it with an older live
-backup. A file under `recovery/` is a different quarantine state and must not be
-moved into `profiles/` directly.
+backup. A file under `recovery/` is a separate token-rotation recovery stage and
+must not be moved into `profiles/` directly. Refresh identity or managed-policy
+rejections are quarantined; import operational failures use the neutral
+"preserved rotation material" wording. Other files can represent superseded,
+commit-incomplete, or cleanup-incomplete states.
 
 ## Reset-card outcome is uncertain
 

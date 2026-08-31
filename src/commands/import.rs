@@ -26,6 +26,59 @@ fn format_import_failure_line(status: &str, source: &str, stage: &str, error: &s
     format!("  {status} {source} [{stage}] {error}")
 }
 
+fn json_import_recovery_fields(
+    recovery_path: Option<&std::path::Path>,
+    cleanup_warning: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    (
+        recovery_path.map(|path| path.display().to_string()),
+        cleanup_warning.map(str::to_string),
+    )
+}
+
+fn validated_import_profile_commit_failure(
+    source: &std::path::Path,
+    action: &profile::SaveAction,
+    incomplete: &profile::ImportProfileCommitIncomplete,
+) -> profile::ImportFailure {
+    let recovery = incomplete
+        .recovery_path
+        .as_ref()
+        .map(|path| format!(" The exact recovery stage remains at {}.", path.display()))
+        .unwrap_or_else(|| {
+            " No recovery path is claimed because the original stage is no longer proven there."
+                .to_string()
+        });
+    profile::ImportFailure {
+        source: source.to_path_buf(),
+        stage: STAGE_TOKEN_ROTATED,
+        error: format!(
+            "validated import profile '{}' became visible, but its commit is incomplete ({:#}).{} Do not retry the consumed source or use the partial profile until its state is inspected.",
+            action.alias(),
+            incomplete.cause,
+            recovery
+        ),
+    }
+}
+
+fn import_cleanup_projection(
+    cleanup: Option<&profile::ImportRecoveryCleanupIncomplete>,
+) -> (Option<std::path::PathBuf>, Option<String>) {
+    let warning = cleanup.map(|cleanup| {
+        let ownership = cleanup
+            .recovery_path
+            .as_ref()
+            .map(|path| format!("exact recovery stage: {}", path.display()))
+            .unwrap_or_else(|| {
+                "no recovery path is claimed because the original stage is no longer proven there"
+                    .to_string()
+            });
+        format!("{:#}; {ownership}", cleanup.cause)
+    });
+    let path = cleanup.and_then(|cleanup| cleanup.recovery_path.clone());
+    (path, warning)
+}
+
 /// Promote or preserve the durable stage written immediately after the auth
 /// server rotated credentials when a later import step fails.
 ///
@@ -43,7 +96,7 @@ fn rescue_rotated_credentials(
     val: serde_json::Value,
     alias: Option<&str>,
     suggested_alias: Option<&str>,
-    stage: Option<profile::ImportRotationStage>,
+    stage: Option<profile::RotationRecoveryStage>,
     cause: &anyhow::Error,
 ) -> profile::ImportFailure {
     let staged_path = stage.as_ref().and_then(|stage| {
@@ -54,29 +107,90 @@ fn rescue_rotated_credentials(
             .map(|_| stage.path().to_path_buf())
     });
     match profile::save_recovered_import_auth_value_with_stage(val, alias, suggested_alias, stage) {
-        Ok(profile::RecoveredImportAction::Profile(action)) => profile::ImportFailure {
-            source: source.to_path_buf(),
-            stage: STAGE_TOKEN_ROTATED,
-            error: format!(
-                "import failed after credential rotation ({cause}), so the usable credentials \
-                 were {} as profile '{}'. {} now holds a dead refresh token — use the profile \
-                 instead of importing that file again.",
-                action.action(),
-                action.alias(),
-                source.display()
-            ),
-        },
-        Ok(profile::RecoveredImportAction::Quarantined { path, reason }) => {
+        Ok(profile::RecoveredImportAction::Profile(outcome)) => {
+            if let Some(incomplete) = outcome.profile_commit.as_ref() {
+                let recovery = incomplete
+                    .recovery_path
+                    .as_ref()
+                    .map(|path| {
+                        format!(
+                            " The exact recovery stage remains at {}.",
+                            path.display()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        " No recovery path is claimed because the original stage is no longer proven there."
+                            .to_string()
+                    });
+                return profile::ImportFailure {
+                    source: source.to_path_buf(),
+                    stage: STAGE_TOKEN_ROTATED,
+                    error: format!(
+                        "import failed after credential rotation ({cause}). Profile '{}' became visible, but its commit is incomplete ({:#}).{} {} now holds a dead refresh token; do not retry that source or use the partial profile until its state is inspected.",
+                        outcome.action.alias(),
+                        incomplete.cause,
+                        recovery,
+                        source.display()
+                    ),
+                };
+            }
+            let cleanup = outcome.recovery_cleanup.as_ref().map(|cleanup| {
+                let path = cleanup
+                    .recovery_path
+                    .as_ref()
+                    .map(|path| {
+                        format!(
+                            " The exact remaining recovery copy is at {}.",
+                            path.display()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        " No recovery path is claimed because the original stage is no longer proven there."
+                            .to_string()
+                    });
+                format!(
+                    " Recovery-stage cleanup is incomplete ({:#}).{}",
+                    cleanup.cause, path
+                )
+            });
             profile::ImportFailure {
                 source: source.to_path_buf(),
                 stage: STAGE_TOKEN_ROTATED,
                 error: format!(
-                    "import failed after credential rotation ({cause}). Identity/policy \
-                     validation or profile persistence also failed ({reason}), so the only usable \
-                     credential copy was quarantined at {} and was not made into an activatable \
-                     profile. Keep that file private and sign in again before deleting it. {} now \
-                     holds a dead refresh token.",
-                    path.display(),
+                    "import failed after credential rotation ({cause}), so the usable credentials \
+                     were {} as profile '{}'. {} now holds a dead refresh token — use the profile \
+                     instead of importing that file again.{}",
+                    outcome.action.action(),
+                    outcome.action.alias(),
+                    source.display(),
+                    cleanup.as_deref().unwrap_or_default()
+                ),
+            }
+        }
+        Ok(profile::RecoveredImportAction::RecoveryPreserved {
+            recovery_path,
+            reason,
+        }) => {
+            let recovery = recovery_path
+                .as_ref()
+                .map(|path| {
+                    format!(
+                        "The exact usable recovery stage remains at {}.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "No recovery path is claimed because the original stage is no longer proven there."
+                        .to_string()
+                });
+            profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: STAGE_TOKEN_ROTATED,
+                error: format!(
+                    "import failed after credential rotation ({cause}). Profile recovery did not \
+                     complete ({reason}). {recovery} No activatable profile is assumed; keep the \
+                     recovery directory private and inspect the reported state before deleting \
+                     anything. {} now holds a dead refresh token.",
                     source.display()
                 ),
             }
@@ -87,8 +201,10 @@ fn rescue_rotated_credentials(
                 stage: STAGE_TOKEN_ROTATED,
                 error: format!(
                     "import failed after credential rotation ({cause}), and promoting the staged \
-                     credentials also failed ({save_error:#}). The usable credentials remain at \
-                     {}. Keep that file private and sign in again before deleting it.",
+                     credentials also failed ({save_error:#}). A matching stage was observed at {} \
+                     before that attempt, but its current file identity could not be confirmed. \
+                     Keep the recovery directory private and inspect the exact state before \
+                     deleting anything.",
                     path.display()
                 ),
             },
@@ -141,10 +257,16 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
         };
         let now = auth::now_unix_secs()?;
         if json {
-            print_json(&output::JsonOk {
+            let (recovery_path, cleanup_warning) = json_import_recovery_fields(
+                imported.recovery_path.as_deref(),
+                imported.cleanup_warning.as_deref(),
+            );
+            print_json(&output::JsonImportResult {
                 ok: true,
                 alias: imported.alias,
                 action: imported.action.to_string(),
+                recovery_path,
+                cleanup_warning,
             })?;
         } else {
             println!(
@@ -158,6 +280,13 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
             );
             print!("  ");
             print_usage_line(&imported.usage, now);
+            if let Some(warning) = imported.cleanup_warning.as_deref() {
+                println!(
+                    "  {} {}",
+                    color::status_tag("WARN"),
+                    crate::safe_text::terminal_text(warning)
+                );
+            }
         }
         return Ok(());
     }
@@ -197,12 +326,18 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
                 .imported
                 .iter()
                 .map(|item| {
+                    let (recovery_path, cleanup_warning) = json_import_recovery_fields(
+                        item.recovery_path.as_deref(),
+                        item.cleanup_warning.as_deref(),
+                    );
                     Ok(output::JsonImportEntry {
                         source: item.source.display().to_string(),
                         alias: item.alias.clone(),
                         action: item.action.to_string(),
                         account: account_to_json(&item.account, item.usage.plan_type.as_deref()),
                         usage: usage_to_json(Ok(&item.usage), now)?,
+                        recovery_path,
+                        cleanup_warning,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -239,6 +374,13 @@ pub(crate) async fn import_cmd(path: &str, alias: Option<&str>, json: bool) -> R
             );
             print!("    ");
             print_usage_line(&item.usage, now);
+            if let Some(warning) = item.cleanup_warning.as_deref() {
+                println!(
+                    "    {} {}",
+                    color::status_tag("WARN"),
+                    crate::safe_text::terminal_text(warning)
+                );
+            }
         }
 
         for item in &report.skipped {
@@ -323,7 +465,7 @@ async fn import_one_file(
         .as_deref()
         .map(profile::alias_from_email);
 
-    let mut rotation_stage: Option<profile::ImportRotationStage> = None;
+    let mut rotation_stage: Option<profile::RotationRecoveryStage> = None;
     let validation = usage::validate_import_auth_with_client(
         &mut val,
         |rotated| {
@@ -413,7 +555,7 @@ async fn import_one_file(
     let reservation = credential_reservation
         .take()
         .expect("import credential reservation must remain held through commit");
-    let action = match profile::save_reserved_imported_auth_value_with_stage(
+    let outcome = match profile::save_reserved_imported_auth_value_with_stage(
         &val,
         alias,
         &validated_account_id,
@@ -421,10 +563,36 @@ async fn import_one_file(
         rotation_stage.take(),
         reservation,
     ) {
-        Ok(action) => action,
+        Ok(profile::ValidatedImportCommit::Profile(outcome)) => outcome,
+        Ok(profile::ValidatedImportCommit::RecoveryPreserved {
+            recovery_path,
+            cause,
+        }) => {
+            let recovery = recovery_path
+                .as_ref()
+                .map(|path| {
+                    format!(
+                        "The exact usable recovery stage remains at {}.",
+                        path.display()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "No recovery path is claimed because the original stage is no longer proven there."
+                        .to_string()
+                });
+            return Err(profile::ImportFailure {
+                source: source.to_path_buf(),
+                stage: STAGE_TOKEN_ROTATED,
+                error: format!(
+                    "validated import could not be safely committed ({cause:#}). {recovery} No activatable profile is assumed. Do not retry the consumed source; inspect the reported state first."
+                ),
+            });
+        }
         // A validated commit failure must not be retried under another alias:
         // that could bypass the duplicate-identity or managed-policy boundary.
-        // The exact staged file stays in recovery and is the durable copy.
+        // Do not infer final profile or recovery-path ownership from the path
+        // captured before the commit attempt; the detailed error owns that
+        // classification.
         Err(error) if rotated => {
             let Some(recovery) = staged_path.as_deref() else {
                 return Err(profile::ImportFailure {
@@ -438,9 +606,10 @@ async fn import_one_file(
                 source: source.to_path_buf(),
                 stage: STAGE_TOKEN_ROTATED,
                 error: format!(
-                    "validated import could not be committed ({error:#}); the rotated credential \
-                     copy was quarantined at {} and was not made into an activatable profile. \
-                     Keep that file private and sign in again before deleting it.",
+                    "validated import could not be safely committed ({error:#}). The recovery \
+                     stage was originally observed at {}, but this wrapper does not claim that \
+                     path still owns it or that no profile became visible. Do not retry the \
+                     consumed source; inspect the reported filesystem state first.",
                     recovery.display()
                 ),
             });
@@ -454,18 +623,33 @@ async fn import_one_file(
         }
     };
 
+    if let Some(incomplete) = outcome.profile_commit.as_ref() {
+        return Err(validated_import_profile_commit_failure(
+            source,
+            &outcome.action,
+            incomplete,
+        ));
+    }
+
+    let (recovery_path, cleanup_warning) =
+        import_cleanup_projection(outcome.recovery_cleanup.as_ref());
     Ok(profile::ImportSuccess {
         source: source.to_path_buf(),
-        alias: action.alias().to_string(),
-        action: action.action(),
+        alias: outcome.action.alias().to_string(),
+        action: outcome.action.action(),
         account,
         usage,
+        recovery_path,
+        cleanup_warning,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::format_import_failure_line;
+    use super::{
+        STAGE_TOKEN_ROTATED, format_import_failure_line, import_cleanup_projection,
+        json_import_recovery_fields, validated_import_profile_commit_failure,
+    };
 
     #[test]
     fn failure_row_preserves_trusted_ansi_after_sanitizing_untrusted_fields() {
@@ -484,5 +668,48 @@ mod tests {
         assert_eq!(rendered.matches('\u{1b}').count(), 2, "{rendered:?}");
         assert!(!rendered.contains('\n'), "{rendered:?}");
         assert!(!rendered.contains('\u{7}'), "{rendered:?}");
+    }
+
+    #[test]
+    fn cleanup_warning_and_exact_path_project_into_both_json_fields() {
+        let path = std::path::PathBuf::from("recovery/rotated-import.json");
+        let cleanup = crate::profile::ImportRecoveryCleanupIncomplete {
+            recovery_path: Some(path.clone()),
+            cause: anyhow::anyhow!("cleanup sync failed"),
+        };
+
+        let (projected_path, warning) = import_cleanup_projection(Some(&cleanup));
+        assert_eq!(projected_path.as_deref(), Some(path.as_path()));
+        let warning = warning.expect("cleanup failure must remain visible");
+        assert!(warning.contains("cleanup sync failed"), "{warning}");
+        assert!(warning.contains(&path.display().to_string()), "{warning}");
+
+        let (json_path, json_warning) =
+            json_import_recovery_fields(projected_path.as_deref(), Some(&warning));
+        let path_text = path.display().to_string();
+        assert_eq!(json_path.as_deref(), Some(path_text.as_str()));
+        assert_eq!(json_warning.as_deref(), Some(warning.as_str()));
+    }
+
+    #[test]
+    fn visible_partial_import_is_not_projected_as_profile_absence() {
+        let source = std::path::Path::new("consumed-auth.json");
+        let recovery = std::path::PathBuf::from("recovery/rotated-import.json");
+        let incomplete = crate::profile::ImportProfileCommitIncomplete {
+            recovery_path: Some(recovery.clone()),
+            cause: anyhow::anyhow!("profile directory sync failed"),
+        };
+        let failure = validated_import_profile_commit_failure(
+            source,
+            &crate::profile::SaveAction::Created("alice".to_string()),
+            &incomplete,
+        );
+
+        assert_eq!(failure.stage, STAGE_TOKEN_ROTATED);
+        assert_eq!(failure.source, source);
+        assert!(failure.error.contains("profile 'alice' became visible"));
+        assert!(failure.error.contains("commit is incomplete"));
+        assert!(failure.error.contains(&recovery.display().to_string()));
+        assert!(failure.error.contains("Do not retry the consumed source"));
     }
 }
