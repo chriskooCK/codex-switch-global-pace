@@ -6706,8 +6706,8 @@ async fn run_oauth_inner(
             })
         }
         OAuthMode::Relogin(alias) => {
-            // Capture the target identity under a short lease, then release it
-            // while the user completes OAuth. Once this first acquisition
+            // Capture a stable target proof under a short lease, then release
+            // it while the user completes OAuth. Once this first acquisition
             // succeeds, batch cancellation drains the round through commit;
             // the second acquisition is therefore intentionally non-cancellable.
             let prepared = {
