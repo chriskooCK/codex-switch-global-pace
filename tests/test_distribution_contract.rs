@@ -6200,17 +6200,25 @@ fn installer_instructions_start_from_source_controlled_verified_bootstrap() {
 }
 
 #[cfg(unix)]
+fn source_controlled_unix_bootstrap(guide: &str) -> &str {
+    let install_section = guide
+        .split_once("## Install\n")
+        .map(|(_, section)| section)
+        .expect("install section");
+    install_section
+        .split_once("```bash\n")
+        .and_then(|(_, section)| section.split_once("```\n").map(|(block, _)| block))
+        .expect("source-controlled Unix bootstrap")
+}
+
+#[cfg(unix)]
 #[test]
 fn source_controlled_unix_bootstrap_peels_an_exact_annotated_tag() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     let guide = repo_file("docs/wiki/Getting-Started.md");
-    let bash_block = guide
-        .split("```bash\n")
-        .nth(1)
-        .and_then(|section| section.split("```\n").next())
-        .expect("source-controlled Unix bootstrap");
+    let bash_block = source_controlled_unix_bootstrap(&guide);
     let resolver = bash_block
         .split("channel=stable")
         .next()
@@ -6261,11 +6269,7 @@ fn source_controlled_stable_bootstrap_reaches_installer_without_a_nounset_empty_
     use std::process::Command;
 
     let guide = repo_file("docs/wiki/Getting-Started.md");
-    let bash_block = guide
-        .split("```bash\n")
-        .nth(1)
-        .and_then(|section| section.split("```\n").next())
-        .expect("source-controlled Unix bootstrap");
+    let bash_block = source_controlled_unix_bootstrap(&guide);
     assert!(bash_block.contains("set -eu"));
     assert!(!bash_block.contains("install_args=("));
     assert!(!bash_block.contains("${install_args[@]}"));
