@@ -10,28 +10,35 @@ static ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// Initialize color support. Call once at startup.
 pub fn init(mode: ColorMode) {
-    let enabled = match mode {
+    let enabled = resolve_enabled(
+        mode,
+        std::env::var_os("NO_COLOR").is_some(),
+        supports_color::on(supports_color::Stream::Stdout).is_some(),
+    );
+    let _ = ENABLED.set(enabled);
+}
+
+fn resolve_enabled(mode: ColorMode, no_color: bool, auto_supported: bool) -> bool {
+    // NO_COLOR is an unconditional user opt-out, including when `--color
+    // always` or `CS_COLOR=always` was also supplied.
+    if no_color {
+        return false;
+    }
+    match mode {
         ColorMode::Always => true,
         ColorMode::Never => false,
-        ColorMode::Auto => {
-            // Respect NO_COLOR convention (https://no-color.org)
-            if std::env::var_os("NO_COLOR").is_some() {
-                return ENABLED.set(false).unwrap_or(());
-            }
-            // Check if stdout is a terminal with color support
-            supports_color::on(supports_color::Stream::Stdout).is_some()
-        }
-    };
-    let _ = ENABLED.set(enabled);
+        ColorMode::Auto => auto_supported,
+    }
 }
 
 /// Whether color output is enabled.
 pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
-        if std::env::var_os("NO_COLOR").is_some() {
-            return false;
-        }
-        supports_color::on(supports_color::Stream::Stdout).is_some()
+        resolve_enabled(
+            ColorMode::Auto,
+            std::env::var_os("NO_COLOR").is_some(),
+            supports_color::on(supports_color::Stream::Stdout).is_some(),
+        )
     })
 }
 
@@ -167,7 +174,24 @@ fn colored_plan(label: &str, plan_type: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{colored_plan, colored_usage_pace, error};
+    use super::{colored_plan, colored_usage_pace, error, resolve_enabled};
+    use crate::cli::ColorMode;
+
+    #[test]
+    fn no_color_overrides_every_explicit_color_mode() {
+        assert!(!resolve_enabled(ColorMode::Always, true, true));
+        assert!(!resolve_enabled(ColorMode::Always, true, false));
+        assert!(!resolve_enabled(ColorMode::Auto, true, true));
+        assert!(!resolve_enabled(ColorMode::Never, true, true));
+    }
+
+    #[test]
+    fn explicit_color_modes_apply_when_no_color_is_absent() {
+        assert!(resolve_enabled(ColorMode::Always, false, false));
+        assert!(!resolve_enabled(ColorMode::Never, false, true));
+        assert!(resolve_enabled(ColorMode::Auto, false, true));
+        assert!(!resolve_enabled(ColorMode::Auto, false, false));
+    }
 
     #[test]
     fn cli_styling_never_replays_untrusted_terminal_controls() {

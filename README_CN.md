@@ -1,18 +1,22 @@
 # codex-switch-global-pace
 
-**[OpenAI Codex CLI](https://github.com/openai/codex) 多账号管理与全局周配额仪表盘。**
-它把所有可用账号的 Weekly quota 视为一个 pool，同时保留登录、切换、预热、
-重置卡、JSON 与 daemon 等既有功能。
+**本机 Codex 多账号管理、当前账号切换与 Global Weekly Pace 仪表盘。**
+它会为下一次启动的 Codex 选择账号，并以 equal-weight 方式显示多个账号的
+Weekly quota；quota 始终分别属于各账号，不会被转移、合并或绕过。
 
 [English README](README.md) · [文档](docs/wiki/Home.md) ·
 [Releases](https://github.com/chriskooCK/codex-switch-global-pace/releases)
+
+> **独立非官方项目：**本项目与 OpenAI 无隶属或背书关系。请仅用于您拥有或获准使用的账号。
 
 > 本程序会管理本机认证文件。请勿公开 profile、`auth.json`、Token、代理凭据或未脱敏的 debug 输出。
 
 ## 快速开始
 
-Codex 必须使用文件型凭据存储。在 `$CODEX_HOME/config.toml`（通常为
-`~/.codex/config.toml`）中确认：
+Codex 必须使用文件型凭据存储。在原生 Windows PowerShell 中，该文件通常为
+`%USERPROFILE%\.codex\config.toml`；在 macOS/Linux 中通常为
+`~/.codex/config.toml`。不要在 WSL shell 中执行 Windows 应用的切换命令，
+因为 WSL 默认使用另一套 home 与认证文件。请在对应文件中确认：
 
 ```toml
 cli_auth_credentials_store = "file"
@@ -22,6 +26,49 @@ cli_auth_credentials_store = "file"
 [已验证安装流程](docs/wiki/Getting-Started.md#install)。该流程使用当前版 [GitHub CLI](https://cli.github.com/)
 通过 `gh attestation verify` 先验证安装器 attestation，再运行本地文件；
 验证失败时不会降级为未验证安装。
+
+安装前先确认 GitHub CLI 已登录：
+
+```bash
+gh auth login
+gh auth status
+```
+
+GitHub 登录只用于下载并验证 Release，不会成为 Codex 账号。
+
+## 最常用：切换 Codex Windows 应用的当前账号
+
+先用不同 alias 保存账号。新身份会保存并立即成为当前账号；如果浏览器身份已
+存在于其他 profile，则会更新并激活匹配的 profile，而不会创建请求的新 alias：
+
+```powershell
+codex-switch-global-pace login personal
+# 确认浏览器显示的是个人账号，再批准登录
+
+codex-switch-global-pace login work
+# 必要时先切换浏览器账号，再批准登录
+
+codex-switch-global-pace list -f
+```
+
+日常切换时：
+
+1. 保存当前工作并关闭 Codex 窗口。
+2. 打开 Windows 通知区域的隐藏图标，找到 Codex 桌面应用的 **ChatGPT**
+   tray 图标（某些版本可能显示 **Codex**），右键后选择 **Quit** 或 **Exit**。
+3. 等到 tray 图标完全消失后再切换：
+
+   ```powershell
+   codex-switch-global-pace list -f
+   codex-switch-global-pace use work
+   # 或自动选择：codex-switch-global-pace use
+   ```
+
+4. 重新打开 Codex Windows 应用。新进程会读取已切换的 `$CODEX_HOME/auth.json`。
+
+只关闭窗口并不够；tray 图标仍存在时，后台进程可能还在运行。使用 Codex CLI 时也应先退出所有正在运行的 Codex session/process（`codex`、`codex resume` 或 `codex exec`），切换成功后再启动新进程。
+
+Alias 长度为 1–64 个 ASCII 字节，只能包含字母、数字、`_`、`-` 和 `.`；`.` 与 `..` 不可使用。重复使用 alias 只能重新授权同一实际账号，不能用另一账号覆盖；如果它原本不是当前账号，请在重新授权后运行 `use <alias>` 才会切换过去。
 
 常用命令：
 
@@ -34,13 +81,13 @@ codex-switch-global-pace          # 打开交互式仪表盘
 
 不带参数运行会直接打开 TUI；Windows 双击
 `codex-switch-global-pace.exe` 也是相同效果。
-`use` 会切换下一个 Codex 进程使用的实际账号；切换后请重新启动已运行的 Codex 应用或 CLI。
+`use` 会切换下一个 Codex 进程使用的实际账号；切换前须完全退出已运行的 Codex 应用（包括 tray）或 CLI。
 
 ## Global Weekly Pace
 
-仪表盘会把所有具有有效 weekly window 的账号合并为一个 equal-weight pool。填充的 bar
-表示汇总后的实际使用量，`↑ pace` marker 表示汇总后的已用时间，也就是当前理想使用位置。
-meter 下方只显示参与账号数和最早到来的账号 reset。
+仪表盘会把所有具有有效 weekly window 的账号以 equal-weight 方式显示在一个本机汇总视图中。
+这只是可视化：账号 quota 仍彼此独立。填充的 bar 表示汇总后的实际使用量，
+`↑ pace` marker 表示汇总后的已用时间，也就是当前理想使用位置。meter 下方只显示参与账号数和最早到来的账号 reset。
 
 只要 reset timestamp 有效，即使账号已用到 `100%` 也会纳入。数据或 reset 不可信的账号会计为
 unavailable，而不会猜测。当前 API 没有可靠且可比较的 weekly capacity，因此账号采用

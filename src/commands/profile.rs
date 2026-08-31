@@ -60,11 +60,7 @@ async fn lookup_and_publish_list_workspace_state(
     Ok(state)
 }
 
-pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result<()> {
-    if !auth_already_handled {
-        profile::auto_track_current()?;
-    }
-
+pub(crate) async fn list_cmd(force: bool, json: bool) -> Result<()> {
     let (profile_accounts, current) = profile::load_profile_accounts_checked_with_active()?;
     if profile_accounts.is_empty() {
         if json {

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    url: https://github.com/chriskooCK/codex-switch-global-pace/security/advisories/new
+    about: Never put credentials, auth files, or vulnerability details in a public issue.
+  - name: Read troubleshooting guidance
+    url: https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/docs/wiki/Troubleshooting.md
+    about: Check login, recovery, proxy, daemon, and update remedies before filing.

@@ -26,7 +26,10 @@ process-facing:
 
 ## Documentation contract
 
-- Keep English as the canonical documentation language. Chinese companion pages may summarize tasks and link back to the English source, but they must not become a second specification.
+- Keep English as the canonical documentation language. Localized companion
+  pages such as the Korean and Chinese quick guides may summarize tasks and
+  link back to the English source, but they must not become a second
+  specification.
 - Keep warnings and prerequisites near the top.
 - Describe observed behavior, not planned behavior.
 - Link to source files for implementation details that may change.

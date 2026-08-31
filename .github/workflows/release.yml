@@ -1078,13 +1078,56 @@ jobs:
             echo "Could not prove candidate ref ${candidate_tag} is absent." >&2
             exit 1
           fi
+
+          # GitHub's automatic notes would use candidate_tag as the compare
+          # destination and leave a dead Full Changelog link after that
+          # isolation ref is removed. Generate the notes against the verified
+          # final tag explicitly, validate that boundary, and attach the exact
+          # body to the candidate without asking GitHub to regenerate it.
+          jq -n \
+            --arg tag "$final_tag" \
+            --arg target "$GITHUB_SHA" \
+            '{tag_name:$tag,target_commitish:$target}' \
+            > "$RUNNER_TEMP/final-release-notes-request.json"
+          if ! gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            --input "$RUNNER_TEMP/final-release-notes-request.json" \
+            > "$RUNNER_TEMP/final-release-notes.json"; then
+            echo "Could not generate release notes against final tag ${final_tag}." >&2
+            exit 1
+          fi
+          if ! jq -e '
+            (type == "object")
+            and (.body | type == "string")
+            and (.body | length > 0)
+          ' "$RUNNER_TEMP/final-release-notes.json" > /dev/null; then
+            echo "GitHub returned invalid release notes for final tag ${final_tag}." >&2
+            exit 1
+          fi
+          jq -r '.body' "$RUNNER_TEMP/final-release-notes.json" \
+            > "$RUNNER_TEMP/final-release-notes.md"
+          if grep -F -- "$candidate_tag" "$RUNNER_TEMP/final-release-notes.md" > /dev/null; then
+            echo "Generated release notes still refer to temporary tag ${candidate_tag}." >&2
+            exit 1
+          fi
+          if ! grep -F -- "https://github.com/${GITHUB_REPOSITORY}/compare/" \
+            "$RUNNER_TEMP/final-release-notes.md" \
+            | grep -F -- "...${final_tag}" > /dev/null; then
+            echo "Generated release notes do not contain a Full Changelog comparison to ${final_tag}." >&2
+            exit 1
+          fi
+          {
+            cat release_body.md
+            printf '\n\n'
+            cat "$RUNNER_TEMP/final-release-notes.md"
+          } > "$RUNNER_TEMP/final-release-body.md"
           jq -n \
             --arg tag "$candidate_tag" \
             --arg target "$GITHUB_SHA" \
             --arg name "$release_name" \
-            --rawfile body release_body.md \
+            --rawfile body "$RUNNER_TEMP/final-release-body.md" \
             --argjson prerelease "$prerelease" \
-            '{tag_name:$tag,target_commitish:$target,name:$name,body:$body,draft:true,prerelease:$prerelease,generate_release_notes:true}' \
+            '{tag_name:$tag,target_commitish:$target,name:$name,body:$body,draft:true,prerelease:$prerelease,generate_release_notes:false}' \
             > "$RUNNER_TEMP/candidate-release.json"
           release=$(gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/releases" \

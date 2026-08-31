@@ -222,6 +222,26 @@ pub fn render(f: &mut Frame, app: &mut App, now: i64) {
     } else if let Some(menu) = app.menu.as_mut() {
         menu.render(f, area, now);
     }
+
+    // Ratatui colors are independent of the ANSI helpers used by the plain
+    // CLI. Normalize the completed frame at this one rendering boundary so
+    // `--color never` and NO_COLOR also cover every TUI view and overlay.
+    // Keep text modifiers: bold is the non-color selection cue, so clearing
+    // the entire style would make keyboard navigation invisible.
+    apply_frame_color_policy(f.buffer_mut(), crate::color::enabled());
+}
+
+fn apply_frame_color_policy(buffer: &mut ratatui::buffer::Buffer, color_enabled: bool) {
+    if !color_enabled {
+        for cell in &mut buffer.content {
+            cell.set_style(
+                Style::default()
+                    .fg(Color::Reset)
+                    .bg(Color::Reset)
+                    .underline_color(Color::Reset),
+            );
+        }
+    }
 }
 
 fn global_weekly_panel_height(total_height: u16, status_height: u16) -> u16 {
@@ -1456,11 +1476,11 @@ mod tests {
     use super::{
         C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
         GLOBAL_WEEKLY_COMPACT_HEIGHT, GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT,
-        PACE_LABEL, editable_input_line, fitted_segments, global_weekly_panel_height, plan_color,
-        quota_pace_color, quota_table_value, render, render_detail_panel,
-        render_global_weekly_pace, render_usage_gauge, render_usage_gauges, reset_timestamp_color,
-        status_bar_content, status_bar_height, status_message_color, table_text_widths,
-        usage_gauges_height,
+        PACE_LABEL, apply_frame_color_policy, editable_input_line, fitted_segments,
+        global_weekly_panel_height, plan_color, quota_pace_color, quota_table_value, render,
+        render_account_table, render_detail_panel, render_global_weekly_pace, render_usage_gauge,
+        render_usage_gauges, reset_timestamp_color, status_bar_content, status_bar_height,
+        status_message_color, table_text_widths, usage_gauges_height,
     };
     use crate::jwt::AccountInfo;
     use crate::tui::app::{
@@ -1472,11 +1492,88 @@ mod tests {
         UsageError, UsageInfo, UsageParseIssue, WindowUsage, usage_availability,
     };
     use ratatui::layout::Rect;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::{Terminal, backend::TestBackend};
 
     type MeterBounds = Option<(u16, u16)>;
     const TEST_NOW: i64 = 1_000_000;
+
+    #[test]
+    fn tui_frame_color_policy_strips_colors_but_preserves_text_modifiers() {
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer[(0, 0)].set_style(
+            Style::default()
+                .fg(Color::Red)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        buffer[(1, 0)].set_style(
+            Style::default()
+                .fg(Color::Rgb(1, 2, 3))
+                .bg(Color::Rgb(4, 5, 6))
+                .add_modifier(Modifier::DIM),
+        );
+
+        apply_frame_color_policy(&mut buffer, true);
+        assert_eq!(buffer[(0, 0)].fg, Color::Red);
+        assert_eq!(buffer[(0, 0)].bg, Color::Blue);
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+
+        apply_frame_color_policy(&mut buffer, false);
+
+        for cell in buffer.content() {
+            assert_eq!(cell.fg, Color::Reset);
+            assert_eq!(cell.bg, Color::Reset);
+        }
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::BOLD));
+        assert!(buffer[(0, 0)].modifier.contains(Modifier::UNDERLINED));
+        assert!(buffer[(1, 0)].modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn no_color_account_table_keeps_the_selected_row_visible() {
+        let mut app = App::new();
+        for alias in ["first", "second"] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loading,
+                is_current: false,
+            });
+        }
+        app.update_view();
+        app.selected = 1;
+
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_account_table(frame, &app, area, TEST_NOW);
+                apply_frame_color_policy(frame.buffer_mut(), false);
+            })
+            .unwrap();
+
+        let find_alias = |alias: &str| {
+            (0..12)
+                .find_map(|y| {
+                    row_text(terminal.backend(), y)
+                        .find(alias)
+                        .map(|x| (x as u16, y))
+                })
+                .unwrap_or_else(|| panic!("missing account row for {alias}"))
+        };
+        let first = find_alias("first");
+        let second = find_alias("second");
+        let buffer = terminal.backend().buffer();
+
+        assert!(!buffer[first].modifier.contains(Modifier::BOLD));
+        assert!(buffer[second].modifier.contains(Modifier::BOLD));
+        for position in [first, second] {
+            assert_eq!(buffer[position].fg, Color::Reset);
+            assert_eq!(buffer[position].bg, Color::Reset);
+        }
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct DashboardGeometry {
@@ -1808,7 +1905,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render(frame, &mut app, TEST_NOW))
+            .draw(|frame| {
+                let area = frame.area();
+                render_account_table(frame, &app, area, TEST_NOW);
+            })
             .unwrap();
 
         let (x, y) = (0..12)

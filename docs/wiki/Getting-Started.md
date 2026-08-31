@@ -1,17 +1,66 @@
 # Getting started
 
-This page takes you from nothing to a working multi-account setup: install codex-switch-global-pace, add accounts, and pick the best one before a Codex session.
+This page takes you from nothing to a working multi-account setup: install
+codex-switch-global-pace, add personal and work accounts, and safely change the
+account used by the next Codex app or CLI session.
+
+> **Independent project:** codex-switch-global-pace is unofficial and is not
+> affiliated with or endorsed by OpenAI. Use it only with accounts and
+> workspaces you are authorized to access. Its global quota view is a local
+> aggregate display; it does not merge, transfer, share, or bypass service
+> quotas or account limits.
 
 ## Requirements
 
-- [OpenAI Codex CLI](https://github.com/openai/codex) installed, plus at least one ChatGPT account that can log in to Codex.
-- Codex must use its **file credential store**, because codex-switch-global-pace works by atomically replacing `$CODEX_HOME/auth.json`. If needed, add this to `$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`):
+- **Supported systems:** Windows, macOS, and Linux on x64/AMD64 or ARM64.
+  Release artifacts are published for all six OS/architecture combinations.
+- **Codex:** the Windows Codex app or
+  [OpenAI Codex CLI](https://github.com/openai/codex), plus at least one ChatGPT
+  account that can sign in to Codex. Two distinct accounts are needed to follow
+  the personal/work example below.
+- **GitHub CLI:** a current [GitHub CLI](https://cli.github.com/) release with
+  `gh attestation verify` support, installed and authenticated to GitHub. This
+  GitHub login is used only to download and verify releases; it is separate
+  from the ChatGPT accounts managed by this application.
+- **Platform tools:** Windows PowerShell 5.1 or PowerShell 7 on Windows. On
+  macOS/Linux, use Bash and have `curl`, `tar`, `mktemp`, and either
+  `sha256sum` or `shasum` available.
+
+Check GitHub CLI before running the installer:
+
+```bash
+gh --version
+gh auth status
+gh attestation verify --help
+```
+
+If `gh auth status` says you are not authenticated, sign in and check again:
+
+```bash
+gh auth login
+gh auth status
+```
+
+Codex must use its
+[**file credential store**](https://learn.chatgpt.com/docs/auth), because
+codex-switch-global-pace works by atomically replacing
+`$CODEX_HOME/auth.json`. If needed, add this to `$CODEX_HOME/config.toml`
+(normally `~/.codex/config.toml`; on Windows, normally
+`%USERPROFILE%\.codex\config.toml`):
 
 ```toml
 cli_auth_credentials_store = "file"
 ```
 
-Explicit `keyring`, `auto`, and `ephemeral` stores are rejected — permanently by design, because OS keyrings cannot provide the locking and atomic-replace guarantees switching depends on (see [why only the file store is supported](Configuration.md#why-only-the-file-store-is-supported)). A managed Codex configuration with `forced_login_method = "api"` is also incompatible, because codex-switch-global-pace manages ChatGPT login profiles. In both cases codex-switch-global-pace stops with an actionable error instead of modifying authentication state; after switching to the file store, log in again.
+Explicit `keyring`, `auto`, and `ephemeral` stores are rejected — permanently
+by design, because OS keyrings cannot provide the locking and atomic-replace
+guarantees switching depends on (see
+[why only the file store is supported](Configuration.md#why-only-the-file-store-is-supported)).
+A managed Codex configuration with `forced_login_method = "api"` is also
+incompatible, because codex-switch-global-pace manages ChatGPT login profiles.
+In both cases codex-switch-global-pace stops with an actionable error instead
+of modifying authentication state; after switching to the file store, log in
+again.
 
 ## Install
 
@@ -207,41 +256,152 @@ Verify the installation:
 codex-switch-global-pace --version
 ```
 
-## Add your first account
+## Add personal and work accounts
+
+First, fully exit the Codex app (including its tray icon) and every active
+Codex session process such as `codex`, `codex resume`, or `codex exec`. A newly
+added account is saved and immediately installed as the live/current Codex
+credential. On Windows, closing the Codex window alone may leave its tray
+process running:
+open the notification area (including hidden icons behind `^`), right-click the
+**ChatGPT** icon for the Codex desktop app (or **Codex** if that is the label
+shown), choose **Quit** or **Exit**, and confirm that the icon disappears.
+
+Aliases make the accounts easy to recognize. An alias must be 1–64 ASCII bytes
+and may contain only ASCII letters, digits, `_`, `-`, and `.`. The aliases `.`
+and `..` are reserved. `personal`, `work`, and `team-a` are valid; non-ASCII
+aliases are not.
+
+Add the personal account first:
+
+```bash
+codex-switch-global-pace login personal
+```
+
+`login` opens a browser PKCE flow. Before approving it, check that the browser
+is signed in to the intended personal email and, when applicable, the intended
+Team or Enterprise workspace. When the command succeeds, `personal` is both a
+saved profile and the live/current Codex account.
+
+Next, change the browser session to the work account and add it:
 
 ```bash
 codex-switch-global-pace login work
 ```
 
-`login` opens a browser PKCE flow; the alias (`work`) is optional and can be renamed later. On a headless machine, use the device-code flow instead:
+Again, verify the email and workspace before approving. A separate browser
+profile or a signed-out/private session helps prevent the browser from silently
+reusing the personal account. When the authenticated identity is distinct, this
+creates `work` and makes it live/current. If the identity already belongs to a
+saved profile, that matching profile is updated and activated instead, and the
+requested `work` alias is not created.
+
+Refresh the account data and verify the two identities:
+
+```bash
+codex-switch-global-pace list -f
+```
+
+Check the alias, email, workspace, and current-account indicator. If both
+browser flows used the same actual account, identity matching updates the
+existing profile instead of creating a second independent account. Correct the
+browser session and repeat the intended login.
+
+Naming an existing alias with `login <alias>` re-authorizes that saved account
+and verifies that its identity has not changed; it cannot replace the alias
+with a different account. For normal day-to-day account selection, use
+`use <alias>` instead. See
+[Correct a wrong browser account](Troubleshooting.md#correct-a-wrong-browser-account)
+if the wrong identity was saved.
+
+### Device-code login and imports
+
+On a headless machine, use the device-code flow instead of the browser callback:
 
 ```bash
 codex-switch-global-pace login --device server
 ```
 
-If you already have `auth.json` backups, import a file or scan a whole directory. Imports are parsed, identity-checked, validated against the usage service, and saved under collision-free aliases. An import never overwrites an existing profile: a Team workspace ID proves access to that workspace, not ownership of another user's saved credentials.
+If you already have `auth.json` backups, import a file or scan a whole
+directory. Imports are parsed, identity-checked, validated against the usage
+service, and saved under collision-free aliases. An import never overwrites an
+existing profile: a Team workspace ID proves access to that workspace, not
+ownership of another user's saved credentials.
 
 ```bash
 codex-switch-global-pace import ~/auth-backups
 ```
 
-codex-switch-global-pace also notices logins performed outside of it: when the live `auth.json` contains an account it does not track (for example after a plain `codex login`), an interactive run offers to save it as a profile.
+codex-switch-global-pace also detects logins performed outside it. When live
+`auth.json` contains an untracked account after a plain `codex login`, an
+interactive CLI command such as `list` offers to save it. The TUI reports that
+the live account is not saved; `a` starts a new OAuth login. To preserve the
+existing external login without authenticating again, quit the TUI and run
+`codex-switch-global-pace list` interactively.
 
-## Inspect quota and pick an account
+## Everyday account switching
+
+### Windows Codex app (recommended example)
+
+1. Save your work and close every Codex window.
+2. Open the Windows notification area, expand hidden icons with `^`, and find
+   **ChatGPT** (the Codex desktop app; some versions may show **Codex**).
+   Right-click it, choose **Quit** or **Exit**, and wait until the tray icon
+   disappears. The app is not fully stopped while that icon remains.
+3. Inspect fresh account data, then switch explicitly:
+
+   ```powershell
+   codex-switch-global-pace list -f
+   codex-switch-global-pace use work
+   ```
+
+   Or let the adaptive scoring algorithm choose the best eligible account:
+
+   ```powershell
+   codex-switch-global-pace use
+   ```
+
+4. Start the Codex app again. The new process reads the selected live
+   credential.
+
+`use <alias>` is the clearest choice when you know which account you want.
+Automatic `use` ranks the eligible saved accounts from their current quota and
+selection data. Neither form changes an already-running Codex process, which is
+why the complete exit and restart are required.
+
+### Codex CLI on Windows, macOS, or Linux
+
+The same process boundary applies to the CLI: finish or terminate every running
+Codex session before switching, then start a new one.
 
 ```bash
-codex-switch-global-pace list        # accounts, quota, availability
-codex-switch-global-pace             # interactive dashboard
-codex-switch-global-pace use         # switch to the best eligible account
+# Run these only after all Codex CLI sessions have stopped.
+codex-switch-global-pace list -f
+codex-switch-global-pace use personal
+codex
 ```
 
-`use` without an alias ranks all accounts with the adaptive scoring algorithm; `use <alias>` switches explicitly. Codex reads authentication at startup, so restart Codex after switching.
+Running `codex-switch-global-pace` with no arguments opens the interactive
+dashboard. The account rows and global meter are local views of reported usage;
+they do not pool quota on the service, move quota between accounts, or bypass
+individual account limits.
 
 ## Where your data lives
 
-Saved profiles, cache, configuration, and daemon state default to `~/.codex-switch` (`%USERPROFILE%\.codex-switch` on Windows). The live Codex file stays at `$CODEX_HOME/auth.json`. See [Configuration](Configuration.md) for every path and setting.
+Saved profiles, cache, configuration, and daemon state default to
+`~/.codex-switch` (`%USERPROFILE%\.codex-switch` on Windows). The live Codex
+file stays at `$CODEX_HOME/auth.json`. See
+[Configuration](Configuration.md) for every path and setting,
+[credential lifecycle and backups](Configuration.md#credential-lifecycle-and-backups),
+and [moving to a new machine](Configuration.md#back-up-restore-or-move-to-a-new-machine).
 
 Never share profile files, `auth.json`, tokens, proxy credentials, or unredacted `--debug` output.
+
+Uninstalling the executable preserves profiles by default. Read
+[Uninstall the application](Updating.md#uninstall-the-application) when removing
+only the program, or
+[Remove all local credentials](Updating.md#remove-all-local-credentials) when
+you intentionally want to erase the locally stored accounts as well.
 
 The data directory is shared with `codex-switch` for compatibility. Do not run
 both daemon services at once; stop and uninstall one daemon before enabling the

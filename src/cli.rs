@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub enum ColorMode {
     /// Detect terminal capabilities automatically
     Auto,
-    /// Always use colors
+    /// Always use colors unless NO_COLOR is set
     Always,
     /// Never use colors
     Never,
@@ -83,7 +83,7 @@ pub struct Cli {
     #[arg(long, global = true, env = "CS_PROXY")]
     pub proxy: Option<String>,
 
-    /// Color output mode
+    /// Color output mode (NO_COLOR always disables color)
     #[arg(long, global = true, default_value = "auto", env = "CS_COLOR")]
     pub color: ColorMode,
 
