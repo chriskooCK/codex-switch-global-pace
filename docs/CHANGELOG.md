@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **A clearer multi-account starting path** — The README and reviewed user
+  guides now lead with the most common Windows workflow: fully quit the Codex
+  app through its notification-area menu, switch the active profile, and start
+  Codex again. Personal/work login examples make the browser identity check,
+  identity deduplication, wrong-account recovery, alias rules, and local-only
+  quota visualization explicit, with Korean and Chinese companion guidance.
+- **Predictable non-interactive and color contracts** — `NO_COLOR` now wins
+  over an explicit `--color always` request in both CLI and TUI rendering while
+  preserving the TUI's non-color selected-row cue. JSON and other
+  non-interactive account listings no longer turn an untracked live login into
+  a saved profile, and daemon status exposes its effective service and
+  configuration details consistently.
+- **Windows desktop-aware daemon switching** — The daemon now recognizes the
+  main process of the packaged OpenAI Codex Windows app, including when its
+  window is closed but its notification-area icon is still present. A pending
+  account switch waits for that same-Windows-user app or an active Codex
+  session to exit, while processes owned by other users and renderer, MCP, and
+  app-server helpers remain non-blocking.
+- **Documented security and data lifecycle** — Private vulnerability reporting,
+  issue/PR templates, credential backup and migration boundaries, recoverable
+  profile deletion, complete credential removal, compatibility expectations,
+  and verified uninstall/recovery commands are now documented together. Stable
+  release notes also compare the actual stable tag instead of a removed
+  candidate tag.
+
 ## v20260829.1.0 — 2026-08-29
 
 - **Authoritative startup refresh no longer waits behind the cache** — Once

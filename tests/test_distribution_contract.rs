@@ -375,6 +375,7 @@ fn documentation_navigation_is_task_oriented_and_progressive() {
         "FAQ.md",
         "Feature-Guide.md",
         "Getting-Started.md",
+        "Korean-Guide.md",
         "Troubleshooting.md",
         "Updating.md",
     ] {
@@ -819,6 +820,34 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     assert!(
         !candidate_creation.contains("releases/tags/${candidate_tag}"),
         "draft recovery must use the authenticated paginated release list because the tag endpoint only returns published releases"
+    );
+    for required in [
+        "--arg tag \"$final_tag\"",
+        "'{tag_name:$tag,target_commitish:$target}'",
+        "repos/${GITHUB_REPOSITORY}/releases/generate-notes",
+        "Generated release notes still refer to temporary tag ${candidate_tag}.",
+        "https://github.com/${GITHUB_REPOSITORY}/compare/",
+        "...${final_tag}",
+        "Generated release notes do not contain a Full Changelog comparison to ${final_tag}.",
+        "generate_release_notes:false",
+    ] {
+        assert!(
+            candidate_creation.contains(required),
+            "candidate notes must be bound to the final stable tag: `{required}`"
+        );
+    }
+    assert!(
+        !candidate_creation.contains("generate_release_notes:true"),
+        "candidate creation must not ask GitHub to regenerate notes against the temporary tag"
+    );
+    let final_notes_creation = candidate_creation
+        .split("# GitHub's automatic notes")
+        .nth(1)
+        .expect("final-tag release-note generation boundary");
+    assert_before(
+        final_notes_creation,
+        "repos/${GITHUB_REPOSITORY}/releases/generate-notes",
+        "--arg tag \"$candidate_tag\"",
     );
     assert_before(
         candidate_creation,
@@ -6005,6 +6034,32 @@ fn readmes_describe_current_cli_and_codex_requirements() {
 }
 
 #[test]
+fn readme_leads_with_the_safe_windows_account_switch_workflow() {
+    let readme = repo_file("README.md");
+    let workflow = readme
+        .split("## Everyday workflow: switch the Windows Codex app account")
+        .nth(1)
+        .and_then(|section| section.split("## Quick start").next())
+        .expect("README must put the everyday Windows switch workflow before quick start");
+
+    for required in [
+        "hidden icons",
+        "Quit",
+        "Exit",
+        "codex-switch-global-pace list -f",
+        "codex-switch-global-pace use work",
+        "codex-switch-global-pace use",
+        "Start the Codex app again",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Windows switch workflow must document `{required}`"
+        );
+    }
+    assert!(readme.contains("[한국어 안내](docs/wiki/Korean-Guide.md)"));
+}
+
+#[test]
 fn installer_instructions_start_from_source_controlled_verified_bootstrap() {
     let trusted_guide = "docs/wiki/Getting-Started.md#install";
     let untrusted_stable_notes = "releases/latest/download/INSTALL.md";
@@ -6124,6 +6179,7 @@ fn installer_instructions_start_from_source_controlled_verified_bootstrap() {
         "docs/wiki/Getting-Started.md",
         "docs/wiki/Development-Releases.md",
         "docs/wiki/Chinese-Guide.md",
+        "docs/wiki/Korean-Guide.md",
         "docs/wiki/Updating.md",
         ".github/workflows/release.yml",
     ] {
@@ -6144,17 +6200,25 @@ fn installer_instructions_start_from_source_controlled_verified_bootstrap() {
 }
 
 #[cfg(unix)]
+fn source_controlled_unix_bootstrap(guide: &str) -> &str {
+    let install_section = guide
+        .split_once("## Install\n")
+        .map(|(_, section)| section)
+        .expect("install section");
+    install_section
+        .split_once("```bash\n")
+        .and_then(|(_, section)| section.split_once("```\n").map(|(block, _)| block))
+        .expect("source-controlled Unix bootstrap")
+}
+
+#[cfg(unix)]
 #[test]
 fn source_controlled_unix_bootstrap_peels_an_exact_annotated_tag() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     let guide = repo_file("docs/wiki/Getting-Started.md");
-    let bash_block = guide
-        .split("```bash\n")
-        .nth(1)
-        .and_then(|section| section.split("```\n").next())
-        .expect("source-controlled Unix bootstrap");
+    let bash_block = source_controlled_unix_bootstrap(&guide);
     let resolver = bash_block
         .split("channel=stable")
         .next()
@@ -6205,11 +6269,7 @@ fn source_controlled_stable_bootstrap_reaches_installer_without_a_nounset_empty_
     use std::process::Command;
 
     let guide = repo_file("docs/wiki/Getting-Started.md");
-    let bash_block = guide
-        .split("```bash\n")
-        .nth(1)
-        .and_then(|section| section.split("```\n").next())
-        .expect("source-controlled Unix bootstrap");
+    let bash_block = source_controlled_unix_bootstrap(&guide);
     assert!(bash_block.contains("set -eu"));
     assert!(!bash_block.contains("install_args=("));
     assert!(!bash_block.contains("${install_args[@]}"));

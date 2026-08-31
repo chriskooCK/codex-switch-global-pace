@@ -4,7 +4,9 @@
 //! `codex login`/`codex logout` is changing that file. Long-lived Codex
 //! infrastructure (MCP servers, `app-server` for desktop/IDE hosts, helper
 //! binaries) shares the same binary but does not own the interactive auth
-//! lifecycle, so those processes remain non-blocking.
+//! lifecycle, so those processes remain non-blocking. On Windows, the main
+//! `ChatGPT.exe` desktop process owns an app session even though its child
+//! `codex.exe app-server` and Chromium helper processes remain non-blocking.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexActivity {
@@ -46,16 +48,18 @@ enum ProcessInspection {
     Failed,
 }
 
-/// One process returned by the Windows CIM query. Keeping the image name and
-/// PID alongside the command line lets us distinguish an unrelated node.exe
-/// whose command line is unavailable from a native Codex process that we were
-/// unable to inspect safely.
+/// One process returned by the Windows CIM query. Keeping the verified owner,
+/// image, and package executable path alongside the command line lets us
+/// distinguish this user's Codex desktop package from another user's process
+/// and from the general ChatGPT desktop app.
 #[cfg(any(windows, test))]
 #[derive(Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct WindowsProcess {
     name: String,
     process_id: u32,
+    owner_is_current_user: Option<bool>,
+    executable_path: Option<String>,
     command_line: Option<String>,
 }
 
@@ -366,10 +370,18 @@ fn list_windows_processes() -> Option<Vec<WindowsProcess>> {
     const PROCESS_QUERY: &str = concat!(
         "$ErrorActionPreference = 'Stop'; ",
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); ",
+        "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; ",
+        "if ([string]::IsNullOrWhiteSpace($currentSid)) { throw 'Current Windows user SID is unavailable.' }; ",
         "$processes = @(Get-CimInstance Win32_Process ",
-        "-Filter \"Name LIKE 'codex%' OR Name = 'node.exe'\" | ForEach-Object { ",
+        "-Filter \"Name LIKE 'codex%' OR Name = 'node.exe' OR Name = 'ChatGPT.exe'\" | ForEach-Object { ",
+        "$ownerIsCurrentUser = $null; ",
+        "try { $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction Stop; ",
+        "if ([uint32]$owner.ReturnValue -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) { ",
+        "$ownerIsCurrentUser = ([string]$owner.Sid -eq $currentSid) } } catch { $ownerIsCurrentUser = $null }; ",
+        "$executablePath = if ($null -eq $_.ExecutablePath) { $null } else { [string]$_.ExecutablePath }; ",
         "$commandLine = if ($null -eq $_.CommandLine) { $null } else { [string]$_.CommandLine }; ",
         "[pscustomobject]@{ Name = [string]$_.Name; ProcessId = [uint32]$_.ProcessId; ",
+        "OwnerIsCurrentUser = $ownerIsCurrentUser; ExecutablePath = $executablePath; ",
         "CommandLine = $commandLine } }); ",
         "[pscustomobject]@{ Processes = $processes } | ConvertTo-Json -Compress -Depth 3"
     );
@@ -399,22 +411,114 @@ fn parse_windows_process_snapshot(output: &[u8]) -> Option<Vec<WindowsProcess>> 
 
 #[cfg(any(windows, test))]
 fn classify_windows_process(process: &WindowsProcess) -> CodexActivity {
-    match process
-        .command_line
-        .as_deref()
-        .filter(|command_line| !command_line.trim().is_empty())
-    {
-        Some(command_line) => classify_codex_command(command_line),
-        None if is_codex_binary_name(&process.name) => {
+    let activity = classify_windows_process_details(
+        &process.name,
+        process.executable_path.as_deref(),
+        process.command_line.as_deref(),
+    );
+    // An infrastructure helper or unrelated application is safe regardless of
+    // ownership. Only a process that could mutate or consume this user's live
+    // credential needs an exact owner decision.
+    if activity == CodexActivity::Idle {
+        return CodexActivity::Idle;
+    }
+    match process.owner_is_current_user {
+        Some(false) => return CodexActivity::Idle,
+        Some(true) => {}
+        None => {
             tracing::debug!(
                 pid = process.process_id,
                 process_name = %process.name,
-                "native Codex process command line unavailable; activity is unknown"
+                "Codex process owner could not be verified; activity is unknown"
             );
-            CodexActivity::Unknown
+            return CodexActivity::Unknown;
         }
+    }
+    if activity == CodexActivity::Unknown {
+        tracing::debug!(
+            pid = process.process_id,
+            process_name = %process.name,
+            executable_path = ?process.executable_path,
+            "Codex process identity or command line unavailable; activity is unknown"
+        );
+    }
+    activity
+}
+
+/// Classify a Windows process from its CIM identity fields. The executable path
+/// disambiguates the Codex package's `ChatGPT.exe` from the general ChatGPT app.
+#[cfg(any(windows, test))]
+fn classify_windows_process_details(
+    process_name: &str,
+    executable_path: Option<&str>,
+    command_line: Option<&str>,
+) -> CodexActivity {
+    if is_chatgpt_desktop_process_name(process_name) {
+        return classify_chatgpt_desktop_process(executable_path, command_line);
+    }
+
+    match command_line.filter(|command_line| !command_line.trim().is_empty()) {
+        Some(command_line) => classify_codex_command(command_line),
+        None if is_codex_binary_name(process_name) => CodexActivity::Unknown,
         None => CodexActivity::Idle,
     }
+}
+
+#[cfg(any(windows, test))]
+fn classify_chatgpt_desktop_process(
+    executable_path: Option<&str>,
+    command_line: Option<&str>,
+) -> CodexActivity {
+    let executable_path = executable_path.filter(|path| !path.trim().is_empty());
+    let command_line = command_line.filter(|line| !line.trim().is_empty());
+    let command_args = command_line.map(split_windows_command_line);
+
+    // Chromium/Electron helpers are never the desktop session owner. This is
+    // safe to decide before package identity: a `--type` child is non-blocking
+    // for both the Codex package and the unrelated general ChatGPT app.
+    if command_args.as_deref().is_some_and(|args| {
+        args.iter().skip(1).any(|arg| {
+            arg.eq_ignore_ascii_case("--type")
+                || arg
+                    .split_once('=')
+                    .is_some_and(|(flag, _)| flag.eq_ignore_ascii_case("--type"))
+        })
+    }) {
+        return CodexActivity::Idle;
+    }
+
+    match executable_path {
+        Some(path) if !is_codex_desktop_executable_path(path) => return CodexActivity::Idle,
+        Some(_) => {}
+        None => {
+            let Some(args) = command_args.as_deref() else {
+                return CodexActivity::Unknown;
+            };
+            let Some(command_executable) = args.first() else {
+                return CodexActivity::Unknown;
+            };
+            if !is_codex_desktop_executable_path(command_executable) {
+                return if is_chatgpt_desktop_process_name(command_executable)
+                    && !is_absolute_windows_path(command_executable)
+                {
+                    CodexActivity::Unknown
+                } else {
+                    CodexActivity::Idle
+                };
+            }
+        }
+    }
+
+    let Some(args) = command_args.as_deref() else {
+        return CodexActivity::Unknown;
+    };
+    if !args
+        .first()
+        .is_some_and(|executable| is_chatgpt_desktop_process_name(executable))
+    {
+        return CodexActivity::Unknown;
+    }
+    CodexActivity::Session
 }
 
 /// Classify a Win32 command line returned by CIM.
@@ -594,6 +698,29 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+#[cfg(any(windows, test))]
+fn is_chatgpt_desktop_process_name(name: &str) -> bool {
+    basename(name.trim_matches('"')).eq_ignore_ascii_case("ChatGPT.exe")
+}
+
+#[cfg(any(windows, test))]
+fn is_codex_desktop_executable_path(path: &str) -> bool {
+    let normalized = path
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    normalized.contains("\\windowsapps\\openai.codex_")
+        && normalized.ends_with("\\app\\chatgpt.exe")
+}
+
+#[cfg(any(windows, test))]
+fn is_absolute_windows_path(path: &str) -> bool {
+    let path = path.trim_matches('"').as_bytes();
+    path.starts_with(br"\\")
+        || (path.get(1) == Some(&b':')
+            && path.get(2).is_some_and(|byte| matches!(byte, b'\\' | b'/')))
+}
+
 #[cfg(any(unix, test))]
 fn possible_codex_process_name(name: &str) -> bool {
     let base = basename(name);
@@ -622,8 +749,9 @@ fn is_codex_binary_name(base: &str) -> bool {
 mod tests {
     use super::{
         CodexActivity, ProcessInspection, classify_codex_args, classify_codex_command,
-        classify_windows_process, collect_process_inspections, linux_effective_uid,
-        parse_macos_process_row, parse_windows_process_snapshot, possible_codex_process_name,
+        classify_windows_process, classify_windows_process_details, collect_process_inspections,
+        linux_effective_uid, parse_macos_process_row, parse_windows_process_snapshot,
+        possible_codex_process_name,
     };
 
     #[test]
@@ -655,13 +783,18 @@ mod tests {
     #[test]
     fn windows_snapshot_preserves_process_identity_and_nullable_command_line() {
         let processes = parse_windows_process_snapshot(
-            br#"{"Processes":[{"Name":"codex.exe","ProcessId":41,"CommandLine":null},{"Name":"node.exe","ProcessId":42,"CommandLine":"node.exe codex app-server"}]}"#,
+            br#"{"Processes":[{"Name":"codex.exe","ProcessId":41,"OwnerIsCurrentUser":true,"ExecutablePath":"C:\\tools\\codex.exe","CommandLine":null},{"Name":"node.exe","ProcessId":42,"OwnerIsCurrentUser":true,"ExecutablePath":"C:\\Program Files\\nodejs\\node.exe","CommandLine":"node.exe codex app-server"},{"Name":"ChatGPT.exe","ProcessId":43,"OwnerIsCurrentUser":true,"ExecutablePath":"C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\\app\\ChatGPT.exe","CommandLine":"\"C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\\app\\ChatGPT.exe\""}]}"#,
         )
         .expect("valid CIM JSON snapshot");
 
-        assert_eq!(processes.len(), 2);
+        assert_eq!(processes.len(), 3);
         assert_eq!(processes[0].name, "codex.exe");
         assert_eq!(processes[0].process_id, 41);
+        assert_eq!(processes[0].owner_is_current_user, Some(true));
+        assert_eq!(
+            processes[0].executable_path.as_deref(),
+            Some("C:\\tools\\codex.exe")
+        );
         assert_eq!(processes[0].command_line, None);
         assert_eq!(processes[1].name, "node.exe");
         assert_eq!(processes[1].process_id, 42);
@@ -669,7 +802,113 @@ mod tests {
             processes[1].command_line.as_deref(),
             Some("node.exe codex app-server")
         );
+        assert_eq!(processes[2].name, "ChatGPT.exe");
+        assert_eq!(
+            classify_windows_process(&processes[2]),
+            CodexActivity::Session
+        );
         assert!(parse_windows_process_snapshot(b"not JSON").is_none());
+    }
+
+    #[test]
+    fn windows_chatgpt_desktop_main_process_is_a_session() {
+        let executable_path = r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#;
+        for command_line in [
+            r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe""#,
+            r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe" --hidden"#,
+        ] {
+            assert_eq!(
+                classify_windows_process_details(
+                    "ChatGPT.exe",
+                    Some(executable_path),
+                    Some(command_line),
+                ),
+                CodexActivity::Session,
+                "{command_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_chatgpt_desktop_helpers_are_not_sessions() {
+        let executable_path = r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#;
+        for process_type in ["renderer", "gpu-process", "utility", "crashpad-handler"] {
+            let command_line = format!(
+                r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe" --type={process_type} --user-data-dir="C:\Users\user\AppData\Roaming\ChatGPT""#
+            );
+            assert_eq!(
+                classify_windows_process_details(
+                    "chatgpt.EXE",
+                    Some(executable_path),
+                    Some(&command_line),
+                ),
+                CodexActivity::Idle,
+                "{process_type}"
+            );
+        }
+        assert_eq!(
+            classify_windows_process_details(
+                "ChatGPT.exe",
+                None,
+                Some("ChatGPT.exe --type=renderer"),
+            ),
+            CodexActivity::Idle
+        );
+    }
+
+    #[test]
+    fn windows_desktop_app_server_child_keeps_the_infrastructure_contract() {
+        assert_eq!(
+            classify_windows_process_details(
+                "codex.exe",
+                Some(
+                    r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\resources\codex.exe"#
+                ),
+                Some(
+                    r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\resources\codex.exe" app-server --analytics-default-enabled"#
+                ),
+            ),
+            CodexActivity::Idle
+        );
+    }
+
+    #[test]
+    fn windows_general_chatgpt_desktop_app_is_irrelevant() {
+        assert_eq!(
+            classify_windows_process_details(
+                "ChatGPT.exe",
+                Some(
+                    r#"C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#
+                ),
+                Some(
+                    r#""C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe""#
+                ),
+            ),
+            CodexActivity::Idle
+        );
+        assert_eq!(
+            classify_windows_process_details(
+                "ChatGPT.exe",
+                None,
+                Some(
+                    r#""C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe""#
+                ),
+            ),
+            CodexActivity::Idle
+        );
+    }
+
+    #[test]
+    fn windows_chatgpt_identity_falls_back_to_the_command_path() {
+        let command_line = r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe" --hidden"#;
+        assert_eq!(
+            classify_windows_process_details("ChatGPT.exe", None, Some(command_line)),
+            CodexActivity::Session
+        );
+        assert_eq!(
+            classify_windows_process_details("ChatGPT.exe", None, Some("ChatGPT.exe")),
+            CodexActivity::Unknown
+        );
     }
 
     #[test]
@@ -677,6 +916,8 @@ mod tests {
         let native = super::WindowsProcess {
             name: "codex.exe".to_string(),
             process_id: 100,
+            owner_is_current_user: Some(true),
+            executable_path: Some("C:\\tools\\codex.exe".to_string()),
             command_line: None,
         };
         assert_eq!(classify_windows_process(&native), CodexActivity::Unknown);
@@ -684,12 +925,25 @@ mod tests {
         let vendor_native = super::WindowsProcess {
             name: "codex-x86_64-pc-windows-msvc.exe".to_string(),
             process_id: 101,
+            owner_is_current_user: Some(true),
+            executable_path: Some("C:\\tools\\codex-x86_64-pc-windows-msvc.exe".to_string()),
             command_line: Some("  ".to_string()),
         };
         assert_eq!(
             classify_windows_process(&vendor_native),
             CodexActivity::Unknown
         );
+
+        let desktop = super::WindowsProcess {
+            name: "ChatGPT.exe".to_string(),
+            process_id: 102,
+            owner_is_current_user: Some(true),
+            executable_path: Some(
+                r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#.to_string(),
+            ),
+            command_line: None,
+        };
+        assert_eq!(classify_windows_process(&desktop), CodexActivity::Unknown);
     }
 
     #[test]
@@ -698,6 +952,8 @@ mod tests {
             let process = super::WindowsProcess {
                 name: name.to_string(),
                 process_id: 200,
+                owner_is_current_user: Some(true),
+                executable_path: None,
                 command_line: None,
             };
             assert_eq!(
@@ -705,6 +961,65 @@ mod tests {
                 CodexActivity::Idle,
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn windows_processes_from_other_users_are_irrelevant() {
+        for (name, executable_path, command_line) in [
+            (
+                "ChatGPT.exe",
+                Some(
+                    r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#,
+                ),
+                None,
+            ),
+            ("codex.exe", Some(r#"C:\tools\codex.exe"#), None),
+        ] {
+            let process = super::WindowsProcess {
+                name: name.to_string(),
+                process_id: 300,
+                owner_is_current_user: Some(false),
+                executable_path: executable_path.map(str::to_string),
+                command_line: command_line.map(str::to_string),
+            };
+            assert_eq!(classify_windows_process(&process), CodexActivity::Idle);
+        }
+    }
+
+    #[test]
+    fn unknown_windows_process_owner_fails_closed() {
+        let process = super::WindowsProcess {
+            name: "ChatGPT.exe".to_string(),
+            process_id: 301,
+            owner_is_current_user: None,
+            executable_path: Some(
+                r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#.to_string(),
+            ),
+            command_line: Some(
+                r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe""#.to_string(),
+            ),
+        };
+        assert_eq!(classify_windows_process(&process), CodexActivity::Unknown);
+
+        for (executable_path, command_line) in [
+            (
+                r#"C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#,
+                r#""C:\Program Files\WindowsApps\OpenAI.ChatGPT_1.0.0.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe""#,
+            ),
+            (
+                r#"C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe"#,
+                r#""C:\Program Files\WindowsApps\OpenAI.Codex_26.825.6671.0_x64__8wekyb3d8bbwe\app\ChatGPT.exe" --type=renderer"#,
+            ),
+        ] {
+            let irrelevant = super::WindowsProcess {
+                name: "ChatGPT.exe".to_string(),
+                process_id: 302,
+                owner_is_current_user: None,
+                executable_path: Some(executable_path.to_string()),
+                command_line: Some(command_line.to_string()),
+            };
+            assert_eq!(classify_windows_process(&irrelevant), CodexActivity::Idle);
         }
     }
 

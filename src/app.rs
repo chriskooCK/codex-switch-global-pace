@@ -426,7 +426,7 @@ mod error_reporting_tests {
     }
 
     #[test]
-    fn tui_skips_plain_terminal_auth_change_prompt() {
+    fn plain_list_keeps_auth_preflight_while_tui_open_and_json_skip_it() {
         assert!(!should_check_auth_change(&None, false));
         assert!(should_check_auth_change(
             &Some(Commands::List { force: false }),
@@ -671,9 +671,7 @@ async fn dispatch(
             alias,
             consume_card,
         }) => commands::use_cmd(alias.as_deref(), json, consume_card).await,
-        Some(Commands::List { force }) => {
-            commands::list_cmd(force, json, auth_preflight_performed).await
-        }
+        Some(Commands::List { force }) => commands::list_cmd(force, json).await,
         Some(Commands::ResetCard { alias, yes }) => {
             commands::reset_card_cmd(&alias, yes, json).await
         }

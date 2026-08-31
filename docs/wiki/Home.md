@@ -1,20 +1,25 @@
 # codex-switch-global-pace documentation
 
-`codex-switch-global-pace` manages multiple local OpenAI Codex CLI logins, shows each account's quota plus one combined Global Weekly Pace, and selects an account for the next Codex session.
+`codex-switch-global-pace` manages multiple local Codex logins, shows each
+account's quota plus one combined Global Weekly Pace visualization, and selects
+the account used by the next Codex process. It does not transfer or merge quota.
 
 > **Required:** Codex must use `cli_auth_credentials_store = "file"`. Start with [Getting started](Getting-Started.md) before importing or switching accounts.
 
 ## Start here
 
-- New users: [install codex-switch-global-pace and add the first account](Getting-Started.md).
+- New users: [install codex-switch-global-pace and add personal and work accounts](Getting-Started.md).
+- Daily use: [fully quit Codex, switch the active account, and restart it](Feature-Guide.md#everyday-workflow-switch-the-active-codex-account).
 - Existing users: [choose a task](#choose-your-task).
+- 한국어 사용자: [한국어 빠른 안내](Korean-Guide.md).
 - 中文读者：[从中文指南开始](Chinese-Guide.md)。
 
 ## Choose your task
 
 | I want to… | Start here |
 |---|---|
-| Install codex-switch-global-pace and add my first account | [Getting started](Getting-Started.md) |
+| Install codex-switch-global-pace and add multiple accounts | [Getting started](Getting-Started.md) |
+| Switch the Codex Windows app to another saved account | [Everyday switching workflow](Feature-Guide.md#codex-windows-app) |
 | Manage accounts, watch quota, switch accounts, or run the daemon | [Feature guide](Feature-Guide.md) |
 | Look up an exact command, flag, or TUI shortcut | [Command reference](Command-Reference.md) |
 | Configure paths, proxy, cache, or daemon behavior | [Configuration](Configuration.md) |
