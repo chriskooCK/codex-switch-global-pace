@@ -192,6 +192,34 @@ struct FileSnapshot {
     changed_low: i64,
 }
 
+/// Process-local proof of one exact file revision.
+///
+/// `FileToken` remains serializable for the installer protocol, where a file
+/// descriptor cannot cross the process boundary. Transactions that stay in one
+/// process can retain this stronger proof instead. Unix keeps the original
+/// file open so a delete/recreate cannot pass through immediate inode reuse.
+/// Windows uses its stable file ID without retaining a handle across an
+/// interactive wait, because an open target can block atomic replacement. The
+/// snapshot also rejects snapshot-visible in-place revisions that restore the
+/// original bytes.
+#[derive(Debug)]
+pub(crate) struct FileRevisionToken {
+    token: FileToken,
+    snapshot: FileSnapshot,
+    #[cfg(unix)]
+    _identity_pin: File,
+}
+
+impl FileRevisionToken {
+    /// Re-open `path` and return its exact `FileToken` only when it still names
+    /// the file revision captured by this process.
+    pub(crate) fn revalidate_path(&self, path: &Path) -> Result<Option<FileToken>> {
+        let mut current = open_direct_regular(path)?;
+        let (token, snapshot) = token_and_snapshot_for_file(&mut current)?;
+        Ok((token == self.token && snapshot == self.snapshot).then_some(token))
+    }
+}
+
 #[cfg(unix)]
 fn file_snapshot(_file: &File, metadata: &fs::Metadata) -> Result<FileSnapshot> {
     Ok(FileSnapshot {
@@ -234,7 +262,7 @@ fn snapshot(file: &File, metadata: &fs::Metadata) -> Result<FileSnapshot> {
     file_snapshot(file, metadata)
 }
 
-pub(crate) fn token_for_file(file: &mut File) -> Result<FileToken> {
+fn token_and_snapshot_for_file(file: &mut File) -> Result<(FileToken, FileSnapshot)> {
     let before = snapshot(
         file,
         &file
@@ -261,16 +289,35 @@ pub(crate) fn token_for_file(file: &mut File) -> Result<FileToken> {
     if before != after {
         anyhow::bail!("transaction file changed while it was hashed");
     }
-    Ok(FileToken {
-        identity_high: after.identity_high,
-        identity_low: after.identity_low,
-        digest: hasher.finalize().into(),
-    })
+    Ok((
+        FileToken {
+            identity_high: after.identity_high,
+            identity_low: after.identity_low,
+            digest: hasher.finalize().into(),
+        },
+        after,
+    ))
+}
+
+pub(crate) fn token_for_file(file: &mut File) -> Result<FileToken> {
+    token_and_snapshot_for_file(file).map(|(token, _)| token)
 }
 
 pub(crate) fn token_for_path(path: &Path) -> Result<FileToken> {
     token_for_file(&mut open_direct_regular(path)?)
         .with_context(|| format!("binding transaction path {}", path.display()))
+}
+
+pub(crate) fn revision_token_for_path(path: &Path) -> Result<FileRevisionToken> {
+    let mut file = open_direct_regular(path)?;
+    let (token, snapshot) = token_and_snapshot_for_file(&mut file)
+        .with_context(|| format!("binding transaction path revision {}", path.display()))?;
+    Ok(FileRevisionToken {
+        token,
+        snapshot,
+        #[cfg(unix)]
+        _identity_pin: file,
+    })
 }
 
 pub(crate) fn token_if_present(path: &Path) -> Result<Option<FileToken>> {
@@ -1570,7 +1617,7 @@ mod tests {
     use super::{
         CreateExactOutcome, DirectoryRenameOutcome, RemoveExactOutcome, create_direct_tempdir,
         create_exclusive_copy, remove_exact, rename_directory_noreplace_durable,
-        rename_directory_noreplace_durable_with_hook, token_for_path,
+        rename_directory_noreplace_durable_with_hook, revision_token_for_path, token_for_path,
     };
     use std::fs;
 
@@ -1780,6 +1827,52 @@ mod tests {
             RemoveExactOutcome::Removed | RemoveExactOutcome::RemovedNamespaceDurabilityUnconfirmed
         ));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn process_local_revision_rejects_same_bytes_recreated_at_the_same_path() {
+        let directory = create_direct_tempdir().unwrap();
+        let path = directory.path().join("credential.json");
+        fs::write(&path, b"same credential bytes").unwrap();
+        let revision = revision_token_for_path(&path).unwrap();
+        let original_token = token_for_path(&path).unwrap();
+        assert_eq!(
+            revision.revalidate_path(&path).unwrap(),
+            Some(original_token),
+            "an unchanged path must satisfy its captured file revision"
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"same credential bytes").unwrap();
+
+        assert!(
+            revision.revalidate_path(&path).unwrap().is_none(),
+            "a same-byte delete/recreate must not satisfy the captured file revision"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_local_revision_does_not_block_windows_atomic_replacement() {
+        use std::io::Write as _;
+
+        let directory = create_direct_tempdir().unwrap();
+        let path = directory.path().join("credential.json");
+        fs::write(&path, b"original credential bytes").unwrap();
+        let revision = revision_token_for_path(&path).unwrap();
+
+        let mut replacement = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        replacement
+            .as_file_mut()
+            .write_all(b"replacement credential bytes")
+            .unwrap();
+        drop(
+            replacement
+                .persist(&path)
+                .expect("a Windows revision proof must not hold the target open"),
+        );
+
+        assert!(revision.revalidate_path(&path).unwrap().is_none());
     }
 
     #[test]

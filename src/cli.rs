@@ -189,6 +189,10 @@ pub enum Commands {
         /// Use device code flow (for headless servers without a browser)
         #[arg(long)]
         device: bool,
+
+        /// Confirm recoverable replacement of a legacy profile with incomplete account identity
+        #[arg(long, short)]
+        yes: bool,
     },
     /// Import an auth.json file, or recursively scan a directory for JSON files to validate and import
     Import {
@@ -509,6 +513,23 @@ mod tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert!(cli.json);
             assert!(matches!(cli.command, Some(Commands::Warmup { .. })));
+        }
+    }
+
+    #[test]
+    fn login_accepts_explicit_legacy_recovery_confirmation_flags() {
+        for flag in ["--yes", "-y"] {
+            let cli =
+                Cli::try_parse_from(["codex-switch-global-pace", "login", "legacy", flag]).unwrap();
+
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Login {
+                    alias: Some(ref alias),
+                    yes: true,
+                    ..
+                }) if alias == "legacy"
+            ));
         }
     }
 }

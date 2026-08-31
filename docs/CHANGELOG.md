@@ -1,7 +1,31 @@
 # Changelog
 
-## Unreleased
+## v20260901.1.0 — 2026-09-01
 
+- **Write-ahead recovery for every refresh-token rotation** — A replacement for
+  a consumed single-use refresh token is now durably staged under the private
+  recovery directory before profile I/O begins. Failures before a durable
+  profile commit preserve and report the returned rotation material. After the
+  profile is durable, the exact stage can be removed even if a later live-auth
+  activation step fails; that partial commit is reported without promising a
+  recovery path. Failed exact cleanup reports a path only while it still has the
+  original file identity, never by claiming an unrelated replacement or
+  spending another token.
+- **Truthful rotated-import outcomes** — A durably created import remains a
+  success when only exact recovery-stage cleanup is incomplete, with an optional
+  verified `recovery_path` and warning in JSON and human output. A merely visible
+  profile with incomplete durability or security is reported as a partial
+  commit, never as an absent or quarantined profile.
+- **Cross-version active refresh handoff** — If an older switcher activates a
+  previously inactive profile while its refresh is in flight, the new token is
+  copied to live auth only when that live file exactly equals the pre-refresh
+  profile. Foreign or newer live credentials are preserved and reported.
+- **Recoverable login migration for incomplete legacy identities** — New OAuth
+  saves now require both a non-empty account ID and email. Reauthorizing a legacy
+  alias that lacks either field requires a default-No confirmation or explicit
+  `--yes`, verifies every identity field that is already known, archives the
+  exact previous credentials in `deleted-profiles/`, and only then replaces the
+  same alias. Strictly bound profiles retain the existing same-account rule.
 - **A clearer multi-account starting path** — The README and reviewed user
   guides now lead with the most common Windows workflow: fully quit the Codex
   app through its notification-area menu, switch the active profile, and start

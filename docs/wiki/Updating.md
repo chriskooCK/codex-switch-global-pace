@@ -462,8 +462,9 @@ Write-Host "Verified: local codex-switch state and Codex credential files are ab
 These commands preserve other files under `$CODEX_HOME`, such as Codex
 configuration and history, while removing the live file, all managed live
 backups, and any interrupted auth-publication artifacts. Removing the complete
-`$CODEX_SWITCH_HOME` also removes saved profiles, deleted archives, quarantined
-recovery credentials, proxy configuration, caches, logs, and daemon state.
+`$CODEX_SWITCH_HOME` also removes saved profiles, deleted archives,
+token-rotation recovery credentials (including any explicitly quarantined
+identity/policy rejection), proxy configuration, caches, logs, and daemon state.
 
 ## Next steps
 

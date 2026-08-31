@@ -442,11 +442,15 @@ fn expired_jwt() -> String {
 }
 
 fn account_id_token() -> String {
+    account_id_token_for("refresh-test@example.com", "acct_refresh_test")
+}
+
+fn account_id_token_for(email: &str, account_id: &str) -> String {
     let payload = URL_SAFE_NO_PAD.encode(
         json!({
-            "email": "refresh-test@example.com",
+            "email": email,
             "https://api.openai.com/auth": {
-                "chatgpt_account_id": "acct_refresh_test"
+                "chatgpt_account_id": account_id
             }
         })
         .to_string(),
@@ -844,12 +848,149 @@ async fn reused_refresh_token_stops_retrying_after_a_single_auth_request() {
     server.shutdown();
 }
 
+/// A valid refresh response consumes the old token before local recovery I/O
+/// begins. If the initial recovery stage cannot be created, the request must
+/// stop immediately without publishing either the profile or live auth and
+/// without sending the newly-issued access token anywhere.
+#[tokio::test]
+async fn valid_refresh_stage_creation_failure_is_terminal_and_leaves_auth_unchanged() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![
+            (
+                "old_access".to_string(),
+                vec![reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"detail": "expired"}),
+                )],
+            ),
+            ("access_1".to_string(), vec![usage_ok()]),
+        ],
+        vec![rotation(1)],
+    )
+    .await;
+    let fx = fixture(&server, "stage-blocked", "old_access");
+    let live_path = fx._home.path().join("codex/auth.json");
+    write_auth_file(&live_path, &account_id_token(), "old_access", "refresh_old");
+    let profile_before = std::fs::read(&fx.profile_path).unwrap();
+    let live_before = std::fs::read(&live_path).unwrap();
+    std::fs::write(
+        fx._home.path().join("recovery"),
+        b"blocks recovery directory",
+    )
+    .unwrap();
+
+    let error = codex_switch::usage::fetch_usage_retried_force("stage-blocked", &fx.profile_path)
+        .await
+        .expect_err("a consumed rotation without a recovery stage must be terminal");
+
+    assert_eq!(error.summary, "refreshed token not saved");
+    assert_eq!(server.token_calls(), vec!["refresh_old".to_string()]);
+    assert_eq!(
+        server.usage_calls(),
+        vec!["old_access".to_string()],
+        "the newly-issued access token must not be sent before recovery staging succeeds"
+    );
+    assert_eq!(std::fs::read(&fx.profile_path).unwrap(), profile_before);
+    assert_eq!(std::fs::read(&live_path).unwrap(), live_before);
+    server.shutdown();
+}
+
+/// A legacy switcher does not know the current per-profile refresh lease. If it
+/// completes a switch from B to A while A's refresh request is parked at the
+/// auth server, the successful rotation must hand the complete new credential
+/// generation to both A's profile and the now-active live auth before the new
+/// bearer is used.
+#[tokio::test]
+async fn refresh_hands_exact_credentials_to_a_profile_activated_by_a_legacy_switch_in_flight() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![
+            (
+                "access_a_old".to_string(),
+                vec![reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"detail": "expired"}),
+                )],
+            ),
+            ("access_1".to_string(), vec![usage_ok()]),
+        ],
+        vec![rotation(1)],
+    )
+    .await;
+    let home = support::tempdir();
+    let _guards = env_guards(&server, home.path());
+    let profile_a = write_profile(
+        home.path(),
+        "account-a",
+        &account_id_token_for("account-a@example.com", "acct_a"),
+        "access_a_old",
+        "refresh_old",
+    );
+    let profile_b = write_profile(
+        home.path(),
+        "account-b",
+        &account_id_token_for("account-b@example.com", "acct_b"),
+        "access_b",
+        "refresh_b",
+    );
+    let original_a = std::fs::read(&profile_a).unwrap();
+    let original_b = std::fs::read(&profile_b).unwrap();
+    let live_path = home.path().join("codex/auth.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(&live_path, &original_b).unwrap();
+    let marker_path = home.path().join("current");
+    std::fs::write(&marker_path, b"account-b\n").unwrap();
+    let mut held = server.hold_token_requests();
+
+    let (result, presented) = tokio::join!(
+        codex_switch::usage::fetch_usage_retried_force("account-a", &profile_a),
+        async {
+            let presented = held.wait_for(1).await;
+            std::fs::write(&live_path, &original_a).unwrap();
+            std::fs::write(&marker_path, b"account-a\n").unwrap();
+            held.release_all();
+            presented
+        },
+    );
+
+    result.expect("the rotated bearer must complete its follow-up usage request");
+    assert_eq!(presented, vec!["refresh_old".to_string()]);
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string()],
+        "the in-flight handoff must spend exactly one refresh token"
+    );
+    assert_eq!(
+        server.usage_calls(),
+        vec!["access_a_old".to_string(), "access_1".to_string()],
+        "the successful follow-up GET must use the persisted rotated bearer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker_path).unwrap().trim(),
+        "account-a"
+    );
+    assert_eq!(
+        std::fs::read(&profile_a).unwrap(),
+        std::fs::read(&live_path).unwrap(),
+        "the activated profile and live auth must contain the exact same credential bytes"
+    );
+    let recovery_dir = home.path().join("recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "a complete profile/live handoff must remove its recovery stage"
+        );
+    }
+    server.shutdown();
+}
+
 /// D5: the last data-loss window. Once the auth server has rotated the
-/// credentials the previous refresh_token is dead, so a failed write leaves the
-/// profile holding a token nothing will ever accept again. Reporting success
-/// (the usage call itself worked) hands the user a bricked account that only
-/// shows up at the next start — the failure has to surface now, and has to be
-/// distinguishable from the auth server *rejecting* the refresh.
+/// credentials the previous refresh_token is dead, so the response must be
+/// durable before the profile write is attempted. A failed profile commit must
+/// surface the exact recovery path rather than report success or imply that the
+/// auth server rejected the refresh.
 #[tokio::test]
 async fn refresh_that_cannot_be_saved_fails_the_account_instead_of_reporting_success() {
     let _lock = ENV_LOCK.lock().await;
@@ -880,21 +1021,7 @@ async fn refresh_that_cannot_be_saved_fails_the_account_instead_of_reporting_suc
 
     assert_eq!(presented, vec!["refresh_old".to_string()]);
 
-    assert!(
-        err.summary.contains("not saved"),
-        "short summary must say the refreshed token was not saved: {}",
-        err.summary
-    );
-    assert!(
-        err.detail.contains("could not be saved"),
-        "detail must state that saving the rotated credentials failed: {}",
-        err.detail
-    );
-    assert!(
-        err.detail.contains("sign in again"),
-        "detail must warn that the account may need a new login: {}",
-        err.detail
-    );
+    assert_eq!(err.summary, "rotated credentials preserved for recovery");
     assert!(
         err.detail.contains("reading") && err.detail.contains("auth.json"),
         "detail must carry the underlying IO/permission cause: {}",
@@ -905,10 +1032,206 @@ async fn refresh_that_cannot_be_saved_fails_the_account_instead_of_reporting_suc
         "a write failure must not read like an auth-server rejection: {}",
         err.detail
     );
+
+    let recovery_files = std::fs::read_dir(fx._home.path().join("recovery"))
+        .expect("the rotated credential must have a recovery directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovery_files.len(),
+        1,
+        "one consumed rotation must leave exactly one recovery file"
+    );
+    assert_eq!(stored_refresh_token(&recovery_files[0]), "refresh_1");
+    assert!(
+        err.detail
+            .contains(&recovery_files[0].display().to_string()),
+        "the surfaced error must name the exact recovery file: {}",
+        err.detail
+    );
     server.shutdown();
 }
 
-/// D5b: every refresh consumes a rotation the profile cannot get back. If the
+/// D5a: v20260824 could rename a profile directory without participating in
+/// the newer per-profile lease. If that older process moves A to B after the
+/// server accepts R0 but before the R1 response arrives, the in-flight process
+/// must neither overwrite B nor lose R1. The moved profile retains R0 and the
+/// complete rotated credential is left once, at a path surfaced to the user.
+#[tokio::test]
+async fn legacy_rename_during_refresh_preserves_the_rotated_response_once() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![
+            (
+                "old_access".to_string(),
+                vec![reply(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"detail": "expired"}),
+                )],
+            ),
+            ("access_1".to_string(), vec![usage_ok()]),
+        ],
+        vec![rotation(1)],
+    )
+    .await;
+    let fx = fixture(&server, "legacy-a", "old_access");
+    let mut held = server.hold_token_requests();
+    let original_profile_dir = fx.profile_path.parent().unwrap().to_path_buf();
+    let moved_profile_path = original_profile_dir
+        .parent()
+        .unwrap()
+        .join("legacy-b")
+        .join("auth.json");
+    let moved_profile_dir = moved_profile_path.parent().unwrap().to_path_buf();
+
+    let (result, presented) = tokio::join!(
+        codex_switch::usage::fetch_usage_retried_force("legacy-a", &fx.profile_path),
+        async {
+            let presented = held.wait_for(1).await;
+            std::fs::rename(&original_profile_dir, &moved_profile_dir)
+                .expect("the legacy rename must move profile A to B");
+            held.release_all();
+            presented
+        },
+    );
+    let err = result.expect_err("an in-flight refresh of the moved alias must stop");
+
+    assert_eq!(presented, vec!["refresh_old".to_string()]);
+    assert_eq!(
+        stored_refresh_token(&moved_profile_path),
+        "refresh_old",
+        "the in-flight writer must not overwrite the profile moved by the legacy process"
+    );
+    assert!(
+        !fx.profile_path.exists(),
+        "the refresh must not recreate the alias that the legacy process moved"
+    );
+
+    let recovery_files = std::fs::read_dir(fx._home.path().join("recovery"))
+        .expect("the rotated credential must have a recovery directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovery_files.len(),
+        1,
+        "one accepted refresh must leave exactly one recovery file"
+    );
+    let recovered: Value = serde_json::from_slice(
+        &std::fs::read(&recovery_files[0]).expect("the recovery file must remain readable"),
+    )
+    .expect("the recovery file must contain complete auth JSON");
+    assert_eq!(
+        recovered
+            .pointer("/tokens/id_token")
+            .and_then(Value::as_str),
+        Some(account_id_token().as_str())
+    );
+    assert_eq!(
+        recovered
+            .pointer("/tokens/access_token")
+            .and_then(Value::as_str),
+        Some("access_1")
+    );
+    assert_eq!(
+        recovered
+            .pointer("/tokens/refresh_token")
+            .and_then(Value::as_str),
+        Some("refresh_1")
+    );
+    assert!(
+        recovered
+            .get("last_refresh")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()),
+        "the recovery file must include the complete refreshed credential metadata"
+    );
+    assert_eq!(err.summary, "rotated credentials preserved for recovery");
+    assert!(
+        err.detail
+            .contains(&recovery_files[0].display().to_string()),
+        "the surfaced error must name the exact recovery file: {}",
+        err.detail
+    );
+    assert_eq!(
+        server.token_calls(),
+        vec!["refresh_old".to_string()],
+        "the consumed refresh token must never be retried"
+    );
+    assert_eq!(
+        server.usage_calls(),
+        vec!["old_access".to_string()],
+        "the rotated bearer must not be used before its profile commit succeeds"
+    );
+    server.shutdown();
+}
+
+/// D5b: a successful rotation can race with a writer that has already stored a
+/// newer credential. The compare-and-swap must preserve the winner on disk and
+/// leave this consumed response in the one documented recovery directory. It
+/// must not use the uncommitted bearer or silently report the account as fresh.
+#[tokio::test]
+async fn successful_rotation_superseded_by_a_concurrent_writer_is_recoverable() {
+    let _lock = ENV_LOCK.lock().await;
+    let server = MockServer::start(
+        vec![(
+            "old_access".to_string(),
+            vec![reply(
+                StatusCode::UNAUTHORIZED,
+                json!({"detail": "expired"}),
+            )],
+        )],
+        vec![rotation(1)],
+    )
+    .await;
+    let fx = fixture(&server, "superseded-success", "old_access");
+    server.set_concurrent_winner(
+        "refresh_old",
+        ConcurrentWinner {
+            profile_path: fx.profile_path.clone(),
+            id_token: account_id_token(),
+            access_token: "access_winner".to_string(),
+            refresh_token: "refresh_winner".to_string(),
+        },
+    );
+
+    let err =
+        codex_switch::usage::fetch_usage_retried_force("superseded-success", &fx.profile_path)
+            .await
+            .expect_err("a consumed response that lost the local CAS must be reported");
+
+    assert_eq!(err.summary, "refreshed token superseded");
+    assert_eq!(
+        stored_refresh_token(&fx.profile_path),
+        "refresh_winner",
+        "the concurrent winner must never be overwritten"
+    );
+
+    let recovery_files = std::fs::read_dir(fx._home.path().join("recovery"))
+        .expect("the superseded rotation must have a recovery directory")
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovery_files.len(),
+        1,
+        "one superseded response must leave exactly one recovery file"
+    );
+    assert_eq!(stored_refresh_token(&recovery_files[0]), "refresh_1");
+    assert!(
+        err.detail
+            .contains(&recovery_files[0].display().to_string()),
+        "the error must name the exact recovery file: {}",
+        err.detail
+    );
+    assert_eq!(server.token_calls(), vec!["refresh_old".to_string()]);
+    assert_eq!(
+        server.usage_calls(),
+        vec!["old_access".to_string()],
+        "the uncommitted bearer must never be sent"
+    );
+    server.shutdown();
+}
+
+/// D5c: every refresh consumes a rotation the profile cannot get back. If the
 /// write fails there is no reason to believe the next one will succeed, so the
 /// account must stop immediately instead of spending further single-use tokens
 /// on the same doomed round trip.

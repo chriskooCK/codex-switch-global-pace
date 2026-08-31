@@ -31,8 +31,8 @@ Accounts are added by logging in with `codex-switch-global-pace login` or by imp
 | `$CODEX_HOME/auth.json` | Live authentication read by Codex. |
 | `$CODEX_HOME/auth.json.bak.<timestamp>-<nonce>` | Managed recovery copies of the displaced live authentication; the three newest are retained after normal cleanup. |
 | `$CODEX_SWITCH_HOME/profiles/<alias>/auth.json` | Saved profile authentication. |
-| `$CODEX_SWITCH_HOME/deleted-profiles/` | Recoverable deleted profiles. |
-| `$CODEX_SWITCH_HOME/recovery/` | Quarantined credentials from an interrupted or rejected token-rotation path; never selectable as profiles. |
+| `$CODEX_SWITCH_HOME/deleted-profiles/` | Recoverable deleted profiles and exact pre-replacement archives for confirmed incomplete-legacy re-login. |
+| `$CODEX_SWITCH_HOME/recovery/` | Private write-ahead stages for rotated credentials; normal commits remove the exact stage, while interrupted, rejected, or superseded stages remain non-selectable. A cleanup error names a path only when the original stage is still proven there. |
 | `$CODEX_SWITCH_HOME/current` | Current alias marker. |
 | `$CODEX_SWITCH_HOME/cache.json` | Identity-bound usage, workspace metadata, rejected-credential verdicts, and selection history. |
 | `$CODEX_SWITCH_HOME/config.toml` | Optional settings. |
@@ -75,14 +75,23 @@ There are four distinct credential states:
    Profiles are long-lived until they are reauthorized, deleted, or removed by
    the user.
 3. Deleting an inactive profile moves its complete directory to
-   `deleted-profiles/<alias>.backup-<timestamp>`. These archives do not expire
-   automatically and can be moved back with the
+   `deleted-profiles/<alias>.backup-<timestamp>`. A confirmed re-login of an
+   incomplete legacy profile also copies its exact previous credential to this
+   naming scheme before replacing the same alias. These archives do not expire
+   automatically and deleted profiles can be moved back with the
    [platform-specific recovery commands](Troubleshooting.md#recover-a-deleted-profile).
-4. `recovery/` holds a token-rotation result when an import or refresh cannot
-   safely finish. A recovery file is intentionally not a profile and is never
-   selected. Keep the exact path named by the error private until the account
-   works again; then remove that exact file rather than deleting the directory
-   by wildcard.
+4. `recovery/` is the mandatory private write-ahead location after the service
+   returns refresh-token rotation material and before profile I/O begins.
+   Conflicts and failures before a durable profile commit retain and report that
+   material. After the profile is durable, cleanup removes only the exact staged
+   file identified when it was created; a later live-auth activation failure is
+   still reported as a partial commit, but may have no recovery path once that
+   cleanup succeeds. If exact cleanup fails, the error names the path only when
+   the original file identity remains there; otherwise it reports cleanup as
+   incomplete without claiming a foreign replacement. A recovery file is
+   intentionally not a profile and is never selected. Keep any exact path named
+   by the error private; never move it into `profiles/` or delete the recovery
+   directory by wildcard.
 
 Before replacing an existing live credential, the application creates an
 independent `auth.json.bak.<timestamp>-<nonce>` beside `auth.json`. After normal

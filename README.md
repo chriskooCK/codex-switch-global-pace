@@ -108,6 +108,14 @@ existing alias does not activate it; run `use <alias>` afterward. Use a separate
 browser profile or sign out between logins when necessary, then verify the
 alias, email, and workspace in `list -f`.
 
+Every OAuth login must provide both a non-empty `account_id` and email before
+credentials are saved. If an older profile is missing either identity field,
+`login <alias>` does not silently overwrite it: an interactive run asks for
+explicit confirmation (default **No**), while JSON or other non-interactive use
+requires `--yes`. After approval, the exact previous credentials are archived
+under `deleted-profiles/` and the completed login replaces the same alias. Any
+known legacy identity field must still match the authenticated account.
+
 Aliases are 1–64 ASCII bytes and may contain only letters, digits, `_`, `-`, and
 `.` (`.` and `..` alone are reserved). For example, `personal`, `work`, and
 `team-a` are valid; non-ASCII aliases are not.
@@ -150,6 +158,15 @@ The application deliberately reuses the original data directory:
 Existing `profiles/`, `cache.json`, `config.toml`, `current`, and
 `daemon-state.json` remain usable without another login. Installers and
 uninstallers preserve this shared directory.
+
+When the service rotates a single-use refresh token, the returned rotation
+material is durably staged in the private `recovery/` directory before the
+profile commit begins. Conflicts and failures before profile durability preserve
+and report that material. After the profile is durable, the exact stage can be
+removed even if a later live-auth step fails, so that partial commit may report
+no recovery path. An exact-cleanup error names a path only while the original
+staged file is still proven there; it never claims or deletes an unrelated file,
+and it never retries a consumed token.
 
 > Do not run the `codex-switch` daemon and the `codex-switch-global-pace` daemon
 > at the same time. They intentionally share profiles, cache, locks, current

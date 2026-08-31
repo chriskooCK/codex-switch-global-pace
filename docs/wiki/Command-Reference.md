@@ -9,7 +9,7 @@ applies when the Windows executable is launched directly.
 
 | Command | Purpose |
 |---|---|
-| `login [--device] [alias]` | Add or reauthorize a profile through browser PKCE or device-code login. An existing alias accepts only the same account identity. For a new alias, a distinct identity creates and activates it; an identity already saved under another alias updates and activates that matching profile instead. |
+| `login [--device] [-y\|--yes] [alias]` | Add or reauthorize a profile through browser PKCE or device-code login. Every saved OAuth result requires a non-empty `account_id` and email. A complete existing alias accepts only the same identity. An incomplete legacy alias requires a default-No confirmation, archives its exact previous credentials under `deleted-profiles/`, and replaces that same alias only when all known identity fields match; `-y` / `--yes` supplies that confirmation for an intentional non-interactive run. For a new alias, a distinct identity creates and activates it; an identity already saved under another alias updates and activates that matching profile instead. |
 | `import <path> [alias]` | Validate and import one `auth.json`, or recursively scan a directory for JSON files. The alias applies to single-file imports only; directories auto-assign aliases. |
 | `list [-f]` | Show profiles, usage, and availability; `-f` / `--force` bypasses the cache. |
 | `use [alias] [--consume-card]` | Switch explicitly, or omit the alias to auto-select with the unified scoring algorithm. When the pool is exhausted, `--consume-card` consumes the earliest-expiring reset card to revive an account (auto-select only; ignored when an alias is given). |
@@ -40,10 +40,33 @@ applies when the Windows executable is launched directly.
 
 - Structured data is written to stdout; progress and diagnostics are written to stderr.
 - JSON and other non-interactive execution never consumes a reset card or deletes a profile without an explicit opt-in flag.
+- Reauthorizing an incomplete legacy alias is also explicit: JSON and other non-interactive runs stop before OAuth unless `login <alias> --yes` was requested. The approved operation archives the prior credentials before replacing the same alias.
 - `list` asks whether to save an untracked live login or refresh a saved profile only in an interactive terminal. `--json`, `--json-pretty`, and stdin-driven non-interactive runs never register or update live credentials implicitly. JSON lists saved profiles only and returns `"profiles": []` when there are none.
 - Human `daemon status` prints the process state, `Service: installed|not installed (manager: ...)`, then `Config:` with `poll_interval_secs`, `cache_refresh_interval_secs`, `auto_warmup`, `token_check_interval_secs`, `switch_threshold`, `notify`, `defer_switch_while_codex_running`, and `log_level`. Its JSON `config` object includes the same settings, including the boolean `defer_switch_while_codex_running`.
 - A manual `use` affects only the next Codex process. Finish and exit `codex`, `codex resume`, or `codex exec` sessions first; on Windows, quit the notification-area Codex app rather than only closing its window. Then run `use` and start Codex again. MCP/app-server helper processes alone are not interactive-session blockers for daemon deferral.
 - Update checks are manual except for the one check performed when the TUI starts.
+
+## Credential persistence
+
+OAuth credentials are not saved unless both `account_id` and email are present.
+When a refresh response rotates its single-use refresh token, the returned
+rotation material is first written durably to the private `recovery/` directory.
+The profile commit then uses the normal identity and compare-and-swap checks.
+Conflicts and failures before a durable profile commit preserve and report that
+material. After the profile is durable, the exact stage can be removed even if a
+later live-auth activation fails, so that partial commit may report no recovery
+path. A failed exact cleanup reports its path only while the original stage
+remains there; otherwise the command reports the partial state without claiming
+a foreign path or automatically retrying the spent token. Successful JSON
+re-authorization of an incomplete legacy alias also returns `archive_path` for
+the exact `deleted-profiles/` archive.
+
+For an import whose profile publication is durable but recovery cleanup is not,
+the profile remains a successful import and human output prints a warning. JSON
+adds optional `cleanup_warning` and `recovery_path` fields; the latter appears
+only when the original stage still owns that exact path. If the profile is only
+visible and its durability or security is incomplete, import reports a partial
+commit instead of claiming either full success or that no profile exists.
 
 Examples:
 
@@ -82,6 +105,9 @@ codex-switch-global-pace self-update --check
 | `q` | Quit |
 
 Destructive or consumptive actions always require confirmation.
+Batch re-login skips an incomplete legacy identity with an error; recover that
+profile individually so its default-No confirmation and exact credential
+archive cannot be bypassed.
 
 ## Next steps
 

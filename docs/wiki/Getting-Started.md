@@ -307,12 +307,29 @@ browser flows used the same actual account, identity matching updates the
 existing profile instead of creating a second independent account. Correct the
 browser session and repeat the intended login.
 
-Naming an existing alias with `login <alias>` re-authorizes that saved account
-and verifies that its identity has not changed; it cannot replace the alias
-with a different account. For normal day-to-day account selection, use
-`use <alias>` instead. See
+Naming a complete existing alias with `login <alias>` re-authorizes that saved
+account and verifies that its identity has not changed; it cannot replace the
+alias with a different account. Every OAuth result must contain both a
+non-empty `account_id` and email before it can be saved.
+
+Profiles created by older versions may be missing one of those identity fields.
+For that specific case, `login <alias>` displays a default-No confirmation.
+Approval archives the exact previous credentials under `deleted-profiles/`,
+then saves the complete authenticated identity back to the same alias; any
+known legacy identity field must match. JSON or other non-interactive recovery
+requires `login <alias> --yes` explicitly. For normal day-to-day account
+selection, use `use <alias>` instead. See
 [Correct a wrong browser account](Troubleshooting.md#correct-a-wrong-browser-account)
 if the wrong identity was saved.
+
+If the authorization server rotates a refresh token but the local profile
+commit cannot finish, the command stops without retrying that consumed token.
+It reports the exact private file under `$CODEX_SWITCH_HOME/recovery/` when that
+original stage is still proven there; if only cleanup or another local commit
+step is incomplete and no exact stage can be rebound, it reports the partial
+state without claiming a path. Resolve the named cause before handling any
+file; the application does not guess or automatically activate a recovery
+credential.
 
 ### Device-code login and imports
 

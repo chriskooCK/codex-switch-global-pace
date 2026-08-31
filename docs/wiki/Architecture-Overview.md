@@ -54,11 +54,15 @@ pinned directory object.
 
 [`src/profile.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/profile.rs) owns aliases, identity deduplication, imports, recoverable deletion, current-profile tracking, and switching. `auth.lock` serializes replacement or synchronization of the live `auth.json`. A compatibility-only `launch.lock` is acquired first so an older `codex-switch` process sharing the same state directory cannot restore staged credentials over a newer switch; this binary does not implement the `launch` command.
 
-Credential replacement requires an exact `account_id` and email match; an
-email-only or otherwise incomplete identity never authorizes an overwrite.
-Interactive re-login captures that strict identity under a short profile
-lease, releases the lease during the browser or device-code wait, and validates
-the initial, current, and incoming identities after reacquiring it for commit.
+New OAuth saves require both a non-empty `account_id` and email. Credential
+replacement for a complete profile requires an exact match on both fields.
+Interactive re-login captures that strict identity under a short profile lease,
+releases the lease during the browser or device-code wait, and validates the
+initial, current, and incoming identities after reacquiring it for commit. An
+incomplete legacy profile instead carries its exact captured file revision and
+known identity components across the wait. Only explicit confirmation permits the
+commit to archive that exact credential in `deleted-profiles/` and replace the
+same alias; every known identity component must match the complete OAuth result.
 Interactive overwrite confirmation follows the same ownership shape: the
 prepared target and live snapshots cross the lease-free stdin wait, then a new
 lease and the auth transaction revalidate them before any switch or reset-card
@@ -69,9 +73,15 @@ a bounded fresh observation rather than publishing stale state.
 Imports are intentionally create-only: Usage API access proves workspace
 membership, but a Team workspace ID can belong to several users and cannot
 authorize overwriting an existing profile. Tokens refreshed while a profile is
-active are written to both the saved profile and the live auth file under the
-same switching discipline. A rotated import that loses verifiable identity is
-written under `recovery/`, outside the selectable profile tree.
+active at commit time are written to both the saved profile and the live auth
+file under the same switching discipline. Returned refresh-token rotation
+material is durably staged under `recovery/` before profile I/O. Conflicts and
+failures before a durable profile commit preserve and report that material
+outside the selectable profile tree. After the profile is durable, the exact
+stage can be removed even if a later live-auth activation fails, so that partial
+commit may report no recovery path. Failed exact cleanup names the stage only if
+its original file identity is still bound to that path; otherwise the partial
+state is reported without claiming a foreign replacement.
 
 ## Usage, refresh, and selection
 
@@ -137,6 +147,7 @@ PID-file cleanup verifies lock ownership before removal. Removing a path while a
 | `$CODEX_SWITCH_HOME/profiles/<alias>/auth.json` | Saved account credentials |
 | `$CODEX_SWITCH_HOME/current` | Current alias marker |
 | `$CODEX_SWITCH_HOME/deleted-profiles/` | Recoverable profile archives |
+| `$CODEX_SWITCH_HOME/recovery/` | Private write-ahead token-rotation material; an exact path is retained and reported only while the original staged file is still proven there |
 | `$CODEX_SWITCH_HOME/cache.json` | Usage, workspace metadata, and rejected-credential cache |
 | `$CODEX_SWITCH_HOME/config.toml` | Application configuration |
 | `$CODEX_SWITCH_HOME/daemon-state.json` | Daemon status and pending-switch snapshot |
