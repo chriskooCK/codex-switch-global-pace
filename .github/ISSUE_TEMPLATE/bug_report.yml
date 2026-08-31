@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a reproducible problem using redacted diagnostic information.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security vulnerabilities belong in [private vulnerability reporting](https://github.com/chriskooCK/codex-switch-global-pace/security/advisories/new), not here.
+
+        Never paste access or refresh tokens, `auth.json`, profile/backup/recovery files, cookies, proxy credentials, email addresses, account/workspace IDs, or unredacted debug output. Replace private paths and identifiers with placeholders.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `codex-switch-global-pace --version` only.
+      placeholder: codex-switch-global-pace 20260829.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other / source build
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Architecture and terminal
+      description: For example, x86_64 with PowerShell 7 or arm64 with zsh.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Redacted command
+      description: Show the smallest failing command. Replace aliases, paths, URLs, and proxy values when they identify you.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use synthetic names and numbered steps. Do not upload an auth or state directory.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and redacted error
+      description: Paste only the relevant, redacted lines. Avoid raw `--debug` output.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I checked that this is not a security vulnerability; otherwise I will use private vulnerability reporting.
+          required: true
+        - label: I removed tokens, auth/profile/backup/recovery contents, cookies, identities, private paths, and proxy credentials.
+          required: true
+        - label: I searched existing issues and tested the latest stable release when practical.
+          required: true

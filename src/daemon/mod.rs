@@ -3048,10 +3048,10 @@ fn status(json: bool) -> Result<()> {
 
     // Loop-written snapshot; only meaningful while the daemon is running.
     let snapshot = if running { state::read()? } else { None };
+    let service_installed = service::is_installed_checked()?;
+    let cfg = &crate::config::get().daemon;
 
     if json {
-        let service_installed = service::is_installed_checked()?;
-        let cfg = crate::config::get();
         print_json(&serde_json::json!({
             "running": running,
             "state": state,
@@ -3067,13 +3067,14 @@ fn status(json: bool) -> Result<()> {
                 "service_installed": service_installed,
             },
             "config": {
-                "poll_interval_secs": cfg.daemon.poll_interval_secs,
-                "cache_refresh_interval_secs": cfg.daemon.cache_refresh_interval_secs,
-                "auto_warmup": cfg.daemon.auto_warmup,
-                "token_check_interval_secs": cfg.daemon.token_check_interval_secs,
-                "switch_threshold": cfg.daemon.switch_threshold,
-                "notify": cfg.daemon.notify,
-                "log_level": cfg.daemon.log_level,
+                "poll_interval_secs": cfg.poll_interval_secs,
+                "cache_refresh_interval_secs": cfg.cache_refresh_interval_secs,
+                "auto_warmup": cfg.auto_warmup,
+                "token_check_interval_secs": cfg.token_check_interval_secs,
+                "switch_threshold": cfg.switch_threshold,
+                "notify": cfg.notify,
+                "defer_switch_while_codex_running": cfg.defer_switch_while_codex_running,
+                "log_level": cfg.log_level,
             }
         }))?;
         if state == "stale" {
@@ -3150,7 +3151,45 @@ fn status(json: bool) -> Result<()> {
             std::env::consts::OS
         ));
     }
+    for line in status_metadata_lines(service_installed, cfg) {
+        user_println(&line);
+    }
     Ok(())
+}
+
+fn status_metadata_lines(
+    service_installed: bool,
+    cfg: &crate::config::DaemonConfig,
+) -> Vec<String> {
+    vec![
+        format!(
+            "Service: {} (manager: {})",
+            if service_installed {
+                "installed"
+            } else {
+                "not installed"
+            },
+            service_manager_name()
+        ),
+        "Config:".to_string(),
+        format!("  poll_interval_secs: {}", cfg.poll_interval_secs),
+        format!(
+            "  cache_refresh_interval_secs: {}",
+            cfg.cache_refresh_interval_secs
+        ),
+        format!("  auto_warmup: {}", cfg.auto_warmup),
+        format!(
+            "  token_check_interval_secs: {}",
+            cfg.token_check_interval_secs
+        ),
+        format!("  switch_threshold: {}", cfg.switch_threshold),
+        format!("  notify: {}", cfg.notify),
+        format!(
+            "  defer_switch_while_codex_running: {}",
+            cfg.defer_switch_while_codex_running
+        ),
+        format!("  log_level: {}", cfg.log_level),
+    ]
 }
 
 fn bounded_status_last_error(error: &str) -> String {
@@ -3207,7 +3246,7 @@ mod startup_file_log_tests {
 
 #[cfg(test)]
 mod status_text_tests {
-    use super::{STATUS_LAST_ERROR_MAX_CHARS, bounded_status_last_error};
+    use super::{STATUS_LAST_ERROR_MAX_CHARS, bounded_status_last_error, status_metadata_lines};
 
     #[test]
     fn persisted_last_error_is_control_free_and_bounded_at_terminal_boundary() {
@@ -3221,6 +3260,29 @@ mod status_text_tests {
         assert!(rendered.chars().all(|ch| !ch.is_control()));
         assert_eq!(rendered.chars().count(), STATUS_LAST_ERROR_MAX_CHARS);
         assert!(rendered.starts_with("upstream]52;clipboard"));
+    }
+
+    #[test]
+    fn human_status_metadata_includes_service_manager_and_complete_config() {
+        let cfg = crate::config::DaemonConfig::default();
+
+        let lines = status_metadata_lines(false, &cfg);
+
+        assert_eq!(
+            lines[0],
+            format!(
+                "Service: not installed (manager: {})",
+                super::service_manager_name()
+            )
+        );
+        assert_eq!(lines[1], "Config:");
+        assert!(lines.iter().any(|line| line == "  poll_interval_secs: 60"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  defer_switch_while_codex_running: true")
+        );
+        assert!(lines.iter().any(|line| line == "  log_level: error"));
     }
 }
 

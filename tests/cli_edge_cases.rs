@@ -395,7 +395,7 @@ fn json_reset_card_requires_explicit_yes() {
 }
 
 #[test]
-fn json_list_auto_track_keeps_stdout_machine_readable() {
+fn json_list_does_not_auto_track_untracked_live_auth() {
     let home = temp_home();
     write_json(
         home.join(".codex/auth.json"),
@@ -406,18 +406,81 @@ fn json_list_auto_track_keeps_stdout_machine_readable() {
     assert!(output.status.success());
 
     let stdout = parse_stdout_json(&output);
-    assert_eq!(stdout["profiles"][0]["alias"], "carol");
-    assert_eq!(
-        stdout["profiles"][0]["usage"]["error"],
-        "no access_token in auth file"
-    );
+    assert_eq!(stdout["profiles"], serde_json::json!([]));
     assert_eq!(stdout["global_weekly"]["included_accounts"], 0);
-    assert_eq!(stdout["global_weekly"]["excluded_accounts"], 1);
+    assert_eq!(stdout["global_weekly"]["excluded_accounts"], 0);
     assert!(stdout["global_weekly"]["pace_percent"].is_null());
+    assert!(output.stderr.is_empty());
+    assert!(
+        !home.join(".codex-switch/profiles").exists(),
+        "machine-readable list must not create a profile without consent"
+    );
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Saved profile: carol"));
-    assert!(stderr.contains("Auto-saved current account as profile: carol"));
+#[test]
+fn no_color_overrides_explicit_always_for_cli_output() {
+    let home = temp_home();
+
+    let output = run_with_env(&home, &["--color", "always", "list"], &[("NO_COLOR", "1")]);
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "(no saved profiles)\n"
+    );
+    assert!(!output.stdout.contains(&0x1b));
+    assert!(!output.stderr.contains(&0x1b));
+}
+
+#[test]
+fn daemon_status_reports_service_manager_and_defer_config_in_both_modes() {
+    let home = temp_home();
+    fs::create_dir_all(home.join(".codex-switch")).unwrap();
+    fs::write(
+        home.join(".codex-switch/config.toml"),
+        "[daemon]\npoll_interval_secs = 7\ndefer_switch_while_codex_running = false\n",
+    )
+    .unwrap();
+
+    let human = run(&home, &["daemon", "status"]);
+    assert!(
+        human.status.success(),
+        "human status failed: {}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.starts_with("Daemon is not running\nService: "));
+    assert!(human.contains("Config:\n  poll_interval_secs: 7"));
+    assert!(human.contains("  defer_switch_while_codex_running: false"));
+
+    let json = run(&home, &["--json", "daemon", "status"]);
+    assert!(
+        json.status.success(),
+        "JSON status failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let json = parse_stdout_json(&json);
+    let service_installed = json["platform"]["service_installed"]
+        .as_bool()
+        .expect("service installation state is boolean");
+    let service_manager = json["platform"]["service_manager"]
+        .as_str()
+        .expect("service manager is named");
+    let expected_service_line = format!(
+        "Service: {} (manager: {service_manager})",
+        if service_installed {
+            "installed"
+        } else {
+            "not installed"
+        }
+    );
+    assert!(
+        human
+            .lines()
+            .any(|line| line == expected_service_line.as_str())
+    );
+    assert_eq!(json["config"]["poll_interval_secs"], 7);
+    assert_eq!(json["config"]["defer_switch_while_codex_running"], false);
 }
 
 #[test]
@@ -873,8 +936,8 @@ fn non_interactive_stdin_does_not_save_new_account() {
         stdout.contains("Detected new account"),
         "expected detection message in stdout, got: {stdout}"
     );
-    // Should NOT have saved — no profiles directory should exist
-    // (auto_track_current is skipped because auth_already_handled=true)
+    // Should NOT have saved — list never performs implicit auto-tracking, and
+    // the non-interactive preflight only reports the detected account.
     let profiles_dir = home.join(".codex-switch/profiles");
     assert!(
         !profiles_dir.exists() || fs::read_dir(&profiles_dir).unwrap().count() == 0,

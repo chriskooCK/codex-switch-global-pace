@@ -9,7 +9,7 @@ applies when the Windows executable is launched directly.
 
 | Command | Purpose |
 |---|---|
-| `login [--device] [alias]` | Add or reauthorize a profile through browser PKCE or device-code login. If the alias already exists, it is reauthorized; otherwise a new profile is created. |
+| `login [--device] [alias]` | Add or reauthorize a profile through browser PKCE or device-code login. An existing alias accepts only the same account identity. For a new alias, a distinct identity creates and activates it; an identity already saved under another alias updates and activates that matching profile instead. |
 | `import <path> [alias]` | Validate and import one `auth.json`, or recursively scan a directory for JSON files. The alias applies to single-file imports only; directories auto-assign aliases. |
 | `list [-f]` | Show profiles, usage, and availability; `-f` / `--force` bypasses the cache. |
 | `use [alias] [--consume-card]` | Switch explicitly, or omit the alias to auto-select with the unified scoring algorithm. When the pool is exhausted, `--consume-card` consumes the earliest-expiring reset card to revive an account (auto-select only; ignored when an alias is given). |
@@ -19,7 +19,7 @@ applies when the Windows executable is launched directly.
 | `delete <alias> [-y]` | Move an inactive profile into recoverable deleted storage; `-y` / `--yes` skips the prompt. |
 | `daemon start [--foreground]` | Start the Beta daemon, detached by default; `--foreground` is for service managers. |
 | `daemon stop` | Stop a running Beta daemon. |
-| `daemon status` | Report daemon support, service, process, configuration, and pending-switch state. |
+| `daemon status` | Report daemon support, process and pending-switch state, whether the native service is installed and which manager owns it, plus the effective daemon configuration. JSON includes the same information. |
 | `daemon install` | Install the native user service: LaunchAgent on macOS, systemd on Linux, Task Scheduler on Windows (elevated PowerShell required). |
 | `daemon uninstall` | Remove the native user service. |
 | `self-update [--check] [--dev\|--stable]`<br>`self-update --version <VERSION>` | Check or update a direct installation. Without flags it stays on the current channel; `--version` installs a specific newer stable version and is mutually exclusive with `--check`, `--dev`, and `--stable`. |
@@ -30,9 +30,9 @@ applies when the Windows executable is launched directly.
 | Option | Environment variable | Behavior |
 |---|---|---|
 | `--json` | — | Compact structured output (supported by `list`, `use`, `reset-card`, `warmup`, `rename`, `delete`, `login`, `import`, `self-update`, `daemon status`). |
-| `--json-pretty` | — | Indented structured output. |
+| `--json-pretty` | — | Indented structured output for the same commands as `--json`; it selects JSON by itself, and wins over compact formatting if both flags are present. |
 | `--proxy <URL>` | `CS_PROXY` | Override proxy configuration for this process; supports `http(s)://`, `socks4://`, `socks5://`, and `socks5h://` (remote DNS). |
-| `--color <auto\|always\|never>` | `CS_COLOR` | Control terminal color. `NO_COLOR` disables color regardless of this option. |
+| `--color <auto\|always\|never>` | `CS_COLOR` | Control CLI and TUI color. The presence of `NO_COLOR`, even with an empty value, always disables color and overrides `always`; non-color emphasis needed to show TUI selection remains visible. |
 | `--debug` | — | Emit diagnostic information (HTTP requests, API responses, cache status) to stderr; redact it before sharing. |
 | `-V`, `--version` | — | Print the binary version. |
 
@@ -40,7 +40,9 @@ applies when the Windows executable is launched directly.
 
 - Structured data is written to stdout; progress and diagnostics are written to stderr.
 - JSON and other non-interactive execution never consumes a reset card or deletes a profile without an explicit opt-in flag.
-- A manual `use` affects the next Codex process. Restart an already-running Codex process to load the new `auth.json`.
+- `list` asks whether to save an untracked live login or refresh a saved profile only in an interactive terminal. `--json`, `--json-pretty`, and stdin-driven non-interactive runs never register or update live credentials implicitly. JSON lists saved profiles only and returns `"profiles": []` when there are none.
+- Human `daemon status` prints the process state, `Service: installed|not installed (manager: ...)`, then `Config:` with `poll_interval_secs`, `cache_refresh_interval_secs`, `auto_warmup`, `token_check_interval_secs`, `switch_threshold`, `notify`, `defer_switch_while_codex_running`, and `log_level`. Its JSON `config` object includes the same settings, including the boolean `defer_switch_while_codex_running`.
+- A manual `use` affects only the next Codex process. Finish and exit `codex`, `codex resume`, or `codex exec` sessions first; on Windows, quit the notification-area Codex app rather than only closing its window. Then run `use` and start Codex again. MCP/app-server helper processes alone are not interactive-session blockers for daemon deferral.
 - Update checks are manual except for the one check performed when the TUI starts.
 
 Examples:

@@ -205,7 +205,10 @@ async fn daemon_start_switch_status_and_stop() {
 
     let status_before = run_cmd(&env, &["daemon", "status"]);
     assert!(status_before.status.success());
-    assert_eq!(stdout(&status_before), "Daemon is not running");
+    let status_before_text = stdout(&status_before);
+    assert!(status_before_text.starts_with("Daemon is not running\nService: not installed"));
+    assert!(status_before_text.contains("Config:\n  poll_interval_secs: 1"));
+    assert!(status_before_text.contains("  defer_switch_while_codex_running: false"));
 
     let start = run_cmd(&env, &["daemon", "start"]);
     assert!(
@@ -254,6 +257,10 @@ async fn daemon_start_switch_status_and_stop() {
     assert_eq!(status_json["config"]["cache_refresh_interval_secs"], 1);
     assert_eq!(status_json["config"]["auto_warmup"], false);
     assert_eq!(status_json["config"]["switch_threshold"], 50.0);
+    assert_eq!(
+        status_json["config"]["defer_switch_while_codex_running"],
+        false
+    );
 
     wait_until(
         Duration::from_secs(10),
@@ -329,7 +336,7 @@ async fn daemon_start_switch_status_and_stop() {
         "daemon stopped and status=not running",
         || {
             let out = run_cmd(&env, &["daemon", "status"]);
-            out.status.success() && stdout(&out) == "Daemon is not running"
+            out.status.success() && stdout(&out).starts_with("Daemon is not running\nService:")
         },
     );
 

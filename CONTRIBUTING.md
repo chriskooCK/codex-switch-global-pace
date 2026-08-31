@@ -9,7 +9,10 @@ Thank you for improving `codex-switch-global-pace`. Contributions should be smal
 3. Base normal work on `dev`; `master` tracks stable releases.
 4. For a substantial feature or architecture change, open an issue before implementation so the boundary can be agreed first.
 
-Security vulnerabilities should not be posted with live credentials or exploit data in a public issue. Share only the minimum redacted reproduction material needed to assess the problem.
+Report suspected vulnerabilities through the private channel described in the
+[security policy](SECURITY.md), not a public issue. Never include live
+credentials. Share only the minimum redacted reproduction material needed to
+assess the problem.
 
 ## Make the change
 
@@ -18,7 +21,9 @@ Security vulnerabilities should not be posted with live credentials or exploit d
 - Prefer existing modules and dependencies. Do not add a dependency when the standard library or an installed crate already solves the problem.
 - Preserve JSON stdout, atomic file writes, cross-process locks, recoverable deletion, and the file-backed Codex credential-store requirement.
 - Write code comments only when the reason is not clear from the code.
-- Write user-facing text and documentation in English.
+- Keep English documentation canonical. Localized quick guides may summarize
+  the reviewed English pages and link back to them, but must not define a
+  separate behavior contract.
 
 ## Verify locally
 
@@ -40,6 +45,8 @@ Update documentation in the same pull request when behavior changes:
 
 - `docs/wiki/` pages for user-visible behavior: `Feature-Guide.md`, `Command-Reference.md`, `Configuration.md`, `Updating.md`, `Troubleshooting.md`
 - `README.md` when the quick start or installation flow is affected
+- localized companion pages when their short workflow would otherwise become
+  misleading
 - `docs/wiki/Architecture-Overview.md` for module, storage, or data-flow changes
 - `docs/wiki/Developer-Onboarding.md` for engineering workflow changes
 - `docs/CHANGELOG.md` for the current development cycle

@@ -1,57 +1,136 @@
 # codex-switch-global-pace
 
-**A multi-account manager and global weekly quota dashboard for
-[OpenAI Codex CLI](https://github.com/openai/codex).** It treats the weekly
-allowances of all available profiles as one pool, while preserving the login,
-switching, warmup, reset-card, JSON, and daemon workflows from its
-one-time `codex-switch` source snapshot.
+**A local multi-account switcher and global weekly pace dashboard for
+[OpenAI Codex](https://github.com/openai/codex).** Switch the active Codex
+credential among accounts you are authorized to use, and inspect their weekly
+usage in one local dashboard.
 
-[中文说明](README_CN.md) · [Documentation](docs/wiki/Home.md) ·
+[한국어 안내](docs/wiki/Korean-Guide.md) · [中文说明](README_CN.md) ·
+[Documentation](docs/wiki/Home.md) ·
 [Releases](https://github.com/chriskooCK/codex-switch-global-pace/releases)
 
-> This program manages local authentication files. Never publish profiles,
-> `auth.json`, tokens, proxy credentials, or unredacted debug output.
+> **Independent project:** this project is unofficial and is not affiliated
+> with or endorsed by OpenAI. Use it only with accounts and workspaces you are
+> authorized to access. It does not merge, transfer, share, or bypass service
+> quotas; the global meter is only a local aggregate display.
+
+> **Credentials stay sensitive:** this program manages local authentication
+> files. Never publish profiles, `auth.json`, tokens, proxy credentials, or
+> unredacted debug output.
+
+## Everyday workflow: switch the Windows Codex app account
+
+This is the main day-to-day workflow. The Windows Codex app can remain in the
+notification area after its window closes, so fully stop it before changing the
+active account.
+
+1. Save your work and close every Codex window.
+2. Open the Windows notification area, including the hidden icons behind `^`.
+   Find the **ChatGPT** tray icon for the Codex desktop app (some versions may
+   label it **Codex**), choose its **Quit** or **Exit** command, and confirm that
+   the icon disappears.
+3. In PowerShell or Command Prompt, refresh the account view and choose the
+   account you want:
+
+   ```powershell
+   codex-switch-global-pace list -f
+   codex-switch-global-pace use work
+   ```
+
+   To let the adaptive scoring algorithm select the best eligible account,
+   omit the alias:
+
+   ```powershell
+   codex-switch-global-pace use
+   ```
+
+4. Start the Codex app again. The new process reads the selected account.
+
+> Closing only the app window is not enough if its tray icon remains. Do not
+> switch while the Codex Windows tray app or an active Codex session (`codex`,
+> `codex resume`, or `codex exec`) is still running. Long-lived MCP or app-server
+> helpers are not session processes. For the Codex CLI on Windows, macOS, or
+> Linux, finish or terminate each session, run `use <alias>` (or automatic
+> `use`), and then start a new session.
 
 ## Quick start
 
-Codex must use its file credential store. If needed, add this to
-`$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`):
+### Requirements
+
+- Windows, macOS, or Linux on x64/AMD64 or ARM64. Release artifacts are
+  published for all six OS/architecture combinations.
+- The Codex Windows app or [Codex CLI](https://github.com/openai/codex), plus at
+  least one ChatGPT account that can sign in to Codex.
+- A current [GitHub CLI](https://cli.github.com/) with attestation support,
+  installed and authenticated to GitHub. Before installing, run `gh --version`,
+  `gh auth login` if needed, `gh auth status`, and
+  `gh attestation verify --help`.
+- Windows PowerShell 5.1 or PowerShell 7 on Windows. On macOS/Linux: Bash,
+  `curl`, `tar`, `mktemp`, and either `sha256sum` or `shasum`.
+
+GitHub CLI authentication is used only to download and verify the release; it
+is separate from the ChatGPT accounts you add below.
+
+Codex must use its
+[file credential store](https://learn.chatgpt.com/docs/auth). If needed, add this to
+`$CODEX_HOME/config.toml` (normally `~/.codex/config.toml`; on Windows, normally
+`%USERPROFILE%\.codex\config.toml`):
 
 ```toml
 cli_auth_credentials_store = "file"
 ```
 
-Install with the source-controlled [verified bootstrap](docs/wiki/Getting-Started.md#install).
-It uses a current [GitHub CLI](https://cli.github.com/) to bind the installer
-attestation to the exact Release tag and commit before running the local file.
-Verification failure stops the install; there is no direct-download fallback.
+Install with the source-controlled
+[verified bootstrap](docs/wiki/Getting-Started.md#install). It binds the
+installer attestation to this repository, the exact Release tag, and its commit
+before running the local file. Verification failure stops the installation;
+there is no direct-download fallback.
 
-Then add an account or open the dashboard:
+For a typical two-account setup, fully exit Codex first, then add each account
+under an explicit alias:
 
-```bash
-codex-switch-global-pace login
-codex-switch-global-pace list
-codex-switch-global-pace use
-codex-switch-global-pace          # open the interactive dashboard
+```powershell
+codex-switch-global-pace login personal
+# In the browser, verify the personal email/workspace before approving.
+
+codex-switch-global-pace login work
+# Switch the browser account and verify the work email/workspace before approving.
+
+codex-switch-global-pace list -f
 ```
 
-Running `codex-switch-global-pace` with no arguments opens the TUI. On Windows,
-double-clicking `codex-switch-global-pace.exe` therefore opens the same dashboard.
-`use` changes the live account used by the next Codex process; restart an
-already-running Codex app or CLI after switching.
+A distinct identity authenticated under a new alias becomes the live/current
+Codex account as soon as login succeeds. If `work` is a distinct identity, the
+sequence above creates and activates `work`. If the browser silently reuses the
+personal account, the matching existing profile is updated and activated
+instead, and a separate `work` alias is not created. Reauthorizing an inactive
+existing alias does not activate it; run `use <alias>` afterward. Use a separate
+browser profile or sign out between logins when necessary, then verify the
+alias, email, and workspace in `list -f`.
+
+Aliases are 1–64 ASCII bytes and may contain only letters, digits, `_`, `-`, and
+`.` (`.` and `..` alone are reserved). For example, `personal`, `work`, and
+`team-a` are valid; non-ASCII aliases are not.
+
+Running `codex-switch-global-pace` with no arguments opens the interactive
+dashboard. On Windows, double-clicking `codex-switch-global-pace.exe` opens the
+same dashboard. See the full [Getting started](docs/wiki/Getting-Started.md)
+guide for installation, device-code login, imports, and troubleshooting links.
 
 ## Global Weekly Pace
 
-The dashboard combines every account with a valid weekly window into one
-equal-weight pool. The filled bar is aggregate actual usage, and the `↑ pace`
-marker is aggregate elapsed time: the ideal amount of the pool to have used by
-now. The text below the meter shows the participating account count and the
-nearest included-account reset.
+The dashboard renders a local aggregate view of every account with a valid
+weekly window. The filled bar is aggregate actual usage, and the `↑ pace`
+marker is aggregate elapsed time: the ideal amount of the displayed capacity
+to have used by now. The text below the meter shows the participating account
+count and the nearest included-account reset.
 
-Fully exhausted accounts remain included when their reset timestamp is valid.
-Accounts whose usage or weekly reset cannot be trusted are counted as
-unavailable instead of being guessed. The current API does not expose a
-reliable comparable weekly capacity, so accounts are weighted equally.
+This view does not combine quotas on the service, move capacity between
+accounts, or circumvent account limits. Fully exhausted accounts remain
+included when their reset timestamp is valid. Accounts whose usage or weekly
+reset cannot be trusted are counted as unavailable instead of being guessed.
+The current API does not expose a reliable comparable weekly capacity, so
+participating accounts are weighted equally.
 
 Quota meters use one relative rule everywhere: yellow means actual usage is
 ahead of the elapsed-time pace, while green means usage is at or behind pace.
@@ -80,25 +159,12 @@ uninstallers preserve this shared directory.
 ## Updates and release verification
 
 `self-update` reads releases only from
-`chriskooCK/codex-switch-global-pace`; it never downloads the original
-project's releases. Direct updates verify the archive's SHA-256 checksum and a
-GitHub build-provenance bundle with `gh attestation verify`, bound to this
-repository, its release workflow, the exact tag ref, and the tag commit digest.
-A current [GitHub CLI](https://cli.github.com/) is therefore required for direct
-self-update. The previous executable is retained until a previously running
-daemon has restarted successfully, so a failed daemon restart can restore the
-exact prior binary and daemon state. The updater holds the daemon lifecycle
-lease through the replacement outcome and the PID-absence lease while the
-daemon is stopped. Normal CLI lifecycle commands remain serialized; a direct
-foreground contender is either rejected by PID absence or stopped by its exact
-published generation before rollback proceeds.
-
-On Windows, macOS, and Linux, the verified direct-installer candidate holds that
-same service-operation authority and PID-absence lease before an upgrade, a
-fresh public-path publication, or an uninstall mutation. It retains them through
-file/PATH rollback, replacement-daemon verification, service removal, and
-recovery-artifact cleanup; the scripts never stop the daemon in one child and
-reacquire lifecycle authority in another.
+`chriskooCK/codex-switch-global-pace`. Direct installs and updates verify the
+archive checksum and GitHub build provenance against this repository, its
+release workflow, the exact tag, and the tag commit. Replacement and daemon
+restart failures preserve or restore the prior installation when it is safe to
+do so. See [Updating](docs/wiki/Updating.md) for the verification model,
+rollback behavior, release channels, and uninstall instructions.
 
 ```bash
 codex-switch-global-pace self-update --check

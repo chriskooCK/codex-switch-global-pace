@@ -2,3 +2,14 @@
 /temp
 .claude/
 .AIINFO/
+
+# Local credentials and private runtime state
+**/auth.json
+**/auth.json.bak.*
+/.codex/
+/.codex-switch/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
