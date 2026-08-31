@@ -2130,15 +2130,15 @@ pub(crate) fn update_profile_tokens_if_refresh_matches_leased(
 
 /// Stable ownership proof captured before an interactive re-login begins.
 /// Complete identities keep the existing strict binding behavior. A legacy
-/// incomplete profile instead retains only its exact file token and known
-/// identity components; replacing it requires explicit caller confirmation and
-/// a durable archive of the old credential.
+/// incomplete profile instead retains its exact process-local file revision and
+/// known identity components; replacing it requires explicit caller
+/// confirmation and a durable archive of the old credential.
 #[derive(Debug)]
 enum ProfileReauthProof {
     Strict(StrictAccountBinding),
     Incomplete {
         identity: AccountIdentity,
-        file_token: crate::fs_ops::FileToken,
+        file_revision: crate::fs_ops::FileRevisionToken,
     },
 }
 
@@ -2188,7 +2188,7 @@ pub(crate) fn prepare_profile_reauth_with_lease(
         Some(binding) => ProfileReauthProof::Strict(binding),
         None => ProfileReauthProof::Incomplete {
             identity,
-            file_token: crate::fs_ops::token_for_path(&profile_path)
+            file_revision: crate::fs_ops::revision_token_for_path(&profile_path)
                 .with_context(|| format!("binding incomplete profile '{alias}' before re-login"))?,
         },
     };
@@ -2337,8 +2337,9 @@ fn replace_strict_profile_auth_and_live(
 
 /// Commit a re-login after the interactive OAuth wait no longer owns the
 /// profile lease. A complete profile must retain its strict identity. An
-/// incomplete legacy profile must retain its exact file identity, match every
-/// known identity component, and be archived before explicit replacement.
+/// incomplete legacy profile must retain its exact captured file revision,
+/// match every known identity component, and be archived before explicit
+/// replacement.
 pub(crate) fn commit_prepared_profile_reauth_with_lease(
     prepared: PreparedProfileReauth,
     lease: &ProfileLease,
@@ -2359,7 +2360,7 @@ pub(crate) fn commit_prepared_profile_reauth_with_lease(
         }
         ProfileReauthProof::Incomplete {
             identity,
-            file_token,
+            file_revision,
         } => {
             anyhow::ensure!(
                 allow_recoverable_replacement,
@@ -2371,14 +2372,16 @@ pub(crate) fn commit_prepared_profile_reauth_with_lease(
 
             let _transaction = lock_auth_transaction()?;
             let profile_path = profile_auth_path(alias)?;
-            let current_token =
-                crate::fs_ops::token_for_path(&profile_path).with_context(|| {
+            let current_token = file_revision
+                .revalidate_path(&profile_path)
+                .with_context(|| {
                     format!("revalidating incomplete profile '{alias}' after OAuth")
+                })?
+                .with_context(|| {
+                    format!(
+                        "profile '{alias}' changed while re-login was in progress; its previous credentials were not archived or replaced"
+                    )
                 })?;
-            anyhow::ensure!(
-                current_token == file_token,
-                "profile '{alias}' changed while re-login was in progress; its previous credentials were not archived or replaced"
-            );
             let existing = read_auth(&profile_path)?;
             anyhow::ensure!(
                 extract_identity(&existing) == identity,
@@ -2404,7 +2407,7 @@ pub(crate) fn commit_prepared_profile_reauth_with_lease(
                 None => false,
             };
             let archive_path =
-                archive_profile_credentials_exact(alias, &profile_path, &file_token)?;
+                archive_profile_credentials_exact(alias, &profile_path, &current_token)?;
             write_profile_auth_durably(alias, &profile_path, val).with_context(|| {
                 format!(
                     "the previous credentials remain recoverable at {}; profile '{alias}' replacement did not complete",

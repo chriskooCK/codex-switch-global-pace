@@ -59,8 +59,8 @@ replacement for a complete profile requires an exact match on both fields.
 Interactive re-login captures that strict identity under a short profile lease,
 releases the lease during the browser or device-code wait, and validates the
 initial, current, and incoming identities after reacquiring it for commit. An
-incomplete legacy profile instead carries its exact file identity and known
-identity components across the wait. Only explicit confirmation permits the
+incomplete legacy profile instead carries its exact captured file revision and
+known identity components across the wait. Only explicit confirmation permits the
 commit to archive that exact credential in `deleted-profiles/` and replace the
 same alias; every known identity component must match the complete OAuth result.
 Interactive overwrite confirmation follows the same ownership shape: the

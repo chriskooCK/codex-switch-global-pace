@@ -91,9 +91,9 @@ pub(crate) async fn login_cmd(
 }
 
 async fn reauth_profile(alias: &str, device: bool, yes: bool, json: bool) -> Result<()> {
-    // Capture only the stable account identity under a short lease. The user
-    // may spend several minutes in OAuth, so unrelated refresh, switch, rename,
-    // and delete operations must not wait behind that interactive pause.
+    // Capture a stable re-login proof under a short lease. The user may spend
+    // several minutes in OAuth, so unrelated refresh, switch, rename, and
+    // delete operations must not wait behind that interactive pause.
     let prepared = {
         let lease = profile::acquire_profile_lease_async(alias.to_string()).await?;
         profile::prepare_profile_reauth_with_lease(&lease)?
