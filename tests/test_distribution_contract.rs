@@ -512,6 +512,10 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
     let github_delete = repo_file("scripts/github-delete.sh");
     let publisher = repo_file("scripts/publish-dev.ps1");
     let release_docs = repo_file("docs/RELEASE.md");
+    let release_contract = release_docs
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let lock_tag = "codex-switch-publish-dev-lock";
 
     assert!(workflow.contains(&format!("lock_tag=\"{lock_tag}\"")));
@@ -669,7 +673,7 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
         "ref-create response remains a manual-recovery case",
     ] {
         assert!(
-            release_docs.contains(required),
+            release_contract.contains(required),
             "release docs must state the shared lock contract: `{required}`"
         );
     }
