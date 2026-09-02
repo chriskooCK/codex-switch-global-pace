@@ -18,33 +18,48 @@ usage in one local dashboard.
 > files. Never publish profiles, `auth.json`, tokens, proxy credentials, or
 > unredacted debug output.
 
-## Everyday workflow: switch the Windows Codex app account
+## Most common workflow: switch the Windows Codex app account
 
-This is the main day-to-day workflow. The Windows Codex app can remain in the
-notification area after its window closes, so fully stop it before changing the
-active account.
+The interactive dashboard is the main day-to-day way to change accounts. The
+Windows Codex app can remain in the notification area after its window closes,
+so fully stop it before changing the active account.
+
+**Account switch keys:** `↑`/`↓` (or `j`/`k`) → `Enter` → `u`
 
 1. Save your work and close every Codex window.
 2. Open the Windows notification area, including the hidden icons behind `^`.
    Find the **ChatGPT** tray icon for the Codex desktop app (some versions may
    label it **Codex**), choose its **Quit** or **Exit** command, and confirm that
    the icon disappears.
-3. In PowerShell or Command Prompt, refresh the account view and choose the
-   account you want:
+3. In PowerShell or Command Prompt, open the interactive dashboard:
 
    ```powershell
-   codex-switch-global-pace list -f
-   codex-switch-global-pace use work
+   codex-switch-global-pace
    ```
 
-   To let the adaptive scoring algorithm select the best eligible account,
-   omit the alias:
+4. Move to the account you want with `↑`/`↓` or `j`/`k`, press `Enter` to open
+   its account menu, and then press `u` (**Use**) to make it active. `Enter` and
+   `u` are consecutive actions, not alternative keys.
+5. Wait for `Switched to <alias>` to appear, then press `q` to close the
+   dashboard.
+6. Start the Codex app again. The new process reads the selected account.
 
-   ```powershell
-   codex-switch-global-pace use
-   ```
+### Command-line alternative
 
-4. Start the Codex app again. The new process reads the selected account.
+After Codex is fully stopped, users who prefer direct commands can refresh the
+account view and switch explicitly:
+
+```powershell
+codex-switch-global-pace list -f
+codex-switch-global-pace use work
+```
+
+To let the adaptive scoring algorithm select the best eligible account, omit
+the alias:
+
+```powershell
+codex-switch-global-pace use
+```
 
 > Closing only the app window is not enough if its tray icon remains. Do not
 > switch while the Codex Windows tray app or an active Codex session (`codex`,
@@ -120,10 +135,10 @@ Aliases are 1–64 ASCII bytes and may contain only letters, digits, `_`, `-`, a
 `.` (`.` and `..` alone are reserved). For example, `personal`, `work`, and
 `team-a` are valid; non-ASCII aliases are not.
 
-Running `codex-switch-global-pace` with no arguments opens the interactive
-dashboard. On Windows, double-clicking `codex-switch-global-pace.exe` opens the
-same dashboard. See the full [Getting started](docs/wiki/Getting-Started.md)
-guide for installation, device-code login, imports, and troubleshooting links.
+On Windows, double-clicking `codex-switch-global-pace.exe` opens the same
+interactive dashboard. See the full
+[Getting started](docs/wiki/Getting-Started.md) guide for installation,
+device-code login, imports, and troubleshooting links.
 
 ## Global Weekly Pace
 

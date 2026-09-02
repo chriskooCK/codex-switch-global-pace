@@ -20,28 +20,42 @@ Global Weekly Pace는 로컬 합산 화면입니다. 계정 사이에서 quota�
 Codex Windows 앱은 창을 닫아도 트레이에서 계속 실행될 수 있습니다. 다음
 순서를 지키는 것이 가장 확실합니다.
 
+**계정 전환 키:** `↑`/`↓`(또는 `j`/`k`) → `Enter` → `u`
+
 1. 진행 중인 작업을 마칩니다.
 2. Codex 앱 창을 닫습니다.
 3. Windows 작업 표시줄의 숨겨진 아이콘을 열고 Codex 데스크톱 앱의
    **ChatGPT** 트레이 아이콘을 우클릭한 뒤 **Quit** 또는 **Exit**를
    선택합니다. 앱 버전에 따라 아이콘 이름이 **Codex**로 보일 수도 있습니다.
 4. 해당 트레이 아이콘이 사라진 것을 확인합니다.
-5. PowerShell에서 계정을 전환합니다. Windows Terminal을 쓴다면 WSL 셸이
-   아닌 **PowerShell 프로필**을 여세요. WSL은 기본적으로 Windows 앱의
+5. PowerShell에서 대시보드를 실행합니다. Windows Terminal을 쓴다면 WSL
+   셸이 아닌 **PowerShell 프로필**을 여세요. WSL은 기본적으로 Windows 앱의
    `%USERPROFILE%\.codex`와 다른 홈 디렉터리를 사용합니다.
 
    ```powershell
-   # 저장된 계정과 최신 사용량 확인
-   codex-switch-global-pace list -f
-
-   # 지정한 계정으로 전환
-   codex-switch-global-pace use work
-
-   # 또는 사용량을 기준으로 가장 적합한 계정을 자동 선택
-   codex-switch-global-pace use
+   codex-switch-global-pace
    ```
 
-6. 전환 성공 메시지를 확인한 뒤 Codex Windows 앱을 다시 실행합니다.
+6. `↑`/`↓` 또는 `j`/`k`로 원하는 계정을 선택하고 `Enter`를 눌러 해당 계정
+   메뉴를 연 다음 `u`(**Use**)를 누릅니다. `Enter`와 `u`는 둘 중 하나를
+   누르는 단축키가 아니라 차례로 실행하는 동작입니다.
+7. `Switched to <alias>` 메시지를 확인한 뒤 `q`를 눌러 대시보드를 닫습니다.
+8. Codex Windows 앱을 다시 실행합니다.
+
+### 명령줄로 바로 전환하기
+
+Codex를 완전히 종료한 뒤 명령줄에서 직접 전환하려면 다음 명령을 사용합니다.
+
+```powershell
+# 저장된 계정과 최신 사용량 확인
+codex-switch-global-pace list -f
+
+# 지정한 계정으로 전환
+codex-switch-global-pace use work
+
+# 또는 사용량을 기준으로 가장 적합한 계정을 자동 선택
+codex-switch-global-pace use
+```
 
 Codex CLI도 동일합니다. 실행 중인 `codex`, `codex resume`, `codex exec`
 세션을 모두 종료한 다음 계정을 전환하고 새 세션을 시작하세요.

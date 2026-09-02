@@ -13,19 +13,35 @@ Weekly quota；quota 始终分别属于各账号，不会被转移、合并或�
 
 ## 最常用：切换 Codex Windows 应用的当前账号
 
+交互式仪表盘是日常切换账号的主要方式。
+
+**账号切换按键：** `↑`/`↓`（或 `j`/`k`）→ `Enter` → `u`
+
 1. 保存当前工作并关闭所有 Codex 窗口。
 2. 打开 Windows 通知区域（包括 `^` 后的隐藏图标），找到 Codex 桌面应用的
    **ChatGPT** tray 图标（某些版本可能显示 **Codex**），右键选择 **Quit** 或
    **Exit**，并确认图标已经消失。
-3. 图标完全消失后，在 PowerShell 或命令提示符中切换：
+3. 图标完全消失后，在 PowerShell 或命令提示符中打开交互式仪表盘：
 
    ```powershell
-   codex-switch-global-pace list -f
-   codex-switch-global-pace use work
-   # 或自动选择：codex-switch-global-pace use
+   codex-switch-global-pace
    ```
 
-4. 重新打开 Codex Windows 应用；新进程会从 `$CODEX_HOME/auth.json` 读取已切换的账号。
+4. 使用 `↑`/`↓` 或 `j`/`k` 选择账号，按 `Enter` 打开该账号的菜单，然后按
+   `u`（**Use**）将它设为当前账号。`Enter` 和 `u` 是连续操作，不是二选一的
+   快捷键。
+5. 等待界面显示 `Switched to <alias>`，然后按 `q` 关闭仪表盘。
+6. 重新打开 Codex Windows 应用；新进程会从 `$CODEX_HOME/auth.json` 读取已切换的账号。
+
+### 命令行备选方式
+
+完全退出 Codex 后，也可以直接使用命令行切换：
+
+```powershell
+codex-switch-global-pace list -f
+codex-switch-global-pace use work
+# 或自动选择：codex-switch-global-pace use
+```
 
 只关闭窗口并不够；tray 图标仍存在时，后台进程可能还在运行。使用 Codex CLI
 时也应先退出所有正在运行的 Codex session/process（`codex`、`codex resume`
@@ -95,9 +111,9 @@ codex-switch-global-pace use
 codex-switch-global-pace          # 打开交互式仪表盘
 ```
 
-不带参数运行会直接打开 TUI；Windows 双击
-`codex-switch-global-pace.exe` 也是相同效果。
-`use` 会切换下一个 Codex 进程使用的实际账号；切换前须完全退出已运行的 Codex 应用（包括 tray）或 CLI。
+Windows 双击 `codex-switch-global-pace.exe` 也会打开相同的 TUI。
+`use` 会切换下一个 Codex 进程使用的实际账号；切换前须完全退出已运行的
+Codex 应用（包括 tray）或 CLI。
 
 ## Global Weekly Pace
 

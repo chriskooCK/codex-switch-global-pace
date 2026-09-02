@@ -358,33 +358,50 @@ existing external login without authenticating again, quit the TUI and run
 
 ## Everyday account switching
 
-### Windows Codex app (recommended example)
+### Windows Codex app: interactive dashboard (recommended)
+
+**Account switch keys:** `↑`/`↓` (or `j`/`k`) → `Enter` → `u`
 
 1. Save your work and close every Codex window.
 2. Open the Windows notification area, expand hidden icons with `^`, and find
    **ChatGPT** (the Codex desktop app; some versions may show **Codex**).
    Right-click it, choose **Quit** or **Exit**, and wait until the tray icon
    disappears. The app is not fully stopped while that icon remains.
-3. Inspect fresh account data, then switch explicitly:
+3. In PowerShell or Command Prompt, open the interactive dashboard:
 
    ```powershell
-   codex-switch-global-pace list -f
-   codex-switch-global-pace use work
+   codex-switch-global-pace
    ```
 
-   Or let the adaptive scoring algorithm choose the best eligible account:
-
-   ```powershell
-   codex-switch-global-pace use
-   ```
-
-4. Start the Codex app again. The new process reads the selected live
+4. Move to the account you want with `↑`/`↓` or `j`/`k`, press `Enter` to open
+   its account menu, and then press `u` (**Use**) to make it active. These are
+   consecutive actions: pressing `u` in the main account list does not switch.
+5. Wait for `Switched to <alias>` to appear, then press `q` to close the
+   dashboard.
+6. Start the Codex app again. The new process reads the selected live
    credential.
 
-`use <alias>` is the clearest choice when you know which account you want.
-Automatic `use` ranks the eligible saved accounts from their current quota and
-selection data. Neither form changes an already-running Codex process, which is
-why the complete exit and restart are required.
+#### Command-line alternative
+
+After Codex is fully stopped, direct commands remain available for scripts or
+users who already know the alias they want:
+
+```powershell
+codex-switch-global-pace list -f
+codex-switch-global-pace use work
+```
+
+Or let the adaptive scoring algorithm choose the best eligible account:
+
+```powershell
+codex-switch-global-pace use
+```
+
+For command-line use, `use <alias>` is the clearest choice when you know which
+account you want. Automatic `use` ranks the eligible saved accounts from their
+current quota and selection data. Neither the dashboard nor the command-line
+forms change an already-running Codex process, which is why the complete exit
+and restart are required.
 
 ### Codex CLI on Windows, macOS, or Linux
 
@@ -398,10 +415,9 @@ codex-switch-global-pace use personal
 codex
 ```
 
-Running `codex-switch-global-pace` with no arguments opens the interactive
-dashboard. The account rows and global meter are local views of reported usage;
-they do not pool quota on the service, move quota between accounts, or bypass
-individual account limits.
+The dashboard's account rows and global meter are local views of reported
+usage; they do not pool quota on the service, move quota between accounts, or
+bypass individual account limits.
 
 ## Where your data lives
 
