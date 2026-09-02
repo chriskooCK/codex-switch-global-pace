@@ -663,7 +663,7 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
         "treats an absent ref as a",
         "exact Git `--force-with-lease`",
         "repeats only the read-only absence check with bounded backoff",
-        "It never retries a",
+        "never retries a deletion",
         "force-deletes a different ref, or treats an alternate API as a fallback",
         "an ambiguous local",
         "ref-create response remains a manual-recovery case",
@@ -916,7 +916,7 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     );
     assert_before(
         candidate_creation,
-        "git/refs/tags/${candidate_tag}",
+        "tag-ref \"$candidate_tag\" commit \"$GITHUB_SHA\"",
         "prior_release_again=$(gh api \\",
     );
 }
@@ -980,7 +980,7 @@ fn stable_release_recovery_states_the_external_writer_boundary() {
     let release_docs = repo_file("docs/RELEASE.md");
 
     for required in [
-        "Release deletion APIs have no conditional version precondition",
+        "GitHub's Release deletion API has no conditional version precondition",
         "atomic compare-and-delete against an external administrator",
     ] {
         assert!(
@@ -6115,8 +6115,14 @@ fn multilingual_entry_points_describe_incomplete_identity_recovery() {
 #[test]
 fn readme_leads_with_the_safe_windows_account_switch_workflow() {
     let readme = repo_file("README.md");
+    let workflow_heading = readme
+        .lines()
+        .find(|line| {
+            line.starts_with("## ") && line.ends_with("switch the Windows Codex app account")
+        })
+        .expect("README must contain the everyday Windows switch workflow heading");
     let workflow = readme
-        .split("## Everyday workflow: switch the Windows Codex app account")
+        .split(workflow_heading)
         .nth(1)
         .and_then(|section| section.split("## Quick start").next())
         .expect("README must put the everyday Windows switch workflow before quick start");

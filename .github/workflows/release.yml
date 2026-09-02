@@ -16,9 +16,10 @@ concurrency:
   # tags must not move its pagination boundaries concurrently. A stable candidate
   # uses a deterministic tag, allowing the next serialized run to identify an
   # interrupted draft before creating a new one. Candidate refs are removed with
-  # an exact Git force-with-lease. GitHub's Release deletion API has no conditional
-  # version precondition, so repository administrators must not mutate temporary
-  # Releases while a run is active.
+  # an exact Git force-with-lease.
+  # GitHub's Release deletion API has no conditional version precondition.
+  # Repository administrators must not mutate temporary Releases while a run is
+  # active.
   # The stable job also acquires the historical
   # refs/tags/codex-switch-publish-dev-lock remote lease before it reads or changes
   # refs or Releases. That shared lease serializes Actions with publish-dev.ps1;
