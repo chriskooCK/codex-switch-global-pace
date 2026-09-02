@@ -117,12 +117,15 @@ ref and annotated-tag identities have been verified. The stable job persists its
 exact tag name, tag-object SHA, source SHA, transaction, and message before it asks
 GitHub to create the fixed ref. Its final `always()` step therefore also runs when
 that request fails or its response is lost. The step treats an absent ref as a
-no-op, removes only the ref whose complete persisted identity still matches, uses
-an exact Git `--force-with-lease`, and succeeds only after the API confirms the ref
-is absent. Any mismatched or unreadable identity is preserved. It does not retry,
-force-delete a different ref, or infer ownership from later visibility. The local
-publisher cannot persist cleanup state outside its process, so an ambiguous local
-ref-create response remains a manual-recovery case.
+no-op and removes only the ref whose complete persisted identity still matches,
+using an exact Git `--force-with-lease`. It issues the deletion mutation once, then
+repeats only the read-only absence check with bounded backoff while the exact old
+identity remains visible. An explicit HTTP 404 confirms success; any mismatched,
+malformed, or unreadable identity is preserved and fails closed immediately. It
+never retries a deletion, force-deletes a different ref, or treats an alternate API
+as a fallback.
+The local publisher cannot persist cleanup state outside its process, so an
+ambiguous local ref-create response remains a manual-recovery case.
 
 The workflow resolves lightweight or annotated release tags to their commit before
 producing any distribution bundle. Stable publication keeps the isolated-draft
@@ -135,11 +138,12 @@ state is preserved and blocks publication. If the publish request commits but it
 response is lost, cleanup verifies and preserves the published release. The
 serialized rerun then recognizes that exact final release instead of deleting it
 as an incomplete draft. These guarantees serialize participating workflow runs.
-The shared lease also serializes the cooperating local publisher. GitHub's REST
-APIs delete a tag ref by name and a Release by ID without a conditional
-object-version precondition. The workflow therefore revalidates the by-name/by-ID
-object and its assets immediately before deletion and preserves every mismatch it
-observes, but this is not an atomic compare-and-delete against a repository administrator.
+The shared lease also serializes the cooperating local publisher. Candidate refs
+are deleted with an exact Git `--force-with-lease`; GitHub's Release API still has
+no conditional object-version precondition. The workflow therefore revalidates
+the by-ID Release and its assets immediately before its single deletion request
+and preserves every mismatch it observes. Even so,
+this is not an atomic compare-and-delete against a repository administrator.
 Administrators must not manually change candidate refs or Releases while a
 publication or recovery run is active.
 

@@ -229,7 +229,8 @@ fn ci_runs_build_test_lint_format_audit_and_script_parsers() {
         "cargo build --locked",
         "cargo fmt --check",
         "cargo audit",
-        "bash -n scripts/install.sh",
+        "for script in scripts/*.sh; do",
+        "bash -n \"$script\"",
         "cargo build --release --locked --target x86_64-unknown-linux-musl",
         "cross build --release --locked --target aarch64-unknown-linux-musl",
     ] {
@@ -508,6 +509,7 @@ fn release_preserves_an_exact_dev_bundle_without_mutating_github_releases() {
 #[test]
 fn stable_and_local_publication_share_one_exact_remote_lock() {
     let workflow = repo_file(".github/workflows/release.yml");
+    let github_delete = repo_file("scripts/github-delete.sh");
     let publisher = repo_file("scripts/publish-dev.ps1");
     let release_docs = repo_file("docs/RELEASE.md");
     let lock_tag = "codex-switch-publish-dev-lock";
@@ -598,10 +600,8 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
         "Shared publication lock ${expected_ref} was never created or is already absent.",
         "Shared publication lock ref changed identity; it was preserved.",
         "Shared publication lock object changed identity; it was preserved.",
-        "--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}",
-        "shared-publication-lock-after-delete-error",
-        "The shared publication lock changed identity during leased deletion; the new ref was preserved.",
-        "Shared publication lock deletion state is ambiguous; deletion was not retried.",
+        "bash scripts/github-delete.sh",
+        "tag-ref \"$LOCK_TAG\" tag \"$LOCK_TAG_OBJECT_SHA\"",
         "Released exact shared publication lock ${expected_ref}.",
     ] {
         assert!(
@@ -617,14 +617,33 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
     assert_before(
         release_lock,
         "shared-publication-lock-release-tag-error",
-        "--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}",
+        "bash scripts/github-delete.sh",
     );
-    assert_before(
-        release_lock,
-        "--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}",
-        "shared-publication-lock-after-delete-error",
+    assert!(!workflow.contains("gh api --method DELETE"));
+    assert!(!workflow.contains("push --porcelain --no-verify"));
+    assert!(!workflow.contains("HTTP 404|Not Found"));
+    for required in [
+        "DELETION_CONFIRMATION_DELAYS=(0 0.5 1 2 4)",
+        "--force-with-lease=${full_ref}:${expected_sha}",
+        "gh api --method DELETE \"$endpoint\"",
+        "if response=$(gh api \"$endpoint\" 2>&1); then",
+        "changed identity after deletion was requested; the new ref was preserved.",
+        "grep -Eq '^gh: .*\\(HTTP 404\\)\\r?$'",
+        "deletion was not retried.",
+    ] {
+        assert!(
+            github_delete.contains(required),
+            "GitHub cleanup helper must contain `{required}`"
+        );
+    }
+    assert_eq!(github_delete.matches("--method DELETE").count(), 1);
+    assert_eq!(
+        github_delete
+            .matches("push --porcelain --no-verify")
+            .count(),
+        1
     );
-    assert!(!release_lock.contains("--method DELETE"));
+    assert!(!github_delete.contains("HTTP 404|Not Found"));
     assert_before(
         &workflow,
         "Remove only this run's incomplete candidate",
@@ -643,8 +662,9 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
         "request fails or its response is lost",
         "treats an absent ref as a",
         "exact Git `--force-with-lease`",
-        "It does not retry,",
-        "force-delete a different ref, or infer ownership from later visibility",
+        "repeats only the read-only absence check with bounded backoff",
+        "It never retries a",
+        "force-deletes a different ref, or treats an alternate API as a fallback",
         "an ambiguous local",
         "ref-create response remains a manual-recovery case",
     ] {
@@ -682,7 +702,6 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
         "Existing stable release ${release_id} metadata differs from this exact source.",
         "verify-release-assets.sh",
         "existing-release-assets\" attest",
-        "existing-release-candidate-ref-after-delete-error",
         "Only the fully verified final release",
         "gh attestation verify",
         "--bundle \"$provenance_bundle\"",
@@ -723,6 +742,12 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
         "Create isolated candidate draft",
         "Upload and verify isolated candidate assets",
     );
+    let existing_release = workflow
+        .split("- name: Inspect an existing exact-tag release")
+        .nth(1)
+        .and_then(|tail| tail.split("- name: Create isolated candidate draft").next())
+        .expect("existing stable release recovery step");
+    assert!(existing_release.contains("tag-ref \"$candidate_tag\" commit \"$GITHUB_SHA\""));
     let verified_cleanup = workflow
         .split("- name: Remove temporary cutover state after verified publication")
         .nth(1)
@@ -735,6 +760,7 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
         "needs.meta.outputs.is_dev != 'true'",
         "steps.publish.outputs.complete == 'true'",
         "cleanup-verified-release-assets",
+        "tag-ref \"$CANDIDATE_TAG\" commit \"$candidate_ref_sha\"",
         "Verified release %s remains published, but temporary state cleanup failed:",
     ] {
         assert!(
@@ -750,13 +776,11 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
         .expect("incomplete candidate cleanup step");
     for required in [
         "incomplete-candidate-ref-error",
-        "incomplete-candidate-ref-after-delete-error",
         "incomplete-candidate-release-error",
-        "incomplete-candidate-release-after-delete-error",
-        "elif ! grep -Eq 'HTTP 404|Not Found' \"$candidate_ref_error\"",
-        "elif grep -Eq 'HTTP 404|Not Found' \"$candidate_release_error\"",
-        "Candidate ref ${CANDIDATE_TAG} deletion state is ambiguous for release ${RELEASE_ID}",
-        "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) deletion state is ambiguous",
+        "elif ! grep -Eq '^gh: .*\\(HTTP 404\\)\\r?$' \"$candidate_ref_error\"",
+        "elif grep -Eq '^gh: .*\\(HTTP 404\\)\\r?$' \"$candidate_release_error\"",
+        "tag-ref \"$CANDIDATE_TAG\" commit \"$GITHUB_SHA\"",
+        "bash scripts/github-delete.sh release \"$RELEASE_ID\"",
         "${target,,}",
         "if [[ \"$tag\" == \"$final_tag\" && \"$draft\" == false ]]",
         "if [[ \"$tag\" != \"$CANDIDATE_TAG\" || \"$draft\" != true ]]",
@@ -773,7 +797,7 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     assert_before(
         incomplete_cleanup,
         "Candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID} no longer belongs",
-        "if ! gh api --method DELETE \\",
+        "tag-ref \"$CANDIDATE_TAG\" commit \"$GITHUB_SHA\"",
     );
     let release_cleanup = incomplete_cleanup
         .split("candidate_release_error=")
@@ -782,7 +806,7 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
     assert_before(
         release_cleanup,
         "Release ${RELEASE_ID} no longer matches this run; refusing cleanup.",
-        "if ! gh api --method DELETE \\",
+        "bash scripts/github-delete.sh release \"$RELEASE_ID\"",
     );
     assert_before(
         incomplete_cleanup,
@@ -817,6 +841,15 @@ fn stable_release_stages_isolated_candidates_and_fails_closed_on_drift() {
                 .next()
         })
         .expect("candidate draft creation and interrupted-run recovery step");
+    for required in [
+        "tag-ref \"$candidate_tag\" commit \"$GITHUB_SHA\"",
+        "bash scripts/github-delete.sh release \"$prior_release_id\"",
+    ] {
+        assert!(
+            candidate_creation.contains(required),
+            "candidate recovery must use the shared cleanup helper: `{required}`"
+        );
+    }
     assert!(
         !candidate_creation.contains("releases/tags/${candidate_tag}"),
         "draft recovery must use the authenticated paginated release list because the tag endpoint only returns published releases"
@@ -1000,6 +1033,9 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "function AcquireRemotePublicationLock",
         "function AssertRemotePublicationLock",
         "function ReleaseRemotePublicationLock",
+        "function WaitRemoteDeletion",
+        "$DeletionConfirmationDelaysMilliseconds = [int[]]@(0, 500, 1000, 2000, 4000)",
+        "(?im)^gh: [^\\r\\n]*\\(HTTP 404\\)\\r?$",
         "Create remote development-publication lock object",
         "Acquire remote development-publication lock",
         "the lock was not claimed and will not be removed automatically",
@@ -1051,6 +1087,7 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
             "dev publisher contract must contain `{required}`"
         );
     }
+    assert!(!publisher.contains("HTTP 404|Not Found"));
     for forbidden in ["target/release", "--clobber", "secrets.RELEASE_TOKEN"] {
         assert!(
             !publisher.contains(forbidden),
@@ -1069,8 +1106,9 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
         "repos/$script:Repo/git/refs",
         "$refResult.Code -ne 0",
         "AssertRemotePublicationLock $lock",
-        "repos/$script:Repo/git/refs/tags/$script:RemoteLockTag",
-        "$after = Ref $script:RemoteLockTag",
+        "WaitRemoteDeletion `",
+        "-ReadArguments @($script:RemoteLockTag)",
+        "-ExpectedIdentity @{ Ref = $refName; TagObjectSha = $Lock.TagObjectSha }",
     ] {
         assert!(
             remote_lock.contains(required),
@@ -1086,8 +1124,29 @@ fn dev_publisher_verifies_one_exact_bundle_and_owns_every_remote_mutation() {
     assert_before(
         remote_lock,
         "'Release remote development-publication lock'",
-        "$after = Ref $script:RemoteLockTag",
+        "WaitRemoteDeletion `",
     );
+    assert_eq!(remote_lock.matches("RunGit @(").count(), 1);
+    let deletion_wait = publisher
+        .split("function WaitRemoteDeletion")
+        .nth(1)
+        .and_then(|section| section.split("function Hash").next())
+        .expect("bounded remote deletion confirmation helper");
+    for forbidden in ["RunGit", "Mutate", "--method", "push"] {
+        assert!(
+            !deletion_wait.contains(forbidden),
+            "read-only deletion confirmation must not contain `{forbidden}`"
+        );
+    }
+    let remove_release = publisher
+        .split("function RemoveRelease")
+        .nth(1)
+        .and_then(|section| section.split("function FindCandidate").next())
+        .expect("development Release deletion helper");
+    assert_eq!(remove_release.matches("Mutate ").count(), 1);
+    assert_eq!(remove_release.matches("WaitRemoteDeletion `").count(), 1);
+    assert!(remove_release.contains("($currentId -is [int]) -or ($currentId -is [long])"));
+    assert_before(remove_release, "Mutate ", "WaitRemoteDeletion `");
     assert!(!publisher.contains("$C.Local $ExactAssets $C.CandidateProjection"));
     let fingerprint = publisher
         .split("function Fingerprint")
@@ -6440,4 +6499,323 @@ fn binary_entrypoint_delegates_to_one_library_module_graph() {
     assert!(lib.contains("mod app;"));
     assert!(lib.contains("mod commands;"));
     assert!(lib.contains("pub use app::run;"));
+}
+
+#[cfg(target_os = "linux")]
+mod github_delete_tests {
+    use super::*;
+
+    const GITHUB_DELETE_TEST_REPOSITORY: &str = "example/project";
+    const GITHUB_DELETE_TEST_TAG: &str = "release-candidate-v1";
+    const GITHUB_DELETE_TEST_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const GITHUB_DELETE_TEST_OTHER_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const GITHUB_DELETE_TEST_RELEASE_ID: &str = "42";
+
+    struct GithubDeleteTestRun {
+        status: std::process::ExitStatus,
+        stdout: String,
+        stderr: String,
+        gh_calls: Vec<String>,
+        git_calls: Vec<String>,
+        sleep_calls: Vec<String>,
+    }
+
+    impl GithubDeleteTestRun {
+        fn diagnostics(&self) -> String {
+            format!(
+                "stdout={}\nstderr={}\ngh calls={:?}\ngit calls={:?}\nsleep calls={:?}",
+                self.stdout, self.stderr, self.gh_calls, self.git_calls, self.sleep_calls
+            )
+        }
+
+        fn gh_delete_count(&self) -> usize {
+            self.gh_calls
+                .iter()
+                .filter(|call| call.contains("--method DELETE"))
+                .count()
+        }
+
+        fn gh_get_count(&self) -> usize {
+            self.gh_calls.len() - self.gh_delete_count()
+        }
+
+        fn git_push_count(&self) -> usize {
+            self.git_calls
+                .iter()
+                .filter(|call| call.contains(" push "))
+                .count()
+        }
+    }
+
+    fn github_delete_test_log(path: &Path) -> Vec<String> {
+        fs::read_to_string(path)
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
+    fn run_github_delete_test(arguments: &[&str], scenario: &str) -> GithubDeleteTestRun {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let root = support::tempdir();
+        let mock_bin = root.path().join("mock-bin");
+        fs::create_dir(&mock_bin).unwrap();
+        let gh_calls = root.path().join("gh-calls");
+        let git_calls = root.path().join("git-calls");
+        let sleep_calls = root.path().join("sleep-calls");
+        let gh_state = root.path().join("gh-state");
+
+        let fake_gh = mock_bin.join("gh");
+        fs::write(
+        &fake_gh,
+        r#"#!/bin/sh
+set -eu
+
+printf '%s\n' "$*" >> "$GH_CALLS"
+if [ "$#" -ge 3 ] && [ "$1" = api ] && [ "$2" = --method ] && [ "$3" = DELETE ]; then
+  case "$GH_SCENARIO" in
+    release-mutation-error-then-404)
+      printf 'gh: delete response lost (HTTP 500)\n' >&2
+      exit 1
+      ;;
+    *) exit 0 ;;
+  esac
+fi
+
+call=0
+if [ -f "$GH_STATE" ]; then
+  call=$(cat "$GH_STATE")
+fi
+call=$((call + 1))
+printf '%s\n' "$call" > "$GH_STATE"
+
+emit_tag() {
+  printf '{"ref":"%s","object":{"type":"%s","sha":"%s"}}\n' \
+    "$EXPECTED_REF" "$1" "$2"
+}
+
+emit_release() {
+  printf '{"id":%s}\n' "$1"
+}
+
+not_found() {
+  printf 'gh: Not Found (HTTP 404)\n' >&2
+  printf '{"message":"Not Found","status":"404"}\n' >&2
+  exit 1
+}
+
+case "$GH_SCENARIO:$call" in
+  tag-stale-then-404:1) emit_tag commit "$EXPECTED_SHA" ;;
+  tag-stale-then-404:*) not_found ;;
+  tag-same:*) emit_tag commit "$EXPECTED_SHA" ;;
+  tag-different:*) emit_tag commit "$OTHER_SHA" ;;
+  tag-not-found-http-500:*) printf 'gh: upstream said Not Found (HTTP 404) (HTTP 500)\n' >&2; exit 1 ;;
+  release-stale-then-404:1) emit_release "$EXPECTED_RELEASE_ID" ;;
+  release-stale-then-404:*) not_found ;;
+  release-mutation-error-then-404:*) not_found ;;
+  *) exit 80 ;;
+esac
+"#,
+    )
+    .unwrap();
+
+        let fake_git = mock_bin.join("git");
+        fs::write(
+            &fake_git,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$GIT_CALLS"
+exit 0
+"#,
+        )
+        .unwrap();
+
+        let fake_sleep = mock_bin.join("sleep");
+        fs::write(
+            &fake_sleep,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$SLEEP_CALLS"
+exit 0
+"#,
+        )
+        .unwrap();
+
+        for executable in [&fake_gh, &fake_git, &fake_sleep] {
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/github-delete.sh");
+        let output = Command::new("bash")
+            .arg(script)
+            .args(arguments)
+            .env("GITHUB_REPOSITORY", GITHUB_DELETE_TEST_REPOSITORY)
+            .env("GH_SCENARIO", scenario)
+            .env("GH_CALLS", &gh_calls)
+            .env("GIT_CALLS", &git_calls)
+            .env("SLEEP_CALLS", &sleep_calls)
+            .env("GH_STATE", &gh_state)
+            .env("EXPECTED_SHA", GITHUB_DELETE_TEST_SHA)
+            .env("OTHER_SHA", GITHUB_DELETE_TEST_OTHER_SHA)
+            .env(
+                "EXPECTED_REF",
+                format!("refs/tags/{GITHUB_DELETE_TEST_TAG}"),
+            )
+            .env("EXPECTED_RELEASE_ID", GITHUB_DELETE_TEST_RELEASE_ID)
+            .env("PATH", format!("{}:/usr/bin:/bin", mock_bin.display()))
+            .output()
+            .unwrap();
+
+        GithubDeleteTestRun {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            gh_calls: github_delete_test_log(&gh_calls),
+            git_calls: github_delete_test_log(&git_calls),
+            sleep_calls: github_delete_test_log(&sleep_calls),
+        }
+    }
+
+    #[test]
+    fn github_tag_delete_accepts_stale_identity_until_the_ref_is_absent() {
+        let run = run_github_delete_test(
+            &[
+                "tag-ref",
+                GITHUB_DELETE_TEST_TAG,
+                "commit",
+                GITHUB_DELETE_TEST_SHA,
+            ],
+            "tag-stale-then-404",
+        );
+
+        assert!(run.status.success(), "{}", run.diagnostics());
+        assert_eq!(run.git_push_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.gh_delete_count(), 0, "{}", run.diagnostics());
+        assert_eq!(run.gh_get_count(), 2, "{}", run.diagnostics());
+        assert_eq!(run.sleep_calls, ["0.5"], "{}", run.diagnostics());
+        let push = run
+            .git_calls
+            .iter()
+            .find(|call| call.contains(" push "))
+            .expect("leased tag deletion");
+        assert!(
+            push.contains(&format!(
+                "--force-with-lease=refs/tags/{GITHUB_DELETE_TEST_TAG}:{GITHUB_DELETE_TEST_SHA}"
+            )),
+            "{}",
+            run.diagnostics()
+        );
+        assert!(
+        push.contains(&format!(
+            "https://github.com/{GITHUB_DELETE_TEST_REPOSITORY}.git :refs/tags/{GITHUB_DELETE_TEST_TAG}"
+        )),
+        "{}",
+        run.diagnostics()
+    );
+    }
+
+    #[test]
+    fn github_tag_delete_fails_after_the_same_identity_exhausts_confirmation() {
+        let run = run_github_delete_test(
+            &[
+                "tag-ref",
+                GITHUB_DELETE_TEST_TAG,
+                "commit",
+                GITHUB_DELETE_TEST_SHA,
+            ],
+            "tag-same",
+        );
+
+        assert!(!run.status.success(), "{}", run.diagnostics());
+        assert_eq!(run.git_push_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.gh_delete_count(), 0, "{}", run.diagnostics());
+        assert_eq!(run.gh_get_count(), 5, "{}", run.diagnostics());
+        assert_eq!(
+            run.sleep_calls,
+            ["0.5", "1", "2", "4"],
+            "{}",
+            run.diagnostics()
+        );
+    }
+
+    #[test]
+    fn github_tag_delete_fails_immediately_when_the_ref_identity_changes() {
+        let run = run_github_delete_test(
+            &[
+                "tag-ref",
+                GITHUB_DELETE_TEST_TAG,
+                "commit",
+                GITHUB_DELETE_TEST_SHA,
+            ],
+            "tag-different",
+        );
+
+        assert!(!run.status.success(), "{}", run.diagnostics());
+        assert_eq!(run.git_push_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.gh_delete_count(), 0, "{}", run.diagnostics());
+        assert_eq!(run.gh_get_count(), 1, "{}", run.diagnostics());
+        assert!(run.sleep_calls.is_empty(), "{}", run.diagnostics());
+    }
+
+    #[test]
+    fn github_tag_delete_rejects_not_found_text_from_an_http_500_read() {
+        let run = run_github_delete_test(
+            &[
+                "tag-ref",
+                GITHUB_DELETE_TEST_TAG,
+                "commit",
+                GITHUB_DELETE_TEST_SHA,
+            ],
+            "tag-not-found-http-500",
+        );
+
+        assert!(!run.status.success(), "{}", run.diagnostics());
+        assert_eq!(run.git_push_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.gh_delete_count(), 0, "{}", run.diagnostics());
+        assert_eq!(run.gh_get_count(), 1, "{}", run.diagnostics());
+        assert!(run.sleep_calls.is_empty(), "{}", run.diagnostics());
+        assert!(
+            run.stderr.contains("deletion was not retried"),
+            "{}",
+            run.diagnostics()
+        );
+    }
+
+    #[test]
+    fn github_release_delete_mutates_once_and_accepts_stale_identity_until_absent() {
+        let run = run_github_delete_test(
+            &["release", GITHUB_DELETE_TEST_RELEASE_ID],
+            "release-stale-then-404",
+        );
+
+        assert!(run.status.success(), "{}", run.diagnostics());
+        assert_eq!(run.gh_delete_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.gh_get_count(), 2, "{}", run.diagnostics());
+        assert_eq!(run.git_push_count(), 0, "{}", run.diagnostics());
+        assert_eq!(run.sleep_calls, ["0.5"], "{}", run.diagnostics());
+        assert!(
+        run.gh_calls
+            .iter()
+            .any(|call| call
+                == &format!(
+                    "api --method DELETE repos/{GITHUB_DELETE_TEST_REPOSITORY}/releases/{GITHUB_DELETE_TEST_RELEASE_ID}"
+                )),
+        "{}",
+        run.diagnostics()
+    );
+    }
+
+    #[test]
+    fn github_release_delete_accepts_a_404_after_the_single_mutation_returns_an_error() {
+        let run = run_github_delete_test(
+            &["release", GITHUB_DELETE_TEST_RELEASE_ID],
+            "release-mutation-error-then-404",
+        );
+
+        assert!(run.status.success(), "{}", run.diagnostics());
+        assert_eq!(run.gh_delete_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.gh_get_count(), 1, "{}", run.diagnostics());
+        assert_eq!(run.git_push_count(), 0, "{}", run.diagnostics());
+        assert!(run.sleep_calls.is_empty(), "{}", run.diagnostics());
+    }
 }

@@ -51,8 +51,11 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch head 2026-07-16
         with:
           components: rustfmt
-      - name: Check shell installer syntax
-        run: bash -n scripts/install.sh
+      - name: Check shell script syntax
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
       - name: Check formatting
         run: cargo fmt --check
       - name: Install cargo-audit
@@ -98,9 +101,12 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch head 2026-07-16
         with:
           components: clippy
-      - name: Check shell installer syntax
+      - name: Check shell script syntax
         if: runner.os != 'Windows'
-        run: bash -n scripts/install.sh
+        run: |
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
       - name: Check PowerShell script syntax
         if: runner.os == 'Windows'
         shell: pwsh

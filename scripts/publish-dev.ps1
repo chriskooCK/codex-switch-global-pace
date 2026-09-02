@@ -51,6 +51,7 @@ $TempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/')
 $Temp = Join-Path $TempBase ('codex-switch-publish-dev-' + [Guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($Temp)
 $Seq = 0
+$DeletionConfirmationDelaysMilliseconds = [int[]]@(0, 500, 1000, 2000, 4000)
 
 function RunCommand([string]$Executable, [string[]]$CommandArguments, [string]$What, [switch]$AllowFailure) {
     $script:Seq++
@@ -96,7 +97,9 @@ function Json([string]$Endpoint, [string]$What) {
 function Maybe([string]$Endpoint, [string]$What) {
     $r = RunGh (ApiArgs $Endpoint '' '') $What -AllowFailure
     if ($r.Code -eq 0) { return [pscustomobject]@{ Found = $true; Value = ($r.Out | ConvertFrom-Json) } }
-    if ($r.Error -match '(?i)(HTTP 404|Not Found)') { return [pscustomobject]@{ Found = $false; Value = $null } }
+    if ($r.Error -match '(?im)^gh: [^\r\n]*\(HTTP 404\)\r?$') {
+        return [pscustomobject]@{ Found = $false; Value = $null }
+    }
     throw "$What failed (gh exit $($r.Code)): $($r.Error)"
 }
 
@@ -123,6 +126,37 @@ function Same([object]$A, [object]$B) {
 function SameSha([object]$A, [object]$B) {
     return ($null -ne $A -and $null -ne $B -and
         [string]::Equals([string]$A, [string]$B, [StringComparison]::OrdinalIgnoreCase))
+}
+
+function WaitRemoteDeletion(
+    [scriptblock]$Read,
+    [object[]]$ReadArguments,
+    [object]$ExpectedIdentity,
+    [scriptblock]$MatchesExpectedIdentity,
+    [string]$Description,
+    [object]$MutationResult,
+    [int[]]$DelaysMilliseconds = $script:DeletionConfirmationDelaysMilliseconds
+) {
+    if ($null -eq $DelaysMilliseconds -or $DelaysMilliseconds.Count -eq 0 -or
+        $DelaysMilliseconds[0] -ne 0 -or
+        @($DelaysMilliseconds | Where-Object { $_ -lt 0 }).Count -ne 0) {
+        throw 'Deletion confirmation delays must start at zero and contain no negative values.'
+    }
+
+    foreach ($delay in $DelaysMilliseconds) {
+        if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }
+        $after = & $Read @ReadArguments
+        if (-not [bool](Prop $after 'Found')) { return }
+        if (-not [bool](& $MatchesExpectedIdentity (Prop $after 'Value') $ExpectedIdentity)) {
+            throw "$Description changed identity after deletion was requested; it was preserved."
+        }
+    }
+
+    $mutationCode = [int](Prop $MutationResult 'Code')
+    $mutationError = [string](Prop $MutationResult 'Error')
+    $mutationDetail = if ($mutationError) { "; mutation diagnostic: $mutationError" } else { '' }
+    throw "$Description still has the expected identity after bounded confirmation " +
+        "(mutation exit $mutationCode)$mutationDetail; deletion was not retried."
 }
 function Hash([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 function SafeWarning([string]$Message) {
@@ -226,22 +260,24 @@ function AcquireRemotePublicationLock([string]$SourceSha) {
 function ReleaseRemotePublicationLock([hashtable]$Lock) {
     AssertRemotePublicationLock $Lock
     $refName = "refs/tags/$script:RemoteLockTag"
-    $lockEndpoint = "repos/$script:Repo/git/refs/tags/$script:RemoteLockTag"
     $lease = "--force-with-lease=$refName`:$($Lock.TagObjectSha)"
     $delete = RunGit @('-C', $script:RepoRoot, '-c', 'credential.helper=',
         '-c', 'credential.helper=!gh auth git-credential',
         'push', '--porcelain', '--no-verify', $lease, "https://github.com/$script:Repo.git", ":$refName") `
         'Release remote development-publication lock' -AllowFailure
-    $after = Ref $script:RemoteLockTag
-    if ($after.Found) {
-        $afterObject = Prop $after.Value 'object'
-        if ((Same (Prop $after.Value 'ref') "refs/tags/$script:RemoteLockTag") -and
-            (Same (Prop $afterObject 'type') 'tag') -and
-            (SameSha (Prop $afterObject 'sha') $Lock.TagObjectSha)) {
-            throw "The exact remote development-publication lock at $lockEndpoint remains after leased deletion: $($delete.Error)"
-        }
-        throw 'The remote development-publication lock changed identity during leased deletion and was preserved.'
-    }
+    WaitRemoteDeletion `
+        -Read { param($tag) Ref $tag } `
+        -ReadArguments @($script:RemoteLockTag) `
+        -ExpectedIdentity @{ Ref = $refName; TagObjectSha = $Lock.TagObjectSha } `
+        -MatchesExpectedIdentity {
+            param($current, $expected)
+            $currentObject = Prop $current 'object'
+            return ((Same (Prop $current 'ref') $expected.Ref) -and
+                (Same (Prop $currentObject 'type') 'tag') -and
+                (SameSha (Prop $currentObject 'sha') $expected.TagObjectSha))
+        } `
+        -Description "Remote lock $refName" `
+        -MutationResult $delete
 }
 
 function AssertRemotePublicationMutationLock {
@@ -458,9 +494,19 @@ function DownloadProjection([string]$Tag, [string]$Dir, [object]$Map, [string]$P
 
 function RemoveRelease([long]$Id) {
     AssertRemotePublicationMutationLock
-    $r = Mutate "repos/$script:Repo/releases/$Id" 'DELETE' '' "Delete release $Id"
-    $after = ReleaseId $Id
-    if ($after.Found) { throw "Release $Id remains after deletion: $($r.Error)" }
+    $delete = Mutate "repos/$script:Repo/releases/$Id" 'DELETE' '' "Delete release $Id"
+    WaitRemoteDeletion `
+        -Read { param($releaseId) ReleaseId ([long]$releaseId) } `
+        -ReadArguments @($Id) `
+        -ExpectedIdentity $Id `
+        -MatchesExpectedIdentity {
+            param($current, $expected)
+            $currentId = Prop $current 'id'
+            return ((($currentId -is [int]) -or ($currentId -is [long])) -and
+                ([long]$currentId -eq [long]$expected))
+        } `
+        -Description "Release $Id" `
+        -MutationResult $delete
 }
 
 function FindCandidate([hashtable]$C) {

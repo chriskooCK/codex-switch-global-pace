@@ -15,15 +15,15 @@ concurrency:
   # recovery enumerates the repository-wide Release collection, so even different
   # tags must not move its pagination boundaries concurrently. A stable candidate
   # uses a deterministic tag, allowing the next serialized run to identify an
-  # interrupted draft before creating a new one. GitHub's ref and Release deletion
-  # APIs have no conditional version precondition, so repository administrators
-  # must not mutate these temporary objects while a run is active.
+  # interrupted draft before creating a new one. Candidate refs are removed with
+  # an exact Git force-with-lease. GitHub's Release deletion API has no conditional
+  # version precondition, so repository administrators must not mutate temporary
+  # Releases while a run is active.
   # The stable job also acquires the historical
   # refs/tags/codex-switch-publish-dev-lock remote lease before it reads or changes
   # refs or Releases. That shared lease serializes Actions with publish-dev.ps1;
   # its old name is retained so an existing publisher lock cannot be bypassed.
-  # Release deletion APIs have no conditional version precondition; only the
-  # shared lock and immediate identity checks serialize cooperating writers.
+  # The shared lock and exact identity checks serialize cooperating writers.
   cancel-in-progress: false
 
 env:
@@ -728,7 +728,7 @@ jobs:
             > /dev/null 2>"$existing_error"; then
             echo "Shared publication lock ${lock_ref} already exists; it was not acquired or removed." >&2
             exit 1
-          elif ! grep -Eq 'HTTP 404|Not Found' "$existing_error"; then
+          elif ! grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$existing_error"; then
             cat "$existing_error" >&2
             echo "Shared publication lock absence could not be established; no ownership was claimed." >&2
             exit 1
@@ -868,7 +868,7 @@ jobs:
           error_file="$RUNNER_TEMP/existing-release-error"
           if release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$error_file"); then
             :
-          elif grep -Eq 'HTTP 404|Not Found' "$error_file"; then
+          elif grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$error_file"; then
             echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           else
@@ -909,21 +909,9 @@ jobs:
               echo "Recovered candidate ref ${candidate_tag} changed identity; it was preserved." >&2
               exit 1
             fi
-            if ! gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${candidate_tag}"; then
-              echo "Recovered candidate ref deletion returned an error; checking its final state." >&2
-            fi
-            if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${candidate_tag}" \
-              > /dev/null 2>"$RUNNER_TEMP/existing-release-candidate-ref-after-delete-error"; then
-              echo "Recovered candidate ref ${candidate_tag} remains." >&2
-              exit 1
-            elif ! grep -Eq 'HTTP 404|Not Found' \
-              "$RUNNER_TEMP/existing-release-candidate-ref-after-delete-error"; then
-              cat "$RUNNER_TEMP/existing-release-candidate-ref-after-delete-error" >&2
-              echo "Could not confirm recovered candidate ref removal." >&2
-              exit 1
-            fi
-          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+            bash scripts/github-delete.sh \
+              tag-ref "$candidate_tag" commit "$GITHUB_SHA"
+          elif ! grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$candidate_ref_error"; then
             cat "$candidate_ref_error" >&2
             echo "Could not inspect the recovered candidate ref; publication remains unconfirmed." >&2
             exit 1
@@ -1017,21 +1005,9 @@ jobs:
                 echo "Existing candidate ref ${candidate_tag} changed identity; interrupted state was preserved." >&2
                 exit 1
               fi
-              if ! gh api --method DELETE \
-                "repos/${GITHUB_REPOSITORY}/git/refs/tags/${candidate_tag}"; then
-                echo "Interrupted candidate ref deletion returned an error; checking its final state." >&2
-              fi
-              if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${candidate_tag}" \
-                > /dev/null 2>"$RUNNER_TEMP/prior-candidate-ref-after-delete-error"; then
-                echo "Interrupted candidate ref ${candidate_tag} remains; its release was preserved." >&2
-                exit 1
-              elif ! grep -Eq 'HTTP 404|Not Found' \
-                "$RUNNER_TEMP/prior-candidate-ref-after-delete-error"; then
-                cat "$RUNNER_TEMP/prior-candidate-ref-after-delete-error" >&2
-                echo "Could not confirm removal of interrupted candidate ref ${candidate_tag}; its release was preserved." >&2
-                exit 1
-              fi
-            elif ! grep -Eq 'HTTP 404|Not Found' "$prior_ref_error"; then
+              bash scripts/github-delete.sh \
+                tag-ref "$candidate_tag" commit "$GITHUB_SHA"
+            elif ! grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$prior_ref_error"; then
               cat "$prior_ref_error" >&2
               echo "Could not inspect interrupted candidate ref ${candidate_tag}; nothing was removed." >&2
               exit 1
@@ -1052,20 +1028,7 @@ jobs:
             fi
             "$RUNNER_TEMP/verify-release-assets.sh" \
               "$prior_release_id" artifacts "$RUNNER_TEMP/prior-candidate-assets-before-delete" subset
-            if ! gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/releases/${prior_release_id}"; then
-              echo "Interrupted candidate release deletion returned an error; checking its final state." >&2
-            fi
-            if gh api "repos/${GITHUB_REPOSITORY}/releases/${prior_release_id}" \
-              > /dev/null 2>"$RUNNER_TEMP/prior-candidate-after-delete-error"; then
-              echo "Interrupted candidate release ${prior_release_id} remains; refusing to overlap it." >&2
-              exit 1
-            elif ! grep -Eq 'HTTP 404|Not Found' \
-              "$RUNNER_TEMP/prior-candidate-after-delete-error"; then
-              cat "$RUNNER_TEMP/prior-candidate-after-delete-error" >&2
-              echo "Could not confirm removal of interrupted candidate release ${prior_release_id}." >&2
-              exit 1
-            fi
+            bash scripts/github-delete.sh release "$prior_release_id"
             echo "Removed verified interrupted candidate release ${prior_release_id}."
           fi
           candidate_ref_error="$RUNNER_TEMP/candidate-ref-preflight-error"
@@ -1073,7 +1036,7 @@ jobs:
             > /dev/null 2>"$candidate_ref_error"; then
             echo "Candidate ref ${candidate_tag} exists without its verified draft; refusing to delete or reuse it." >&2
             exit 1
-          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+          elif ! grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$candidate_ref_error"; then
             cat "$candidate_ref_error" >&2
             echo "Could not prove candidate ref ${candidate_tag} is absent." >&2
             exit 1
@@ -1264,19 +1227,12 @@ jobs:
                   "${candidate_ref_sha,,}" != "${GITHUB_SHA,,}" ]]; then
               cleanup_errors+=("candidate ref ${CANDIDATE_TAG} changed identity and was preserved")
             else
-              if ! gh api --method DELETE \
-                "repos/${GITHUB_REPOSITORY}/git/refs/tags/${CANDIDATE_TAG}"; then
-                echo "Deletion of candidate ref ${CANDIDATE_TAG} returned an error; checking its final state." >&2
-              fi
-              candidate_after_error="$RUNNER_TEMP/candidate-ref-after-delete-error"
-              if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" \
-                > /dev/null 2>"$candidate_after_error"; then
-                cleanup_errors+=("candidate ref ${CANDIDATE_TAG} remains")
-              elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_after_error"; then
-                cleanup_errors+=("candidate ref ${CANDIDATE_TAG} deletion could not be confirmed")
+              if ! bash scripts/github-delete.sh \
+                tag-ref "$CANDIDATE_TAG" commit "$candidate_ref_sha"; then
+                cleanup_errors+=("candidate ref ${CANDIDATE_TAG} cleanup did not complete")
               fi
             fi
-          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+          elif ! grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$candidate_ref_error"; then
             cleanup_errors+=("candidate ref ${CANDIDATE_TAG} could not be inspected")
           fi
 
@@ -1294,16 +1250,16 @@ jobs:
           RELEASE_ID: ${{ steps.candidate.outputs.id }}
           CANDIDATE_TAG: ${{ steps.candidate.outputs.tag }}
         run: |
-          # Releases are deleted by stable positive ID and refs by their verified
-          # full name after immediate revalidation. GitHub offers no conditional
-          # delete token for either object, so this cleanup is safe among the
-          # serialized workflow participants but assumes administrators do not
-          # race a manual mutation between the observation and delete request.
+          # Releases are deleted by stable positive ID after full revalidation.
+          # Refs use their verified full name and object SHA as an exact Git
+          # force-with-lease. The Release API has no equivalent precondition, so
+          # serialized cleanup still assumes administrators do not race a manual
+          # Release mutation between the observation and deletion request.
           candidate_release_error="$RUNNER_TEMP/incomplete-candidate-release-error"
           if release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             2>"$candidate_release_error"); then
             release_missing=false
-          elif grep -Eq 'HTTP 404|Not Found' "$candidate_release_error"; then
+          elif grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$candidate_release_error"; then
             release_missing=true
           else
             cat "$candidate_release_error" >&2
@@ -1350,27 +1306,9 @@ jobs:
               echo "Candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID} no longer belongs to this run; it was preserved." >&2
               exit 1
             fi
-            if ! gh api --method DELETE \
-              "repos/${GITHUB_REPOSITORY}/git/refs/tags/${CANDIDATE_TAG}"; then
-              echo "Candidate ref ${CANDIDATE_TAG} deletion returned an error; checking its final state." >&2
-            fi
-            candidate_ref_after_error="$RUNNER_TEMP/incomplete-candidate-ref-after-delete-error"
-            if candidate_ref_after=$(gh api \
-              "repos/${GITHUB_REPOSITORY}/git/ref/tags/${CANDIDATE_TAG}" \
-              2>"$candidate_ref_after_error"); then
-              if [[ "$(jq -r '.object.type' <<<"$candidate_ref_after")" != commit || \
-                    "$(jq -r '.object.sha' <<<"$candidate_ref_after" | tr '[:upper:]' '[:lower:]')" != "${GITHUB_SHA,,}" ]]; then
-                echo "Candidate ref ${CANDIDATE_TAG} changed identity after deletion was requested; it was preserved." >&2
-              else
-                echo "Candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID} remains; rerun cleanup after checking GitHub." >&2
-              fi
-              exit 1
-            elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_after_error"; then
-              cat "$candidate_ref_after_error" >&2
-              echo "Candidate ref ${CANDIDATE_TAG} deletion state is ambiguous for release ${RELEASE_ID}; rerun cleanup after checking GitHub." >&2
-              exit 1
-            fi
-          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_ref_error"; then
+            bash scripts/github-delete.sh \
+              tag-ref "$CANDIDATE_TAG" commit "$GITHUB_SHA"
+          elif ! grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$candidate_ref_error"; then
             cat "$candidate_ref_error" >&2
             echo "Could not inspect candidate ref ${CANDIDATE_TAG} for release ${RELEASE_ID}; nothing else was changed." >&2
             exit 1
@@ -1394,20 +1332,7 @@ jobs:
           fi
           "$RUNNER_TEMP/verify-release-assets.sh" \
             "$RELEASE_ID" artifacts "$RUNNER_TEMP/pre-delete-candidate-assets" subset
-          if ! gh api --method DELETE \
-            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}"; then
-            echo "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) deletion returned an error; checking its final state." >&2
-          fi
-          candidate_release_after_error="$RUNNER_TEMP/incomplete-candidate-release-after-delete-error"
-          if release_after=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            2>"$candidate_release_after_error"); then
-            echo "Candidate release ${RELEASE_ID} remains after deletion was requested; it was not deleted again." >&2
-            exit 1
-          elif ! grep -Eq 'HTTP 404|Not Found' "$candidate_release_after_error"; then
-            cat "$candidate_release_after_error" >&2
-            echo "Candidate release ${RELEASE_ID} (${CANDIDATE_TAG}) deletion state is ambiguous; rerun cleanup after checking GitHub." >&2
-            exit 1
-          fi
+          bash scripts/github-delete.sh release "$RELEASE_ID"
           echo "Removed this run's incomplete candidate release ${RELEASE_ID}."
       - name: Recover or release exact shared remote publication lock
         if: always() && needs.meta.outputs.is_dev != 'true' && steps.publication_lock.outputs.cleanup_candidate == 'true'
@@ -1439,7 +1364,7 @@ jobs:
           if ! current_ref=$(gh api \
             "repos/${GITHUB_REPOSITORY}/git/ref/tags/${LOCK_TAG}" \
             2>"$current_ref_error"); then
-            if grep -Eq 'HTTP 404|Not Found' "$current_ref_error"; then
+            if grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$current_ref_error"; then
               echo "Shared publication lock ${expected_ref} was never created or is already absent."
               exit 0
             fi
@@ -1479,36 +1404,6 @@ jobs:
             exit 1
           fi
 
-          lease="--force-with-lease=${expected_ref}:${LOCK_TAG_OBJECT_SHA}"
-          if git -c credential.helper= \
-            -c 'credential.helper=!gh auth git-credential' \
-            push --porcelain --no-verify "$lease" \
-            "https://github.com/${GITHUB_REPOSITORY}.git" ":${expected_ref}"; then
-            delete_status=0
-          else
-            delete_status=$?
-            echo "Leased shared publication lock deletion returned status ${delete_status}; checking the exact final ref state." >&2
-          fi
-
-          after_error="$RUNNER_TEMP/shared-publication-lock-after-delete-error"
-          if after_ref=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/git/ref/tags/${LOCK_TAG}" \
-            2>"$after_error"); then
-            if ! jq -e 'type == "object"' <<<"$after_ref" > /dev/null; then
-              echo "Shared publication lock post-delete check returned invalid JSON; deletion was not retried." >&2
-              exit 1
-            fi
-            if [[ "$(jq -r '.ref' <<<"$after_ref")" == "$expected_ref" && \
-                  "$(jq -r '.object.type' <<<"$after_ref")" == tag && \
-                  "$(jq -r '.object.sha' <<<"$after_ref" | tr '[:upper:]' '[:lower:]')" == "$LOCK_TAG_OBJECT_SHA" ]]; then
-              echo "The exact shared publication lock remains after leased deletion; it was not deleted again." >&2
-            else
-              echo "The shared publication lock changed identity during leased deletion; the new ref was preserved." >&2
-            fi
-            exit 1
-          elif ! grep -Eq 'HTTP 404|Not Found' "$after_error"; then
-            cat "$after_error" >&2
-            echo "Shared publication lock deletion state is ambiguous; deletion was not retried." >&2
-            exit 1
-          fi
+          bash scripts/github-delete.sh \
+            tag-ref "$LOCK_TAG" tag "$LOCK_TAG_OBJECT_SHA"
           echo "Released exact shared publication lock ${expected_ref}."
