@@ -717,7 +717,7 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
                     } else {
                         let (status, color) = match usage_availability(u, &entry.info) {
                             UsageAvailability::Available => ("OK", C_GREEN),
-                            UsageAvailability::Limited => ("Limited", C_RED),
+                            UsageAvailability::Limited => ("Used up", C_RED),
                             UsageAvailability::Unavailable => ("N/A", DIM),
                         };
                         (
@@ -1926,6 +1926,55 @@ mod tests {
                 .expect("status cell")
                 .fg,
             DIM
+        );
+    }
+
+    #[test]
+    fn account_table_renders_exhausted_quota_as_used_up() {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "exhausted".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                secondary: Some(WindowUsage {
+                    used_percent: Some(100.0),
+                    ..WindowUsage::default()
+                }),
+                ..UsageInfo::default()
+            })),
+            is_current: false,
+        });
+        app.update_view();
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_account_table(frame, &app, area, TEST_NOW);
+            })
+            .unwrap();
+
+        let (x, y) = (0..12)
+            .find_map(|y| {
+                row_text(terminal.backend(), y)
+                    .find("Used up")
+                    .map(|x| (x as u16, y))
+            })
+            .expect("used-up status");
+        let rendered = (0..12)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<String>();
+        assert!(rendered.contains("Used up"), "{rendered:?}");
+        assert!(!rendered.contains("Limited"), "{rendered:?}");
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, y))
+                .expect("status cell")
+                .fg,
+            C_RED
         );
     }
 
