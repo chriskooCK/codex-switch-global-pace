@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Visible auto-refresh state in the TUI** — The persistent shortcut footer now
+  focuses on search, menus, account creation, manual refresh, auto-refresh, and
+  Help. Its `t auto refresh` entry reports `[ON]` or `[OFF]` directly, while
+  navigation, account-detail, and quit shortcuts remain available in Help. The
+  footer and version indicator now share one measured layout, so neither can
+  overwrite the other when the terminal is narrow.
+
 ## v20260901.1.0 — 2026-09-01
 
 - **Write-ahead recovery for every refresh-token rotation** — A replacement for

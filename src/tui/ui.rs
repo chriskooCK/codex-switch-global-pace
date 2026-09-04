@@ -1073,7 +1073,6 @@ fn reset_cards_color(u: &UsageInfo) -> Color {
 
 struct StatusBarContent {
     lines: Vec<Line<'static>>,
-    show_version: bool,
 }
 
 fn wrapped_status_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
@@ -1113,13 +1112,11 @@ fn status_bar_content(app: &App, width: u16) -> StatusBarContent {
                 ),
                 width,
             ),
-            show_version: false,
         };
     }
     if let Some(confirm) = &app.confirm {
         return StatusBarContent {
             lines: wrapped_status_line(confirmation_status_line(confirm), width),
-            show_version: false,
         };
     }
     if app.search_active
@@ -1135,7 +1132,6 @@ fn status_bar_content(app: &App, width: u16) -> StatusBarContent {
                 ),
                 width,
             ),
-            show_version: false,
         };
     }
     if let Some(progress) = app.profile_switch_progress() {
@@ -1144,7 +1140,6 @@ fn status_bar_content(app: &App, width: u16) -> StatusBarContent {
                 Line::from(Span::styled(progress, base().fg(C_CYAN))),
                 width,
             ),
-            show_version: false,
         };
     }
     if let Some(status) = &app.status_msg {
@@ -1156,48 +1151,44 @@ fn status_bar_content(app: &App, width: u16) -> StatusBarContent {
                 )),
                 width,
             ),
-            show_version: false,
         };
     }
     if !app.marked.is_empty() {
+        let lines = wrapped_status_line(
+            Line::from(vec![
+                Span::styled(" ", base()),
+                Span::styled(
+                    app.marked.len().to_string(),
+                    base().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" selected", base().fg(C_YELLOW)),
+                Span::styled(" \u{2014} ", base().fg(DIM)),
+                Span::styled("enter", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+                Span::styled(" for batch \u{2502} ", base().fg(DIM)),
+                Span::styled("esc", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+                Span::styled(" to clear", base().fg(DIM)),
+            ]),
+            width,
+        );
         return StatusBarContent {
-            lines: wrapped_status_line(
-                Line::from(vec![
-                    Span::styled(" ", base()),
-                    Span::styled(
-                        app.marked.len().to_string(),
-                        base().fg(C_YELLOW).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" selected", base().fg(C_YELLOW)),
-                    Span::styled(" \u{2014} ", base().fg(DIM)),
-                    Span::styled("enter", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
-                    Span::styled(" for batch \u{2502} ", base().fg(DIM)),
-                    Span::styled("esc", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
-                    Span::styled(" to clear", base().fg(DIM)),
-                ]),
-                width,
-            ),
-            show_version: true,
+            lines: append_status_bar_version(app, lines, width),
         };
     }
+    let lines = build_shortcut_lines(app, width.into());
     StatusBarContent {
-        lines: build_help_lines(width.into()),
-        show_version: true,
+        lines: append_status_bar_version(app, lines, width),
     }
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let content = status_bar_content(app, area.width);
     f.render_widget(Paragraph::new(content.lines).style(base()), area);
-    if !content.show_version {
-        return;
-    }
+}
 
-    // Version indicator is reserved for the ordinary help/selection footer.
+fn status_bar_version(app: &App) -> Line<'static> {
     let version = crate::update::current_version();
     let ver_spans: Vec<Span> = if let Some(latest) = &app.update_available {
         vec![
-            Span::styled(" \u{2502} ", base().fg(DIM)),
             Span::styled(format!("v{version}"), base().fg(DIM)),
             Span::styled(
                 format!(" -> v{} ", safe_text::terminal_text(latest)),
@@ -1205,24 +1196,43 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     } else {
-        vec![
-            Span::styled(" \u{2502} ", base().fg(DIM)),
-            Span::styled(format!("v{version} "), base().fg(DIM)),
-        ]
+        vec![Span::styled(format!("v{version} "), base().fg(DIM))]
     };
-    let ver_width: usize = ver_spans.iter().map(|s| s.width()).sum();
-    if (area.width as usize) > ver_width {
-        let ver_area = Rect {
-            x: area.x + area.width - ver_width as u16,
-            y: area.y + area.height.saturating_sub(1),
-            width: ver_width as u16,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(ver_spans)).style(base()),
-            ver_area,
-        );
+    Line::from(ver_spans)
+}
+
+fn append_status_bar_version(
+    app: &App,
+    mut lines: Vec<Line<'static>>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let version = status_bar_version(app);
+    let width = usize::from(width);
+    let version_width = version.width();
+    if width < version_width {
+        return lines;
     }
+
+    let separator = Span::styled(" \u{2502} ", base().fg(DIM));
+    let inline_version_width = separator.width().saturating_add(version_width);
+    let last = lines
+        .last_mut()
+        .expect("status bar builders always return at least one line");
+    if last.width().saturating_add(inline_version_width) <= width {
+        let padding = width.saturating_sub(last.width().saturating_add(inline_version_width));
+        if padding > 0 {
+            last.spans.push(Span::styled(" ".repeat(padding), base()));
+        }
+        last.spans.push(separator);
+        last.spans.extend(version.spans);
+        return lines;
+    }
+
+    let padding = width.saturating_sub(version_width);
+    let mut version_line = Line::from(Span::styled(" ".repeat(padding), base()));
+    version_line.spans.extend(version.spans);
+    lines.push(version_line);
+    lines
 }
 
 /// Render a single usage gauge (5h or 7d) with block chars and pace marker.
@@ -1393,7 +1403,16 @@ fn usage_pct_style(color: Color, is_selected: bool) -> Style {
     }
 }
 
-fn build_help_lines(width: usize) -> Vec<Line<'static>> {
+fn status_bar_indicator_span(app: &App, indicator: keymap::StatusBarIndicator) -> Span<'static> {
+    match indicator {
+        keymap::StatusBarIndicator::AutoRefresh if app.auto_refresh_enabled => {
+            Span::styled(" [ON]", base().fg(C_GREEN).add_modifier(Modifier::BOLD))
+        }
+        keymap::StatusBarIndicator::AutoRefresh => Span::styled(" [OFF]", base().fg(DIM)),
+    }
+}
+
+fn build_shortcut_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let key_style = base().fg(C_YELLOW);
     let sep_style = base().fg(DIM);
     let label_style = base().fg(C_GRAY);
@@ -1402,29 +1421,30 @@ fn build_help_lines(width: usize) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = vec![Span::styled(" ", space_style)];
     let mut used = 1usize;
 
-    let items = keymap::status_bar_items();
-    for (i, (k, label)) in items.iter().enumerate() {
-        let key_disp = (*k).to_string();
-        let label_short = short_label(label);
-        let sep = " \u{2502} ";
-        let item_len = key_disp.chars().count()
+    let sep = " \u{2502} ";
+    let sep_width = display_width(sep);
+    for (keys, item) in keymap::status_bar_items() {
+        let indicator = item
+            .indicator
+            .map(|indicator| status_bar_indicator_span(app, indicator));
+        let item_len = display_width(keys)
             + 1
-            + label_short.chars().count()
-            + if i + 1 < items.len() {
-                sep.chars().count()
-            } else {
-                0
-            };
-        if used + item_len > width && used > 1 {
+            + display_width(item.label)
+            + indicator.as_ref().map(Span::width).unwrap_or(0);
+        if used > 1 && used + sep_width + item_len > width {
             lines.push(Line::from(spans));
             spans = vec![Span::styled(" ", space_style)];
             used = 1;
         }
-        spans.push(Span::styled(key_disp, key_style));
-        spans.push(Span::styled(" ", space_style));
-        spans.push(Span::styled(label_short.to_string(), label_style));
-        if i + 1 < items.len() {
+        if used > 1 {
             spans.push(Span::styled(sep, sep_style));
+            used += sep_width;
+        }
+        spans.push(Span::styled(keys, key_style));
+        spans.push(Span::styled(" ", space_style));
+        spans.push(Span::styled(item.label, label_style));
+        if let Some(indicator) = indicator {
+            spans.push(indicator);
         }
         used += item_len;
     }
@@ -1435,20 +1455,6 @@ fn build_help_lines(width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled("", space_style)));
     }
     lines
-}
-
-/// Compress verbose keymap labels for status bar.
-fn short_label(label: &str) -> &str {
-    match label {
-        "move selection" => "nav",
-        "search" => "search",
-        "open menu (account or batch)" => "menu",
-        "refresh visible accounts" => "refresh",
-        "show / hide account detail panel" => "quota",
-        "show this help" => "help",
-        "quit" => "quit",
-        other => other,
-    }
 }
 
 fn format_auto_refresh_remaining(secs: u64) -> String {
@@ -1673,6 +1679,107 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn ordinary_footer_surfaces_primary_actions_and_auto_refresh_state() {
+        let mut app = App::new();
+
+        let off = status_content_text(&app);
+        assert!(off.contains("/ search"), "{off:?}");
+        assert!(off.contains("enter menu"), "{off:?}");
+        assert!(off.contains("a add new account"), "{off:?}");
+        assert!(off.contains("r refresh"), "{off:?}");
+        assert!(off.contains("t auto refresh [OFF]"), "{off:?}");
+        assert!(off.contains("h help"), "{off:?}");
+        assert!(!off.contains("nav"), "{off:?}");
+        assert!(!off.contains("quota"), "{off:?}");
+        assert!(!off.contains("q quit"), "{off:?}");
+
+        app.auto_refresh_enabled = true;
+        let on = status_content_text(&app);
+        assert!(on.contains("t auto refresh [ON]"), "{on:?}");
+        assert!(!on.contains("[OFF]"), "{on:?}");
+    }
+
+    #[test]
+    fn auto_refresh_footer_state_has_distinct_visual_emphasis() {
+        let mut app = App::new();
+
+        let off = status_bar_content(&app, 120);
+        let off_state = off
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.as_ref() == " [OFF]")
+            .expect("disabled auto-refresh state");
+        assert_eq!(off_state.style.fg, Some(DIM));
+        assert!(!off_state.style.add_modifier.contains(Modifier::BOLD));
+
+        app.auto_refresh_enabled = true;
+        let on = status_bar_content(&app, 120);
+        let on_state = on
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.as_ref() == " [ON]")
+            .expect("enabled auto-refresh state");
+        assert_eq!(on_state.style.fg, Some(C_GREEN));
+        assert!(on_state.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn footer_and_version_share_the_measured_layout_without_overlap() {
+        for width in [60, 80, 100] {
+            let mut app = App::new();
+            app.update_available = Some("9.9.9".to_string());
+            let status_height = status_bar_height(&app, width);
+            let backend = TestBackend::new(width, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+
+            terminal
+                .draw(|frame| render(frame, &mut app, TEST_NOW))
+                .unwrap();
+
+            let rendered = ((20 - status_height as u16)..20)
+                .map(|y| row_text(terminal.backend(), y).trim_end().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for expected in [
+                "/ search",
+                "enter menu",
+                "a add new account",
+                "r refresh",
+                "t auto refresh [OFF]",
+                "h help",
+                "-> v9.9.9",
+            ] {
+                assert!(rendered.contains(expected), "width {width}: {rendered:?}");
+            }
+            let content = status_bar_content(&app, width);
+            assert!(
+                content
+                    .lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width)),
+                "width {width}: a status line exceeds its measured width"
+            );
+            assert_eq!(
+                content.lines.last().map(|line| line.width()),
+                Some(usize::from(width)),
+                "width {width}: version should remain right-aligned"
+            );
+            if width == 100 {
+                let version_line = content.lines.last().expect("version line");
+                let version_text = version_line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(version_text.contains("-> v9.9.9"), "{version_text:?}");
+                assert!(!version_text.contains("h help"), "{version_text:?}");
+            }
+        }
     }
 
     #[test]

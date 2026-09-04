@@ -80,6 +80,9 @@ codex-switch-global-pace self-update --check
 ## TUI shortcuts
 
 `Enter` opens the scrollable detail and action menu for the selected account; if accounts are marked, it opens the batch menu instead.
+The persistent footer keeps the primary `/`, `Enter`, `a`, `r`, `t`, and `h`
+actions visible. Its `t auto refresh` label reports `[ON]` or `[OFF]`; open
+Help with `h` for the complete shortcut list.
 
 | Key | Action |
 |---|---|
