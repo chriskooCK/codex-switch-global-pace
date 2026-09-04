@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
 };
 
-use super::app::{App, UsageStatus};
+use super::app::{App, ResetCardExpiry, UsageStatus};
 use super::keymap;
 use super::meter::{percent_marker_offset, usage_meter_line};
 use super::popup;
@@ -209,7 +209,14 @@ pub fn render(f: &mut Frame, app: &mut App, now: i64) {
 
     render_account_table(f, app, vertical[0], now);
     let global_weekly = app.global_weekly_summary(now);
-    render_global_weekly_pace(f, &global_weekly, now, vertical[1]);
+    let reset_card_expiry = app.earliest_reset_card_expiry(now);
+    render_global_weekly_pace(
+        f,
+        &global_weekly,
+        reset_card_expiry.as_ref(),
+        now,
+        vertical[1],
+    );
     if app.detail_visible && detail_height > 0 {
         render_detail_panel(f, app, vertical[2], now);
     }
@@ -263,7 +270,13 @@ pub(super) fn quota_pace_color(used_percent: Option<f64>, pace_percent: Option<f
     }
 }
 
-fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: i64, area: Rect) {
+fn render_global_weekly_pace(
+    f: &mut Frame,
+    summary: &GlobalWeeklySummary,
+    reset_card_expiry: Option<&ResetCardExpiry>,
+    now: i64,
+    area: Rect,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -272,6 +285,7 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
         f.render_widget(
             Paragraph::new(compact_global_weekly_line(
                 summary,
+                reset_card_expiry,
                 now,
                 area.width as usize,
             ))
@@ -352,7 +366,7 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
 
     let summary_text = fitted_segments(
         content.width.into(),
-        global_weekly_summary_segments(summary, now),
+        global_weekly_summary_segments(summary, reset_card_expiry, now),
     );
 
     if content.height > 2 {
@@ -369,6 +383,7 @@ fn render_global_weekly_pace(f: &mut Frame, summary: &GlobalWeeklySummary, now: 
 
 fn compact_global_weekly_line(
     summary: &GlobalWeeklySummary,
+    reset_card_expiry: Option<&ResetCardExpiry>,
     now: i64,
     width: usize,
 ) -> Line<'static> {
@@ -379,7 +394,7 @@ fn compact_global_weekly_line(
     };
     let summary_text = fitted_segments(
         width.saturating_sub(display_width(prefix)),
-        global_weekly_summary_segments(summary, now),
+        global_weekly_summary_segments(summary, reset_card_expiry, now),
     );
 
     Line::from(vec![
@@ -388,13 +403,22 @@ fn compact_global_weekly_line(
     ])
 }
 
-fn global_weekly_summary_segments(summary: &GlobalWeeklySummary, now: i64) -> Vec<String> {
-    let mut segments = Vec::with_capacity(2);
+fn global_weekly_summary_segments(
+    summary: &GlobalWeeklySummary,
+    reset_card_expiry: Option<&ResetCardExpiry>,
+    now: i64,
+) -> Vec<String> {
+    let mut segments = Vec::with_capacity(3);
     if let Some(accounts) = global_account_count_text(summary) {
         segments.push(accounts);
     }
     if let Some(next) = next_reset_text(summary, now) {
         segments.push(format!("Next reset: {next}"));
+    }
+    if let Some(expiry) = reset_card_expiry
+        && let Some(next) = account_event_text(&expiry.alias, expiry.expires_at, now)
+    {
+        segments.push(format!("Card expiry: {next}"));
     }
     segments
 }
@@ -417,7 +441,11 @@ fn global_account_count_text(summary: &GlobalWeeklySummary) -> Option<String> {
 fn next_reset_text(summary: &GlobalWeeklySummary, now: i64) -> Option<String> {
     let alias = summary.next_reset_alias.as_deref()?;
     let resets_at = summary.next_reset_at?;
-    let remaining = u64::try_from(resets_at.checked_sub(now)?).ok()?;
+    account_event_text(alias, resets_at, now)
+}
+
+fn account_event_text(alias: &str, timestamp: i64, now: i64) -> Option<String> {
+    let remaining = u64::try_from(timestamp.checked_sub(now)?).ok()?;
     (remaining > 0).then(|| format!("{alias} in {}", format_duration_compact(remaining)))
 }
 
@@ -1482,7 +1510,7 @@ mod tests {
     use super::{
         C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_YELLOW, DIM,
         GLOBAL_WEEKLY_COMPACT_HEIGHT, GLOBAL_WEEKLY_FULL_HEIGHT, MIN_ACCOUNT_TABLE_HEIGHT,
-        PACE_LABEL, apply_frame_color_policy, editable_input_line, fitted_segments,
+        PACE_LABEL, apply_frame_color_policy, display_width, editable_input_line, fitted_segments,
         global_weekly_panel_height, plan_color, quota_pace_color, quota_table_value, render,
         render_account_table, render_detail_panel, render_global_weekly_pace, render_usage_gauge,
         render_usage_gauges, reset_timestamp_color, status_bar_content, status_bar_height,
@@ -1490,7 +1518,7 @@ mod tests {
     };
     use crate::jwt::AccountInfo;
     use crate::tui::app::{
-        AccountEntry, App, ConfirmAction, RenameState, SearchState, UsageStatus,
+        AccountEntry, App, ConfirmAction, RenameState, ResetCardExpiry, SearchState, UsageStatus,
     };
     use crate::tui::meter::percent_marker_offset;
     use crate::usage::{
@@ -2210,6 +2238,13 @@ mod tests {
         }
     }
 
+    fn reset_card_expiry(now: i64) -> ResetCardExpiry {
+        ResetCardExpiry {
+            alias: "work1".to_string(),
+            expires_at: now + 2 * 86_400 + 6 * 3_600,
+        }
+    }
+
     fn dashboard_geometry(width: u16, is_current: bool) -> DashboardGeometry {
         let now = TEST_NOW;
         let usage = UsageInfo {
@@ -2243,6 +2278,7 @@ mod tests {
                 render_global_weekly_pace(
                     frame,
                     &summary,
+                    None,
                     now,
                     Rect::new(0, 0, width, GLOBAL_WEEKLY_FULL_HEIGHT),
                 );
@@ -2347,14 +2383,23 @@ mod tests {
     }
 
     #[test]
-    fn full_global_panel_renders_usage_pace_marker_account_count_and_reset() {
+    fn full_global_panel_renders_usage_pace_marker_resets_and_card_expiry() {
         let now = 1_000_000;
         let summary = global_summary(now);
+        let reset_card_expiry = reset_card_expiry(now);
         let backend = TestBackend::new(110, GLOBAL_WEEKLY_FULL_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| {
+                render_global_weekly_pace(
+                    frame,
+                    &summary,
+                    Some(&reset_card_expiry),
+                    now,
+                    frame.area(),
+                )
+            })
             .unwrap();
 
         let rendered = (0..GLOBAL_WEEKLY_FULL_HEIGHT)
@@ -2378,6 +2423,7 @@ mod tests {
         }));
         assert!(rendered.contains("3/4 accounts"));
         assert!(rendered.contains("Next reset: work2 in 3h18m"));
+        assert!(rendered.contains("Card expiry: work1 in 2d6h"));
         for removed in [
             "Pace 106.7%",
             "100% normal",
@@ -2403,7 +2449,7 @@ mod tests {
         let backend = TestBackend::new(80, GLOBAL_WEEKLY_FULL_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| render_global_weekly_pace(frame, &summary, None, now, frame.area()))
             .unwrap();
 
         let (meter_start, meter_end) = meter_bounds(terminal.backend(), 1).expect("global meter");
@@ -2459,7 +2505,7 @@ mod tests {
         let backend = TestBackend::new(80, GLOBAL_WEEKLY_FULL_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| render_global_weekly_pace(frame, &summary, None, now, frame.area()))
             .unwrap();
 
         let (meter_start, meter_end) = meter_bounds(terminal.backend(), 1).expect("global meter");
@@ -2480,7 +2526,9 @@ mod tests {
                 let backend = TestBackend::new(width, GLOBAL_WEEKLY_FULL_HEIGHT);
                 let mut terminal = Terminal::new(backend).unwrap();
                 terminal
-                    .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+                    .draw(|frame| {
+                        render_global_weekly_pace(frame, &summary, None, now, frame.area())
+                    })
                     .unwrap();
 
                 let marker_x = symbol_x(terminal.backend(), 1, "|").expect("pace marker");
@@ -2504,7 +2552,7 @@ mod tests {
         let backend = TestBackend::new(80, GLOBAL_WEEKLY_FULL_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| render_global_weekly_pace(frame, &summary, None, now, frame.area()))
             .unwrap();
         let full_text = (0..GLOBAL_WEEKLY_FULL_HEIGHT)
             .map(|y| row_text(terminal.backend(), y))
@@ -2530,7 +2578,7 @@ mod tests {
         let backend = TestBackend::new(80, GLOBAL_WEEKLY_COMPACT_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| render_global_weekly_pace(frame, &summary, None, now, frame.area()))
             .unwrap();
         let compact_text = row_text(terminal.backend(), 0);
         assert!(compact_text.contains("Global Weekly: 0/2 accounts"));
@@ -2631,17 +2679,27 @@ mod tests {
     fn compact_global_panel_keeps_account_count_and_reset_on_one_line() {
         let now = 1_000_000;
         let summary = global_summary(now);
+        let reset_card_expiry = reset_card_expiry(now);
         let backend = TestBackend::new(70, GLOBAL_WEEKLY_COMPACT_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| {
+                render_global_weekly_pace(
+                    frame,
+                    &summary,
+                    Some(&reset_card_expiry),
+                    now,
+                    frame.area(),
+                )
+            })
             .unwrap();
         let text = row_text(terminal.backend(), 0);
 
         assert!(!text.contains("106.7%"));
         assert!(text.contains("3/4 accounts"));
         assert!(text.contains("Next reset: work2 in 3h18m"));
+        assert!(!text.contains("Card expiry"));
         assert!(!text.contains("+6.7%p"));
         for symbol in ["█", "░", "|", "↑"] {
             assert_eq!(symbol_x(terminal.backend(), 0, symbol), None);
@@ -2652,17 +2710,67 @@ mod tests {
     fn compact_global_panel_reports_included_over_total_accounts() {
         let now = 1_000_000;
         let summary = global_summary(now);
+        let reset_card_expiry = reset_card_expiry(now);
         let backend = TestBackend::new(120, GLOBAL_WEEKLY_COMPACT_HEIGHT);
         let mut terminal = Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| render_global_weekly_pace(frame, &summary, now, frame.area()))
+            .draw(|frame| {
+                render_global_weekly_pace(
+                    frame,
+                    &summary,
+                    Some(&reset_card_expiry),
+                    now,
+                    frame.area(),
+                )
+            })
             .unwrap();
 
         assert_eq!(
             row_text(terminal.backend(), 0).trim_end(),
-            " Global Weekly: 3/4 accounts · Next reset: work2 in 3h18m"
+            " Global Weekly: 3/4 accounts · Next reset: work2 in 3h18m · Card expiry: work1 in 2d6h"
         );
+    }
+
+    #[test]
+    fn compact_global_panel_drops_the_complete_card_segment_at_its_width_boundary() {
+        let now = 1_000_000;
+        let summary = global_summary(now);
+        let reset_card_expiry = reset_card_expiry(now);
+        let full = " Global Weekly: 3/4 accounts · Next reset: work2 in 3h18m · Card expiry: work1 in 2d6h";
+        let without_card = " Global Weekly: 3/4 accounts · Next reset: work2 in 3h18m";
+        let full_width = display_width(full);
+
+        assert_eq!(
+            super::compact_global_weekly_line(&summary, Some(&reset_card_expiry), now, full_width,)
+                .to_string(),
+            full
+        );
+        assert_eq!(
+            super::compact_global_weekly_line(
+                &summary,
+                Some(&reset_card_expiry),
+                now,
+                full_width - 1,
+            )
+            .to_string(),
+            without_card
+        );
+    }
+
+    #[test]
+    fn card_expiry_is_independent_of_the_weekly_reset_segment() {
+        let now = 1_000_000;
+        let mut summary = global_summary(now);
+        summary.next_reset_at = None;
+        summary.next_reset_alias = None;
+        let reset_card_expiry = reset_card_expiry(now);
+
+        let text = super::compact_global_weekly_line(&summary, Some(&reset_card_expiry), now, 120)
+            .to_string();
+
+        assert!(text.contains("3/4 accounts · Card expiry: work1 in 2d6h"));
+        assert!(!text.contains("Next reset"));
     }
 
     #[test]
@@ -2671,13 +2779,13 @@ mod tests {
         let mut summary = global_summary(now);
         summary.excluded_accounts = 0;
 
-        let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
+        let text = super::compact_global_weekly_line(&summary, None, now, 120).to_string();
 
         assert!(text.contains("Global Weekly: 3 accounts · "), "{text:?}");
         assert!(!text.contains("3/3 accounts"), "{text:?}");
 
         summary.included_accounts = 1;
-        let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
+        let text = super::compact_global_weekly_line(&summary, None, now, 120).to_string();
         assert!(text.contains("Global Weekly: 1 account · "), "{text:?}");
         assert!(!text.contains("1 accounts"), "{text:?}");
     }
@@ -2689,7 +2797,7 @@ mod tests {
         summary.included_accounts = usize::MAX;
         summary.excluded_accounts = 1;
 
-        let text = super::compact_global_weekly_line(&summary, now, 120).to_string();
+        let text = super::compact_global_weekly_line(&summary, None, now, 120).to_string();
 
         assert!(!text.contains("accounts"), "{text:?}");
         assert!(text.contains("Next reset: work2 in 3h18m"), "{text:?}");

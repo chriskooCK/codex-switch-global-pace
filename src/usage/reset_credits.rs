@@ -572,12 +572,20 @@ async fn fetch_reset_credits_at_url_with_network(
         .context("reset credits response does not match the expected details shape")
 }
 
-pub(crate) fn reset_credit_expiry_sort_key(credit: &ResetCredit) -> i64 {
+pub(crate) fn reset_credit_expiry_timestamp(
+    credit: &ResetCredit,
+) -> std::result::Result<Option<i64>, chrono::ParseError> {
     credit
         .expires_at
         .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-        .map(|dt| dt.timestamp())
+        .map(|value| chrono::DateTime::parse_from_rfc3339(value).map(|dt| dt.timestamp()))
+        .transpose()
+}
+
+pub(crate) fn reset_credit_expiry_sort_key(credit: &ResetCredit) -> i64 {
+    reset_credit_expiry_timestamp(credit)
+        .ok()
+        .flatten()
         .unwrap_or(i64::MAX)
 }
 

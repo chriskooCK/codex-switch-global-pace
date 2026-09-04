@@ -146,7 +146,9 @@ The dashboard renders a local aggregate view of every account with a valid
 weekly window. The filled bar is aggregate actual usage, and the `↑ pace`
 marker is aggregate elapsed time: the ideal amount of the displayed capacity
 to have used by now. The text below the meter shows the participating account
-count and the nearest included-account reset.
+count and the nearest included-account reset. Once every account has a complete
+reset-card snapshot, it also names the account whose available card expires
+first. That trailing card segment is omitted as a unit on narrower terminals.
 
 This view does not combine quotas on the service, move capacity between
 accounts, or circumvent account limits. Fully exhausted accounts remain

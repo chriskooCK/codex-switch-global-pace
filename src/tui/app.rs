@@ -20,7 +20,7 @@ use crate::safe_text;
 use crate::usage::{
     ConsumeResetCreditError, ConsumedResetCredit, GlobalPaceAccountInput, GlobalWeeklySummary,
     Refresh, ResetCredit, UsageError, UsageInfo, calculate_global_weekly_summary,
-    reset_credit_expiry_sort_key,
+    reset_credit_expiry_sort_key, reset_credit_expiry_timestamp,
 };
 use crate::warmup::ModelEntry;
 
@@ -40,6 +40,12 @@ pub enum UsageStatus {
     Loading,
     Loaded(Box<UsageInfo>),
     Error(UsageError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResetCardExpiry {
+    pub alias: String,
+    pub expires_at: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3109,6 +3115,50 @@ impl App {
             })
             .collect();
         calculate_global_weekly_summary(&inputs, now)
+    }
+
+    /// Return the earliest future reset-card expiry across all registered
+    /// accounts once every account has a complete, successful card snapshot.
+    /// Reset cards are independent of weekly-quota eligibility and search
+    /// filtering, so neither participates in this selection.
+    pub(super) fn earliest_reset_card_expiry(&self, now: i64) -> Option<ResetCardExpiry> {
+        let mut earliest: Option<ResetCardExpiry> = None;
+
+        for entry in &self.accounts {
+            let UsageStatus::Loaded(usage) = &entry.usage else {
+                return None;
+            };
+            let listed_count = u64::try_from(usage.reset_credits.len()).ok();
+            if usage.reset_credits_error.is_some()
+                || listed_count != usage.reset_credits_available_count
+            {
+                return None;
+            }
+
+            for credit in &usage.reset_credits {
+                let expires_at = match reset_credit_expiry_timestamp(credit) {
+                    Ok(Some(expires_at)) => expires_at,
+                    Ok(None) => continue,
+                    Err(_) => return None,
+                };
+                if expires_at <= now {
+                    continue;
+                }
+
+                let precedes_current = earliest.as_ref().is_none_or(|current| {
+                    (expires_at, entry.alias.as_str())
+                        < (current.expires_at, current.alias.as_str())
+                });
+                if precedes_current {
+                    earliest = Some(ResetCardExpiry {
+                        alias: entry.alias.clone(),
+                        expires_at,
+                    });
+                }
+            }
+        }
+
+        earliest
     }
 
     pub fn is_refreshing(&self, alias: &str) -> bool {
@@ -8475,6 +8525,153 @@ mod tests {
             summary.next_reset_alias.as_deref(),
             Some("loaded-before-cache-ttl")
         );
+    }
+
+    #[test]
+    fn earliest_reset_card_expiry_uses_all_accounts_independently_of_weekly_quota() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-05T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let loaded = |credits: Vec<ResetCredit>| {
+            let count = u64::try_from(credits.len()).unwrap();
+            UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits_available_count: Some(count),
+                reset_credits: credits,
+                ..UsageInfo::default()
+            }))
+        };
+        let mut app = App::new();
+        app.accounts = vec![
+            AccountEntry {
+                alias: "visible".into(),
+                info: AccountInfo::default(),
+                usage: loaded(vec![ResetCredit {
+                    id: "later".into(),
+                    granted_at: None,
+                    expires_at: Some("2026-09-08T00:00:00Z".into()),
+                }]),
+                is_current: true,
+            },
+            AccountEntry {
+                alias: "filtered-out".into(),
+                info: AccountInfo::default(),
+                usage: loaded(vec![
+                    ResetCredit {
+                        id: "no-expiry".into(),
+                        granted_at: None,
+                        expires_at: None,
+                    },
+                    ResetCredit {
+                        id: "expired".into(),
+                        granted_at: None,
+                        expires_at: Some("2026-09-04T00:00:00Z".into()),
+                    },
+                    ResetCredit {
+                        id: "earliest-future".into(),
+                        granted_at: None,
+                        expires_at: Some("2026-09-07T06:00:00Z".into()),
+                    },
+                ]),
+                is_current: false,
+            },
+        ];
+        app.view_indices = vec![0];
+
+        let expiry = app
+            .earliest_reset_card_expiry(now)
+            .expect("complete card snapshots should produce a future expiry");
+
+        assert_eq!(expiry.alias, "filtered-out");
+        assert_eq!(
+            expiry.expires_at,
+            chrono::DateTime::parse_from_rfc3339("2026-09-07T06:00:00Z")
+                .unwrap()
+                .timestamp()
+        );
+        assert_eq!(app.global_weekly_summary(now).included_accounts, 0);
+    }
+
+    #[test]
+    fn earliest_reset_card_expiry_breaks_timestamp_ties_by_alias() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-05T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let loaded = |expires_at: &str| {
+            UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits_available_count: Some(1),
+                reset_credits: vec![ResetCredit {
+                    id: expires_at.to_string(),
+                    granted_at: None,
+                    expires_at: Some(expires_at.to_string()),
+                }],
+                ..UsageInfo::default()
+            }))
+        };
+        let mut app = App::new();
+        app.accounts = vec![
+            AccountEntry {
+                alias: "zeta".into(),
+                info: AccountInfo::default(),
+                usage: loaded("2026-09-07T00:00:00Z"),
+                is_current: false,
+            },
+            AccountEntry {
+                alias: "alpha".into(),
+                info: AccountInfo::default(),
+                usage: loaded("2026-09-07T09:00:00+09:00"),
+                is_current: false,
+            },
+        ];
+
+        assert_eq!(
+            app.earliest_reset_card_expiry(now)
+                .map(|expiry| expiry.alias),
+            Some("alpha".to_string())
+        );
+    }
+
+    #[test]
+    fn earliest_reset_card_expiry_requires_complete_valid_card_snapshots() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-05T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let valid_credit = ResetCredit {
+            id: "valid".into(),
+            granted_at: None,
+            expires_at: Some("2026-09-07T00:00:00Z".into()),
+        };
+        let mut app = App::new();
+        app.accounts = vec![AccountEntry {
+            alias: "account".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits_available_count: Some(1),
+                reset_credits: vec![valid_credit.clone()],
+                ..UsageInfo::default()
+            })),
+            is_current: false,
+        }];
+        assert!(app.earliest_reset_card_expiry(now).is_some());
+
+        if let UsageStatus::Loaded(usage) = &mut app.accounts[0].usage {
+            usage.reset_credits_error = Some("details unavailable".into());
+        }
+        assert_eq!(app.earliest_reset_card_expiry(now), None);
+
+        if let UsageStatus::Loaded(usage) = &mut app.accounts[0].usage {
+            usage.reset_credits_error = None;
+            usage.reset_credits_available_count = Some(2);
+        }
+        assert_eq!(app.earliest_reset_card_expiry(now), None);
+
+        if let UsageStatus::Loaded(usage) = &mut app.accounts[0].usage {
+            usage.reset_credits_available_count = Some(1);
+            usage.reset_credits[0].expires_at = Some("not-a-date".into());
+        }
+        assert_eq!(app.earliest_reset_card_expiry(now), None);
+
+        app.accounts[0].usage = UsageStatus::Loading;
+        assert_eq!(app.earliest_reset_card_expiry(now), None);
     }
 
     #[test]

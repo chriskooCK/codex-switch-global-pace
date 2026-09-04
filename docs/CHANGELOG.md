@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Global reset-card expiry visibility** — The Global Weekly summary now shows
+  the account whose available reset card expires first, alongside the nearest
+  weekly quota reset. The card segment appears only when every account has a
+  complete, valid reset-card snapshot and is dropped as one unit when the
+  terminal is too narrow.
 - **Visible auto-refresh state in the TUI** — The persistent shortcut footer now
   focuses on search, menus, account creation, manual refresh, auto-refresh, and
   Help. Its `t auto refresh` entry reports `[ON]` or `[OFF]` directly, while

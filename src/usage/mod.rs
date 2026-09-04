@@ -53,7 +53,7 @@ pub(crate) use reset_credits::{
     execute_prepared_reset_credit_enrichment_with_existing_lease_and_client,
     prepare_reset_credit_consume_with_existing_lease,
     prepare_reset_credit_enrichment_with_existing_lease, reset_credit_expiry_sort_key,
-    validate_reset_credit_preflight,
+    reset_credit_expiry_timestamp, validate_reset_credit_preflight,
 };
 pub use reset_credits::{consume_reset_credit_by_id, earliest_reset_credit};
 #[allow(unused_imports)]

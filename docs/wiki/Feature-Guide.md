@@ -167,10 +167,13 @@ as one equal-weight pool. This is only an aggregate display: quota remains
 separate on each account. Its filled bar is aggregate actual usage, while the
 `↑ pace` marker is aggregate elapsed time and therefore the ideal usage position
 for the current point in the weekly windows. The summary text shows the
-participating account count and nearest included-account reset. A fully
-exhausted account is still included when its reset timestamp is valid. Missing,
-expired, inconsistent, or failed weekly data is counted as unavailable instead
-of being guessed.
+participating account count and nearest included-account reset. Once every
+account has a complete reset-card snapshot, the same line also identifies the
+account whose available card expires first. The card segment is omitted when
+the data is incomplete or the terminal is too narrow; no expiry is inferred.
+A fully exhausted account is still included when its reset timestamp is valid.
+Missing, expired, inconsistent, or failed weekly data is counted as unavailable
+instead of being guessed.
 
 Every quota meter uses the same relative state: yellow when actual usage is
 ahead of elapsed-time pace, and green when usage is at or behind pace. The
