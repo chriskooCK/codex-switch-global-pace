@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Refresh quota after CLI reset-card use** — Successful `reset-card` commands
+  now force-refresh and cache usage, displaying the server's remaining quota
+  in human output and a `usage` object in JSON. A failed refresh is reported
+  separately while preserving confirmed card consumption.
+
 - **Global reset-card expiry visibility** — The Global Weekly summary now shows
   the account whose available reset card expires first, alongside the nearest
   weekly quota reset. The card segment appears only when every account has a

@@ -125,6 +125,15 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
     if let Err(err) = cache::invalidate(alias) {
         tracing::warn!("Failed to invalidate usage cache for {alias}: {err}");
     }
+    // Keep the consume lease and identity through the forced refresh so the
+    // displayed quota and persisted cache belong to the account just reset.
+    // A refresh failure must not turn a confirmed redemption into a retryable
+    // consumption error.
+    let refreshed =
+        fetch_reset_card_usage_observation(alias, &path, &lease, Some(&expected_binding), &client)
+            .await
+            .map(|observation| observation.usage);
+    let now = auth::now_unix_secs()?;
     if json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -135,6 +144,10 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
             "code": result.code,
             "windows_reset": result.windows_reset,
             "redeemed_at": result.redeemed_at,
+            "usage": crate::output::usage_to_json(
+                refreshed.as_ref().map_err(|error| error.detail.as_str()),
+                now,
+            )?,
         }))?;
     } else {
         println!(
@@ -151,6 +164,13 @@ pub(crate) async fn reset_card_cmd(alias: &str, yes: bool, json: bool) -> Result
         );
         if let Some(windows_reset) = result.windows_reset {
             println!("  windows reset: {windows_reset}");
+        }
+        match &refreshed {
+            Ok(usage) => super::render::print_usage_line(usage, now),
+            Err(error) => eprintln!(
+                "Reset card was consumed, but usage refresh failed: {}; refresh usage to verify the remaining quota",
+                error.detail
+            ),
         }
     }
     Ok(())

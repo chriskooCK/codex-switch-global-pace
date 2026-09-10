@@ -13,7 +13,7 @@ applies when the Windows executable is launched directly.
 | `import <path> [alias]` | Validate and import one `auth.json`, or recursively scan a directory for JSON files. The alias applies to single-file imports only; directories auto-assign aliases. |
 | `list [-f]` | Show profiles, usage, and availability; `-f` / `--force` bypasses the cache. |
 | `use [alias] [--consume-card]` | Switch explicitly, or omit the alias to auto-select with the unified scoring algorithm. When the pool is exhausted, `--consume-card` consumes the earliest-expiring reset card to revive an account (auto-select only; ignored when an alias is given). |
-| `reset-card <alias> [-y]` | Consume the earliest-expiring reset card for a profile after confirmation; `-y` / `--yes` skips the prompt. |
+| `reset-card <alias> [-y]` | Consume the earliest-expiring reset card for a profile after confirmation, then force-refresh usage and display the remaining quota; `-y` / `--yes` skips the prompt. |
 | `warmup [alias]` | Send a minimal request to activate the quota-window countdown for one or all profiles. Supports the global `--json` mode with per-profile results and a top-level `ok` field. |
 | `rename <old> <new>` | Rename a saved profile. |
 | `delete <alias> [-y]` | Move an inactive profile into recoverable deleted storage; `-y` / `--yes` skips the prompt. |
@@ -40,6 +40,7 @@ applies when the Windows executable is launched directly.
 
 - Structured data is written to stdout; progress and diagnostics are written to stderr.
 - JSON and other non-interactive execution never consumes a reset card or deletes a profile without an explicit opt-in flag.
+- After successful `reset-card` consumption, JSON includes refreshed quota in `usage`. If that lookup fails, `ok: true` and `action: "reset-card-consumed"` still confirm consumption, while `usage.error` describes the refresh failure. Human output reports the same distinction. Refresh usage to verify the quota; do not consume another card just because the refresh failed.
 - Reauthorizing an incomplete legacy alias is also explicit: JSON and other non-interactive runs stop before OAuth unless `login <alias> --yes` was requested. The approved operation archives the prior credentials before replacing the same alias.
 - `list` asks whether to save an untracked live login or refresh a saved profile only in an interactive terminal. `--json`, `--json-pretty`, and stdin-driven non-interactive runs never register or update live credentials implicitly. JSON lists saved profiles only and returns `"profiles": []` when there are none.
 - Human `daemon status` prints the process state, `Service: installed|not installed (manager: ...)`, then `Config:` with `poll_interval_secs`, `cache_refresh_interval_secs`, `auto_warmup`, `token_check_interval_secs`, `switch_threshold`, `notify`, `defer_switch_while_codex_running`, and `log_level`. Its JSON `config` object includes the same settings, including the boolean `defer_switch_while_codex_running`.

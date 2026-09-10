@@ -1600,6 +1600,124 @@ mod revival {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_reset_card_refreshes_display_and_cache_after_consumption() {
+        for json_output in [false, true] {
+            for used in [0.0, 12.0] {
+                let home = temp_home();
+                write_long_ttl_config(&home);
+                write_cached_profile(&home, "card_holder", "tok_card_holder", 100.0, &[]);
+                let server = mock::MockServer::start(vec![(
+                    "tok_card_holder".into(),
+                    vec![
+                        mock::transformer::base_response("plus", 100.0, 1800, 100.0, 604800),
+                        mock::transformer::base_response("plus", used, 1800, used, 604800),
+                    ],
+                )])
+                .await;
+                let args = if json_output {
+                    vec!["--json", "reset-card", "card_holder", "--yes"]
+                } else {
+                    vec!["reset-card", "card_holder", "--yes"]
+                };
+                let output = run_with_env(
+                    &home,
+                    &args,
+                    &[
+                        ("CS_USAGE_URL", &server.usage_url()),
+                        ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+                        (
+                            "CS_RESET_CREDITS_CONSUME_URL",
+                            &server.reset_credits_consume_url(),
+                        ),
+                    ],
+                );
+                assert!(output.status.success(), "{output:?}");
+                assert_eq!(server.request_count("tok_card_holder"), 2);
+                if json_output {
+                    let result = parse_stdout_json(&output);
+                    assert_eq!(result["ok"], true);
+                    assert_eq!(result["action"], "reset-card-consumed");
+                    for window in ["primary", "secondary"] {
+                        assert_eq!(result["usage"][window]["remaining_percent"], 100.0 - used);
+                    }
+                } else {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(stdout.contains("Consumed reset card"), "{stdout}");
+                    assert_eq!(
+                        stdout
+                            .matches(&format!("{:.0}% left", 100.0 - used))
+                            .count(),
+                        2,
+                        "{stdout}"
+                    );
+                }
+                let cached: Value = serde_json::from_slice(
+                    &fs::read(home.join(".codex-switch/cache.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(cached["entries"]["card_holder"]["primary_used"], used);
+                assert_eq!(cached["entries"]["card_holder"]["secondary_used"], used);
+                server.shutdown();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn explicit_reset_card_refresh_failure_preserves_confirmed_consumption() {
+        for json_output in [false, true] {
+            let home = temp_home();
+            write_cached_profile(&home, "card_holder", "tok_card_holder", 100.0, &[]);
+            let server = mock::MockServer::start_programmed(vec![(
+                "tok_card_holder".into(),
+                vec![
+                    mock::MockResponse::json(
+                        StatusCode::OK,
+                        mock::transformer::base_response("plus", 100.0, 1800, 100.0, 604800),
+                    ),
+                    mock::MockResponse::text(StatusCode::BAD_REQUEST, "refresh unavailable"),
+                ],
+            )])
+            .await;
+            let args = if json_output {
+                vec!["--json", "reset-card", "card_holder", "--yes"]
+            } else {
+                vec!["reset-card", "card_holder", "--yes"]
+            };
+            let output = run_with_env(
+                &home,
+                &args,
+                &[
+                    ("CS_USAGE_URL", &server.usage_url()),
+                    ("CS_RESET_CREDITS_URL", &server.reset_credits_url()),
+                    (
+                        "CS_RESET_CREDITS_CONSUME_URL",
+                        &server.reset_credits_consume_url(),
+                    ),
+                ],
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(server.request_count("tok_card_holder"), 2);
+            if json_output {
+                let result = parse_stdout_json(&output);
+                assert_eq!(result["ok"], true);
+                assert_eq!(result["action"], "reset-card-consumed");
+                assert!(result["usage"]["error"].is_string(), "{result}");
+                assert!(result["usage"]["primary"].is_null());
+            } else {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stdout.contains("Consumed reset card"), "{stdout}");
+                assert!(!stdout.contains("% left"), "{stdout}");
+                assert!(
+                    stderr.contains("was consumed, but usage refresh failed"),
+                    "{stderr}"
+                );
+            }
+            server.shutdown();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn explicit_reset_card_unknown_json_warns_to_verify_before_retry() {
         let home = temp_home();
         write_long_ttl_config(&home);
