@@ -465,7 +465,7 @@ mod tests {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test(flavor = "current_thread")]
-    async fn reset_card_yes_adopts_identity_from_one_forced_lookup_before_consuming() {
+    async fn reset_card_yes_looks_up_identity_once_before_consuming_then_refreshes() {
         let _url_lock = auth::URL_ENV_LOCK.lock().await;
         let _profile_env_lock = profile::TEST_ENV_LOCK
             .lock()
@@ -482,6 +482,9 @@ mod tests {
         let usage_hits = Arc::clone(&usage_calls);
         let credit_hits = Arc::clone(&credit_calls);
         let consume_hits = Arc::clone(&consume_calls);
+        let preflight_calls = Arc::new(AtomicUsize::new(0));
+        let preflight_hits = Arc::clone(&preflight_calls);
+        let usage_before_consume = Arc::clone(&usage_calls);
         let app = axum::Router::new()
             .route(
                 "/usage",
@@ -521,7 +524,13 @@ mod tests {
                 "/consume",
                 post(move || {
                     let hits = Arc::clone(&consume_hits);
+                    let preflight_hits = Arc::clone(&preflight_hits);
+                    let usage_before_consume = Arc::clone(&usage_before_consume);
                     async move {
+                        preflight_hits.store(
+                            usage_before_consume.load(Ordering::SeqCst),
+                            Ordering::SeqCst,
+                        );
                         hits.fetch_add(1, Ordering::SeqCst);
                         Json(json!({"code": "reset", "windows_reset": 2}))
                     }
@@ -542,8 +551,9 @@ mod tests {
         server.abort();
         result.unwrap();
 
-        assert_eq!(usage_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(credit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(preflight_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(usage_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(credit_calls.load(Ordering::SeqCst), 2);
         assert_eq!(consume_calls.load(Ordering::SeqCst), 1);
     }
 
