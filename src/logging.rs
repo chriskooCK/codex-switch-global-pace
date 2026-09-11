@@ -79,7 +79,7 @@ struct LogState {
     dir: PathBuf,
     /// Keeps every Windows ancestor pinned for the lifetime of the cached
     /// handles. On Unix this witnesses the owner/mode ancestry contract.
-    _directory_guard: crate::auth::PrivateDirectoryGuard,
+    _directory_guard: crate::auth::DirectoryGuard,
     /// One writer-lifetime handle retains the cross-process serialization
     /// inode/file identity and avoids reopening and rehardening `.lock` for
     /// every tracing record.
@@ -276,9 +276,7 @@ impl FileLogWriter {
     }
 }
 
-fn initialize_directory(
-    shared: &SharedLogState,
-) -> Result<(PathBuf, crate::auth::PrivateDirectoryGuard)> {
+fn initialize_directory(shared: &SharedLogState) -> Result<(PathBuf, crate::auth::DirectoryGuard)> {
     let dir = match &shared.directory {
         LogDirectory::AppHome => crate::auth::app_home()?.join("logs"),
         #[cfg(test)]
@@ -290,7 +288,7 @@ fn initialize_directory(
 }
 
 impl LogState {
-    fn open(dir: PathBuf, directory_guard: crate::auth::PrivateDirectoryGuard) -> Result<Self> {
+    fn open(dir: PathBuf, directory_guard: crate::auth::DirectoryGuard) -> Result<Self> {
         let mut lock_options = OpenOptions::new();
         lock_options.create(true).truncate(false).write(true);
         let lock_path = dir.join(".lock");
@@ -372,7 +370,7 @@ fn retain_bounded_pending(pending: &mut Vec<u8>, record: &[u8]) {
     pending.extend_from_slice(record);
 }
 
-fn create_private_log_dir(dir: &Path) -> Result<crate::auth::PrivateDirectoryGuard> {
+fn create_private_log_dir(dir: &Path) -> Result<crate::auth::DirectoryGuard> {
     crate::auth::acquire_private_directory(dir)
 }
 

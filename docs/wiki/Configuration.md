@@ -52,14 +52,17 @@ path is accepted only when its full ancestry can be kept private and stable:
   or root. The final state directory must belong to the effective user and is
   kept at mode `0700`.
 - On Windows, a private directory must belong to the current user and receives
-  a protected ACL for that user, Local System, and Administrators. Credential
+  a protected ACL for that user, Local System, and Administrators. A parent used
+  to publish individually private files may also retain read/list/traverse
+  grants: each staged file receives its own protected ACL at creation. This
+  does not permit extra write, delete, or permission-changing rights. Credential
   publication and the log writer keep direct handles to every path component,
   without delete sharing, for the entire path-based operation. A writable
   shared parent is therefore never trusted merely because an earlier path
   check succeeded.
 
 These checks run whenever a private state directory is prepared. Operations
-that hold a private-directory guard — including live-auth temporary-file
+that hold a directory guard — including live-auth temporary-file
 publication, rotated-credential recovery staging, and the log writer — keep it
 for the complete path-based operation. An override whose ancestry cannot meet
 the rules fails explicitly instead of falling back to a different directory.

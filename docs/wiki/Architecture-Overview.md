@@ -45,12 +45,21 @@ does no log-path or ACL work.
 
 [`src/auth.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/auth.rs) resolves `CODEX_HOME`, validates the Codex credential-store contract, reads and atomically writes authentication JSON, rotates live-auth backups, and builds network clients. For an existing live credential, the replacement candidate, independent original backup, and recovery record are prepared privately and flushed concurrently; all three must become durable and the live token must still match before the recovery record or replacement is published. It does not own profile selection.
 
-On Windows, private-directory validation holds non-delete-shared handles for the
-complete path and compares the protected DACL by meaning rather than ACE order.
-An already exact current-user/System/Administrators policy is read-only; actual
-permission drift retains recursive repair so permissions inherited by existing
-children are corrected, and the repaired DACL is checked again on the same
-pinned directory object.
+On Windows, directory validation holds non-delete-shared handles for the complete
+path and compares the protected DACL by meaning rather than ACE order. Private
+directories require the exact current-user/System/Administrators policy. Parents
+used to publish individually private files may additionally grant read/list/traverse
+access to other principals, without rewriting unrelated descendants. No principal
+names or paths are exempted. Mutation rights and other policy violations retain
+recursive repair and revalidation on the same pinned directory object.
+
+Temporary files and independent recovery copies receive their protected DACL in
+the Windows creation call, before even an empty file becomes accessible. The live
+credential is secured individually immediately before publication because Windows
+replacement preserves its destination DACL. Directory ownership checks, path pins,
+exact-file recovery and durable publication boundaries remain enforced. The
+switcher therefore does not need to reset the entire shared Codex home merely
+because a sandbox has read-only access to that directory.
 
 [`src/profile.rs`](https://github.com/chriskooCK/codex-switch-global-pace/blob/dev/src/profile.rs) owns aliases, identity deduplication, imports, recoverable deletion, current-profile tracking, and switching. `auth.lock` serializes replacement or synchronization of the live `auth.json`. A compatibility-only `launch.lock` is acquired first so an older `codex-switch` process sharing the same state directory cannot restore staged credentials over a newer switch; this binary does not implement the `launch` command.
 

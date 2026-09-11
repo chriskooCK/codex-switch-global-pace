@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Private files without shared-home ACL tree resets** — Windows credential
+  publication now protects each file at creation and secures the live credential
+  before replacement. Additional read-only permissions on its parent no longer
+  trigger a recursive ACL reset across the Codex home. Private directories and
+  untrusted mutation permissions retain the existing strict security policy;
+  there are no account, group-name, or path exceptions.
+
 - **Visible auto-refresh state in the TUI** — The persistent shortcut footer now
   focuses on search, menus, account creation, manual refresh, auto-refresh, and
   Help. Its `t auto refresh` entry reports `[ON]` or `[OFF]` directly, while

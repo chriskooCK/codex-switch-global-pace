@@ -725,7 +725,7 @@ pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<Priva
 
 struct StagedPrivateFile {
     file: tempfile::NamedTempFile,
-    _directory_guard: PrivateDirectoryGuard,
+    _directory_guard: DirectoryGuard,
 }
 
 fn stage_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile> {
@@ -740,12 +740,15 @@ fn stage_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile>
 
 fn prepare_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFile> {
     let parent = private_write_parent(path)?;
-    let directory_guard = acquire_private_directory(parent)?;
+    let directory_guard = acquire_private_file_parent(parent)?;
 
+    #[cfg(not(windows))]
     let mut tmp = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("creating temporary file in {}", parent.display()))?;
     #[cfg(windows)]
-    harden_windows_acl(tmp.path(), false)?;
+    let mut tmp = tempfile::Builder::new()
+        .make_in(parent, create_windows_private_file)
+        .with_context(|| format!("creating private temporary file in {}", parent.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -760,13 +763,15 @@ fn prepare_private_file(path: &Path, contents: &[u8]) -> Result<StagedPrivateFil
     })
 }
 
-/// Capability proving that `path` is a direct private directory for the
-/// lifetime of a path-based operation. On Windows the capability owns a handle
+/// Capability proving a direct, owner-controlled directory for the
+/// lifetime of a path-based operation. A Windows private-file parent may
+/// retain read-only grants; its files must be private from creation.
+/// On Windows the capability owns a handle
 /// for every component and denies delete sharing, so neither the directory nor
 /// an ancestor can be renamed after validation. Unix instead proves a durable
 /// ownership/mode invariant that an unrelated user cannot change.
 #[derive(Debug)]
-pub(crate) struct PrivateDirectoryGuard {
+pub(crate) struct DirectoryGuard {
     #[cfg(windows)]
     _handles: Vec<std::fs::File>,
     #[cfg(not(windows))]
@@ -777,7 +782,21 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     acquire_private_directory(path).map(drop)
 }
 
-pub(crate) fn acquire_private_directory(path: &Path) -> Result<PrivateDirectoryGuard> {
+pub(crate) fn acquire_private_directory(path: &Path) -> Result<DirectoryGuard> {
+    acquire_directory(path, DirectoryPolicy::Private)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryPolicy {
+    Private,
+    PrivateFileParent,
+}
+
+fn acquire_private_file_parent(path: &Path) -> Result<DirectoryGuard> {
+    acquire_directory(path, DirectoryPolicy::PrivateFileParent)
+}
+
+fn acquire_directory(path: &Path, _policy: DirectoryPolicy) -> Result<DirectoryGuard> {
     if !path.is_absolute() {
         anyhow::bail!(
             "private directory path must be absolute: {}",
@@ -801,12 +820,12 @@ pub(crate) fn acquire_private_directory(path: &Path) -> Result<PrivateDirectoryG
     }
     #[cfg(windows)]
     {
-        acquire_windows_private_directory(path)
+        acquire_windows_private_directory(path, _policy)
     }
     #[cfg(unix)]
     {
         prepare_unix_private_directory(path)?;
-        Ok(PrivateDirectoryGuard { _private: () })
+        Ok(DirectoryGuard { _private: () })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -923,7 +942,10 @@ fn validate_private_directory_owner(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuard> {
+fn acquire_windows_private_directory(
+    path: &Path,
+    policy: DirectoryPolicy,
+) -> Result<DirectoryGuard> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1034,15 +1056,13 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
         // closed instead of being adopted.
         if private_tree_started || index == final_index {
             require_windows_path_owner(&component_path, "private directory")?;
-            if !windows_private_directory_acl_is_exact(&directory, &component_path)? {
-                // Retain recursive repair for a genuinely drifted directory:
-                // inherited permissions may already have reached existing
-                // descendants. The exact common case above must not invoke
-                // SetNamedSecurityInfoW because Windows would walk that whole
-                // descendant tree even when the DACL is unchanged.
+            if !windows_acl_satisfies(&directory, &component_path, true, policy)? {
+                // Unsafe directory access still needs the established repair.
+                // A file parent may retain read-only grants: every file we
+                // create there has its own protected DACL from creation.
                 harden_windows_acl(&component_path, true)?;
                 anyhow::ensure!(
-                    windows_private_directory_acl_is_exact(&directory, &component_path)?,
+                    windows_acl_satisfies(&directory, &component_path, true, policy)?,
                     "private Windows directory ACL did not match the required policy after repair: {}",
                     component_path.display()
                 );
@@ -1051,63 +1071,136 @@ fn acquire_windows_private_directory(path: &Path) -> Result<PrivateDirectoryGuar
         handles.push(directory);
     }
 
-    Ok(PrivateDirectoryGuard { _handles: handles })
+    Ok(DirectoryGuard { _handles: handles })
+}
+
+#[cfg(windows)]
+struct WindowsPrivateSecurity(windows_sys::Win32::Security::PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl WindowsPrivateSecurity {
+    fn new(path: &Path, directory: bool) -> std::io::Result<Self> {
+        use std::os::windows::ffi::OsStrExt as _;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+
+        let user_sid = windows_current_user_sid_string(path)
+            .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+        let sddl = windows_private_acl_sddl(&user_sid, directory);
+        let wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut descriptor = null_mut();
+        // SAFETY: the input is NUL-terminated and the output is writable.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self(descriptor))
+    }
+
+    fn attributes(&self) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.0,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsPrivateSecurity {
+    fn drop(&mut self) {
+        // SAFETY: this descriptor owns one LocalAlloc allocation.
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.0);
+        }
+    }
 }
 
 #[cfg(windows)]
 fn create_windows_private_directory(path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
-    use std::ptr::null_mut;
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
-    struct Descriptor(*mut core::ffi::c_void);
-    impl Drop for Descriptor {
-        fn drop(&mut self) {
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-
-    let current_user_sid = windows_current_user_sid_string(path)
-        .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
-    let sddl = windows_private_acl_sddl(&current_user_sid, true);
-    let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl_wide.as_ptr(),
-            SDDL_REVISION_1,
-            &mut security_descriptor,
-            null_mut(),
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    let _descriptor = Descriptor(security_descriptor);
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: security_descriptor,
-        bInheritHandle: 0,
-    };
+    let security = WindowsPrivateSecurity::new(path, true)?;
+    let attributes = security.attributes();
     let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // SAFETY: both the terminated path and descriptor remain live.
     if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn create_windows_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::{ffi::OsStrExt as _, io::FromRawHandle as _};
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let security = WindowsPrivateSecurity::new(path, false)?;
+    let attributes = security.attributes();
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private file path has no name",
+        )
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private file path has no parent",
+        )
+    })?;
+    // Callers have already pinned/validated the parent. Canonicalization keeps
+    // the extended Windows prefix that std's file creation previously supplied
+    // automatically, so CreateFileW also supports long existing parent paths.
+    let resolved = std::fs::canonicalize(parent)?.join(name);
+    let mut wide: Vec<u16> = resolved.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private file path contains NUL",
+        ));
+    }
+    wide.push(0);
+    // SAFETY: CREATE_NEW cannot adopt an existing file or link. The protected
+    // DACL applies before another process can open even the empty file.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the successful creation transfers its sole owned handle.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 #[cfg(unix)]
@@ -1205,7 +1298,7 @@ struct ExactPrivateFile {
     path: PathBuf,
     token: crate::fs_ops::FileToken,
     cleanup_on_drop: bool,
-    _directory_guard: PrivateDirectoryGuard,
+    _directory_guard: DirectoryGuard,
 }
 
 impl ExactPrivateFile {
@@ -2021,7 +2114,7 @@ fn settle_auth_publication(
 /// unknown namespace occupants are never overwritten or deleted.
 pub(crate) fn recover_interrupted_auth_publication(live_path: &Path) -> Result<()> {
     let started = Instant::now();
-    let _directory_guard = acquire_private_directory(private_write_parent(live_path)?)?;
+    let _directory_guard = acquire_private_file_parent(private_write_parent(live_path)?)?;
     let directory_guard_ms = started.elapsed().as_millis();
     let record_started = Instant::now();
     let Some((record, record_token)) = read_publication_record(live_path)? else {
@@ -2453,6 +2546,12 @@ pub(crate) fn atomic_write_private_if_unchanged(
 
     let (record, mut candidate, mut backup_stage, record_stage) =
         prepare_existing_auth_publication(path, &expected_token, expected_bytes, contents)?;
+    // ReplaceFileW preserves the destination's DACL. Secure that file only
+    // when publishing it, while the staged artifacts pin its parent. Generic
+    // transaction recovery must not block an unrelated profile's persistence
+    // merely because the live path is unavailable.
+    #[cfg(windows)]
+    harden_windows_private_file(path)?;
     let record_path = auth_publication_record_path(path)?;
     let record_token = match publish_record_exclusive(&record_path, record_stage)? {
         RecordPublication::Durable(token) => token,
@@ -2779,18 +2878,25 @@ fn windows_private_acl_sddl(current_user_sid: &str, directory: bool) -> String {
 }
 
 #[cfg(windows)]
-fn windows_private_directory_acl_is_exact(file: &std::fs::File, path: &Path) -> Result<bool> {
+fn windows_acl_satisfies(
+    file: &std::fs::File,
+    path: &Path,
+    directory: bool,
+    policy: DirectoryPolicy,
+) -> Result<bool> {
     use std::os::windows::io::AsRawHandle as _;
     use std::ptr::null_mut;
 
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_EXECUTE, GENERIC_READ, LocalFree};
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, GetAce,
         GetLengthSid, GetSecurityDescriptorControl, IsValidAcl, IsValidSid, OBJECT_INHERIT_ACE,
         PSECURITY_DESCRIPTOR, SE_DACL_PRESENT, SE_DACL_PROTECTED, SID,
     };
-    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
     struct LocalAllocation(PSECURITY_DESCRIPTOR);
@@ -2864,7 +2970,7 @@ fn windows_private_directory_acl_is_exact(file: &std::fs::File, path: &Path) -> 
     if control & SE_DACL_PRESENT == 0
         || control & SE_DACL_PROTECTED == 0
         || unsafe { IsValidAcl(dacl) } == 0
-        || unsafe { (*dacl).AceCount } != 3
+        || policy == DirectoryPolicy::Private && unsafe { (*dacl).AceCount } != 3
     {
         return Ok(false);
     }
@@ -2876,14 +2982,18 @@ fn windows_private_directory_acl_is_exact(file: &std::fs::File, path: &Path) -> 
         WINDOWS_BUILTIN_ADMINISTRATORS_SID,
     ];
     let mut seen = [false; 3];
-    let expected_flags = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
-    for index in 0..3 {
+    let expected_flags = if directory {
+        (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
+    } else {
+        0
+    };
+    for index in 0..unsafe { (*dacl).AceCount } as u32 {
         let mut raw_ace = null_mut();
         if unsafe { GetAce(dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
             return Ok(false);
         }
         let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
-        if header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8 || header.AceFlags != expected_flags {
+        if header.AceType != ACCESS_ALLOWED_ACE_TYPE as u8 {
             return Ok(false);
         }
         let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
@@ -2891,9 +3001,6 @@ fn windows_private_directory_acl_is_exact(file: &std::fs::File, path: &Path) -> 
             return Ok(false);
         }
         let ace = raw_ace.cast::<ACCESS_ALLOWED_ACE>();
-        if unsafe { (*ace).Mask } != FILE_ALL_ACCESS {
-            return Ok(false);
-        }
         let sid = unsafe {
             std::ptr::addr_of!((*ace).SidStart)
                 .cast_mut()
@@ -2904,6 +3011,17 @@ fn windows_private_directory_acl_is_exact(file: &std::fs::File, path: &Path) -> 
         }
         let sid_bytes = unsafe { GetLengthSid(sid) } as usize;
         if sid_bytes == 0 || sid_offset + sid_bytes > usize::from(header.AceSize) {
+            return Ok(false);
+        }
+        // Listing/traversal of a shared parent does not grant access to files
+        // created with a protected DACL. Never allow extra mutation rights,
+        // regardless of the principal's name or SID.
+        let mask = unsafe { (*ace).Mask };
+        let read_only = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | GENERIC_READ | GENERIC_EXECUTE;
+        if policy == DirectoryPolicy::PrivateFileParent && mask & !read_only == 0 {
+            continue;
+        }
+        if mask != FILE_ALL_ACCESS || header.AceFlags != expected_flags {
             return Ok(false);
         }
         let Some(sid) = sid_string(sid) else {
@@ -2935,89 +3053,31 @@ fn windows_directory_acl_repair_count() -> usize {
 
 #[cfg(windows)]
 fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStrExt as _;
     use std::ptr::{null, null_mut};
-
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetNamedSecurityInfoW,
-    };
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    struct LocalAllocation(*mut core::ffi::c_void);
-
-    impl Drop for LocalAllocation {
-        fn drop(&mut self) {
-            // SAFETY: both wrapped pointers come from Win32 APIs documented to
-            // allocate with LocalAlloc and are released exactly once here.
-            unsafe {
-                LocalFree(self.0);
-            }
-        }
-    }
-
-    fn last_error(path: &Path, api: &str) -> anyhow::Error {
-        anyhow::anyhow!(
-            "{api} failed for {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )
-    }
-
-    let current_user_sid = windows_current_user_sid_string(path)?;
-
-    let sddl = windows_private_acl_sddl(&current_user_sid, directory);
-    let sddl_wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    // SAFETY: `sddl_wide` is NUL-terminated and the output pointer is writable;
-    // the returned descriptor is owned by LocalFree.
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl_wide.as_ptr(),
-            SDDL_REVISION_1,
-            &mut security_descriptor,
-            null_mut(),
-        )
-    } == 0
+    let security = WindowsPrivateSecurity::new(path, directory)?;
+    let mut present = 0;
+    let mut dacl = null_mut();
+    let mut defaulted = 0;
+    // SAFETY: the descriptor is live and the outputs are writable.
+    if unsafe { GetSecurityDescriptorDacl(security.0, &mut present, &mut dacl, &mut defaulted) }
+        == 0
     {
-        return Err(last_error(
-            path,
-            "ConvertStringSecurityDescriptorToSecurityDescriptorW",
-        ));
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("reading private DACL for {}", path.display()));
     }
-    let _security_descriptor = LocalAllocation(security_descriptor);
-
-    let mut dacl_present = 0;
-    let mut dacl: *mut ACL = null_mut();
-    let mut dacl_defaulted = 0;
-    // SAFETY: `security_descriptor` is live and valid; all output pointers
-    // refer to initialized local variables.
-    if unsafe {
-        GetSecurityDescriptorDacl(
-            security_descriptor,
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    } == 0
-    {
-        return Err(last_error(path, "GetSecurityDescriptorDacl"));
-    }
-    if dacl_present == 0 || dacl.is_null() {
-        anyhow::bail!(
-            "GetSecurityDescriptorDacl returned no DACL for {}",
-            path.display()
-        );
-    }
-
-    let path_wide: Vec<u16> = path
+    anyhow::ensure!(
+        present != 0 && !dacl.is_null(),
+        "private DACL is absent for {}",
+        path.display()
+    );
+    let wide: Vec<u16> = path
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
@@ -3026,12 +3086,11 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
     if directory {
         TEST_WINDOWS_DIRECTORY_ACL_REPAIR_COUNT.with(|count| count.set(count.get() + 1));
     }
-    // SAFETY: the path is NUL-terminated, `dacl` points inside the live
-    // security descriptor, and null owner/group/SACL pointers are required
-    // because only the exact protected DACL is being replaced.
+    // SAFETY: the path is terminated and the DACL belongs to the live descriptor.
+    // Owner/group/SACL stay unchanged; private directories retain recursive repair.
     let status = unsafe {
         SetNamedSecurityInfoW(
-            path_wide.as_ptr(),
+            wide.as_ptr(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             null_mut(),
@@ -3041,13 +3100,12 @@ fn harden_windows_acl(path: &Path, directory: bool) -> Result<()> {
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(anyhow::anyhow!(
+        anyhow::bail!(
             "SetNamedSecurityInfoW failed for {}: {}",
             path.display(),
             std::io::Error::from_raw_os_error(status as i32)
-        ));
+        );
     }
-
     Ok(())
 }
 
@@ -4175,6 +4233,156 @@ mod tests {
         let err = validate_managed_auth_config(&config, Some("workspace-a")).unwrap_err();
 
         assert!(err.to_string().contains("requires API key login"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_file_staging_preserves_read_only_parent_access() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let parent = root.path().join("shared-parent");
+        drop(acquire_private_directory(&parent).unwrap());
+        let seeded = std::process::Command::new("icacls")
+            .arg(&parent)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)RX"])
+            .output()
+            .unwrap();
+        assert!(seeded.status.success());
+
+        reset_windows_directory_acl_repair_count();
+        let staged = prepare_private_file(&parent.join("credential"), b"private bytes").unwrap();
+        assert_eq!(std::fs::read(staged.file.path()).unwrap(), b"private bytes");
+        assert_eq!(
+            windows_directory_acl_repair_count(),
+            0,
+            "writing a private file must not reset read-only access across its parent's tree"
+        );
+        assert!(
+            windows_acl_satisfies(
+                staged.file.as_file(),
+                staged.file.path(),
+                false,
+                DirectoryPolicy::Private
+            )
+            .unwrap()
+        );
+        assert!(
+            !windows_acl_satisfies(
+                staged._directory_guard._handles.last().unwrap(),
+                &parent,
+                true,
+                DirectoryPolicy::Private
+            )
+            .unwrap(),
+            "the parent's additional read-only grant must survive"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_files_are_protected_at_creation_and_reject_collisions() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let path = root.path().join("private-file");
+        let file = create_windows_private_file(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        assert!(windows_acl_satisfies(&file, &path, false, DirectoryPolicy::Private).unwrap());
+        assert_eq!(
+            create_windows_private_file(&path).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_file_creation_accepts_long_unprefixed_paths() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let plain_root = root.path().to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        let mut parent = std::path::PathBuf::from(plain_root);
+        while parent.as_os_str().len() <= 280 {
+            parent.push("long-private-parent");
+        }
+        std::fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("credential");
+        let file = create_windows_private_file(&path).unwrap();
+        assert!(windows_acl_satisfies(&file, &path, false, DirectoryPolicy::Private).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_file_parent_repairs_untrusted_mutation_permissions() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        for right in ["WD", "AD", "DC", "D", "WDAC", "WO", "M", "F"] {
+            let parent = root.path().join(right);
+            drop(acquire_private_directory(&parent).unwrap());
+            let seeded = std::process::Command::new("icacls")
+                .arg(&parent)
+                .args(["/grant", &format!("*S-1-1-0:(OI)(CI)({right})")])
+                .output()
+                .unwrap();
+            assert!(
+                seeded.status.success(),
+                "{right}: {}",
+                String::from_utf8_lossy(&seeded.stderr)
+            );
+            reset_windows_directory_acl_repair_count();
+            let staged = prepare_private_file(&parent.join("credential"), b"private").unwrap();
+            assert_eq!(windows_directory_acl_repair_count(), 1, "{right}");
+            assert!(
+                windows_acl_satisfies(
+                    staged._directory_guard._handles.last().unwrap(),
+                    &parent,
+                    true,
+                    DirectoryPolicy::Private
+                )
+                .unwrap(),
+                "{right}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auth_publication_secures_live_and_backup_without_resetting_parent_acl() {
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let parent = root.path().join("shared-parent");
+        drop(acquire_private_directory(&parent).unwrap());
+        let seeded = std::process::Command::new("icacls")
+            .arg(&parent)
+            .args(["/grant", "*S-1-1-0:(OI)(CI)RX"])
+            .output()
+            .unwrap();
+        assert!(seeded.status.success());
+        let live = parent.join("auth.json");
+        // Deliberately inherit the parent's read grant, as an external writer
+        // may do. Publication must secure this file before ReplaceFileW.
+        std::fs::write(&live, b"old").unwrap();
+        reset_windows_directory_acl_repair_count();
+        assert_eq!(
+            atomic_write_private_if_unchanged(&live, Some(b"old"), b"new").unwrap(),
+            ConditionalWrite::Written
+        );
+        assert_eq!(windows_directory_acl_repair_count(), 0);
+        assert_eq!(std::fs::read(&live).unwrap(), b"new");
+        let mut backups = 0;
+        for entry in std::fs::read_dir(&parent).unwrap() {
+            let path = entry.unwrap().path();
+            if path == live
+                || path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("auth.json.bak.")
+            {
+                let file = std::fs::File::open(&path).unwrap();
+                assert!(
+                    windows_acl_satisfies(&file, &path, false, DirectoryPolicy::Private).unwrap()
+                );
+                if path != live {
+                    backups += 1;
+                    assert_eq!(std::fs::read(&path).unwrap(), b"old");
+                }
+            }
+        }
+        assert_eq!(backups, 1);
     }
 
     #[test]

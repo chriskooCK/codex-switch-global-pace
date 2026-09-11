@@ -104,6 +104,20 @@ codex-switch-global-pace delete work-wrong
 Choose another valid temporary alias if `work-wrong` already exists. Never
 delete the mistaken profile until the intended login is verified.
 
+## Slow account switching on Windows
+
+Credential publication protects individual files without recursively resetting a
+parent folder just because it has additional read-only permissions. This avoids
+walking a large Codex home after a sandbox grants directory read access. It does
+not grant that access to authentication files. Directory permissions that allow
+other principals to modify files, delete entries, or change permissions still
+require the existing security repair.
+
+If switching remains slow, run the dashboard with `--debug` and inspect the
+phase and credential-lock timings in its logs. These distinguish profile-lease
+waits, live-auth locking/recovery, and commit work. Follow the normal requirement
+to fully quit Codex before switching, and redact diagnostics before sharing them.
+
 ## Fully quit Codex on Windows
 
 Account switching changes the credential used by the **next** Codex process.

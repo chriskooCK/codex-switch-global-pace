@@ -2965,7 +2965,7 @@ pub(crate) enum RecoveredImportAction {
 pub(crate) struct RotationRecoveryStage {
     path: PathBuf,
     token: crate::fs_ops::FileToken,
-    _directory_guard: crate::auth::PrivateDirectoryGuard,
+    _directory_guard: crate::auth::DirectoryGuard,
 }
 
 impl RotationRecoveryStage {
@@ -4553,7 +4553,7 @@ fn create_rotation_recovery_file(
 ) -> Result<(
     PathBuf,
     crate::fs_ops::FileToken,
-    crate::auth::PrivateDirectoryGuard,
+    crate::auth::DirectoryGuard,
 )> {
     let recovery_dir = crate::auth::app_home()?.join("recovery");
     let directory_guard = crate::auth::acquire_private_directory(&recovery_dir)?;
