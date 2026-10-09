@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v20261009.2.0 — 2026-10-09
 
 - Fix false release-cleanup failures when GitHub CLI emits a JSON error body
   without a trailing newline before its HTTP 404 diagnostic. Check stderr
