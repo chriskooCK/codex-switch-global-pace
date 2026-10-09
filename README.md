@@ -146,9 +146,16 @@ The dashboard renders a local aggregate view of every account with a valid
 weekly window. The filled bar is aggregate actual usage, and the `↑ pace`
 marker is aggregate elapsed time: the ideal amount of the displayed capacity
 to have used by now. The text below the meter shows the participating account
-count and the nearest included-account reset. Once every account has a complete
-reset-card snapshot, it also names the account whose available card expires
-first. That trailing card segment is omitted as a unit on narrower terminals.
+count and the nearest included-account reset. In compact mode, a card countdown
+is included when every account has complete card data and space permits.
+
+The full panel also shows the earliest upcoming reset-card expiry across all
+registered accounts, including accounts hidden by search. `Reset card: <alias>
+· expires in <duration> · MM/DD HH:MM` uses local time; expiries within three
+days are yellow and within 24 hours are red. Missing or failed card details
+are flagged with `Some accounts unchecked`; absent expiry dates are not
+invented. Expired cards are excluded. Short terminals retain the compact
+weekly summary, and narrow panels may omit the date or shorten the alias.
 
 This view does not combine quotas on the service, move capacity between
 accounts, or circumvent account limits. Fully exhausted accounts remain

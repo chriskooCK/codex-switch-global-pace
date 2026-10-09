@@ -4,6 +4,7 @@ pub mod menu;
 mod meter;
 pub mod popup;
 mod switch;
+mod terminal;
 pub mod ui;
 
 use anyhow::Result;

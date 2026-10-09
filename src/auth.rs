@@ -3874,7 +3874,8 @@ mod tests {
 
     #[test]
     fn test_empty_codex_home_falls_back_to_default_home() {
-        let user_home = std::env::current_dir().unwrap().join("test-user-home");
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let user_home = root.path().join("test-user-home");
 
         let codex_home =
             codex_home_from_values(Some(std::ffi::OsString::from("")), Some(user_home.clone()))
@@ -3975,8 +3976,9 @@ mod tests {
 
     #[test]
     fn configured_state_homes_accept_clean_absolute_paths() {
-        let path = std::env::current_dir()
-            .unwrap()
+        let root = crate::fs_ops::create_direct_tempdir().unwrap();
+        let path = root
+            .path()
             .join("state")
             .join("codex-switch")
             .into_os_string();

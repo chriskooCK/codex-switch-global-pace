@@ -36,7 +36,7 @@ const C_MAGENTA: Color = Color::Rgb(220, 130, 255); // team plans
 const C_BLUE: Color = Color::Rgb(80, 140, 220); // borders (inactive)
 const C_HIGHLIGHT_BG: Color = Color::Rgb(55, 55, 65); // selected row bg
 
-const GLOBAL_WEEKLY_FULL_HEIGHT: u16 = 5;
+const GLOBAL_WEEKLY_FULL_HEIGHT: u16 = 6;
 const GLOBAL_WEEKLY_COMPACT_HEIGHT: u16 = 1;
 const MIN_ACCOUNT_TABLE_HEIGHT: u16 = 6;
 const USAGE_BAR_LABEL_COLUMN_WIDTH: u16 = 6;
@@ -209,7 +209,11 @@ pub fn render(f: &mut Frame, app: &mut App, now: i64) {
 
     render_account_table(f, app, vertical[0], now);
     let global_weekly = app.global_weekly_summary(now);
-    let reset_card_expiry = app.earliest_reset_card_expiry(now);
+    let reset_card_expiry = if vertical[1].height == GLOBAL_WEEKLY_COMPACT_HEIGHT {
+        app.earliest_reset_card_expiry(now)
+    } else {
+        None
+    };
     render_global_weekly_pace(
         f,
         &global_weekly,
@@ -217,6 +221,7 @@ pub fn render(f: &mut Frame, app: &mut App, now: i64) {
         now,
         vertical[1],
     );
+    render_global_reset_card(f, app, now, vertical[1]);
     if app.detail_visible && detail_height > 0 {
         render_detail_panel(f, app, vertical[2], now);
     }
@@ -379,6 +384,136 @@ fn render_global_weekly_pace(
             },
         );
     }
+}
+
+/// Inspect all registered accounts, independent of the current search/selection.
+fn global_reset_card_line(app: &App, now: i64, width: usize) -> Line<'static> {
+    let mut earliest: Option<(&str, i64)> = None;
+    let mut unchecked = false;
+    let mut unknown_expiry = false;
+    for account in &app.accounts {
+        let UsageStatus::Loaded(usage) = &account.usage else {
+            unchecked = true;
+            continue;
+        };
+        if usage.reset_credits_error.is_some() {
+            unchecked = true;
+            continue;
+        }
+        let Some(count) = reset_credits_count(usage) else {
+            unchecked = true;
+            continue;
+        };
+        if count != usage.reset_credits.len() as u64
+            || usage.reset_credits_available_count.is_none()
+        {
+            unchecked = true;
+        }
+        for credit in &usage.reset_credits {
+            let expiry = credit
+                .expires_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok());
+            let Some(expiry) = expiry else {
+                unknown_expiry = true;
+                continue;
+            };
+            let timestamp = expiry.timestamp();
+            if timestamp <= now {
+                continue;
+            }
+            let candidate = (account.alias.as_str(), timestamp);
+            if earliest.is_none_or(|current| (timestamp, candidate.0) < (current.1, current.0)) {
+                earliest = Some(candidate);
+            }
+        }
+    }
+    let partial = unchecked || unknown_expiry;
+    // Keep the qualifier ahead of the date so a narrow window cannot present
+    // an incomplete scan as the confirmed earliest expiry across all accounts.
+    let qualifier = if partial {
+        " · Some accounts unchecked"
+    } else {
+        ""
+    };
+    let (text, color) = if let Some((alias, expiry)) = earliest {
+        let remaining = expiry.saturating_sub(now) as u64;
+        let duration = format!(" · expires in {}", format_duration_compact(remaining));
+        let prefix = "Reset card: ";
+        let available = width.saturating_sub(
+            display_width(prefix) + display_width(&duration) + display_width(qualifier),
+        );
+        let date = chrono::DateTime::from_timestamp(expiry, 0)
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%m/%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "--".into());
+        let date_width = display_width(&date) + 3;
+        let alias_budget = if available >= date_width + 8 {
+            available - date_width
+        } else {
+            available
+        };
+        let alias = fit_reset_card_alias(&safe_display(alias), alias_budget);
+        let text = fitted_segments(
+            width,
+            [format!("{prefix}{alias}{duration}{qualifier}"), date],
+        );
+        let color = if remaining <= 86_400 {
+            C_RED
+        } else if remaining <= 3 * 86_400 {
+            C_YELLOW
+        } else {
+            C_GRAY
+        };
+        (text, color)
+    } else if unchecked {
+        ("Reset card: Some accounts unchecked".into(), C_YELLOW)
+    } else if unknown_expiry {
+        ("Reset card: Expiry unavailable".into(), C_YELLOW)
+    } else {
+        ("Reset card: None".into(), DIM)
+    };
+    // On very narrow terminals prefer an explicit unavailable summary over a
+    // misleading partial alias or a silently dropped scan qualifier.
+    let text = if text.is_empty() {
+        "Reset card: Widen terminal".into()
+    } else {
+        text
+    };
+    Line::from(Span::styled(text, base().fg(color)))
+}
+
+fn fit_reset_card_alias(alias: &str, width: usize) -> String {
+    if display_width(alias) <= width {
+        return alias.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut text = String::new();
+    let line = Line::from(alias);
+    for grapheme in line.styled_graphemes(Style::default()) {
+        if display_width(&text) + display_width(grapheme.symbol) + 1 > width {
+            break;
+        }
+        text.push_str(grapheme.symbol);
+    }
+    text.push('…');
+    text
+}
+
+fn render_global_reset_card(f: &mut Frame, app: &App, now: i64, area: Rect) {
+    if area.height < GLOBAL_WEEKLY_FULL_HEIGHT || area.width < 5 {
+        return;
+    }
+    let row = Rect::new(area.x + 2, area.y + 4, area.width - 4, 1);
+    f.render_widget(
+        Paragraph::new(global_reset_card_line(app, now, row.width.into())),
+        row,
+    );
 }
 
 fn compact_global_weekly_line(
@@ -2358,6 +2493,132 @@ mod tests {
             fitted_segments(6, ["too long".to_string(), "x".to_string()]),
             ""
         );
+    }
+
+    fn reset_card_account(alias: &str, expiries: &[Option<i64>]) -> AccountEntry {
+        AccountEntry {
+            alias: alias.into(),
+            info: AccountInfo::default(),
+            is_current: false,
+            usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                reset_credits_available_count: Some(expiries.len() as u64),
+                reset_credits: expiries
+                    .iter()
+                    .map(|expiry| crate::usage::ResetCredit {
+                        expires_at: expiry.map(|ts| {
+                            chrono::DateTime::from_timestamp(ts, 0)
+                                .unwrap()
+                                .to_rfc3339()
+                        }),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn global_reset_card_uses_all_accounts_and_ignores_expired_cards() {
+        let mut app = App::new();
+        app.accounts = vec![
+            reset_card_account("later", &[Some(TEST_NOW + 5 * 86_400)]),
+            reset_card_account(
+                "earliest",
+                &[Some(TEST_NOW - 1), Some(TEST_NOW + 2 * 86_400 + 5 * 3_600)],
+            ),
+        ];
+        app.view_indices = vec![0]; // Search hides the account with the earliest card.
+        let line = super::global_reset_card_line(&app, TEST_NOW, 110);
+        let text = line.to_string();
+        assert!(
+            text.contains("Reset card: earliest · expires in 2d5h"),
+            "{text}"
+        );
+        let date = chrono::DateTime::from_timestamp(TEST_NOW + 2 * 86_400 + 5 * 3_600, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%m/%d %H:%M")
+            .to_string();
+        assert!(text.contains(&date));
+        assert_eq!(line.spans[0].style.fg, Some(C_YELLOW));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, TEST_NOW))
+            .unwrap();
+        assert!((0..30).any(|y| row_text(terminal.backend(), y).contains(&text)));
+    }
+
+    #[test]
+    fn global_reset_card_distinguishes_empty_unknown_and_failed_data() {
+        let mut app = App::new();
+        app.accounts = vec![reset_card_account("empty", &[])];
+        assert_eq!(
+            super::global_reset_card_line(&app, TEST_NOW, 120).to_string(),
+            "Reset card: None"
+        );
+        app.accounts[0] = reset_card_account("unknown", &[None]);
+        assert!(
+            super::global_reset_card_line(&app, TEST_NOW, 120)
+                .to_string()
+                .contains("Expiry unavailable")
+        );
+        app.accounts
+            .push(reset_card_account("known", &[Some(TEST_NOW + 60)]));
+        assert!(
+            super::global_reset_card_line(&app, TEST_NOW, 120)
+                .to_string()
+                .contains("Some accounts unchecked")
+        );
+        if let UsageStatus::Loaded(usage) = &mut app.accounts[0].usage {
+            usage.reset_credits_error = Some("failed".into());
+            usage.reset_credits = vec![crate::usage::ResetCredit {
+                expires_at: Some(
+                    chrono::DateTime::from_timestamp(TEST_NOW + 1, 0)
+                        .unwrap()
+                        .to_rfc3339(),
+                ),
+                ..Default::default()
+            }];
+        }
+        let text = super::global_reset_card_line(&app, TEST_NOW, 120).to_string();
+        assert!(text.contains("known"));
+        assert!(!text.contains("unknown · expires"));
+        app.accounts[1].usage = UsageStatus::Loading;
+        assert_eq!(
+            super::global_reset_card_line(&app, TEST_NOW, 120).to_string(),
+            "Reset card: Some accounts unchecked"
+        );
+    }
+
+    #[test]
+    fn global_reset_card_countdown_color_boundaries_and_narrow_layout() {
+        let mut app = App::new();
+        for (seconds, expected, label) in [
+            (1, C_RED, "<1m"),
+            (86_400, C_RED, "1d0h"),
+            (86_401, C_YELLOW, "1d0h"),
+            (259_200, C_YELLOW, "3d0h"),
+            (259_201, C_GRAY, "3d0h"),
+        ] {
+            app.accounts = vec![reset_card_account("account", &[Some(TEST_NOW + seconds)])];
+            let line = super::global_reset_card_line(&app, TEST_NOW, 120);
+            assert_eq!(line.spans[0].style.fg, Some(expected));
+            assert!(line.to_string().contains(label));
+        }
+        app.accounts[0].alias = "긴계정이름".repeat(30);
+        app.accounts.push(reset_card_account("loading", &[]));
+        app.accounts[1].usage = UsageStatus::Loading;
+        let line = super::global_reset_card_line(&app, TEST_NOW, 76);
+        assert!(line.width() <= 76);
+        assert!(line.to_string().contains("Some accounts unchecked"));
+        assert!(line.to_string().contains('…'));
+        for (width, height) in [(120, 30), (80, 24), (40, 12), (20, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render(frame, &mut app, TEST_NOW))
+                .unwrap();
+        }
     }
 
     #[test]

@@ -65,6 +65,8 @@ impl CacheLockAcquireControl {
         }
     }
 
+    // Atomic::try_update is newer than our Rust 1.88 minimum.
+    #[allow(deprecated)]
     pub(crate) fn cancel_waiting(&self) -> bool {
         let cancelled = self
             .state
@@ -116,6 +118,8 @@ impl CacheLockAcquireControl {
         }
     }
 
+    // Atomic::try_update is newer than our Rust 1.88 minimum.
+    #[allow(deprecated)]
     fn mark_acquired(&self) -> bool {
         self.state
             .fetch_update(

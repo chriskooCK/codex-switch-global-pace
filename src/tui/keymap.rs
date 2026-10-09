@@ -203,6 +203,12 @@ pub const KEYMAP: &[Binding] = &[
         status_bar: None,
     },
     Binding {
+        keys: "ctrl+l",
+        section: Section::Global,
+        label: "repaint screen",
+        status_bar: None,
+    },
+    Binding {
         keys: "h",
         section: Section::Global,
         label: "show this help",

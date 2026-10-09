@@ -1,23 +1,36 @@
 # Changelog
 
-## Unreleased
+## v20261009.1.0 — 2026-10-09
+
+- Update Rustls to address RUSTSEC-2026-0285 and retain compatibility with the
+  minimum Rust version when using atomic update methods.
 
 - **Refresh quota after CLI reset-card use** — Successful `reset-card` commands
   now force-refresh and cache usage, displaying the server's remaining quota
   in human output and a `usage` object in JSON. A failed refresh is reported
   separately while preserving confirmed card consumption.
 
-- **Global reset-card expiry visibility** — The Global Weekly summary now shows
-  the account whose available reset card expires first, alongside the nearest
-  weekly quota reset. The card segment appears only when every account has a
-  complete, valid reset-card snapshot and is dropped as one unit when the
-  terminal is too narrow.
 - **Visible auto-refresh state in the TUI** — The persistent shortcut footer now
   focuses on search, menus, account creation, manual refresh, auto-refresh, and
   Help. Its `t auto refresh` entry reports `[ON]` or `[OFF]` directly, while
   navigation, account-detail, and quit shortcuts remain available in Help. The
   footer and version indicator now share one measured layout, so neither can
   overwrite the other when the terminal is narrow.
+- Show the earliest upcoming reset-card expiry across all accounts in Global
+  Weekly Pace, with the account alias, countdown, and local expiration date.
+  Highlight expiries within three days (yellow) and one day (red), and flag
+  incomplete reset-card data. Very short terminals retain the compact summary.
+
+- Capture mouse input while the macOS dashboard is active so wheel/trackpad
+  gestures navigate its list and scrollable popups instead of native terminal
+  history. Release capture for OAuth, exit, and panic cleanup.
+
+- Keep a real cursor visible on macOS for IME anchoring. Repaint committed
+  non-ASCII shortcut input without cursor-position queries or display erasure,
+  and show an English-input hint without changing Unicode search. Ctrl+L also
+  repaints the dashboard. Native Terminal.app composition still needs manual
+  verification; moving a hidden cursor alone did not resolve the reported issue.
+- Document the temporary plain-text screen used during browser/device login.
 
 ## v20260901.1.0 — 2026-09-01
 

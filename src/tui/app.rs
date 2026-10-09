@@ -2586,6 +2586,22 @@ impl App {
         self.menu = Some(super::menu::MenuState::batch_relogin_flow(count));
     }
 
+    fn reject_non_ascii_shortcut(&mut self, code: KeyCode) -> bool {
+        // Keep Unicode editing intact; only command shortcuts require ASCII.
+        if self.search_active || self.rename.is_some() {
+            return false;
+        }
+        if matches!(code, KeyCode::Char(c) if !c.is_ascii()) {
+            self.set_status(
+                "Switch to English (ABC) for shortcuts: a = add, then b = browser login."
+                    .to_string(),
+                8,
+            );
+            return true;
+        }
+        false
+    }
+
     pub fn open_add_menu(&mut self) {
         self.menu = Some(super::menu::MenuState::add());
     }
@@ -5905,11 +5921,11 @@ pub async fn run(file_log_writer: crate::logging::FileLogWriter) -> Result<()> {
     // Ensure terminal is restored even on panic
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        ratatui::restore();
+        super::terminal::restore();
         original_hook(info);
     }));
 
-    let mut terminal = ratatui::init();
+    let mut terminal = super::terminal::init();
     let startup_exit_warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
     let result = run_app(
         &mut terminal,
@@ -5917,7 +5933,7 @@ pub async fn run(file_log_writer: crate::logging::FileLogWriter) -> Result<()> {
         Arc::clone(&startup_exit_warnings),
     )
     .await;
-    ratatui::restore();
+    super::terminal::restore();
     let warnings = std::mem::take(
         &mut *startup_exit_warnings
             .lock()
@@ -6063,13 +6079,15 @@ async fn run_app(
     // per account. Start that immutable snapshot on the blocking pool, paint
     // immediately, and only then let its result drive reconciliation/cache IO.
     app.start_startup_profile_load();
-    let initial_draw = terminal
-        .draw(|frame| super::ui::render(frame, &mut app, initial_render_now))
-        .context("drawing initial TUI frame");
+    let initial_draw = super::terminal::draw(terminal, false, |frame| {
+        super::ui::render(frame, &mut app, initial_render_now)
+    })
+    .context("drawing initial TUI frame");
     app.start_post_draw_startup_maintenance(file_log_writer);
     drain_credential_tasks_on_error(&mut app, initial_draw).await?;
     let mut last_render_second = initial_render_now;
     let mut redraw_requested = false;
+    let mut repaint_requested = false;
 
     // Client construction may synchronously read and parse a custom CA bundle.
     // Track it on the blocking pool so profile/cache startup and input handling
@@ -6196,12 +6214,14 @@ async fn run_app(
             last_render_second,
             render_now,
         ) {
-            let draw_result = terminal
-                .draw(|f| super::ui::render(f, &mut app, render_now))
-                .context("drawing TUI");
+            let draw_result = super::terminal::draw(terminal, repaint_requested, |frame| {
+                super::ui::render(frame, &mut app, render_now)
+            })
+            .context("drawing TUI");
             drain_credential_tasks_on_error(&mut app, draw_result).await?;
             last_render_second = render_now;
             redraw_requested = false;
+            repaint_requested = false;
         }
 
         let event_ready = drain_credential_tasks_on_error(
@@ -6215,11 +6235,31 @@ async fn run_app(
                 event::read().context("reading terminal event"),
             )
             .await?;
+            if let Event::Mouse(mouse) = terminal_event {
+                redraw_requested |= handle_mouse_scroll(&mut app, mouse.kind);
+                continue;
+            }
             redraw_requested = true;
             let Event::Key(key) = terminal_event else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            if key.code == KeyCode::Char('l')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+            {
+                repaint_requested = true;
+                continue;
+            }
+
+            if app.reject_non_ascii_shortcut(key.code) {
+                // Repaint directly: querying/clearing the terminal while an
+                // IME owns composition can stall input or disturb the viewport.
+                repaint_requested = true;
                 continue;
             }
 
@@ -6290,8 +6330,9 @@ async fn run_app(
                         app.set_status(message.to_string(), 60);
                         // Failure to paint the exit notice must not skip the
                         // credential-safety boundary below.
-                        let _ =
-                            terminal.draw(|frame| super::ui::render(frame, &mut app, render_now));
+                        let _ = super::terminal::draw(terminal, false, |frame| {
+                            super::ui::render(frame, &mut app, render_now)
+                        });
                         app.drain_credential_tasks().await;
                         app.drain_startup_maintenance().await;
                     }
@@ -6454,13 +6495,13 @@ fn reset_plain_terminal_view() {
 }
 
 fn suspend_tui_for_plain_output() {
-    ratatui::restore();
+    super::terminal::restore();
     reset_plain_terminal_view();
 }
 
 fn resume_tui_after_plain_output(terminal: &mut DefaultTerminal) {
     reset_plain_terminal_view();
-    *terminal = ratatui::init();
+    *terminal = super::terminal::init();
     let _ = terminal.clear();
 }
 
@@ -6823,6 +6864,45 @@ async fn run_oauth_inner(
             })
         }
     }
+}
+
+/// Wheel navigation never dispatches an account action or dismisses a dialog.
+fn handle_mouse_scroll(app: &mut App, kind: crossterm::event::MouseEventKind) -> bool {
+    use crossterm::event::MouseEventKind;
+    let down = match kind {
+        MouseEventKind::ScrollDown => true,
+        MouseEventKind::ScrollUp => false,
+        _ => return false,
+    };
+    if app.rename.is_some() || app.search_active || app.confirm.is_some() {
+        return false;
+    }
+    let popup = if let Some(popup) = app.help_popup.as_mut() {
+        Some(popup)
+    } else if let Some(super::menu::MenuState::Account { popup, .. }) = app.menu.as_mut() {
+        Some(popup)
+    } else {
+        None
+    };
+    if let Some(popup) = popup {
+        let before = popup.scroll;
+        if down {
+            popup.scroll_down(u16::MAX);
+        } else {
+            popup.scroll_up();
+        }
+        return popup.scroll != before;
+    }
+    if app.menu.is_some() {
+        return false;
+    }
+    let before = app.selected;
+    if down && app.selected + 1 < app.view_indices.len() {
+        app.selected += 1;
+    } else if !down {
+        app.selected = app.selected.saturating_sub(1);
+    }
+    app.selected != before
 }
 
 fn handle_help_key(app: &mut App, code: KeyCode) {
@@ -9950,6 +10030,81 @@ mod tests {
         let task = app.account_tasks.remove(&0).expect("tracked task");
         task.handle.abort();
         let _ = task.handle.await;
+    }
+
+    #[test]
+    fn wheel_navigation_is_bounded_and_preserves_dialogs_and_editors() {
+        use crossterm::event::MouseEventKind::{Moved, ScrollDown, ScrollUp};
+        let mut app = App::new();
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollDown));
+        add_test_account(&mut app, "first");
+        add_test_account(&mut app, "second");
+        app.update_view();
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollUp));
+        assert!(super::handle_mouse_scroll(&mut app, ScrollDown));
+        assert_eq!(app.selected, 1);
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollDown));
+        assert!(!super::handle_mouse_scroll(&mut app, Moved));
+        app.open_add_menu();
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollUp));
+        assert!(app.menu.is_some());
+        assert_eq!(app.selected, 1);
+        app.close_menu();
+        app.confirm = Some(ConfirmAction::Delete("first".into()));
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollUp));
+        assert!(matches!(app.confirm, Some(ConfirmAction::Delete(_))));
+        assert_eq!(app.accounts.len(), 2);
+        app.confirm = None;
+        app.search_active = true;
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollUp));
+        app.search_active = false;
+        app.start_rename_alias("first");
+        assert!(!super::handle_mouse_scroll(&mut app, ScrollUp));
+        app.rename = None;
+        assert!(super::handle_mouse_scroll(&mut app, ScrollUp));
+        assert_eq!(app.selected, 0);
+        app.help_popup = Some(crate::tui::popup::PopupState::new());
+        assert!(super::handle_mouse_scroll(&mut app, ScrollDown));
+        assert_eq!(app.help_popup.as_ref().unwrap().scroll, 1);
+        assert!(super::handle_mouse_scroll(&mut app, ScrollUp));
+        assert!(app.help_popup.is_some());
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn ime_shortcuts_preserve_menu_and_unicode_editing() {
+        let mut app = App::new();
+        assert!(app.reject_non_ascii_shortcut(KeyCode::Char('ㅁ')));
+        assert!(
+            app.menu.is_none(),
+            "Korean input must not trigger account actions"
+        );
+        assert!(app.status_msg.as_deref().unwrap().contains("English (ABC)"));
+
+        app.open_add_menu();
+        assert!(app.reject_non_ascii_shortcut(KeyCode::Char('ㅠ')));
+        assert!(app.menu.is_some(), "IME input keeps the existing menu open");
+        assert!(!app.reject_non_ascii_shortcut(KeyCode::Char('b')));
+        assert!(matches!(
+            app.menu.as_mut().unwrap().handle_key(KeyCode::Char('b')),
+            crate::tui::menu::MenuAction::Add { device: false }
+        ));
+        app.close_menu();
+
+        app.search_active = true;
+        app.search = Some(SearchState {
+            query: String::new(),
+            cursor: 0,
+        });
+        for c in "한글".chars() {
+            assert!(!app.reject_non_ascii_shortcut(KeyCode::Char(c)));
+            app.handle_search_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.search.as_ref().unwrap().query, "한글");
+        app.search_active = false;
+        add_test_account(&mut app, "old");
+        app.start_rename_alias("old");
+        assert!(!app.reject_non_ascii_shortcut(KeyCode::Char('한')));
     }
 
     #[test]

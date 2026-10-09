@@ -85,11 +85,24 @@ The persistent footer keeps the primary `/`, `Enter`, `a`, `r`, `t`, and `h`
 actions visible. Its `t auto refresh` label reports `[ON]` or `[OFF]`; open
 Help with `h` for the complete shortcut list.
 
+Use English (ABC) input for letter shortcuts. Non-ASCII input outside text
+editors is ignored with an input-mode hint and a screen repaint; it never
+silently triggers an account action. Search continues to accept Unicode text.
+To add an account, press `a`, then `b` for browser login (or `d` for device code).
+The dashboard temporarily gives way to plain-text login instructions and
+returns after the login attempt finishes.
+
+On macOS, wheel/trackpad gestures navigate accounts or scroll account details
+and help while the dashboard is open. Mouse capture is released for login
+instructions and on exit. Native text selection may require your terminal's
+mouse-reporting bypass modifier.
+
 | Key | Action |
 |---|---|
 | `j` / `k` or `↑` / `↓` | Navigate |
 | `Enter` | Open the account menu, or the batch menu when accounts are marked |
 | `/` | Filter accounts |
+| `Ctrl+L` | Repaint the dashboard without changing accounts or editor text |
 | `r` | Refresh visible accounts |
 | `a` | Add a new account |
 | `t` | Toggle auto-refresh |
