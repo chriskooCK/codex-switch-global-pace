@@ -9644,8 +9644,11 @@ mod tests {
         );
 
         let auth_lock = crate::profile::lock_live_auth().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            // Keep contention in place until the event-loop probe finishes.
+            // The fallback also releases the lock if the runtime is blocked.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
             drop(auth_lock);
         });
         let mut app = App::new();
@@ -9657,18 +9660,21 @@ mod tests {
         });
         app.view_indices.push(0);
 
+        let started = std::time::Instant::now();
         app.switch_selected();
-        let responsive = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+        let responsive = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             tokio::task::yield_now().await;
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         })
         .await;
+        let responsive_in_time =
+            responsive.is_ok() && started.elapsed() < std::time::Duration::from_secs(2);
+        let _ = release_tx.send(());
+        release.join().unwrap();
         assert!(
-            responsive.is_ok(),
+            responsive_in_time,
             "auth-lock contention must stay on the blocking pool"
         );
-
-        release.join().unwrap();
         settle_profile_switch(&mut app).await;
         assert!(app.accounts[0].is_current);
         assert!(!app.status_is_error);
