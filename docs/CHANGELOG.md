@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix false release-cleanup failures when GitHub CLI emits a JSON error body
+  without a trailing newline before its HTTP 404 diagnostic. Check stderr
+  separately; ambiguous failures still stop without retrying deletion.
+
 ## v20261009.1.0 — 2026-10-09
 
 - Update Rustls to address RUSTSEC-2026-0285 and retain compatibility with the

@@ -630,7 +630,7 @@ fn stable_and_local_publication_share_one_exact_remote_lock() {
         "DELETION_CONFIRMATION_DELAYS=(0 0.5 1 2 4)",
         "--force-with-lease=${full_ref}:${expected_sha}",
         "gh api --method DELETE \"$endpoint\"",
-        "if response=$(gh api \"$endpoint\" 2>&1); then",
+        "if response=$(gh api \"$endpoint\" 2>\"$read_error\"); then",
         "changed identity after deletion was requested; the new ref was preserved.",
         "grep -Eq '^gh: .*\\(HTTP 404\\)\\r?$'",
         "deletion was not retried.",
@@ -6511,7 +6511,7 @@ fn binary_entrypoint_delegates_to_one_library_module_graph() {
     assert!(lib.contains("pub use app::run;"));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod github_delete_tests {
     use super::*;
 
@@ -6615,6 +6615,17 @@ not_found() {
 }
 
 case "$GH_SCENARIO:$call" in
+  json-body-then-404:*)
+    printf '{"message":"Not Found","status":"404"}'
+    printf 'gh: Not Found (HTTP 404)\n' >&2
+    exit 1 ;;
+  body-only-404:*)
+    printf '{"message":"Not Found","status":"404"}'
+    exit 1 ;;
+  json-body-then-500:*)
+    printf '{"message":"Not Found","status":"404"}'
+    printf 'gh: Internal Server Error (HTTP 500)\n' >&2
+    exit 1 ;;
   tag-stale-then-404:1) emit_tag commit "$EXPECTED_SHA" ;;
   tag-stale-then-404:*) not_found ;;
   tag-same:*) emit_tag commit "$EXPECTED_SHA" ;;
@@ -6683,6 +6694,49 @@ exit 0
             gh_calls: github_delete_test_log(&gh_calls),
             git_calls: github_delete_test_log(&git_calls),
             sleep_calls: github_delete_test_log(&sleep_calls),
+        }
+    }
+
+    #[test]
+    fn github_delete_accepts_404_with_a_json_body_without_a_newline() {
+        for arguments in [
+            vec![
+                "tag-ref",
+                GITHUB_DELETE_TEST_TAG,
+                "commit",
+                GITHUB_DELETE_TEST_SHA,
+            ],
+            vec!["release", GITHUB_DELETE_TEST_RELEASE_ID],
+        ] {
+            let run = run_github_delete_test(&arguments, "json-body-then-404");
+            assert!(run.status.success(), "{}", run.diagnostics());
+            assert_eq!(
+                run.git_push_count() + run.gh_delete_count(),
+                1,
+                "{}",
+                run.diagnostics()
+            );
+            assert_eq!(run.gh_get_count(), 1, "{}", run.diagnostics());
+            assert!(run.sleep_calls.is_empty(), "{}", run.diagnostics());
+        }
+    }
+
+    #[test]
+    fn github_delete_does_not_trust_a_404_in_the_response_body() {
+        for scenario in ["body-only-404", "json-body-then-500"] {
+            let run = run_github_delete_test(
+                &[
+                    "tag-ref",
+                    GITHUB_DELETE_TEST_TAG,
+                    "commit",
+                    GITHUB_DELETE_TEST_SHA,
+                ],
+                scenario,
+            );
+            assert!(!run.status.success(), "{}", run.diagnostics());
+            assert_eq!(run.git_push_count(), 1, "{}", run.diagnostics());
+            assert_eq!(run.gh_get_count(), 1, "{}", run.diagnostics());
+            assert!(run.sleep_calls.is_empty(), "{}", run.diagnostics());
         }
     }
 

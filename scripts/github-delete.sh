@@ -20,13 +20,18 @@ if [[ ! "${GITHUB_REPOSITORY:-}" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]]; then
   exit 2
 fi
 
+# gh can write a JSON body without a trailing newline to stdout before its
+# HTTP diagnostic on stderr. Never merge these streams for status detection.
+read_error=$(mktemp)
+trap 'rm -f "$read_error"' EXIT
+
 resource_kind="${1:-}"
 case "$resource_kind" in
   tag-ref)
     (( $# == 4 )) || usage
     tag="$2"
     expected_type="$3"
-    expected_sha="${4,,}"
+    expected_sha="$(printf '%s' "$4" | tr '[:upper:]' '[:lower:]')"
     if [[ -z "$tag" || \
           ( "$expected_type" != commit && "$expected_type" != tag ) || \
           ! "$expected_sha" =~ ^[0-9a-f]{40}$ ]]; then
@@ -69,7 +74,7 @@ for delay in "${DELETION_CONFIRMATION_DELAYS[@]}"; do
     sleep "$delay"
   fi
 
-  if response=$(gh api "$endpoint" 2>&1); then
+  if response=$(gh api "$endpoint" 2>"$read_error"); then
     case "$resource_kind" in
       tag-ref)
         if ! jq -e '
@@ -104,10 +109,11 @@ for delay in "${DELETION_CONFIRMATION_DELAYS[@]}"; do
     read_status=$?
   fi
 
-  if grep -Eq '^gh: .*\(HTTP 404\)\r?$' <<<"$response"; then
+  if grep -Eq '^gh: .*\(HTTP 404\)\r?$' "$read_error"; then
     exit 0
   fi
   printf '%s\n' "$response" >&2
+  cat "$read_error" >&2
   echo "Could not confirm deletion of ${description} (read status ${read_status}); deletion was not retried." >&2
   exit 1
 done
