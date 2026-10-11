@@ -42,6 +42,7 @@ const MIN_ACCOUNT_TABLE_HEIGHT: u16 = 6;
 const USAGE_BAR_LABEL_COLUMN_WIDTH: u16 = 6;
 const USAGE_BAR_SUFFIX_WIDTH: u16 = 24;
 const PACE_LABEL: &str = "\u{2191} pace";
+const ACCOUNT_TABLE_EMAIL_MIN_WIDTH: u16 = 86;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UsageBarAreas {
@@ -671,16 +672,24 @@ fn table_text_widths(
     };
     let mut widths = TableTextWidths {
         alias: desired("Alias", aliases).max(5),
-        email: desired("Email", emails).max(5),
+        email: if total_width >= ACCOUNT_TABLE_EMAIL_MIN_WIDTH {
+            desired("Email", emails).max(5)
+        } else {
+            0
+        },
         plan: desired("Plan", plans).max(4),
     };
 
-    // Borders, column spacing, marker and fixed quota columns consume 64 cells.
-    let budget = total_width.saturating_sub(64).max(14);
+    // At 80 columns, omit email rather than clipping credits or reset timestamps.
+    let show_email = widths.email > 0;
+    let fixed_width = if show_email { 72 } else { 71 };
+    let budget = total_width
+        .saturating_sub(fixed_width)
+        .max(if show_email { 14 } else { 9 });
     let total = u32::from(widths.alias) + u32::from(widths.email) + u32::from(widths.plan);
     let mut excess = total.saturating_sub(u32::from(budget));
     for (width, minimum) in [
-        (&mut widths.email, 5_u16),
+        (&mut widths.email, if show_email { 5_u16 } else { 0 }),
         (&mut widths.plan, 4_u16),
         (&mut widths.alias, 5_u16),
     ] {
@@ -718,7 +727,8 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
     }
 
     let hdr = base().fg(C_CYAN).add_modifier(Modifier::BOLD);
-    let header = Row::new(vec![
+    let show_email = area.width >= ACCOUNT_TABLE_EMAIL_MIN_WIDTH;
+    let mut header_cells = vec![
         Cell::from(" ").style(base().fg(DIM)),
         Cell::from("Alias").style(hdr),
         Cell::from("Email").style(hdr),
@@ -726,11 +736,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
         Cell::from("Status").style(hdr),
         Cell::from("5h").style(hdr),
         Cell::from("7d").style(hdr),
+        Cell::from("Credits").style(hdr),
         Cell::from("5h Reset").style(hdr),
         Cell::from("7d Reset").style(hdr),
         Cell::from("Cards").style(hdr),
-    ])
-    .height(1);
+    ];
+    if !show_email {
+        header_cells.remove(2);
+    }
+    let header = Row::new(header_cells).height(1);
 
     let mut rows: Vec<Row> = Vec::new();
     let mut render_selected: usize = 0;
@@ -901,7 +915,8 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
                 }
             };
 
-            Row::new(vec![
+            let (credits, credits_color) = credits_table_value(&entry.usage);
+            let mut cells = vec![
                 Cell::from(Span::styled(marker, marker_style)),
                 Cell::from(alias).style(row_style),
                 Cell::from(email).style(row_style),
@@ -915,11 +930,15 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
                 )),
                 Cell::from(pct_5h).style(usage_pct_style(pct_5h_color, is_selected)),
                 Cell::from(pct_7d).style(usage_pct_style(pct_7d_color, is_selected)),
+                Cell::from(credits).style(base().fg(credits_color)),
                 Cell::from(reset_5h).style(base().fg(reset_5h_color)),
                 Cell::from(reset_7d).style(base().fg(reset_7d_color)),
                 Cell::from(reset_cards).style(base().fg(reset_cards_color)),
-            ])
-            .height(1)
+            ];
+            if !show_email {
+                cells.remove(2);
+            }
+            Row::new(cells).height(1)
         };
 
         if view_i == app.selected {
@@ -986,37 +1005,71 @@ fn render_account_table(f: &mut Frame, app: &App, area: Rect, now: i64) {
     let plans: Vec<&str> = plan_labels.iter().map(String::as_str).collect();
     let text_widths = table_text_widths(area.width, &aliases, &emails, &plans);
 
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(2),                 // marker
-            Constraint::Length(text_widths.alias), // alias
-            Constraint::Length(text_widths.email), // email
-            Constraint::Length(text_widths.plan),  // plan
-            Constraint::Length(8),                 // status
-            Constraint::Length(6),                 // 5h %
-            Constraint::Length(6),                 // 7d %
-            Constraint::Length(12),                // 5h reset
-            Constraint::Length(12),                // 7d reset
-            Constraint::Length(7),                 // reset cards
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(base().fg(C_BLUE))
-            .style(base()),
-    )
-    .row_highlight_style(
-        Style::default()
-            .bg(C_HIGHLIGHT_BG)
-            .add_modifier(Modifier::BOLD),
-    )
-    .style(base());
+    let mut constraints = vec![
+        Constraint::Length(2),                 // marker
+        Constraint::Length(text_widths.alias), // alias
+        Constraint::Length(text_widths.email), // email
+        Constraint::Length(text_widths.plan),  // plan
+        Constraint::Length(7),                 // status
+        Constraint::Length(6),                 // 5h %
+        Constraint::Length(6),                 // 7d %
+        Constraint::Length(10),                // credits
+        Constraint::Length(12),                // 5h reset
+        Constraint::Length(12),                // 7d reset
+        Constraint::Length(5),                 // reset cards
+    ];
+    if !show_email {
+        constraints.remove(2);
+    }
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(base().fg(C_BLUE))
+                .style(base()),
+        )
+        .row_highlight_style(
+            Style::default()
+                .bg(C_HIGHLIGHT_BG)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(base());
 
     f.render_stateful_widget(table, area, &mut table_state);
+}
+
+fn credits_table_value(status: &UsageStatus) -> (String, Color) {
+    let usage = match status {
+        UsageStatus::Idle => return ("--".into(), DIM),
+        UsageStatus::Loading => return ("...".into(), C_YELLOW),
+        UsageStatus::Error(_) => return ("Err".into(), C_RED),
+        UsageStatus::Loaded(usage) => usage,
+    };
+    if usage.unlimited_credits == Some(true) {
+        return ("Unlimited".into(), C_GRAY);
+    }
+    let Some(balance) = usage
+        .credits_balance
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    else {
+        return ("--".into(), DIM);
+    };
+    let text = if balance == 0.0 {
+        "0".into()
+    } else if balance < 0.01 {
+        "<0.01".into()
+    } else {
+        let decimal = format!("{balance:.2}");
+        let trimmed = decimal.trim_end_matches('0').trim_end_matches('.');
+        if trimmed.len() <= 10 {
+            trimmed.to_string()
+        } else {
+            format!("{balance:.2e}")
+        }
+    };
+    (text, C_GRAY)
 }
 
 fn usage_gauges_height(usage: &UsageInfo) -> u16 {
@@ -3206,6 +3259,96 @@ mod tests {
     }
 
     #[test]
+    fn account_table_shows_credits_between_weekly_usage_and_reset() {
+        let mut app = App::new();
+        for (alias, balance, unlimited) in [
+            ("paid", Some(1250.5), false),
+            ("zero", Some(0.0), false),
+            ("none", None, false),
+            ("unlim", None, true),
+        ] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo::default(),
+                usage: UsageStatus::Loaded(Box::new(UsageInfo {
+                    credits_balance: balance,
+                    unlimited_credits: Some(unlimited),
+                    primary: Some(WindowUsage {
+                        used_percent: Some(12.0),
+                        resets_at: Some(TEST_NOW + 86400),
+                        ..WindowUsage::default()
+                    }),
+                    secondary: Some(WindowUsage {
+                        used_percent: Some(34.0),
+                        resets_at: Some(TEST_NOW + 172800),
+                        ..WindowUsage::default()
+                    }),
+                    ..UsageInfo::default()
+                })),
+                is_current: false,
+            });
+        }
+        app.update_view();
+        for width in [80, 86, 100, 120, 180] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_account_table(frame, &app, frame.area(), TEST_NOW);
+                })
+                .unwrap();
+            let header = row_text(terminal.backend(), 1);
+            let credit_x = header.find("Credits").expect("Credits column");
+            assert!(header.find("7d").unwrap() < credit_x, "{header}");
+            assert!(credit_x < header.find("5h Reset").unwrap(), "{header}");
+            assert!(
+                header.contains("7d Reset") && header.contains("Cards"),
+                "{header}"
+            );
+            for (alias, expected) in [
+                ("paid", "1250.5"),
+                ("zero", "0"),
+                ("none", "--"),
+                ("unlim", "Unlimited"),
+            ] {
+                let row = (2..8)
+                    .map(|y| row_text(terminal.backend(), y))
+                    .find(|row| row.contains(alias))
+                    .unwrap();
+                // Buffer text is Unicode (box borders); column offsets use characters.
+                let x = header[..credit_x].chars().count();
+                let cell: String = row.chars().skip(x).take(10).collect();
+                assert_eq!(cell.trim(), expected, "width {width}: {row}");
+                for timestamp in [TEST_NOW + 86400, TEST_NOW + 172800] {
+                    assert!(
+                        row.contains(&crate::output::format_reset_short(timestamp, TEST_NOW)),
+                        "width {width}: {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn account_table_credit_values_keep_missing_and_small_balances_distinct() {
+        assert_eq!(super::credits_table_value(&UsageStatus::Idle).0, "--");
+        assert_eq!(super::credits_table_value(&UsageStatus::Loading).0, "...");
+        for (balance, expected) in [
+            (0.004, "<0.01"),
+            (12.34, "12.34"),
+            (1e20, "1.00e20"),
+            (f64::NAN, "--"),
+            (f64::INFINITY, "--"),
+            (-1.0, "--"),
+        ] {
+            let usage = UsageStatus::Loaded(Box::new(UsageInfo {
+                credits_balance: Some(balance),
+                ..UsageInfo::default()
+            }));
+            assert_eq!(super::credits_table_value(&usage).0, expected);
+        }
+    }
+
+    #[test]
     fn account_table_columns_expand_to_fit_names_when_space_is_available() {
         let widths = table_text_widths(
             180,
@@ -3227,7 +3370,8 @@ mod tests {
             &["Team - NightCity Workspace"],
         );
 
-        assert!(widths.alias + widths.email + widths.plan <= 16);
+        assert_eq!(widths.email, 0);
+        assert!(widths.alias + widths.plan + 71 <= 80);
     }
 
     #[test]

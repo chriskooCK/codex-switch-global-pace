@@ -1,5 +1,12 @@
 # Changelog
 
+## v20261011.1.0 — 2026-10-11
+
+- Show each account's remaining credits between `7d` and `5h Reset` in the
+  dashboard. Keep zero distinct from unavailable data, preserve cached balances
+  during refresh, and hide the email column below 86 terminal columns to retain
+  credits and reset timestamps at 80 columns.
+
 ## v20261009.2.0 — 2026-10-09
 
 - Fix false release-cleanup failures when GitHub CLI emits a JSON error body

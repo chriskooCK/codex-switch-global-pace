@@ -149,6 +149,17 @@ the same cached organization result.
 
 Normal reads refresh only stale entries. Use `list -f` or the TUI refresh action when a fresh network read is required.
 
+The dashboard's `Credits` column sits between `7d` and `5h Reset` and shows
+the account's reported credit balance without a currency conversion. `0` is a
+reported zero balance; `--` means no balance is available (including accounts
+without credits), `Unlimited` means the service reports unlimited credits,
+`...` means the first fetch is pending, and `Err` means the usage fetch failed.
+Balances refresh with usage; an in-progress refresh keeps the last loaded value.
+Values use up to two decimal places (`<0.01` for a smaller positive balance)
+and scientific notation for numbers too large for the column. Below 86 terminal
+columns, email is omitted from the list so credits and reset timestamps still
+fit at 80 columns; email remains available in the account menu.
+
 When the service issues a replacement for a single-use refresh token, the app
 must first durably stage the returned rotation material under the private
 `recovery/` directory. Only then can it attempt the identity-bound profile
