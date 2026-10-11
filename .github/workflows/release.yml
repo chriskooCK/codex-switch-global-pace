@@ -170,7 +170,7 @@ jobs:
           7z a "${{ matrix.name }}.zip" "./target/${{ matrix.target }}/release/codex-switch-global-pace.exe"
           sha256sum "${{ matrix.name }}.zip" > "${{ matrix.name }}.zip.sha256"
       - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.name }}
           path: |
@@ -706,7 +706,7 @@ jobs:
         run: "$RUNNER_TEMP/verify-release-tag.sh"
       - name: Preserve verified dev release bundle
         if: needs.meta.outputs.is_dev == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dev-release-${{ github.sha }}
           path: dev-bundle/
