@@ -864,7 +864,7 @@ mod tests {
             user_id: Some("user-id".into()),
             workspace_name: Some("Night City".into()),
             is_fedramp: false,
-            plan_label: "Pro 20×".into(),
+            plan_label: "Pro 200".into(),
             plan_type: Some("pro".into()),
             is_current: true,
             organizations: vec!["Night City · Owner · default workspace".into()],

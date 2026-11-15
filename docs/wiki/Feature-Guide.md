@@ -173,10 +173,21 @@ proven there; a replaced or unverifiable name is reported as partial cleanup
 without being mislabeled as the rotated credential. No failure path
 automatically retries a token the service already consumed.
 
+Plan labels follow the current consumer tiers: Plus, Pro 100 (`prolite`),
+Pro 200 (`pro`), and Pro 500 (`promax`). The usage service's plan takes precedence
+over older login claims. Unknown plan identifiers remain visible as returned;
+they are not assigned a known tier. See the
+[official Pro tiers](https://help.openai.com/en/articles/9793128-about-chatgpt-pro-tiers).
+Labels do not scale usage: the 5h and 7d columns show each server window's
+remaining percentage independently. A 5h limit can be exhausted while 7d still
+has 69% remaining; the account is then `Used up` until the short limit resets.
+
 The Global Weekly Pace box visualizes every account with a valid weekly window
-as one equal-weight pool. This is only an aggregate display: quota remains
-separate on each account. Its filled bar is aggregate actual usage, while the
-`↑ pace` marker is aggregate elapsed time and therefore the ideal usage position
+as an `Account average`. This is an equal-weight average of account percentages,
+not a combined quota balance: quota remains separate on each account. The API
+does not supply comparable absolute capacities, and monthly prices or former
+plan multipliers are not used to invent them. Its filled bar is average usage,
+while the `↑ pace` marker is average elapsed time and therefore the ideal usage position
 for the current point in the weekly windows. The summary text shows the
 participating account count and nearest included-account reset. A separate row
 shows the earliest upcoming reset-card expiry across all registered accounts,

@@ -135,7 +135,10 @@ fn run_cmd(env: &TestEnv, args: &[&str]) -> Output {
     Command::new(bin)
         .args(args)
         .env("HOME", &env.home)
+        .env("CODEX_SWITCH_HOME", env.app_home())
         .env("CODEX_HOME", &env.codex_home)
+        // Test the configured log level, independent of the invoking shell.
+        .env_remove("RUST_LOG")
         .env("CS_USAGE_URL", &env.usage_url)
         .env("CS_TOKEN_URL", &env.token_url)
         .env("NO_COLOR", "1")

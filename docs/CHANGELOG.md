@@ -1,5 +1,20 @@
 # Changelog
 
+## v20261115.1.0 — 2026-11-15
+
+- Update ZIP, TLS, QUIC, Tokio, and Rustix dependencies to address reported
+  security and soundness advisories. ZIP filename decoding errors now propagate
+  before the update candidate is written.
+- Isolate the daemon integration test from inherited `RUST_LOG` and
+  `CODEX_SWITCH_HOME` settings, so its configured info-level file logging and
+  temporary profile directory are tested consistently.
+- Replace outdated Pro 5×/20× labels with Pro 100/200 and recognize the
+  `promax` tier as Pro 500 in CLI and TUI plan labels and colors. Keep server
+  usage percentages independent of plan names and prices.
+- Label Global Weekly Pace as `Account average` so mixed Plus/Pro percentages
+  are not presented as a capacity-weighted quota balance. The API does not
+  provide the comparable capacities needed for that calculation.
+
 ## v20261011.1.0 — 2026-10-11
 
 - Show each account's remaining credits between `7d` and `5h Reset` in the

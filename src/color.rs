@@ -164,7 +164,7 @@ fn colored_plan(label: &str, plan_type: Option<&str>) -> String {
         PlanKind::Go => format!("[{}]", label.bright_blue()),
         PlanKind::Plus => format!("[{}]", label.cyan()),
         PlanKind::ProLite => format!("[{}]", label.yellow()),
-        PlanKind::Pro => format!("[{}]", label.bright_yellow().bold()),
+        PlanKind::Pro | PlanKind::ProMax => format!("[{}]", label.bright_yellow().bold()),
         PlanKind::Team | PlanKind::Business | PlanKind::Edu => {
             format!("[{}]", label.magenta())
         }
@@ -202,12 +202,14 @@ mod tests {
     }
 
     #[test]
-    fn plan_colors_distinguish_go_and_both_pro_tiers() {
+    fn plan_colors_distinguish_go_and_pro_tiers() {
         assert!(colored_plan("Go", Some("go")).contains("\u{1b}[94m"));
-        assert!(colored_plan("Pro 5×", Some("prolite")).contains("\u{1b}[33m"));
-        let pro = colored_plan("Pro 20×", Some("pro"));
-        assert!(pro.contains("\u{1b}[93m"));
-        assert!(pro.contains("\u{1b}[1m"));
+        assert!(colored_plan("Pro 100", Some("prolite")).contains("\u{1b}[33m"));
+        for (wire, label) in [("pro", "Pro 200"), ("promax", "Pro 500")] {
+            let pro = colored_plan(label, Some(wire));
+            assert!(pro.contains("\u{1b}[93m"));
+            assert!(pro.contains("\u{1b}[1m"));
+        }
     }
 
     #[test]

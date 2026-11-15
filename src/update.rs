@@ -3164,7 +3164,10 @@ fn extract_zip_binary(archive_path: &Path, binary_name: &str, output_path: &Path
         let mut entry = archive
             .by_index(index)
             .with_context(|| format!("reading zip entry #{index}"))?;
-        let name = entry.name().replace('\\', "/");
+        let name = entry
+            .name()
+            .with_context(|| format!("decoding zip entry #{index} name"))?
+            .replace('\\', "/");
         if Path::new(&name)
             .file_name()
             .and_then(|value| value.to_str())
@@ -3474,6 +3477,59 @@ mod tests {
         assert!(asset_name().starts_with("codex-switch-global-pace-"));
         assert!(extracted_binary_name().starts_with("codex-switch-global-pace"));
         assert_eq!(UPDATE_CACHE_NAME, "global-pace-update-check.json");
+    }
+
+    #[test]
+    fn zip_binary_extraction_accepts_release_paths_without_unpacking_other_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("release.zip");
+        let output = temp.path().join("candidate.exe");
+        let binary_name = "codex-switch-global-pace.exe";
+        for separator in ["/", "\\"] {
+            let mut archive = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            archive.start_file("README.md", options).unwrap();
+            archive.write_all(b"not the executable").unwrap();
+            archive
+                .start_file(format!("release{separator}{binary_name}"), options)
+                .unwrap();
+            archive.write_all(b"verified executable").unwrap();
+            archive.finish().unwrap();
+
+            extract_zip_binary(&archive_path, binary_name, &output).unwrap();
+
+            assert_eq!(fs::read(&output).unwrap(), b"verified executable");
+            assert!(!temp.path().join("README.md").exists());
+            assert!(!temp.path().join("release").exists());
+        }
+    }
+
+    #[test]
+    fn zip_binary_extraction_preserves_output_when_archive_is_unusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("release.zip");
+        let output = temp.path().join("candidate.exe");
+        let mut archive = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+        archive
+            .start_file("README.md", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        archive.write_all(b"no executable in this archive").unwrap();
+        archive.finish().unwrap();
+        fs::write(&output, b"existing candidate").unwrap();
+
+        let error = extract_zip_binary(&archive_path, "candidate.exe", &output).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("binary 'candidate.exe' not found")
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"existing candidate");
+
+        fs::write(&archive_path, b"invalid zip archive").unwrap();
+        let error = extract_zip_binary(&archive_path, "candidate.exe", &output).unwrap_err();
+        assert!(error.to_string().contains("opening zip archive"));
+        assert_eq!(fs::read(&output).unwrap(), b"existing candidate");
     }
 
     #[test]

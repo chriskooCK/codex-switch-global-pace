@@ -43,6 +43,7 @@ pub enum PlanKind {
     Plus,
     ProLite,
     Pro,
+    ProMax,
     Team,
     Business,
     Enterprise,
@@ -58,6 +59,7 @@ impl PlanKind {
             Some("plus") => Self::Plus,
             Some("prolite") => Self::ProLite,
             Some("pro") => Self::Pro,
+            Some("promax") => Self::ProMax,
             Some("team") => Self::Team,
             Some(
                 "self_serve_business_prolite" | "self_serve_business_usage_based" | "business",
@@ -75,8 +77,9 @@ impl PlanKind {
             Self::Free => "Free".to_string(),
             Self::Go => "Go".to_string(),
             Self::Plus => "Plus".to_string(),
-            Self::ProLite => "Pro 5×".to_string(),
-            Self::Pro => "Pro 20×".to_string(),
+            Self::ProLite => "Pro 100".to_string(),
+            Self::Pro => "Pro 200".to_string(),
+            Self::ProMax => "Pro 500".to_string(),
             Self::Team => "Team".to_string(),
             Self::Business => "Business".to_string(),
             Self::Enterprise => "Enterprise".to_string(),
@@ -557,8 +560,9 @@ mod tests {
             ("free", "Free"),
             ("go", "Go"),
             ("plus", "Plus"),
-            ("prolite", "Pro 5×"),
-            ("pro", "Pro 20×"),
+            ("prolite", "Pro 100"),
+            ("pro", "Pro 200"),
+            ("promax", "Pro 500"),
         ] {
             info.plan_type = Some(wire.to_string());
             assert_eq!(info.plan_label(), expected);

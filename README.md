@@ -161,8 +161,10 @@ This view does not combine quotas on the service, move capacity between
 accounts, or circumvent account limits. Fully exhausted accounts remain
 included when their reset timestamp is valid. Accounts whose usage or weekly
 reset cannot be trusted are counted as unavailable instead of being guessed.
-The current API does not expose a reliable comparable weekly capacity, so
-participating accounts are weighted equally.
+The panel is labeled `Account average`: the current API does not expose a
+reliable comparable weekly capacity, so participating accounts are weighted
+equally. This is the average of each account's usage percentage, not a combined
+quota balance across Plus and Pro plans. Plan prices are not quota weights.
 
 Quota meters use one relative rule everywhere: yellow means actual usage is
 ahead of the elapsed-time pace, while green means usage is at or behind pace.

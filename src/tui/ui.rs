@@ -16,8 +16,8 @@ use crate::output::{
 };
 use crate::safe_text;
 use crate::usage::{
-    GlobalWeeklySummary, QuotaPaceState, UsageAvailability, UsageInfo, quota_pace_state,
-    usage_availability,
+    GlobalPaceWeighting, GlobalWeeklySummary, QuotaPaceState, UsageAvailability, UsageInfo,
+    quota_pace_state, usage_availability,
 };
 
 // ── RGB-only color palette ───────────────────────────────
@@ -301,8 +301,12 @@ fn render_global_weekly_pace(
         return;
     }
 
+    let title = match summary.weighting {
+        GlobalPaceWeighting::Equal => " Global Weekly Pace · Account average ",
+        GlobalPaceWeighting::Capacity => " Global Weekly Pace · Capacity weighted ",
+    };
     let block = Block::default()
-        .title(" Global Weekly Pace ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(base().fg(C_BLUE))
         .style(base());
@@ -1584,11 +1588,16 @@ fn plan_color(plan: Option<&str>, is_selected: bool) -> Style {
         PlanKind::Free | PlanKind::Unknown => C_GRAY,
         PlanKind::Go => C_BLUE,
         PlanKind::Plus => C_CYAN,
-        PlanKind::ProLite | PlanKind::Pro => C_YELLOW,
+        PlanKind::ProLite | PlanKind::Pro | PlanKind::ProMax => C_YELLOW,
         PlanKind::Team | PlanKind::Business | PlanKind::Enterprise | PlanKind::Edu => C_MAGENTA,
     };
     let s = base().fg(fg);
-    if is_selected || matches!(kind, PlanKind::Pro | PlanKind::Enterprise) {
+    if is_selected
+        || matches!(
+            kind,
+            PlanKind::Pro | PlanKind::ProMax | PlanKind::Enterprise
+        )
+    {
         s.add_modifier(Modifier::BOLD)
     } else {
         s
@@ -2721,6 +2730,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Global Weekly Pace"));
+        assert!(rendered.contains("Account average"));
         assert!(rendered.contains("7% used"));
         assert!(rendered.contains("93% left"));
         assert!(rendered.contains("↑ pace"));
@@ -3250,12 +3260,70 @@ mod tests {
         assert_eq!(plan_color(Some("go"), false).fg, Some(C_BLUE));
         assert_eq!(plan_color(Some("plus"), false).fg, Some(C_CYAN));
         assert_eq!(plan_color(Some("prolite"), false).fg, Some(C_YELLOW));
-        let pro = plan_color(Some("pro"), false);
-        assert_eq!(pro.fg, Some(C_YELLOW));
-        assert!(pro.add_modifier.contains(Modifier::BOLD));
+        for wire in ["pro", "promax"] {
+            let pro = plan_color(Some(wire), false);
+            assert_eq!(pro.fg, Some(C_YELLOW));
+            assert!(pro.add_modifier.contains(Modifier::BOLD));
+        }
         assert_eq!(plan_color(Some("team"), false).fg, Some(C_MAGENTA));
         assert_eq!(plan_color(Some("business"), false).fg, Some(C_MAGENTA));
         assert_eq!(plan_color(Some("future_plan"), false).fg, Some(C_GRAY));
+    }
+
+    #[test]
+    fn current_plus_usage_overrides_pro_claims_without_rescaling() {
+        for (short_used, used, remaining, status) in [
+            (0, 31, "69%", "OK"),
+            (100, 31, "69%", "Used up"),
+            (0, 100, "0%", "Used up"),
+        ] {
+            let usage = crate::usage::parse_usage(&serde_json::json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "allowed": short_used < 100 && used < 100,
+                    "limit_reached": short_used == 100 || used == 100,
+                    "primary_window": {
+                        "used_percent": short_used,
+                        "limit_window_seconds": 18000,
+                        "reset_at": TEST_NOW + 18000
+                    },
+                    "secondary_window": {
+                        "used_percent": used,
+                        "limit_window_seconds": 604800,
+                        "reset_at": TEST_NOW + 604800
+                    }
+                }
+            }))
+            .unwrap();
+            let mut app = App::new();
+            app.accounts.push(AccountEntry {
+                alias: "downgraded".into(),
+                info: AccountInfo {
+                    plan_type: Some("pro".into()),
+                    ..AccountInfo::default()
+                },
+                usage: UsageStatus::Loaded(Box::new(usage)),
+                is_current: false,
+            });
+            app.update_view();
+            let mut terminal = Terminal::new(TestBackend::new(160, 6)).unwrap();
+            terminal
+                .draw(|frame| render_account_table(frame, &app, frame.area(), TEST_NOW))
+                .unwrap();
+            let header = row_text(terminal.backend(), 1);
+            let row = (2..6)
+                .map(|y| row_text(terminal.backend(), y))
+                .find(|row| row.contains("downgraded"))
+                .unwrap();
+            assert!(row.contains("Plus"), "{row}");
+            assert!(!row.contains("Pro"), "{row}");
+            assert!(row.contains(status), "{row}");
+            let weekly_column = header[..header.find("7d").unwrap()].chars().count();
+            let weekly = row.chars().skip(weekly_column).take(6).collect::<String>();
+            assert_eq!(weekly.trim(), remaining, "{row}");
+            let global = app.global_weekly_summary(TEST_NOW);
+            assert_eq!(global.aggregate_used_percent, Some(f64::from(used)));
+        }
     }
 
     #[test]
@@ -3354,7 +3422,7 @@ mod tests {
             180,
             &["oai001_20x", "a-very-long-account-alias"],
             &["oai001@example.com"],
-            &["Pro 20×", "Team - NightCity Workspace"],
+            &["Pro 200", "Team - NightCity Workspace"],
         );
 
         assert!(widths.alias >= "a-very-long-account-alias".chars().count() as u16);
