@@ -362,19 +362,18 @@ fn metadata_lookup_requires_parent(error: &std::io::Error) -> bool {
 }
 
 fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
-    if metadata.file_type().is_symlink() {
-        return true;
-    }
+    let is_symlink = metadata.file_type().is_symlink();
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
+        is_symlink
+            || metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
     }
     #[cfg(not(windows))]
     {
-        false
+        is_symlink
     }
 }
 

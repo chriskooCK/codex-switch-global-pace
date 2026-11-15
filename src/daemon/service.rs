@@ -366,10 +366,7 @@ pub(crate) fn is_installed_checked() -> Result<bool> {
     #[cfg(target_os = "windows")]
     {
         let task_file = windows_task_file_path()?;
-        if optional_task_definition(&task_file)?.is_none() {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(optional_task_definition(&task_file)?.is_some())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     Ok(false)

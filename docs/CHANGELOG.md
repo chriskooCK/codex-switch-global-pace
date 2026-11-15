@@ -8,6 +8,8 @@
 - Isolate the daemon integration test from inherited `RUST_LOG` and
   `CODEX_SWITCH_HOME` settings, so its configured info-level file logging and
   temporary profile directory are tested consistently.
+- Remove the unused `tracing-appender` dependency and simplify platform checks
+  for Rust 1.100 without changing filesystem or process-detection behavior.
 - Replace outdated Pro 5×/20× labels with Pro 100/200 and recognize the
   `promax` tier as Pro 500 in CLI and TUI plan labels and colors. Keep server
   usage percentages independent of plan names and prices.

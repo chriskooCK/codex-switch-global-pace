@@ -210,15 +210,15 @@ fn linux_effective_uid(status: &str) -> Option<u32> {
 
 #[cfg(any(unix, test))]
 fn process_vanished(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return true;
-    }
-
+    let not_found = error.kind() == std::io::ErrorKind::NotFound;
     #[cfg(unix)]
-    return error.raw_os_error() == Some(libc::ESRCH);
-
+    {
+        not_found || error.raw_os_error() == Some(libc::ESRCH)
+    }
     #[cfg(not(unix))]
-    false
+    {
+        not_found
+    }
 }
 
 #[cfg(target_os = "macos")]
